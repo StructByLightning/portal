@@ -113,3 +113,58 @@ test('an RPC issued during a reconnect is sent on resumed', async (t) => {
   ws2.feed({ op: 'rpc_result', d: { id: frames[0].d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
   assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
 });
+
+test('an RPC issued while the socket is closing is held, not dropped', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+
+  // CLOSING: the socket is no longer OPEN but its close event hasn't fired yet.
+  created[0].readyState = 2;
+  const p = client.sendMessage({ channelId: 'c1', content: 'while closing' });
+  created[0].emit('close', 1006);
+  await new Promise((r) => setTimeout(r, 60)); // > jittered backoff (≤20ms)
+  const ws2 = created[1];
+  assert.ok(ws2, 'reconnected');
+
+  ws2.feed(HELLO);
+  ws2.feed({ op: 'resumed', d: { replayedEvents: 0 } });
+  const frames = ws2.rpcFrames();
+  assert.equal(frames.length, 1, 'the call made during CLOSING is sent after resume');
+  assert.equal(frames[0].d.method, 'send_message');
+
+  ws2.feed({ op: 'rpc_result', d: { id: frames[0].d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
+  assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
+});
+
+test('close() rejects held RPCs and a later connect() never sends them', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  const p = client.sendMessage({ channelId: 'c1', content: 'before shutdown' });
+  const rejected = assert.rejects(p, /closed/);
+
+  client.close();
+  client.connect().catch(() => {});
+  const ws2 = created[1];
+  ws2.feed(HELLO);
+  ws2.feed(READY);
+  assert.equal(ws2.rpcFrames().length, 0, 'work queued before close() is not sent after reconnecting');
+  await rejected;
+});
+
+test('a held RPC sends the params as they were at call time', (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  const params = { channelId: 'c1', content: 'hi' };
+  client.sendMessage(params).catch(() => {});
+  params.channelId = 'c2';
+
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+  const [frame] = created[0].sent.map((s) => JSON.parse(s)).filter((f) => f.op === 'rpc');
+  assert.equal(frame.d.params.channelId, 'c1');
+});
