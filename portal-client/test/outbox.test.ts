@@ -168,3 +168,20 @@ test('a held RPC sends the params as they were at call time', (t) => {
   const [frame] = created[0].sent.map((s) => JSON.parse(s)).filter((f) => f.op === 'rpc');
   assert.equal(frame.d.params.channelId, 'c1');
 });
+
+test('an RPC issued after close() is rejected and never sent on a later connect()', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+
+  client.close();
+  const p = client.sendMessage({ channelId: 'c1', content: 'after shutdown' });
+  const rejected = assert.rejects(p, /closed/);
+  client.connect().catch(() => {});
+  created[1].feed(HELLO);
+  created[1].feed(READY);
+  assert.equal(created[1].rpcFrames().length, 0, 'a call made after close() is not sent after reconnecting');
+  await rejected;
+});

@@ -111,13 +111,12 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   private backoff = 1000;
   private closedByUser = false;
   private ready = false;
-  /** RPC frames issued while the session couldn't take them (before the
-   *  first `ready`, during a reconnect, or while the socket is CLOSING).
-   *  sendFrame drops anything sent on a socket that isn't OPEN, and the relay
-   *  ignores RPCs before identify, so these are held and flushed on
-   *  `ready`/`resumed`. Each frame is serialized when the call is made, so a
-   *  caller mutating its params afterwards can't change what gets sent. Each
-   *  call's own timer still bounds how long it waits; close() rejects them. */
+  /** RPC frames waiting for a session that can take them: identified (`ready`
+   *  or `resumed`) and on an OPEN socket. Held through startup, reconnects and
+   *  a CLOSING socket, and flushed by flushOutbox in call order. Each frame is
+   *  serialized when the call is made, so a caller mutating its params
+   *  afterwards can't change what gets sent. Each call's own timer still
+   *  bounds how long it waits; close() rejects them. */
   private outbox: Array<{ id: string; json: string }> = [];
 
   constructor(options: PortalClientOptions) {
@@ -159,7 +158,9 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
     this.closedByUser = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
     // Unsent work dies with the client: a later connect() must not run an
-    // operation the caller issued before shutting down.
+    // operation the caller issued before shutting down. Calls already sent
+    // keep their timers, since a result can still arrive before the socket
+    // finishes closing.
     const held = this.outbox;
     this.outbox = [];
     for (const { id } of held) {
@@ -175,8 +176,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
 
   /** Typed RPC call. */
   call<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
+    if (this.closedByUser) return Promise.reject(new Error('RPC cancelled: client closed'));
     const id = `rpc_${randomUUID()}`;
     return new Promise<RpcResult<M>>((resolve, reject) => {
+      const json = JSON.stringify({ op: 'rpc', d: { id, method, params } });
       const timer = setTimeout(() => {
         this.pending.delete(id);
         // A call that timed out while held must not be sent later, nor pile
@@ -185,7 +188,7 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
         reject(new Error(`RPC ${method} timed out`));
       }, this.opts.rpcTimeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
-      this.outbox.push({ id, json: JSON.stringify({ op: 'rpc', d: { id, method, params } }) });
+      this.outbox.push({ id, json });
       if (this.ready) this.flushOutbox();
     });
   }
@@ -464,19 +467,23 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
   }
 
   /** Send the held RPCs in call order. `ready` alone isn't enough: a socket
-   *  can be CLOSING before its close event resets `ready`, and a frame sent
-   *  then is lost, so the outbox keeps everything until the socket is OPEN. */
+   *  can be CLOSING before its close event resets `ready`, so whatever trySend
+   *  refuses stays held for the next `ready`/`resumed`. */
   private flushOutbox(): void {
-    if (!this.ws || this.ws.readyState !== this.ws.OPEN) return;
-    const queued = this.outbox;
-    this.outbox = [];
-    for (const { json } of queued) this.ws.send(json);
+    while (this.outbox.length > 0 && this.trySend(this.outbox[0].json)) this.outbox.shift();
   }
 
+  /** Control frames (identify, resume, heartbeat) are dropped when the socket
+   *  isn't OPEN; the next connection sends its own. */
   private sendFrame(frame: unknown): void {
-    if (this.ws && this.ws.readyState === this.ws.OPEN) {
-      this.ws.send(JSON.stringify(frame));
-    }
+    this.trySend(JSON.stringify(frame));
+  }
+
+  /** Send on an OPEN socket. Returns false, sending nothing, otherwise. */
+  private trySend(json: string): boolean {
+    if (!this.ws || this.ws.readyState !== this.ws.OPEN) return false;
+    this.ws.send(json);
+    return true;
   }
 }
 
