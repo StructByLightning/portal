@@ -186,6 +186,25 @@ test('a qualified label reaches the client as a resolved id; ids and the composi
   assert.deepEqual(sent.map((s) => s.channelId), Array(4).fill('100000000000000003'));
 });
 
+test('send_message names a thread under channelId on every chunk, and only when given', async () => {
+  const { agent, sent } = agentWithCache();
+  // Over Discord's 2000 characters, so it goes out as two chunks.
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    threadId: '200000000000000001',
+    content: 'x'.repeat(2500),
+  });
+  await agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi' });
+  assert.deepEqual(
+    sent.map((s) => [s.channelId, (s as { threadId?: string }).threadId]),
+    [
+      ['100000000000000003', '200000000000000001'],
+      ['100000000000000003', '200000000000000001'],
+      ['100000000000000003', undefined],
+    ],
+  );
+});
+
 test('an ambiguous or unknown name errors and NOTHING is sent', async () => {
   const { agent, sent } = agentWithCache();
   await assert.rejects(

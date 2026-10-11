@@ -171,6 +171,9 @@ export class PortalAgent {
         for (let i = 0; i < chunks.length; i++) {
           const result = await this.client.sendMessage({
             channelId: str(args.channelId),
+            // Every chunk goes to the same place: a thread under channelId
+            // when one is named, else channelId itself.
+            threadId: optStr(args.threadId),
             content: chunks[i],
             ...(i === 0
               ? {

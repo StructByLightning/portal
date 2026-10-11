@@ -58,11 +58,13 @@ const definitions: ToolDefinition[] = [
     name: 'send_message',
     description:
       'Post a message to a channel or thread as your persona (via webhook). ' +
-      'Pass a thread channel id directly to post in a thread.',
+      'To post in a thread, pass its id as threadId with its parent as channelId, ' +
+      'or pass the thread channel id directly as channelId.',
     inputSchema: {
       type: 'object',
       properties: {
         channelId: { type: 'string', description: PORTAL_CHANNEL_ID_DESC },
+        threadId: { type: 'string', description: 'Target a thread under channelId' },
         content: { type: 'string', description: 'Message content (optional if files attached)' },
         files: FILES_PROP,
         replyToId: { type: 'string', description: 'Relay message id to reply to (rendered as a quoted link)' },
