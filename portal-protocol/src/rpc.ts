@@ -122,9 +122,11 @@ export interface CreateThreadParams {
   name: string;
 }
 /** Requires MANAGE_CHANNELS at the destination: effective category caps when
- *  categoryId is supplied, otherwise an unrestricted guild policy grant and
- *  the bot's guild-level ManageChannels permission. Channel-scoped grants do
- *  not authorize creation at the guild root. The guild must be allowed. */
+ *  categoryId is supplied, otherwise an unrestricted grant (a guild-bound
+ *  all-channel role, or the persona's guild or persona-wide default) and the
+ *  bot's guild-level ManageChannels permission. Channel-scoped and mirrored
+ *  grants do not authorize creation at the guild root. The guild must be
+ *  allowed. Without categoryId (or with null), the channel goes at the root. */
 export interface CreateTextChannelParams {
   guildId: GuildId;
   name: string;

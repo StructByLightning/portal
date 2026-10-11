@@ -1942,7 +1942,9 @@ export class Relay implements GatewayHooks {
    *  root when no category is supplied. Rights on a sibling channel never
    *  confer authority to create elsewhere in the guild. */
   private async createTextChannel(personaId: string, p: RpcParams<'create_text_channel'>): Promise<ChannelMeta> {
-    const { guildId, categoryId, name } = p;
+    const { guildId, name } = p;
+    // A null categoryId asks for no category, the guild root, as it did before this gate.
+    const categoryId = p.categoryId ?? undefined;
     if (typeof guildId !== 'string' || !guildId ||
         (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
       throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
@@ -1966,13 +1968,22 @@ export class Relay implements GatewayHooks {
       this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
     } else {
       const allowed = this.permissions.resolveGuild(personaId, guildId);
+      if (!allowed.has('MANAGE_CHANNELS')) throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      // The persona holds the right; a refusal past here is a Discord-side gap,
+      // which a permissions.json edit can't fix. Say which, for the operator.
       const me = this.bot.meIn(guildId);
-      if (!allowed.has('MANAGE_CHANNELS') || !me?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
-        throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      if (!me) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot isn't in the guild`);
+        throw rpcError('FORBIDDEN', "the relay's Discord bot isn't in this guild");
+      }
+      if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot lacks Manage Channels`);
+        throw rpcError('FORBIDDEN', "the relay's Discord bot lacks Manage Channels in this guild");
       }
     }
-    // Keep the final check and create invocation in the same continuation.
-    // Awaiting a separate authorization helper here would open a revocation gap.
+    // The final check runs in the same continuation as the bot call, with no
+    // await between them. The bot's own guild fetch still precedes Discord's
+    // create, so a revocation that lands during that fetch isn't seen.
     return this.bot.createTextChannel(guildId, name, categoryId);
   }
 

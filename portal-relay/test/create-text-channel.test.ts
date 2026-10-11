@@ -60,6 +60,9 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
   const remoteChannels = new Map(channels);
   const fetchCalls: string[] = [];
   const calls: unknown[][] = [];
+  // The constructor's MirrorCache holds the real, never-logged-in DiscordBot.
+  // Mirror lookups see nothing here unless a test sets a lookup or its own cache.
+  relay.mirror = { lookup: () => new Map(), invalidateGuild: () => {}, invalidateRole: () => {}, flush: () => {} };
   relay.bot = {
     isGuildAllowed: (id: string) => state.allowedGuilds.has(id),
     meIn: (id: string) =>
@@ -383,10 +386,55 @@ test('permission revocation is checked on each create RPC', async (t) => {
 
 test('malformed destination IDs cannot fall through to root authorization', async (t) => {
   const h = makeRelay(t, { default: MANAGE });
-  for (const categoryId of ['', null, false, 0, [], {}]) {
+  for (const categoryId of ['', false, 0, [], {}]) {
     await h.denied({ guildId: GUILD, categoryId }, 'alice', 'INVALID_PARAMS');
   }
   for (const guildId of ['', null, false, 0, [], {}, undefined]) {
     await h.denied({ guildId }, 'alice', 'INVALID_PARAMS');
+  }
+});
+
+test('a null categoryId asks for the guild root, as before the gate', async (t) => {
+  const root = makeRelay(t, { default: MANAGE });
+  const before = root.calls.length;
+  const response = await root.rpc({ guildId: GUILD, categoryId: null });
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.deepEqual(root.calls.slice(before), [[GUILD, 'new-channel', undefined]]);
+  // Root authority is still what it takes: category authority alone doesn't do.
+  const local = makeRelay(t, { personas: { alice: { default: [], guilds: { [GUILD]: { channels: { [CATEGORY]: MANAGE } } } } } });
+  await local.denied({ guildId: GUILD, categoryId: null });
+});
+
+test("a bot that lacks Manage Channels, or isn't in the guild, is named as the gap, not the persona's grant", async (t) => {
+  const h = makeRelay(t, { default: MANAGE });
+  h.state.guildPerms = new PermissionsBitField();
+  const response = await h.rpc({ guildId: GUILD });
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, 'FORBIDDEN');
+  assert.match(response.error.message, /bot lacks Manage Channels/);
+  h.state.botInGuild = false;
+  const absent = await h.rpc({ guildId: GUILD });
+  assert.equal(absent.ok, false);
+  assert.equal(absent.error.code, 'FORBIDDEN');
+  assert.match(absent.error.message, /bot isn't in this guild/);
+});
+
+test('a persona removed during a category fetch is refused, even where the file default grants', async (t) => {
+  // requireCap goes through capsFor, which refuses a persona with no identity before reading any policy.
+  const h = makeRelay(t, { default: MANAGE });
+  h.channels.delete(CATEGORY);
+  h.state.onFetch = () => { h.relay.identity.remove('alice'); };
+  await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+  assert.deepEqual(h.fetchCalls, [CATEGORY]);
+});
+
+test('hand-edited gaps deny root creation rather than throw', async (t) => {
+  // A policy with no default anywhere, and a role reference with no catalog entry.
+  for (const policy of [
+    { personas: { alice: { guilds: { [GUILD]: { channels: {} } } } } },
+    { personas: { alice: { roles: ['no-such-role'] } } },
+  ] as unknown as PermissionsFile[]) {
+    const h = makeRelay(t, policy);
+    await h.denied({ guildId: GUILD });
   }
 });
