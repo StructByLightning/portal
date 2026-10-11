@@ -16,7 +16,11 @@ interface GatewayInternals {
   reapStale(): void;
 }
 
-function fixture(t: TestContext, enroll?: GatewayHooks['enroll']) {
+function fixture(
+  t: TestContext,
+  enroll?: GatewayHooks['enroll'],
+  opts: { resumeRetentionMs?: number; log?: (line: string) => void } = { resumeRetentionMs: 100 },
+) {
   let now = 0;
   t.mock.method(Date, 'now', () => now);
   const gw = new Gateway({
@@ -28,7 +32,7 @@ function fixture(t: TestContext, enroll?: GatewayHooks['enroll']) {
     }),
     handleRpc: async () => {},
     enroll,
-  }, 30_000, { resumeRetentionMs: 100, log: () => {} });
+  }, 30_000, { log: () => {}, ...opts });
   const internals = gw as unknown as GatewayInternals;
   const socket = () => {
     const frames: ServerFrame[] = [];
@@ -37,7 +41,7 @@ function fixture(t: TestContext, enroll?: GatewayHooks['enroll']) {
       send: (data: string) => frames.push(JSON.parse(data) as ServerFrame),
       close: () => {}, terminate: () => {},
     };
-    return { session: new Session(ws as unknown as WebSocket, gw), frames };
+    return { session: new Session(ws as unknown as WebSocket, gw), frames, ws };
   };
   const identify = async (personaId = 'p1') => {
     const connection = socket();
@@ -203,9 +207,10 @@ test('late enrollment cannot promote a disconnected socket into an immortal sess
 });
 
 test('late enrollment cannot replace a concurrent successful identify', async (t) => {
+  const lines: string[] = [];
   let complete!: (data: RegisteredData) => void;
   const pending = new Promise<RegisteredData>((resolve) => { complete = resolve; });
-  const f = fixture(t, () => pending);
+  const f = fixture(t, () => pending, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
   const a = f.socket();
   const registering = f.internals.onRegister(a.session, {
     protocolVersion: 4, invite: 'invite', desiredName: 'new',
@@ -215,6 +220,7 @@ test('late enrollment cannot replace a concurrent successful identify', async (t
   await registering;
   assert.equal(a.session.personaId, 'existing');
   assert.deepEqual(a.frames.map((frame) => frame.op), ['ready']);
+  assert.ok(lines.some((l) => / session register-abandoned .*reason="already identified" minted=new /.test(l)), lines.join('\n'));
   assert.deepEqual(f.gw.activePersonas(), ['existing']);
   assert.deepEqual(f.gw.streamPersonas(), ['existing']);
   assert.equal(f.internals.sessionPersona.size, 1);
@@ -231,4 +237,68 @@ test('resume retention must be finite and nonnegative', () => {
     assert.throws(() => new Gateway(hooks, 30_000, { resumeRetentionMs }), /resumeRetentionMs/);
   }
   assert.doesNotThrow(() => new Gateway(hooks, 30_000, { resumeRetentionMs: 0 }));
+});
+
+test('the default resume window is five minutes', async (t) => {
+  // Every other test shortens the window; this one pins the default the relay runs with.
+  const f = fixture(t, undefined, {});
+  const a = await f.identify();
+  f.disconnect(a.session);
+  f.at(5 * 60_000 - 1);
+  f.sweep();
+  assert.equal(f.internals.sessionPersona.size, 1, 'kept until the five minutes are up');
+  f.at(5 * 60_000);
+  f.sweep();
+  assert.equal(f.internals.sessionPersona.size, 0);
+});
+
+test("each key's deadline runs from its own last disconnect", async (t) => {
+  // One persona, two keys, disconnected 50 ms apart: the later disconnect must not
+  // move the earlier key's deadline, nor the earlier one the later's.
+  const f = fixture(t);
+  const a = await f.identify();
+  const b = await f.identify();
+  f.disconnect(a.session);
+  f.at(50);
+  f.disconnect(b.session);
+  f.at(100);
+  f.sweep();
+  const fresh = f.socket();
+  f.internals.onResume(fresh.session, a.session.id, 0);
+  assert.equal(fresh.frames.at(-1)?.op, 'invalid_session', 'the first key expired at 100');
+  f.at(149);
+  const resumed = f.socket();
+  f.internals.onResume(resumed.session, b.session.id, 0);
+  assert.equal(resumed.frames.at(-1)?.op, 'resumed', 'the second key lives until 150');
+});
+
+test('an expired key is logged when it is released', async (t) => {
+  const lines: string[] = [];
+  const f = fixture(t, undefined, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
+  const a = await f.identify();
+  f.disconnect(a.session);
+  f.at(100);
+  f.sweep();
+  assert.equal(lines.filter((l) => / session resume-expired persona=p1 /.test(l)).length, 1, lines.join('\n'));
+});
+
+test('a late enrollment is logged when it is discarded, and a closing socket is never promoted', async (t) => {
+  const lines: string[] = [];
+  let complete!: (data: RegisteredData) => void;
+  const pending = new Promise<RegisteredData>((resolve) => { complete = resolve; });
+  const f = fixture(t, () => pending, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
+  const a = f.socket();
+  const registering = f.internals.onRegister(a.session, {
+    protocolVersion: 4, invite: 'invite', desiredName: 'new',
+  });
+  // The close handshake has begun, but ws hasn't emitted 'close' yet.
+  a.ws.readyState = 2;
+  complete({ personaId: 'new', token: 'new-token', persona: { id: 'new', displayName: 'New', avatarUrl: '' } });
+  await registering;
+  assert.equal(a.session.identified, false);
+  assert.deepEqual(a.frames, []);
+  assert.equal(f.internals.sessionPersona.size, 0);
+  assert.deepEqual(f.gw.streamPersonas(), []);
+  assert.ok(lines.some((l) => / session register-abandoned .*reason="socket closed" minted=new /.test(l)), lines.join('\n'));
+  assert.ok(!lines.some((l) => / session register /.test(l)), 'no live register line for a socket that never got the result');
 });
