@@ -9,12 +9,17 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push supersedes a pull request's earlier run. Each push to main
+  # has a group of its own, so no main commit's run is cancelled, running or
+  # waiting, and each main commit gets a result.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  client:
-    name: Strict install, build & test
+  # The two packages are separate jobs, so a failure in one never skips the
+  # other's checks.
+  protocol:
+    name: Protocol strict install, build & test
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -26,12 +31,8 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: |
-            portal-protocol/package-lock.json
-            portal-client/package-lock.json
+          cache-dependency-path: portal-protocol/package-lock.json
 
-      # Build the client's TypeScript project reference first. The client's
-      # protocol dependency still comes from its own committed lockfile.
       - name: Install, build & test protocol
         working-directory: portal-protocol
         run: |
@@ -39,6 +40,26 @@ jobs:
           npm run build
           npm test
 
+  client:
+    name: Client strict install, build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal-client/package-lock.json
+
+      # The client builds and tests against the published protocol that its
+      # own lockfile records, which npm ci installs into node_modules: what the
+      # client's consumers get. It doesn't read ../portal-protocol, so a
+      # protocol change reaches this check when the client's dependency moves
+      # to the release that carries it.
       - name: Install, build & test client
         working-directory: portal-client
         run: |
