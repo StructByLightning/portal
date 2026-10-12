@@ -254,10 +254,12 @@ export class Gateway {
   }
 
   private async onFrame(session: Session, frame: ClientFrame): Promise<void> {
-    // ws still emits 'message' while a socket is CLOSING (until 'close'), and
-    // nothing sent on it arrives. A frame there is ignored: no handshake can
-    // promote the socket, and no rpc reaches a persona whose socket a revoke
-    // is closing.
+    // ws still emits 'message' for frames received while a socket is CLOSING
+    // (until 'close'), and nothing the gateway sends there reaches the
+    // client. Such a frame is ignored: no handshake promotes the socket, and
+    // no rpc that arrives once a revoke has begun closing it is handled. An
+    // rpc admitted before then completes, as a request admitted before any
+    // revocation does.
     if (!session.open) return;
     session.touch();
     switch (frame.op) {
@@ -404,7 +406,10 @@ export class Gateway {
     const personaId = this.sessionPersona.get(sessionId)?.personaId;
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
-      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${logSafe(String(sessionId).slice(5, 13))} from-seq=${logSafe(fromSeq, 16)}`);
+      // The key's first eight characters, as resume-expired logs them, kept
+      // to the id alphabet: it's client text, and goes in unquoted.
+      const key = String(sessionId).slice(5, 13).replace(/[^0-9a-f-]/gi, '?');
+      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${key} from-seq=${logSafe(fromSeq, 16)}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }

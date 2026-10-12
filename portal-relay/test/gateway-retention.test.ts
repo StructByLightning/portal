@@ -40,14 +40,21 @@ function fixture(
   const sockets = new Map<Session, { readyState: number }>();
   const socket = () => {
     const frames: ServerFrame[] = [];
+    const closed: { code?: number; reason?: string }[] = [];
     const ws = {
       OPEN: 1, readyState: 1,
       send: (data: string) => frames.push(JSON.parse(data) as ServerFrame),
-      close: () => {}, terminate: () => {},
+      // As ws does: a close starts the handshake, and the socket is CLOSING
+      // until it emits 'close'.
+      close: (code?: number, reason?: string) => {
+        closed.push({ code, reason });
+        if (ws.readyState === 1) ws.readyState = 2;
+      },
+      terminate: () => {},
     };
     const session = new Session(ws as unknown as WebSocket, gw);
     sockets.set(session, ws);
-    return { session, frames, ws };
+    return { session, frames, ws, closed };
   };
   const identify = async (personaId = 'p1') => {
     const connection = socket();
@@ -392,6 +399,7 @@ test('a pending enrollment cannot undo a revoke: credentials that no longer auth
   await registering;
   assert.equal(a.session.identified, false);
   assert.deepEqual(a.frames.map((frame) => frame.op), ['invalid_session']);
+  assert.deepEqual(a.closed, [{ code: 4003, reason: 'register failed' }]);
   assert.equal(f.internals.sessionPersona.size, 0, 'no resume key');
   assert.deepEqual(f.gw.streamPersonas(), [], 'no stream');
   assert.deepEqual(f.gw.activePersonas(), [], 'no live session');
@@ -425,4 +433,13 @@ test('a discarded enrollment says the socket closed when it has, even if another
   complete({ personaId: 'new', token: 'new-token', persona: { id: 'new', displayName: 'New', avatarUrl: '' } });
   await registering;
   assert.ok(lines.some((l) => / session register-abandoned .*reason="socket closed" minted=new /.test(l)), lines.join('\n'));
+});
+
+test("a refused resume's key is logged only in the id alphabet: client text can't add a field", async (t) => {
+  const lines: string[] = [];
+  const f = fixture(t, undefined, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
+  const late = f.socket();
+  f.internals.onResume(late.session, 'sess_a b=c "d', 0);
+  const line = lines.find((l) => / session resume-rejected /.test(l)) ?? '';
+  assert.match(line, / key=a\?b\?c\?\?d from-seq=0 /, line);
 });
