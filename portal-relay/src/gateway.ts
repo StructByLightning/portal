@@ -402,14 +402,24 @@ export class Gateway {
     // A handshake frame on a socket that already identified is ignored, as
     // identify and register ignore theirs: one socket, one persona.
     if (session.identified) return;
+    // A resume carries the last seq the client saw, a nonnegative integer,
+    // and any other seq is refused. A missing or non-numeric one would make
+    // the gap check and the replay filter both compare false, resuming the
+    // socket with nothing replayed. A refused seq is client text, so it
+    // isn't logged.
+    if (!Number.isSafeInteger(fromSeq) || fromSeq < 0) {
+      this.rejectLog('resume-rejected', session, 'reason="bad seq"');
+      session.send({ op: 'invalid_session', d: { resumable: false, reason: 'bad seq' } });
+      return;
+    }
     this.pruneResumeState(Date.now());
     const personaId = this.sessionPersona.get(sessionId)?.personaId;
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
-      // The key's first eight characters, as resume-expired logs them, kept
-      // to the id alphabet: it's client text, and goes in unquoted.
+      // The eight UUID characters after `sess_`, as resume-expired logs them,
+      // kept to the id alphabet: it's client text, and goes in unquoted.
       const key = String(sessionId).slice(5, 13).replace(/[^0-9a-f-]/gi, '?');
-      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${key} from-seq=${logSafe(fromSeq, 16)}`);
+      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${key} from-seq=${fromSeq}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
@@ -421,7 +431,7 @@ export class Gateway {
     const gap = oldest !== undefined ? fromSeq < oldest - 1 : fromSeq < stream.seq;
     if (gap) {
       this.emit(
-        `[portal-relay] session resume-rejected persona=${logSafe(personaId)} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${logSafe(fromSeq, 16)} stream-seq=${stream.seq} ${this.live()}`,
+        `[portal-relay] session resume-rejected persona=${logSafe(personaId)} sess=${session.id.slice(5, 13)} reason="resume window exceeded" from-seq=${fromSeq} stream-seq=${stream.seq} ${this.live()}`,
       );
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'resume window exceeded' } });
       return;

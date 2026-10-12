@@ -439,7 +439,38 @@ test("a refused resume's key is logged only in the id alphabet: client text can'
   const lines: string[] = [];
   const f = fixture(t, undefined, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
   const late = f.socket();
-  f.internals.onResume(late.session, 'sess_a b=c "d', 0);
+  // Longer than the eight characters logged, so the width is pinned too.
+  f.internals.onResume(late.session, 'sess_a b=c "d-0123456789', 0);
   const line = lines.find((l) => / session resume-rejected /.test(l)) ?? '';
   assert.match(line, / key=a\?b\?c\?\?d from-seq=0 /, line);
+});
+
+test("a resume whose seq isn't a nonnegative integer is refused, and the seq isn't logged", async (t) => {
+  const lines: string[] = [];
+  const f = fixture(t, undefined, { resumeRetentionMs: 100, log: (line) => lines.push(line) });
+  const a = await f.identify();
+  f.disconnect(a.session);
+  for (const seq of ['0 persona=x', undefined, -1, 1.5] as unknown[]) {
+    const late = f.socket();
+    f.internals.onResume(late.session, a.session.id, seq as number);
+    assert.equal(late.session.identified, false, `seq ${String(seq)}`);
+    assert.deepEqual(late.frames, [{ op: 'invalid_session', d: { resumable: false, reason: 'bad seq' } }], `seq ${String(seq)}`);
+  }
+  assert.equal(lines.filter((l) => / session resume-rejected .*reason="bad seq"/.test(l)).length, 4, lines.join('\n'));
+  assert.ok(!lines.some((l) => l.includes('persona=x')), lines.join('\n'));
+  // The key is still good: a well-formed resume takes it.
+  const resumed = f.socket();
+  f.internals.onResume(resumed.session, a.session.id, 0);
+  assert.equal(resumed.frames.at(-1)?.op, 'resumed');
+});
+
+test("a revoke's close stops the persona's next rpc: the socket is CLOSING once the gateway closes it", async (t) => {
+  const rpcs: string[] = [];
+  const f = fixture(t, undefined, { resumeRetentionMs: 100, hooks: { handleRpc: async (_s, req) => { rpcs.push(req.id); } } });
+  const a = await f.identify('p1');
+  await f.internals.onFrame(a.session, { op: 'rpc', d: { id: 'before', method: 'list_guilds', params: {} } });
+  f.gw.closePersona('p1');
+  assert.deepEqual(a.closed, [{ code: 4001, reason: 'persona revoked' }]);
+  await f.internals.onFrame(a.session, { op: 'rpc', d: { id: 'after', method: 'list_guilds', params: {} } });
+  assert.deepEqual(rpcs, ['before']);
 });
