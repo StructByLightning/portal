@@ -128,8 +128,10 @@ export class PortalMcplServer {
   private openChannels = new Set<string>();
   /** Channels whose close waits on its unsubscribe. They stay in
    *  openChannels until the close succeeds, but a resume doesn't reassert
-   *  them, so from a resume until the close settles the relay sends no
-   *  ambient events for them. A close that fails subscribes its channel again. */
+   *  them, so after a resume the relay sends no ambient events for them until
+   *  the close settles. A close that fails subscribes its channel again if
+   *  it is still open. Host requests are handled one at a time, so a channel
+   *  has at most one close waiting. */
   private closingChannels = new Set<string>();
   /** Ping message ids already surfaced as a wake (live or catch-up), so a
    *  reconnect doesn't re-wake for the same offline-accrued pings. */

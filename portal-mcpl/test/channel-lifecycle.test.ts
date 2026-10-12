@@ -391,6 +391,64 @@ test('a close that fails after a resume skipped it subscribes the channel again'
   assert.deepEqual(restored, [channel.id, channel.id], 'a later resume reasserts it as open');
 });
 
+/** A server with one open channel whose unsubscribe waits until the test settles it. */
+function closingHarness() {
+  const client = clientWithChannel();
+  const restored: string[] = [];
+  client.subscribe = async (channelId) => {
+    restored.push(channelId);
+    return {};
+  };
+  const pending: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  client.unsubscribe = () =>
+    new Promise((resolve, reject) => {
+      pending.push({ resolve: () => resolve({}), reject });
+    });
+  const server = new PortalMcplServer(
+    client,
+    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
+  );
+  const internal = server as unknown as {
+    openChannels: Set<string>;
+    wireClient(): void;
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+  internal.openChannels.add(channel.id);
+  internal.wireClient();
+  const close = () => internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+  return { client, restored, pending, internal, close, tick };
+}
+
+test('a close that fails with no resume subscribes the channel again', async () => {
+  // The unsubscribe may have reached the relay before it failed.
+  const { restored, pending, internal, close, tick } = closingHarness();
+  const closing = close();
+  await tick();
+  pending[0]!.reject(new Error('relay refused unsubscribe_channel'));
+  await assert.rejects(closing, /refused/);
+  assert.equal(internal.openChannels.has(channel.id), true);
+  assert.deepEqual(restored, [channel.id]);
+});
+
+test('a failed resubscribe after a failed close is logged, not thrown', async (t) => {
+  const { client, pending, close, tick } = closingHarness();
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => {
+    logged.push(args.map(String).join(' '));
+  });
+  client.subscribe = async () => {
+    throw new Error('socket closed');
+  };
+  const closing = close();
+  await tick();
+  pending[0]!.reject(new Error('rpc unsubscribe_channel timed out'));
+  await assert.rejects(closing, /timed out/);
+  await tick();
+  assert.equal(logged.length, 1);
+  assert.match(logged[0]!, new RegExp(`failed to restore open channel ${channel.id}: socket closed`));
+});
+
 // ── Live rights propagation (issue #5) ──
 
 /** Harness with a captured conn + wired client events (post-initial-registration). */
