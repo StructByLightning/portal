@@ -276,6 +276,89 @@ test('relay resume reasserts channels that the host still has open', async () =>
   assert.deepEqual(restored, [channel.id]);
 });
 
+test('a resume while a close waits on its unsubscribe skips the channel, and the close then closes it', async () => {
+  const client = clientWithChannel();
+  const restored: string[] = [];
+  client.subscribe = async (channelId) => {
+    restored.push(channelId);
+    return {};
+  };
+  // An unsubscribe can still be waiting when a resume lands: a client that
+  // holds calls until its session is ready flushes them just before it emits
+  // `resumed`, and the result comes back after.
+  let finish!: () => void;
+  const unsubscribed = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  client.unsubscribe = async () => {
+    await unsubscribed;
+    return {};
+  };
+  const server = new PortalMcplServer(
+    client,
+    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
+  );
+  const internal = server as unknown as {
+    openChannels: Set<string>;
+    wireClient(): void;
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+  internal.openChannels.add(channel.id);
+  internal.wireClient();
+
+  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+  client.emit('resumed', 0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(internal.openChannels.has(channel.id), true, 'open until the close succeeds');
+  finish();
+
+  assert.deepEqual(await closing, { closed: true });
+  assert.deepEqual(restored, [], 'a resume must not subscribe a channel that is closing');
+  assert.equal(internal.openChannels.has(channel.id), false);
+});
+
+test('a close that fails after a resume skipped it subscribes the channel again', async () => {
+  const client = clientWithChannel();
+  const restored: string[] = [];
+  client.subscribe = async (channelId) => {
+    restored.push(channelId);
+    return {};
+  };
+  let fail!: (error: Error) => void;
+  const unsubscribed = new Promise<void>((_, reject) => {
+    fail = reject;
+  });
+  client.unsubscribe = async () => {
+    await unsubscribed;
+    return {};
+  };
+  const server = new PortalMcplServer(
+    client,
+    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
+  );
+  const internal = server as unknown as {
+    openChannels: Set<string>;
+    wireClient(): void;
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+  internal.openChannels.add(channel.id);
+  internal.wireClient();
+
+  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+  client.emit('resumed', 0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(restored, [], 'the resume skips a channel that is closing');
+
+  fail(new Error('rpc unsubscribe_channel timed out'));
+  await assert.rejects(closing, /timed out/);
+  assert.equal(internal.openChannels.has(channel.id), true);
+  assert.deepEqual(restored, [channel.id], 'the failed close subscribes it again, since the resume skipped it');
+
+  client.emit('resumed', 0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(restored, [channel.id, channel.id], 'a later resume reasserts it as open');
+});
+
 // ── Live rights propagation (issue #5) ──
 
 /** Harness with a captured conn + wired client events (post-initial-registration). */
@@ -374,6 +457,43 @@ test('channelRemove retracts an advertised channel and cleans local state', asyn
     guildId: channel.guildId,
   });
   assert.equal(t.notifications.length, 1);
+});
+
+test('a close that fails after its channel was removed leaves the channel closed', async () => {
+  const t = await registeredServer();
+  t.internal.openChannels.add(channel.id);
+  const restored: string[] = [];
+  t.client.subscribe = async (channelId) => {
+    restored.push(channelId);
+    return {};
+  };
+  let fail!: (error: Error) => void;
+  const unsubscribed = new Promise<void>((_, reject) => {
+    fail = reject;
+  });
+  t.client.unsubscribe = async () => {
+    await unsubscribed;
+    return {};
+  };
+  const internal = t.internal as typeof t.internal & {
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+
+  const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
+  (t.client as unknown as { onEvent(e: unknown): void }).onEvent({
+    type: 'channel_delete',
+    channelId: channel.id,
+    guildId: channel.guildId,
+  });
+  assert.deepEqual(t.notifications.at(-1)?.params, { removed: [`portal:${channel.id}`] });
+
+  fail(new Error('rpc unsubscribe_channel timed out'));
+  await assert.rejects(closing, /timed out/);
+  assert.equal(t.internal.openChannels.has(channel.id), false, 'the host was told the channel is gone');
+
+  t.client.emit('resumed', 0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(restored, []);
 });
 
 test('a channel arriving via live channel_create is announced as added', async () => {

@@ -126,6 +126,10 @@ export class PortalMcplServer {
    *  ambient traffic folds into the open conversation; closed channels use
    *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
   private openChannels = new Set<string>();
+  /** Open channels whose close waits on its unsubscribe. A resume doesn't
+   *  reassert them; they stay open, for events and the host, until the close
+   *  succeeds. */
+  private closingChannels = new Set<string>();
   /** Ping message ids already surfaced as a wake (live or catch-up), so a
    *  reconnect doesn't re-wake for the same offline-accrued pings. */
   private wokenPings = new Set<string>();
@@ -149,6 +153,7 @@ export class PortalMcplServer {
     this.rejected.clear();
     this.pendingRemovals.clear();
     this.openChannels.clear();
+    this.closingChannels.clear();
     this.initialRegistrationComplete = false;
     this.registrationInFlight = null;
     this.policy.reset();
@@ -471,9 +476,32 @@ export class PortalMcplServer {
   private async handleChannelClose(close: ChannelsCloseParams): Promise<ChannelsCloseResult> {
     const channelId = parsePortalChannelId(close.channelId);
     if (!channelId) throw new Error(`invalid Portal channel id: ${close.channelId}`);
-    await this.client.unsubscribe(channelId);
+    // A resume can land while the unsubscribe waits: a client that holds calls
+    // until its session is ready flushes them just before it emits `resumed`.
+    // The resume reasserts every open channel, so it skips this one.
+    this.closingChannels.add(channelId);
+    try {
+      await this.client.unsubscribe(channelId);
+    } catch (error) {
+      this.closingChannels.delete(channelId);
+      // The channel is still open, but a resume may have skipped it, or the
+      // unsubscribe may have reached the relay: subscribe it again.
+      if (this.openChannels.has(channelId)) this.reassertOpenChannel(channelId);
+      throw error;
+    }
+    this.closingChannels.delete(channelId);
     this.openChannels.delete(channelId);
     return { closed: true };
+  }
+
+  /** Subscribe an open channel on the relay again, as a resume does. */
+  private reassertOpenChannel(channelId: string): void {
+    void this.client.subscribe(channelId).catch((err) =>
+      console.error(
+        `[portal-mcpl] failed to restore open channel ${channelId}:`,
+        (err as Error).message,
+      ),
+    );
   }
 
   private async handleChannelAcknowledge(
@@ -554,12 +582,7 @@ export class PortalMcplServer {
       // starts with no ambient subscriptions. Reassert actual host-open state;
       // a fresh identify already receives the client's mutable replay set.
       for (const channelId of this.openChannels) {
-        void this.client.subscribe(channelId).catch((err) =>
-          console.error(
-            `[portal-mcpl] failed to restore open channel ${channelId}:`,
-            (err as Error).message,
-          ),
-        );
+        if (!this.closingChannels.has(channelId)) this.reassertOpenChannel(channelId);
       }
     });
     this.client.on('message', (e) => {
