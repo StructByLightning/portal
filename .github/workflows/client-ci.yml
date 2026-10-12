@@ -9,9 +9,10 @@ permissions:
   contents: read
 
 concurrency:
-  # A newer push supersedes a pull request's earlier run. Each push to main
-  # has a group of its own, so no main commit's run is cancelled, running or
-  # waiting, and each main commit gets a result.
+  # In a pull request, the newest run to start cancels the one in progress:
+  # usually a newer push superseding an older one, though re-running an older
+  # run cancels the current one too. Runs for distinct main commits have
+  # groups of their own, so they never cancel each other.
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -55,11 +56,14 @@ jobs:
           cache: npm
           cache-dependency-path: portal-client/package-lock.json
 
-      # The client builds and tests against the published protocol that its
-      # own lockfile records, which npm ci installs into node_modules: what the
-      # client's consumers get. It doesn't read ../portal-protocol, so a
-      # protocol change reaches this check when the client's dependency moves
-      # to the release that carries it.
+      # The client's imports resolve to the published protocol release its
+      # own lockfile pins, which npm ci installs into node_modules, not to
+      # ../portal-protocol's sources. So a protocol change reaches this check
+      # when the client's lockfile moves to the release that carries it, and
+      # consumers, who resolve the client's range themselves, may get a later
+      # release than the one checked here. The client's tsconfig still
+      # references ../portal-protocol as a project, so the checkout must
+      # include it.
       - name: Install, build & test client
         working-directory: portal-client
         run: |
