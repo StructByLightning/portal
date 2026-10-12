@@ -35,7 +35,9 @@ export interface GatewayHooks {
   /**
    * Self-registration. Mint a new persona from an invite template. Returns the
    * minted credentials on success or `{ error }` to reject. Absent → the relay
-   * has no invites configured and registration is disabled.
+   * has no invites configured and registration is disabled. The gateway checks
+   * the returned credentials with `authenticate` before promoting the socket,
+   * as identify would, so a revoke that lands while this awaits isn't undone.
    */
   enroll?(data: RegisterData): Promise<RegisteredData | { error: string }>;
   /**
@@ -252,6 +254,11 @@ export class Gateway {
   }
 
   private async onFrame(session: Session, frame: ClientFrame): Promise<void> {
+    // ws still emits 'message' while a socket is CLOSING (until 'close'), and
+    // nothing sent on it arrives. A frame there is ignored: no handshake can
+    // promote the socket, and no rpc reaches a persona whose socket a revoke
+    // is closing.
+    if (!session.open) return;
     session.touch();
     switch (frame.op) {
       case 'identify':
@@ -281,7 +288,7 @@ export class Gateway {
     personaId: string,
     subscriptions?: string[],
   ): Promise<void> {
-    if (session.identified || session.disconnected) return;
+    if (session.identified) return;
     const ok = this.hooks.authenticate(token, personaId);
     if (!ok) {
       this.rejectLog('identify-rejected', session, `claimed="${logSafe(personaId)}" reason="auth failed"`);
@@ -314,9 +321,10 @@ export class Gateway {
       this.sessionLog(`${via}-failed`, session, `ready-ms=${Date.now() - t0} error="${logSafe((err as Error).message, 160)}"`);
       return;
     }
-    if (session.disconnected) {
-      // The client left while ready was being built; `send` would drop the
-      // frame silently. Say so rather than record a success nobody received.
+    if (!session.open) {
+      // The socket closed, or began closing, while ready was being built;
+      // `send` would drop the frame silently. Say so rather than record a
+      // success nobody received.
       this.sessionLog(`${via}-abandoned`, session, `ready-ms=${Date.now() - t0}`);
       return;
     }
@@ -330,7 +338,7 @@ export class Gateway {
   }
 
   private async onRegister(session: Session, d: RegisterData): Promise<void> {
-    if (session.identified || session.disconnected) return;
+    if (session.identified) return;
     if (!this.hooks.enroll) {
       this.sessionLog('register-rejected', session, 'reason="registration disabled"');
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'registration disabled' } });
@@ -342,9 +350,10 @@ export class Gateway {
     // can't carry the result, and another identify/register may have won
     // while we waited. Neither may be promoted into a new live session here.
     // The hook may already have minted a persona and spent an invite use, so
-    // the discard is logged with what it dropped, as sendReady's abandoned is.
-    if (session.disconnected || session.identified || !session.open) {
-      const why = session.identified ? 'already identified' : 'socket closed';
+    // the discard line names what it dropped: the minted persona, or the
+    // hook's error.
+    if (session.identified || !session.open) {
+      const why = !session.open ? 'socket closed' : 'already identified';
       const what = 'error' in res ? `error="${logSafe(res.error, 160)}"` : `minted=${logSafe(res.personaId)}`;
       this.sessionLog('register-abandoned', session, `reason="${why}" ${what}`);
       return;
@@ -352,6 +361,15 @@ export class Gateway {
     if ('error' in res) {
       this.sessionLog('register-rejected', session, `reason="${logSafe(res.error, 160)}"`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: res.error } });
+      session.close(4003, 'register failed');
+      return;
+    }
+    // Promotion is an identify by another door, so it takes the same check:
+    // the hook may have awaited while the minted credentials were revoked,
+    // and a session is only promoted with credentials that authenticate now.
+    if (!this.hooks.authenticate(res.token, res.personaId)) {
+      this.sessionLog('register-rejected', session, `reason="credentials no longer valid" minted=${logSafe(res.personaId)}`);
+      session.send({ op: 'invalid_session', d: { resumable: false, reason: 'credentials no longer valid' } });
       session.close(4003, 'register failed');
       return;
     }
@@ -381,12 +399,12 @@ export class Gateway {
   private onResume(session: Session, sessionId: string, fromSeq: number): void {
     // A handshake frame on a socket that already identified is ignored, as
     // identify and register ignore theirs: one socket, one persona.
-    if (session.identified || session.disconnected) return;
+    if (session.identified) return;
     this.pruneResumeState(Date.now());
     const personaId = this.sessionPersona.get(sessionId)?.personaId;
     const stream = personaId ? this.streams.get(personaId) : undefined;
     if (!personaId || !stream) {
-      this.rejectLog('resume-rejected', session, `reason="unknown session" from-seq=${logSafe(fromSeq, 16)}`);
+      this.rejectLog('resume-rejected', session, `reason="unknown session" key=${logSafe(String(sessionId).slice(5, 13))} from-seq=${logSafe(fromSeq, 16)}`);
       session.send({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
       return;
     }
@@ -473,9 +491,10 @@ export class Gateway {
       if (retained.expiresAt !== undefined && retained.expiresAt <= now) {
         this.sessionPersona.delete(id);
         // An expired key is then refused as "unknown session", like a key a
-        // restart lost; this line is how an operator tells the two apart.
+        // restart lost. The refusal names the key it was given, and this line
+        // the key that expired, so an operator can tell the two apart.
         this.emit(
-          `[portal-relay] session resume-expired persona=${logSafe(retained.personaId)} sess=${id.slice(5, 13)} ${this.live()}`,
+          `[portal-relay] session resume-expired persona=${logSafe(retained.personaId)} key=${id.slice(5, 13)} ${this.live()}`,
         );
       } else {
         retainedPersonas.add(retained.personaId);

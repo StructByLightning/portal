@@ -98,6 +98,9 @@ test('register: enroll mints creds, then ready; disabled when no enroll hook', a
   // (a) enroll hook present → register returns `registered` then `ready`.
   const withEnroll: GatewayHooks = {
     ...hooks(),
+    // The minted credentials authenticate, as the relay's enroll stores them before returning.
+    authenticate: (token, personaId) =>
+      token === 'secret' || (token === 'tok-1' && personaId === 'minted-1') ? personaId : null,
     enroll: async (d) => {
       if (d.invite !== 'good') return { error: 'invite unknown' };
       return {
