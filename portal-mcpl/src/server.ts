@@ -126,9 +126,10 @@ export class PortalMcplServer {
    *  ambient traffic folds into the open conversation; closed channels use
    *  push/event (which the host's wake gate evaluates). Mirrors discord-mcpl. */
   private openChannels = new Set<string>();
-  /** Open channels whose close waits on its unsubscribe. A resume doesn't
-   *  reassert them; they stay open, for events and the host, until the close
-   *  succeeds. */
+  /** Channels whose close waits on its unsubscribe. They stay in
+   *  openChannels until the close succeeds, but a resume doesn't reassert
+   *  them, so from a resume until the close settles the relay sends no
+   *  ambient events for them. A close that fails subscribes its channel again. */
   private closingChannels = new Set<string>();
   /** Ping message ids already surfaced as a wake (live or catch-up), so a
    *  reconnect doesn't re-wake for the same offline-accrued pings. */
@@ -579,8 +580,9 @@ export class PortalMcplServer {
     });
     this.client.on('resumed', () => {
       // A Portal transport resume restores event delivery but the relay session
-      // starts with no ambient subscriptions. Reassert actual host-open state;
-      // a fresh identify already receives the client's mutable replay set.
+      // starts with no ambient subscriptions. Reassert actual host-open state,
+      // except a channel whose close waits: its close subscribes it again if it
+      // fails. A fresh identify already receives the client's mutable replay set.
       for (const channelId of this.openChannels) {
         if (!this.closingChannels.has(channelId)) this.reassertOpenChannel(channelId);
       }

@@ -303,18 +303,50 @@ test('a resume while a close waits on its unsubscribe skips the channel, and the
     wireClient(): void;
     handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
   };
+  // A second open channel, with no close waiting, which the same resume reasserts.
+  const other = '1526659685036331059';
   internal.openChannels.add(channel.id);
+  internal.openChannels.add(other);
   internal.wireClient();
 
   const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
   client.emit('resumed', 0);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(internal.openChannels.has(channel.id), true, 'open until the close succeeds');
+  assert.deepEqual(restored, [other], 'the resume reasserts only the channel that is not closing');
   finish();
 
   assert.deepEqual(await closing, { closed: true });
-  assert.deepEqual(restored, [], 'a resume must not subscribe a channel that is closing');
+  assert.deepEqual(restored, [other], 'a resume must not subscribe a channel that is closing');
   assert.equal(internal.openChannels.has(channel.id), false);
+});
+
+test('a close that succeeds clears its mark, so a resume after a reopen reasserts the channel', async () => {
+  const client = clientWithChannel();
+  const restored: string[] = [];
+  client.subscribe = async (channelId) => {
+    restored.push(channelId);
+    return {};
+  };
+  client.unsubscribe = async () => ({});
+  const server = new PortalMcplServer(
+    client,
+    new PortalAgent(client, { hostOwnsChannelLifecycle: true }),
+  );
+  const internal = server as unknown as {
+    openChannels: Set<string>;
+    wireClient(): void;
+    handleChannelClose(params: { channelId: string }): Promise<{ closed: boolean }>;
+  };
+  internal.openChannels.add(channel.id);
+  internal.wireClient();
+
+  assert.deepEqual(await internal.handleChannelClose({ channelId: `portal:${channel.id}` }), { closed: true });
+  // The host opens the channel again, as channels/open would leave it.
+  internal.openChannels.add(channel.id);
+  client.emit('resumed', 0);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(restored, [channel.id], 'a reopened channel is reasserted like any open channel');
 });
 
 test('a close that fails after a resume skipped it subscribes the channel again', async () => {
