@@ -341,3 +341,27 @@ test('an optional string argument of another type is refused by name, and nothin
   assert.deepEqual(sent, []);
   assert.equal(fetched.length, 1);
 });
+
+test('a send split into parts says which parts went out when a later part fails', async () => {
+  const { agent, client } = agentWithCache();
+  const activity: string[] = [];
+  (agent as unknown as { onPublicActivity: (kind: string) => void }).onPublicActivity = (kind) => activity.push(kind);
+  let calls = 0;
+  (client as unknown as { sendMessage: unknown }).sendMessage = async () => {
+    calls++;
+    if (calls === 1) return { messageId: 'm1' };
+    throw new Error('Nothing ran: you can\'t send in this channel now.');
+  };
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'x'.repeat(2500) }),
+    /^Error: Only part of the message was sent: the first 1 of 2 parts were posted \("m1"\), and part 2 wasn't\. Its call answered: "Nothing ran: you can't send in this channel now\." To send the rest, call send_message with only the text that didn't go out; fetch_around shows what did\.$/,
+  );
+  assert.deepEqual(activity, ['message'], 'the posted part counts as public activity');
+  // A failing first part is that part's own answer: nothing went out.
+  calls = 1;
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi' }),
+    /^Error: Nothing ran: you can't send in this channel now\.$/,
+  );
+  assert.deepEqual(activity, ['message'], 'a first part that fails posts nothing');
+});

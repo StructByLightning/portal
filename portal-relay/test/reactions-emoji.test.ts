@@ -109,7 +109,7 @@ test('unreact on a message id the relay has no record of is refused, and nothing
     relay.resolveRef = async () => null; // the store and Discord both have no such message
     await assert.rejects(
       () => relay.dispatchRpc(session, 'unreact', { messageId: 'no-such-message', emoji: '👍', native: true }),
-      (e: any) => e?.code === 'NOT_FOUND' && /^No message has the id "no-such-message", so no reaction was removed\./.test(e.message),
+      (e: any) => e?.code === 'NOT_FOUND' && /^The relay can't find message "no-such-message", so no reaction was removed\./.test(e.message),
     );
     assert.equal(calls.removeReaction.length, 0);
     assert.equal(dispatched.length, 0);

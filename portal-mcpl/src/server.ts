@@ -1253,7 +1253,9 @@ function stringify(v: unknown): string {
  * refusal can be an authority's verdict that saying it again won't change,
  * so only an error's line suggests saying it again; an error that cut the
  * utterance off says what was heard, with the boundary's estimate flag as an
- * interruption's line has it.
+ * interruption's line has it. A refusal says nothing was said only when no
+ * characters were billed, since the output stopping mid-utterance is also
+ * reported as a refusal.
  */
 export function voiceReceiptLine(e: Extract<PortalEvent, { type: 'voice_receipt' }>, where: string): string {
   const reason = e.reason ?? 'no reason given';
@@ -1265,7 +1267,11 @@ export function voiceReceiptLine(e: Extract<PortalEvent, { type: 'voice_receipt'
       return `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
         `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}"`;
     case 'refused':
-      return `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
+      // Characters are billed when voicing opens, so a refusal that comes
+      // after billing (the output stopping mid-utterance) may have been heard.
+      return e.billedChars > 0
+        ? `[voice] your utterance in ${where} was stopped after the relay began voicing it, so some of it may have been heard: ${reason}.`
+        : `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
     default:
       return e.voicedText
         ? `[voice] your utterance in ${where} was cut off by an error: ${reason} — ` +

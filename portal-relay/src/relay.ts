@@ -2022,8 +2022,9 @@ function containerNotFound(channelId: string, threadId?: string): Error & { code
 function unknownMessage(messageId: string, outcome: string): Error & { code: string } {
   return rpcError(
     'NOT_FOUND',
-    `No message has the id ${JSON.stringify(messageId)}, so ${outcome}. ` +
-      'Use the id that send_message, fetch_history or fetch_around gives for it.',
+    `The relay can't find message ${JSON.stringify(messageId)}, so ${outcome}. ` +
+      'Check the id against what send_message, fetch_history or fetch_around gave; if it matches, ' +
+      "the message may have been deleted, or its channel may be out of the relay's reach.",
   );
 }
 

@@ -444,6 +444,11 @@ test('a voice receipt says what was said, and only an error suggests saying it a
     voiceReceiptLine({ ...base, status: 'refused', reason: 'no grant authority deployed' }, '#v'),
     '[voice] your utterance in #v was refused, so nothing was said: no grant authority deployed.',
   );
+  // Output stopping mid-utterance is a refusal too, after its characters were billed.
+  assert.equal(
+    voiceReceiptLine({ ...base, status: 'refused', reason: 'output path stopped', billedChars: 5 }, '#v'),
+    '[voice] your utterance in #v was stopped after the relay began voicing it, so some of it may have been heard: output path stopped.',
+  );
   assert.equal(
     voiceReceiptLine({ ...base, status: 'error', reason: 'TTS open failed: x' }, '#v'),
     '[voice] your utterance in #v was dropped by an error, so nothing was said: TTS open failed: x. Call voice_speak again if it still matters.',

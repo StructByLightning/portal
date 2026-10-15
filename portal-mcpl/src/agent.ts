@@ -215,22 +215,40 @@ export class PortalAgent {
         // sequential sends (files/reply/mentions ride on the first chunk).
         const content = optStr(args.content, 'content');
         const chunks = content !== undefined ? chunkText(content) : [content];
+        const posted: string[] = [];
         let first: unknown;
         for (let i = 0; i < chunks.length; i++) {
-          const result = await this.client.sendMessage({
-            channelId: str(args.channelId, 'channelId'),
-            // Every chunk goes to the same place: a thread under channelId
-            // when one is named, else channelId itself.
-            threadId: optStr(args.threadId, 'threadId'),
-            content: chunks[i],
-            ...(i === 0
-              ? {
-                  files: args.files as never,
-                  replyToId: optStr(args.replyToId, 'replyToId'),
-                  mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
-                }
-              : {}),
-          });
+          let result: unknown;
+          try {
+            result = await this.client.sendMessage({
+              channelId: str(args.channelId, 'channelId'),
+              // Every chunk goes to the same place: a thread under channelId
+              // when one is named, else channelId itself.
+              threadId: optStr(args.threadId, 'threadId'),
+              content: chunks[i],
+              ...(i === 0
+                ? {
+                    files: args.files as never,
+                    replyToId: optStr(args.replyToId, 'replyToId'),
+                    mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
+                  }
+                : {}),
+            });
+          } catch (e) {
+            if (i === 0) throw e;
+            // The earlier parts are posted, so a refusal of this part, which
+            // says nothing ran for its own call, isn't the whole answer; and
+            // posting them was public activity.
+            this.onPublicActivity?.('message');
+            throw new Error(
+              `Only part of the message was sent: the first ${i} of ${chunks.length} parts were posted ` +
+                `(${posted.map((id) => JSON.stringify(id)).join(', ')}), and part ${i + 1} wasn't. ` +
+                `Its call answered: "${(e as Error).message}" ` +
+                'To send the rest, call send_message with only the text that didn\'t go out; fetch_around shows what did.',
+            );
+          }
+          const id = (result as { messageId?: unknown } | undefined)?.messageId;
+          if (typeof id === 'string') posted.push(id);
           first ??= result;
         }
         this.onPublicActivity?.('message');
