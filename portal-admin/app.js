@@ -220,6 +220,10 @@ function setupScope(me, guilds) {
       }
       state.guildId = v;
       state.q = ''; state.offset = 0;
+      // Drawers were built for the previous guild (its pickers, its ids) and
+      // submit against the current one — close them rather than let a form
+      // opened in one guild write into another.
+      closeDrawer();
       render();
     });
   }
@@ -475,7 +479,7 @@ async function renderInvites(view) {
     el('td', {}, [el('span', { class: 'badge', text: inv.mode || 'mint' })]),
     el('td', { text: (inv.uses || 0) + '/' + (inv.maxUses != null ? inv.maxUses : '∞') }),
     el('td', { text: inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'never' }),
-    el('td', { class: 'cell-roles', text: grantSummary(inv, names) }),
+    el('td', { class: 'cell-roles', text: grantSummary(inv, names), title: scopeIds(inv.grant && inv.grant.scope) || undefined }),
     el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke', onclick: (e) => { e.stopPropagation(); revokeInvite(inv.code); } })]),
   ]));
   view.appendChild(table([
@@ -599,6 +603,10 @@ async function renderRoles(view) {
 }
 
 function openRoleDrawer(discordRoles, channels) {
+  // The guild this drawer was opened for — its pickers list this guild's
+  // channels and roles, so the role must be saved to it whatever happens to
+  // the scope switcher meanwhile.
+  const gid = state.guildId;
   const name = el('input', { type: 'text', placeholder: 'role name' });
   const caps = capsCheckboxes();
   // Roles are guild-scoped (the API requires guildId): a role is defined in the
@@ -631,7 +639,7 @@ function openRoleDrawer(discordRoles, channels) {
     else if (kind.value === 'mirrorRole') { if (!mirrorSel.value) return banner('Pick a Discord role.', 'err'); scope = { mirrorRole: mirrorSel.value }; }
     else if (kind.value === 'mirrorRoles') { const ids = mirrorMulti.values(); if (!ids.length) return banner('Pick at least one Discord role.', 'err'); scope = { mirrorRoles: ids }; }
     else { const ids = chanMulti.values(); if (!ids.length) return banner('Pick at least one channel.', 'err'); scope = { channels: ids }; }
-    const role = { caps: caps.values(), scope, guildId: state.guildId };
+    const role = { caps: caps.values(), scope, guildId: gid };
     try { await api('POST', '/admin/roles', { name: name.value.trim(), role }); banner('Role created'); invalidateGuildMeta(); closeDrawer(); render(); }
     catch (e) { banner('Create failed: ' + e.message, 'err'); }
   });
@@ -640,7 +648,7 @@ function openRoleDrawer(discordRoles, channels) {
     el('div', { class: 'field' }, [el('label', { text: 'Name' }), name]),
     el('div', { class: 'field' }, [el('label', { text: 'Scope kind' }), kind]),
     scopeArea,
-    el('div', { class: 'field' }, [el('label', { text: 'Guild' }), el('div', { title: state.guildId, text: currentGuildName() })]),
+    el('div', { class: 'field' }, [el('label', { text: 'Guild' }), el('div', { title: gid, text: currentGuildName() })]),
     el('div', { class: 'field' }, [el('label', { text: 'Capabilities' }), caps.node]),
     submit,
   ]));
@@ -759,7 +767,7 @@ async function renderAudit(view) {
     el('td', { class: 'mono', text: r.ts ? new Date(r.ts).toLocaleString() : '—' }),
     el('td', {}, [(r.actor && r.actor.name) || '?', ' ', el('span', { class: 'muted', text: r.actor ? '(' + r.actor.kind + ')' : '' })]),
     el('td', {}, [el('code', { text: r.action })]),
-    el('td', { class: 'cell-roles' }, auditTarget(r, names)),
+    el('td', { class: 'cell-roles', title: r.detail ? JSON.stringify(r.detail) : undefined }, auditTarget(r, names)),
     el('td', {}, [el('span', { class: r.ok ? 'badge-ok' : 'badge-no', text: r.ok ? '✓' : '✗' })]),
   ]));
   view.appendChild(table([{ label: 'Time' }, { label: 'Actor' }, { label: 'Action' }, { label: 'Target' }, { label: 'OK', cls: 'col-narrow' }], rows));
@@ -1126,10 +1134,16 @@ function auditTarget(r, names) {
   if (t) {
     const nm = (names.personas && names.personas[t]) || (names.guilds && names.guilds[t]);
     kids.push(nm ? el('span', { text: nm, title: t }) : el('span', { text: t }));
+  } else if (r.detail) {
+    // No target (e.g. a denied slash command): the detail is what says what
+    // happened — keep it, minus the channel, which is named below.
+    const rest = Object.assign({}, r.detail);
+    delete rest.channelId;
+    if (Object.keys(rest).length) kids.push(JSON.stringify(rest));
   }
   const cid = auditChannel(r);
-  if (cid) kids.push(t ? ' in ' : '', chanNode(cid, names));
-  if (!kids.length) kids.push(r.detail ? JSON.stringify(r.detail) : '—');
+  if (cid) kids.push(kids.length ? ' in ' : '', chanNode(cid, names));
+  if (!kids.length) kids.push('—');
   return kids;
 }
 function auditChannel(r) {
