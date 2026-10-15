@@ -103,7 +103,7 @@ test('a mention wake folds the relay-side backlog of FOLLOWED channels and settl
   assert.doesNotMatch(content, /mc1/, 'unfollowed channels are not folded');
   // B settled on the relay up to its last missed message (both of its unread,
   // pings left alone); A (the trigger) left to the agent.
-  assert.deepEqual(h.marked, [{ channelId: B, uptoCreatedAt: T(7), count: 2, keepPings: true }]);
+  assert.deepEqual(h.marked, [{ channelId: B, uptoCreatedAt: T(7), count: 2, since: T(5), keepPings: true }]);
   assert.ok(!h.calls.includes('history:300'), 'no history fetched for an unfollowed channel');
 });
 
@@ -119,7 +119,7 @@ test('a catch-up wake carries the followed backlog alongside the pings, and sett
   assert.match(content, /\[catch-up\] 1 message\(s\) addressed to you while you were away, plus what you missed in 1 followed channel\(s\)/);
   assert.match(content, /» Bob: @P are you there \(role_mention\)/);
   assert.match(content, /— #beta —\nBob: mb2\nBob: mb3/);
-  assert.deepEqual(h.marked, [{ channelId: B, uptoCreatedAt: T(7), count: 2, keepPings: true }]);
+  assert.deepEqual(h.marked, [{ channelId: B, uptoCreatedAt: T(7), count: 2, since: T(5), keepPings: true }]);
   assert.doesNotMatch(content, /mc1/);
 });
 
@@ -211,7 +211,7 @@ test('200 missed, cap 50: the OLDEST are delivered, the watermark advances only 
   assert.match(c, /\[152 more unread message\(s\) in #beta will fold into your next wake\]/);
   assert.deepEqual(
     h.marked,
-    [{ channelId: B, uptoCreatedAt: S(48), count: 48, keepPings: true }],
+    [{ channelId: B, uptoCreatedAt: S(48), count: 48, since: S(0), keepPings: true }],
     'watermark = last message shown, not the relay lastAt; the relay is told how many it covers',
   );
   // Paged back to the watermark with cursors, not one uncursored newest-N call.

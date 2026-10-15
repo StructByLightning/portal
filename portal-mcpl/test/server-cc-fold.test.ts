@@ -181,7 +181,7 @@ test('thread replies under a followed channel are folded (fetched by threadId), 
   assert.deepEqual(shownIds(h.wakes[0].content).filter((id) => id !== 'a9'), ['b1', 't2', 'b3']);
   assert.match(h.wakes[0].content, /Bob: mt2 \[thread 900\]/, 'a thread reply is labelled with its thread');
   assert.ok(r.fetches.some((f) => f.channelId === B && f.threadId === TH), 'the thread was read');
-  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(3), count: 3, keepPings: true });
+  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(3), count: 3, since: S(0), keepPings: true });
 });
 
 test("another channel's pending ping keeps that channel's relay watermark; it still isn't re-folded", async () => {
@@ -211,7 +211,7 @@ test('a message both delivered live and in the relay history is shown once', asy
   ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
   await h.settle();
   assert.deepEqual(shownIds(h.wakes[0].content).filter((id) => id.startsWith('b')), ['b4', 'b5']);
-  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(5), count: 2, keepPings: true });
+  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(5), count: 2, since: S(0), keepPings: true });
 });
 
 test("a ping queued for persona A behind a switch to B is not delivered as B's, and stays pending for A", async () => {
@@ -254,4 +254,46 @@ test('a wake delivered after a switch settles the persona it was built for', asy
 
   assert.equal(ra.marked.filter((m) => m.channelId === B).length, 1, "A's fold was settled on A's relay session");
   assert.equal(rb.marked.length, 0, 'nothing was marked on B');
+});
+
+test('a read position never ends inside a group of messages sharing a timestamp', async () => {
+  // b2 and b3 share a millisecond; the cap shows only up to b2.
+  const r = relayClient({
+    messages: [msg('b1', B, S(1)), msg('b2', B, S(2)), msg('b3', B, S(2)), msg('b4', B, S(3)), msg('a0', A, S(0))],
+    watermarks: { [B]: S(0) },
+  });
+  const h = serverFor(r.client, { cap: 4 }); // trigger + A backfill + 2 of B
+  ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
+  await h.settle();
+  const shownB = shownIds(h.wakes[0].content).filter((id) => id.startsWith('b'));
+  assert.equal(shownB.length, 2);
+  assert.equal(shownB[0], 'b1');
+  const unshownTwin = shownB[1] === 'b2' ? 'b3' : 'b2'; // same-timestamp order is unspecified
+  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(1), count: 1, since: S(0), keepPings: true },
+    'stops before the shared timestamp, so its unshown twin is not marked read unseen');
+
+  ping(r.client, msg('a10', A, S(10), { content: '@P again' }));
+  await h.settle();
+  assert.ok(shownIds(h.wakes[1].content).includes(unshownTwin), 'the twin folds next time');
+});
+
+test("a relay that can't list threads (only names the latest) gets a note, not a fold that would lose replies", async () => {
+  const r = relayClient({ messages: [msg('b1', B, S(1)), msg('t2', B, S(2), { threadId: TH })], watermarks: { [B]: S(0) } });
+  // Simulate the old relay: channel_missed names threadId but no thread list.
+  const call = (r.client as unknown as { call: (m: string, p: Record<string, unknown>) => Promise<unknown> }).call.bind(r.client);
+  Object.assign(r.client, {
+    async call(method: string, params: Record<string, unknown>) {
+      const res = (await call(method, params)) as Record<string, unknown>;
+      if (method === 'channel_missed' && res.threads) {
+        const { threads, ...rest } = res;
+        return { ...rest, threadId: (threads as Array<{ threadId: string }>)[0].threadId };
+      }
+      return res;
+    },
+  });
+  const h = serverFor(r.client);
+  ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
+  await h.settle();
+  assert.match(h.wakes[0].content, /missed in #beta — more than a wake folds/);
+  assert.equal(r.marked.filter((m) => m.channelId === B).length, 0);
 });

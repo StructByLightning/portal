@@ -131,7 +131,10 @@ export class ReadStateStore {
       };
       this.evictChannels(ib);
     }
-    if (message.threadId) this.tallyThread(ib.tallies[channelId], message.threadId, message.createdAt);
+    // The tally may already be gone: a new one for a long-quiet channel is the
+    // oldest, and evictChannels can drop it on the spot.
+    const kept = ib.tallies[channelId];
+    if (kept && message.threadId) this.tallyThread(kept, message.threadId, message.createdAt);
 
     // Pending ping (full message), deduped by id.
     if (addressedToMe && !ib.pings.some((p) => p.message.id === message.id)) {
@@ -147,7 +150,7 @@ export class ReadStateStore {
     personaId: string,
     channelId: string,
     upto?: string,
-    opts: { count?: number; keepPings?: boolean } = {},
+    opts: { count?: number; since?: string; keepPings?: boolean } = {},
   ): void {
     const ib = this.inboxes.get(personaId);
     if (!ib) return;
@@ -160,9 +163,15 @@ export class ReadStateStore {
       // A PARTIAL mark: unread remains above the cutoff, and the tally is how
       // list_unread finds this channel at all — deleting it would hide the
       // rest until new traffic arrived. Bodies aren't stored, so the remaining
-      // count comes from the caller's `count` (else it stays as it was).
+      // count comes from the caller's `count` — applied only when this mark
+      // moved the watermark from exactly where the caller counted from (else a
+      // repeat, or an overlap with another session's mark, would subtract the
+      // same messages twice). Otherwise the count stays: overstated, never hidden.
       const before = t.messages;
-      const left = Math.max(1, before - Math.max(0, Math.floor(opts.count ?? 0)));
+      const moved = !prev || cutoff > prev;
+      const fromHere = (opts.since ?? undefined) === (prev ?? undefined);
+      const covered = moved && fromHere ? Math.max(0, Math.floor(opts.count ?? 0)) : 0;
+      const left = Math.max(1, before - covered);
       t.characters = before > 0 ? Math.round((t.characters * left) / before) : t.characters;
       t.messages = left;
       if (t.threads) {

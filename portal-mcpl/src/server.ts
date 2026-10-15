@@ -859,11 +859,21 @@ export class PortalMcplServer {
     const open = this.openChannels.has(message.channelId);
     if (open ? !this.canSendIncoming() : !this.canPush()) return;
     const conn = this.conn;
+    // The persona this message reached. Building the content can wait on an
+    // image download; if the identity switches meanwhile, this is the OLD
+    // persona's message and must not go out as the new one's.
+    const epoch = this.swapEpoch;
+    const woken = this.wokenPings;
     const meta = wakeMetadata(message, addressedToMe, reasons);
     const tags = deriveTags(message, addressedToMe, reasons);
     const channelMcplId = portalChannelId(message.channelId);
     void buildContent(message).then((content) => {
       if (this.conn !== conn) return;
+      if (this.swapEpoch !== epoch) {
+        // Leave a ping for that persona's next catch-up (the relay holds it).
+        if (addressedToMe) woken.delete(message.id);
+        return;
+      }
       if (this.openChannels.has(message.channelId)) {
         if (!this.canSendIncoming()) return;
         conn

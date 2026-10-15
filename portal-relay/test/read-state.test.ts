@@ -150,3 +150,31 @@ test('keepPings advances the watermark without acknowledging pending pings', () 
   rs.markRead('p1', 'c');
   assert.equal(rs.pendingPings('p1').length, 0);
 });
+
+test('a thread message whose new tally is evicted on the spot does not throw', () => {
+  const rs = new ReadStateStore({ channelsCap: 1 });
+  rs.record('p1', msg({ channelId: 'busy', content: 'newer' }), false, []);
+  // An OLDER message for another channel: its new tally is the oldest and is
+  // evicted immediately.
+  const old = msg({ channelId: 'quiet', threadId: 't1', content: 'late reply' });
+  const backdated = { ...old, createdAt: new Date(0).toISOString() };
+  assert.doesNotThrow(() => rs.record('p1', backdated, true, ['mention']));
+  assert.equal(rs.pendingPings('p1').length, 1, 'the ping is still stored');
+});
+
+test('a repeated or overlapping partial mark does not subtract the same messages twice', () => {
+  const rs = new ReadStateStore();
+  const ms = Array.from({ length: 10 }, (_, i) => msg({ channelId: 'c', content: `m${i}` }));
+  for (const m of ms) rs.record('p1', m, false, []);
+  // Two sessions fold the same 4-message prefix from the same watermark.
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // A mark counted from an older watermark than the relay's (overlap): the
+  // count can't be trusted, so it stays overstated rather than shrink.
+  rs.markRead('p1', 'c', ms[5].createdAt, { count: 6, since: ms[0].createdAt });
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // Counted from exactly where the watermark is: applied.
+  rs.markRead('p1', 'c', ms[7].createdAt, { count: 2, since: ms[5].createdAt });
+  assert.equal(rs.unread('p1')[0].count, 4);
+});

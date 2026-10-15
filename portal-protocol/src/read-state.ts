@@ -93,6 +93,10 @@ export interface MarkReadParams {
    *  is left (it stores no bodies to count from). Without it, a partial mark
    *  keeps the previous count. */
   count?: number;
+  /** The watermark `count` was counted from. The relay subtracts `count` only
+   *  while its own watermark is still exactly this — so a repeated mark, or one
+   *  overlapping another session's, never charges the same messages twice. */
+  since?: string;
   /** Leave pending pings in place: advance the watermark for ambient traffic
    *  without acknowledging addressed messages the agent hasn't handled. */
   keepPings?: boolean;

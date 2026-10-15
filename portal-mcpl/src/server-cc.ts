@@ -337,13 +337,16 @@ export class PortalCcChannelServer {
         if (!upto) continue;
         const since = [missed.since, b.seen.get(u.channelId)].filter((w): w is string => !!w).sort().pop();
         if (since && since >= upto) continue; // everything unread was already shown
-        if (missed.messages > FOLD_BOUND || missed.threadsTruncated) {
+        // Too much to page safely, or thread replies we can't enumerate: a relay
+        // that predates per-thread tallies names only its LATEST thread, so
+        // folding would mark the other threads' replies read unseen.
+        const threadsUnknown = missed.threads === undefined && !!missed.threadId;
+        if (missed.messages > FOLD_BOUND || missed.threadsTruncated || threadsUnknown) {
           out.push({ channelId: u.channelId, unseen: [], messages: [], tooMany: missed.messages });
           continue;
         }
         // The channel's own history, then each thread with replies past `since`.
-        // A relay without per-thread tallies names only its latest thread.
-        const threads = missed.threads ?? (missed.threadId ? [{ threadId: missed.threadId, messages: 0, lastAt: upto }] : []);
+        const threads = missed.threads ?? [];
         const pages: Array<PortalMessage[] | null> = [await this.pageBack(b, u.channelId, undefined, since, upto)];
         for (const th of threads) {
           if (since && th.lastAt <= since) continue;
@@ -359,7 +362,7 @@ export class PortalCcChannelServer {
           out.push({ channelId: u.channelId, unseen: [], messages: [], tooMany: missed.messages });
           continue;
         }
-        if (unseen.length) out.push({ channelId: u.channelId, unseen, messages: [] });
+        if (unseen.length) out.push({ channelId: u.channelId, unseen, messages: [], ...(since ? { since } : {}) });
       } catch (err) {
         if (process.env.PORTAL_DEBUG) {
           console.error(`[portal-cc] could not fold missed traffic for ${u.channelId}:`, (err as Error).message);
@@ -463,19 +466,34 @@ export class PortalCcChannelServer {
    * in the channel for fetch_history, and pings — the traffic that must not be
    * lost — are exempt above. (Same shape as discord-mcpl #30.)
    */
-  private settleFolded(b: Bound, folded: FoldedChannel[], keep: Set<string> | null, delivered: PortalMessage[]): void {
+  private settleFolded(
+    b: Bound,
+    folded: FoldedChannel[],
+    keep: Set<string> | null,
+    delivered: PortalMessage[],
+    droppedLive: PortalMessage[] = [],
+  ): void {
     const shown = new Set(delivered.map((m) => m.id));
     for (const f of folded) {
       if (f.tooMany !== undefined || f.unseen.length === 0) continue;
       let run = 0;
       while (run < f.unseen.length && shown.has(f.unseen[run].id)) run++;
+      // A read position is a timestamp: never end it inside a group of
+      // messages sharing one, or the unshown rest of the group would be marked
+      // read too (and the next fold, which starts strictly after it, skip them).
+      while (run > 0 && run < f.unseen.length && f.unseen[run].createdAt === f.unseen[run - 1].createdAt) run--;
       if (run === 0) continue;
       let upto = f.unseen[run - 1].createdAt;
       let count = run;
       if (run === f.unseen.length) {
+        // The whole backlog was shown: newer live messages shown in this
+        // channel are seen too — up to (not including) the oldest live message
+        // the cap left out, and never into a timestamp it shares.
         const unseenIds = new Set(f.unseen.map((m) => m.id));
-        for (const m of delivered) {
+        const stop = droppedLive.filter((m) => m.channelId === f.channelId).map((m) => m.createdAt).sort()[0];
+        for (const m of [...delivered].sort(byCreatedAt)) {
           if (m.channelId !== f.channelId || unseenIds.has(m.id) || m.createdAt <= upto) continue;
+          if (stop !== undefined && m.createdAt >= stop) break;
           upto = m.createdAt;
           count++;
         }
@@ -485,7 +503,13 @@ export class PortalCcChannelServer {
       if (keep === null || keep.has(f.channelId)) continue;
       b.agent.state.markRead(f.channelId, upto);
       void b.client
-        .call('mark_read', { channelId: f.channelId, uptoCreatedAt: upto, count, keepPings: true })
+        .call('mark_read', {
+          channelId: f.channelId,
+          uptoCreatedAt: upto,
+          count,
+          ...(f.since ? { since: f.since } : {}),
+          keepPings: true,
+        })
         .catch((err) =>
           console.error(`[portal-cc] mark_read after fold failed for ${f.channelId}:`, (err as Error).message),
         );
@@ -589,6 +613,8 @@ export class PortalCcChannelServer {
     // left (see planFold).
     const others = drained.filter((m) => m.channelId !== channelId);
     const { messages: base, omitted } = this.capped(dedupeById([...others, ...triggerCtx, message]));
+    const baseIds = new Set(base.map((m) => m.id));
+    const droppedLive = drained.filter((m) => !baseIds.has(m.id)); // the cap left these out
     const all = this.planFold(missed, base);
     const notes = this.remainingNotes(missed, all);
 
@@ -613,7 +639,7 @@ export class PortalCcChannelServer {
     // The trigger's channel and every channel with a ping still pending keep
     // their relay watermark; if the pending set couldn't be read, none move.
     const keep = pending === null ? null : new Set([channelId, ...pending.map((p) => p.message.channelId)]);
-    this.deliverWake(b, body, meta, [message.id], () => this.settleFolded(b, missed, keep, all));
+    this.deliverWake(b, body, meta, [message.id], () => this.settleFolded(b, missed, keep, all, droppedLive));
   }
 
   /** Render the wake payload: optional truncation note, channel-labeled lines,
@@ -665,6 +691,8 @@ interface FoldedChannel {
   unseen: PortalMessage[];
   /** The part of `unseen` this wake folds in (set by planFold). */
   messages: PortalMessage[];
+  /** The read position this fold counted from (relay watermark or `seen`). */
+  since?: string;
   /** Set when the channel was NOT folded: too much missed to page safely. */
   tooMany?: number;
 }
