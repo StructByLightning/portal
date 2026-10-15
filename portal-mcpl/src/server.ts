@@ -35,8 +35,8 @@ import {
 } from '@animalabs/mcpl-core';
 import type { PortalClient } from '@animalabs/portal-client';
 import { chunkText } from './chunk.js';
-import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
-import type { PortalAgent } from './agent.js';
+import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
+import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS } from './feature-sets.js';
@@ -236,16 +236,28 @@ export class PortalMcplServer {
     if (!this.mcplEnabled) return true; // plain MCP host: §3.2, MCPL never applies
     const required = INBOUND_CAPABILITY[req.method];
     if (required === undefined) return true;
+    // The capability path and the spec section go to the operator log; the
+    // message says what didn't happen in words an agent can act on.
     if (!this.policy.isReady) {
+      console.error(
+        `[portal-mcpl] ${req.method} refused: capability ${required} — no featureSets/update policy received yet (SPEC §5.3)`,
+      );
       conn.sendError(
         req.id,
         ERR_CAPABILITY_DENIED,
-        `capability denied: ${required} — no featureSets/update policy received yet (SPEC §5.3)`,
+        "Nothing ran: Portal hasn't yet received this host's permissions, so it can't act for the host yet. " +
+          'Try again in a few seconds; if it keeps happening, ask whoever runs this host.',
       );
       return false;
     }
     if (!this.policy.allows(required)) {
-      conn.sendError(req.id, ERR_CAPABILITY_DENIED, `capability denied: ${required}`);
+      console.error(`[portal-mcpl] ${req.method} refused: capability ${required} not granted`);
+      conn.sendError(
+        req.id,
+        ERR_CAPABILITY_DENIED,
+        "Nothing ran: this host hasn't granted Portal what this call needs, so calling again won't change that. " +
+          'If you need it, ask whoever runs this host.',
+      );
       return false;
     }
     return true;
@@ -278,15 +290,23 @@ export class PortalMcplServer {
         case 'tools/call': {
           const toolName = params.name as string;
           // A tool with no declared feature set is unauthorizable, so it is
-          // refused rather than defaulted on (§6.4 fails closed).
-          const owningSet = TOOL_FEATURE_SETS[toolName];
-          if (this.mcplEnabled && (owningSet === undefined || !this.policy.featureEnabled(owningSet))) {
+          // refused rather than defaulted on (§6.4 fails closed). A declared
+          // tool this host doesn't list is retired here: the agent answers it
+          // with a pointer to the host's own tools, and runs nothing, so it
+          // isn't gated.
+          const owningSet = Object.hasOwn(TOOL_FEATURE_SETS, toolName) ? TOOL_FEATURE_SETS[toolName] : undefined;
+          const listed = this.agent.tools.some((tool) => tool.name === toolName);
+          if (this.mcplEnabled && (owningSet === undefined || (listed && !this.policy.featureEnabled(owningSet)))) {
+            if (owningSet !== undefined) {
+              console.error(`[portal-mcpl] tools/call ${toolName} refused: feature set not enabled: ${owningSet}`);
+            }
             conn.sendError(
               req.id,
               owningSet === undefined ? ERR_CAPABILITY_DENIED : ERR_FEATURE_SET_NOT_ENABLED,
               owningSet === undefined
-                ? `tool ${toolName} has no declared feature set`
-                : `feature set not enabled: ${owningSet}`,
+                ? unknownToolMessage(toolName, this.availableTools())
+                : `${toolName} isn't enabled for this host, so the call didn't run, and calling it again won't change that. ` +
+                  'If you need it, ask whoever runs this host.',
             );
             break;
           }
@@ -332,7 +352,8 @@ export class PortalMcplServer {
       const e = err as Error & { code?: string };
       // Tool errors come back as a tool result with isError, not a JSON-RPC error.
       if (req.method === 'tools/call') {
-        conn.sendResponse(req.id, { content: [textContent(`Error: ${e.message}`)], isError: true });
+        // isError says it failed; the message says what happened.
+        conn.sendResponse(req.id, { content: [textContent(e.message)], isError: true });
       } else {
         conn.sendError(req.id, -32000, e.message);
       }
@@ -434,7 +455,13 @@ export class PortalMcplServer {
     const addr = open.address as { channelId?: string } | undefined;
     const channelId = exact ?? addr?.channelId;
     const channel = channelId ? this.client.cache.getChannel(channelId) : undefined;
-    if (!channelId || !channel) throw new Error('unknown channel');
+    if (!channelId || !channel) {
+      const looked = channelId !== undefined ? portalChannelId(channelId) : (open.channelId ?? null);
+      throw new Error(
+        `No Portal channel matches ${shortJson(looked)}, so nothing was opened. Portal channel ids look like ` +
+          "portal:<id>; your host's channel list shows the ones you can open, so copy one from there.",
+      );
+    }
 
     const result: ChannelsOpenResult = {
       channel: toDescriptor(channel, false, undefined, this.guildName(channel.guildId)),
@@ -469,8 +496,13 @@ export class PortalMcplServer {
   }
 
   private async handleChannelClose(close: ChannelsCloseParams): Promise<ChannelsCloseResult> {
-    const channelId = parsePortalChannelId(close.channelId);
-    if (!channelId) throw new Error(`invalid Portal channel id: ${close.channelId}`);
+    const channelId = typeof close.channelId === 'string' ? parsePortalChannelId(close.channelId) : null;
+    if (!channelId) {
+      throw new Error(
+        `Nothing was closed: ${shortJson(close.channelId ?? null)} isn't a Portal channel id. Portal channel ids ` +
+          "look like portal:<id>; your host's channel list shows the ones you can close.",
+      );
+    }
     await this.client.unsubscribe(channelId);
     this.openChannels.delete(channelId);
     return { closed: true };
@@ -479,8 +511,11 @@ export class PortalMcplServer {
   private async handleChannelAcknowledge(
     request: ChannelsAcknowledgeParams,
   ): Promise<ChannelsAcknowledgeResult> {
-    if (!parsePortalChannelId(request.channelId)) {
-      return { acknowledged: false, reason: `invalid Portal channel id: ${request.channelId}` };
+    if (typeof request.channelId !== 'string' || !parsePortalChannelId(request.channelId)) {
+      return {
+        acknowledged: false,
+        reason: `Nothing was acknowledged: ${shortJson(request.channelId ?? null)} isn't a Portal channel id, which looks like portal:<id>.`,
+      };
     }
     const representation = request.value?.trim() || '👀';
     try {
@@ -660,14 +695,7 @@ export class PortalMcplServer {
     // ambient.
     this.client.on('voiceReceipt', (e) => {
       if (!this.conn || !this.canPushVoice()) return;
-      const where = this.channelLabel(e.channelId);
-      const line =
-        e.status === 'spoken'
-          ? `[voice] you spoke in ${where} (${(e.playedMs / 1000).toFixed(1)}s): ${e.voicedText}`
-          : e.status === 'interrupted'
-            ? `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
-              `heard: "${e.voicedText}"${e.estimated ? ' (boundary estimated)' : ''} — unsaid: "${e.unvoicedText}"`
-            : `[voice] your utterance in ${where} was ${e.status === 'refused' ? 'refused' : 'dropped by an error'}: ${e.reason ?? 'no reason given'}`;
+      const line = voiceReceiptLine(e, this.channelLabel(e.channelId));
       this.conn
         .sendRequest(method.PUSH_EVENT, {
           featureSet: VOICE,
@@ -1217,5 +1245,32 @@ function stringify(v: unknown): string {
     return JSON.stringify(v, null, 2);
   } catch {
     return String(v);
+  }
+}
+
+/**
+ * The context line for a voice_speak receipt, as the speaker reads it. A
+ * refusal can be an authority's verdict that saying it again won't change,
+ * so only an error's line suggests saying it again; an error that cut the
+ * utterance off says what was heard, with the boundary's estimate flag as an
+ * interruption's line has it.
+ */
+export function voiceReceiptLine(e: Extract<PortalEvent, { type: 'voice_receipt' }>, where: string): string {
+  const reason = e.reason ?? 'no reason given';
+  const estimated = e.estimated ? ' (boundary estimated)' : '';
+  switch (e.status) {
+    case 'spoken':
+      return `[voice] you spoke in ${where} (${(e.playedMs / 1000).toFixed(1)}s): ${e.voicedText}`;
+    case 'interrupted':
+      return `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
+        `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}"`;
+    case 'refused':
+      return `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
+    default:
+      return e.voicedText
+        ? `[voice] your utterance in ${where} was cut off by an error: ${reason} — ` +
+          `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}". Call voice_speak with the rest if it still matters.`
+        : `[voice] your utterance in ${where} was dropped by an error, so nothing was said: ${reason}. ` +
+          'Call voice_speak again if it still matters.';
   }
 }

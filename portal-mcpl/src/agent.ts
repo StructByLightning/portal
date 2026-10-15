@@ -25,6 +25,27 @@ import {
 import { chunkText } from './chunk.js';
 import { toolDefinitions } from './tools.js';
 
+/**
+ * Tools retired where the host opens and closes channels itself
+ * (hostOwnsChannelLifecycle): each answer says nothing ran and points to the
+ * host's own channel tools.
+ */
+const RETIRED_WHEN_HOST_OWNS_CHANNELS: Readonly<Record<string, string>> = {
+  subscribe_channel:
+    'subscribe_channel is retired here: this host opens and closes channels itself, so nothing ran. ' +
+    "Open the channel with your host's own channel tool instead, such as channel_open.",
+  unsubscribe_channel:
+    'unsubscribe_channel is retired here: this host opens and closes channels itself, so nothing ran. ' +
+    "Close the channel with your host's own channel tool instead, such as channel_close.",
+  list_subscriptions:
+    'list_subscriptions is retired here: this host keeps track of open channels itself, so nothing ran. ' +
+    "Your host's own channel tool lists them, such as channel_list.",
+  set_reaction_visibility:
+    'set_reaction_visibility is retired here, so nothing ran: reactions show in a channel while it is open, ' +
+    "and this host opens and closes channels itself. To show or hide them, open or close the channel with your host's " +
+    'own channel tools, such as channel_open and channel_close.',
+};
+
 export interface PortalAgentOptions {
   /** Restore persisted read-state (watermarks + pings). */
   state?: AgentState;
@@ -93,11 +114,7 @@ export class PortalAgent {
 
   get tools(): typeof toolDefinitions {
     if (!this.hostOwnsChannelLifecycle) return toolDefinitions;
-    return toolDefinitions.filter((tool) =>
-      tool.name !== 'subscribe_channel' &&
-      tool.name !== 'unsubscribe_channel' &&
-      tool.name !== 'list_subscriptions' &&
-      tool.name !== 'set_reaction_visibility');
+    return toolDefinitions.filter((tool) => !Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, tool.name));
   }
 
   /** Server-authoritative pending pings, including any accrued while this
@@ -147,6 +164,15 @@ export class PortalAgent {
 
   /** Dispatch a tool call. Returns a plain JSON-able result. */
   async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+    // A tool that won't run is answered before its arguments are looked at:
+    // a retired tool's pointer, or an unknown name's nearest tools, is the
+    // whole answer, whatever channel the call names.
+    if (this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, name)) {
+      throw new Error(RETIRED_WHEN_HOST_OWNS_CHANNELS[name]);
+    }
+    if (!toolDefinitions.some((tool) => tool.name === name)) {
+      throw new Error(unknownToolMessage(name, this.tools));
+    }
     // THE chokepoint for channel addressing: every tool that takes a channelId
     // goes through here, so a name is resolved exactly once, before any side
     // effect, or the call fails audibly — never a silent pick, never a name
@@ -155,7 +181,9 @@ export class PortalAgent {
       const parsed = parseChannelRef(args.channelId);
       if (parsed?.kind !== 'id') {
         const resolved = this.resolveChannelRef(args.channelId);
-        if (!resolved.ok) throw new Error(resolved.message);
+        if (!resolved.ok) {
+          throw new Error(`Nothing ran: channelId ${shortJson(args.channelId)} ${resolved.message}`);
+        }
         args = { ...args, channelId: resolved.id };
       } else if (parsed.id !== args.channelId) {
         args = { ...args, channelId: parsed.id }; // `portal:<id>` → bare id
@@ -170,41 +198,35 @@ export class PortalAgent {
     if (args.threadId === null) {
       args = { ...args, threadId: undefined };
     } else if (args.threadId !== undefined) {
-      if (typeof args.threadId !== 'string' || !args.threadId.trim()) {
+      const parsed = typeof args.threadId === 'string' ? parseChannelRef(args.threadId) : null;
+      // Threads aren't addressable by label, so only an id names one.
+      if (parsed?.kind !== 'id') {
         throw new Error(
-          `threadId must name a thread (its id or portal:<id>), or be null for none; got ${shortJson(args.threadId)}. ` +
-            'Nothing was sent or read.',
+          `Nothing ran: threadId ${shortJson(args.threadId)} isn't a thread id. A thread is named by its id ` +
+            "(or portal:<id>), as create_thread returns it and as a message's threadId shows it; " +
+            'null or no threadId means no thread.',
         );
       }
-      const parsed = parseChannelRef(args.threadId);
-      let threadId: string;
-      if (parsed?.kind !== 'id') {
-        const resolved = this.resolveChannelRef(args.threadId);
-        if (!resolved.ok) throw new Error(`threadId: ${resolved.message}`);
-        threadId = resolved.id;
-      } else {
-        threadId = parsed.id; // `portal:<id>` → bare id
-      }
-      args = { ...args, threadId: threadId === args.channelId ? undefined : threadId };
+      args = { ...args, threadId: parsed.id === args.channelId ? undefined : parsed.id };
     }
     switch (name) {
       case 'send_message': {
         // Discord caps content at 2000 chars — split long messages into
         // sequential sends (files/reply/mentions ride on the first chunk).
-        const content = optStr(args.content);
+        const content = optStr(args.content, 'content');
         const chunks = content !== undefined ? chunkText(content) : [content];
         let first: unknown;
         for (let i = 0; i < chunks.length; i++) {
           const result = await this.client.sendMessage({
-            channelId: str(args.channelId),
+            channelId: str(args.channelId, 'channelId'),
             // Every chunk goes to the same place: a thread under channelId
             // when one is named, else channelId itself.
-            threadId: optStr(args.threadId),
+            threadId: optStr(args.threadId, 'threadId'),
             content: chunks[i],
             ...(i === 0
               ? {
                   files: args.files as never,
-                  replyToId: optStr(args.replyToId),
+                  replyToId: optStr(args.replyToId, 'replyToId'),
                   mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
                 }
               : {}),
@@ -215,16 +237,16 @@ export class PortalAgent {
         return first;
       }
       case 'edit_message': {
-        const edited = await this.client.editMessage(str(args.messageId), str(args.content));
+        const edited = await this.client.editMessage(str(args.messageId, 'messageId'), str(args.content, 'content'));
         this.onPublicActivity?.('edit');
         return edited;
       }
       case 'delete_message':
-        return this.client.deleteMessage(str(args.messageId));
+        return this.client.deleteMessage(str(args.messageId, 'messageId'));
       case 'react': {
         const reacted = await this.client.react(
-          str(args.messageId),
-          str(args.emoji),
+          str(args.messageId, 'messageId'),
+          str(args.emoji, 'emoji'),
           Boolean(args.visible),
           Boolean(args.native),
         );
@@ -232,21 +254,21 @@ export class PortalAgent {
         return reacted;
       }
       case 'unreact':
-        return this.client.unreact(str(args.messageId), str(args.emoji), Boolean(args.native));
+        return this.client.unreact(str(args.messageId, 'messageId'), str(args.emoji, 'emoji'), Boolean(args.native));
       case 'fetch_history':
         return this.client.fetchHistory({
-          channelId: str(args.channelId),
-          threadId: optStr(args.threadId),
+          channelId: str(args.channelId, 'channelId'),
+          threadId: optStr(args.threadId, 'threadId'),
           limit: typeof args.limit === 'number' ? args.limit : undefined,
-          before: optStr(args.before),
-          after: optStr(args.after),
+          before: optStr(args.before, 'before'),
+          after: optStr(args.after, 'after'),
         });
       case 'fetch_around':
         return this.fetchAround(
-          str(args.channelId),
-          str(args.messageId),
+          str(args.channelId, 'channelId'),
+          str(args.messageId, 'messageId'),
           typeof args.limit === 'number' ? args.limit : 50,
-          optStr(args.threadId),
+          optStr(args.threadId, 'threadId'),
         );
       case 'list_guilds':
         return this.client.call('list_guilds', {});
@@ -254,7 +276,7 @@ export class PortalAgent {
         // Each channel carries its `label` — the exact string every channelId
         // argument accepts (display form == address form). Threads/categories
         // are labelled too but remain id-only addresses.
-        const guildId = str(args.guildId);
+        const guildId = str(args.guildId, 'guildId');
         const guildName = this.client.cache.getGuild(guildId)?.name;
         const res = (await this.client.call('list_channels', { guildId })) as {
           channels: Array<{ id: string; name: string | null; type: string }>;
@@ -268,53 +290,39 @@ export class PortalAgent {
       }
       case 'create_thread':
         return this.client.call('create_thread', {
-          channelId: str(args.channelId),
-          name: str(args.name),
+          channelId: str(args.channelId, 'channelId'),
+          name: str(args.name, 'name'),
         });
       case 'subscribe_channel': {
-        if (this.hostOwnsChannelLifecycle) {
-          throw new Error('subscribe_channel is retired; use the host channel_open tool');
-        }
-        const channelId = str(args.channelId);
+        const channelId = str(args.channelId, 'channelId');
         this.state.subscribe(channelId); // durable; persisted via onChange
         return this.client.subscribe(channelId);
       }
       case 'unsubscribe_channel': {
-        if (this.hostOwnsChannelLifecycle) {
-          throw new Error('unsubscribe_channel is retired; use the host channel_close tool');
-        }
-        const channelId = str(args.channelId);
+        const channelId = str(args.channelId, 'channelId');
         this.state.unsubscribe(channelId);
         return this.client.unsubscribe(channelId);
       }
       case 'list_subscriptions':
-        if (this.hostOwnsChannelLifecycle) {
-          throw new Error('list_subscriptions is retired; use the host channel_list tool');
-        }
         // Durable agent state is the source of truth (survives reconnect/restart).
         return { channelIds: this.state.subscriptionList() };
       case 'list_members':
         return this.client.call('list_members', {
-          guildId: str(args.guildId),
-          query: optStr(args.query),
+          guildId: str(args.guildId, 'guildId'),
+          query: optStr(args.query, 'query'),
           limit: typeof args.limit === 'number' ? args.limit : undefined,
         });
       case 'resolve_mentions':
         return this.client.call('resolve_mentions', {
-          guildId: str(args.guildId),
+          guildId: str(args.guildId, 'guildId'),
           handles: (args.handles as string[]) ?? [],
         });
       case 'list_roles':
-        return this.client.call('list_roles', { guildId: str(args.guildId) });
+        return this.client.call('list_roles', { guildId: str(args.guildId, 'guildId') });
       case 'list_emojis':
-        return this.client.call('list_emojis', { guildId: optStr(args.guildId) });
+        return this.client.call('list_emojis', { guildId: optStr(args.guildId, 'guildId') });
       case 'set_reaction_visibility': {
-        if (this.hostOwnsChannelLifecycle) {
-          throw new Error(
-            'set_reaction_visibility is retired; reactions follow host channel_open/channel_close state',
-          );
-        }
-        const channelId = str(args.channelId);
+        const channelId = str(args.channelId, 'channelId');
         const visible = Boolean(args.visible);
         // Durable per-channel opt-in; persisted via onChange. Reactions are shown
         // in context but NEVER wake the agent (see server.ts push path).
@@ -324,16 +332,16 @@ export class PortalAgent {
           : `Reaction visibility OFF for ${channelId}.`;
       }
       case 'list_pins':
-        return this.client.call('list_pins', { channelId: str(args.channelId) });
+        return this.client.call('list_pins', { channelId: str(args.channelId, 'channelId') });
       case 'voice_join':
-        return this.client.call('voice_join', { channelId: str(args.channelId) });
+        return this.client.call('voice_join', { channelId: str(args.channelId, 'channelId') });
       case 'voice_leave':
-        return this.client.call('voice_leave', { channelId: str(args.channelId) });
+        return this.client.call('voice_leave', { channelId: str(args.channelId, 'channelId') });
       case 'voice_speak':
         return this.client.call('voice_speak', {
-          channelId: str(args.channelId),
-          text: str(args.text),
-          ...(args.requestId !== undefined ? { requestId: str(args.requestId) } : {}),
+          channelId: str(args.channelId, 'channelId'),
+          text: str(args.text, 'text'),
+          ...(args.requestId !== undefined ? { requestId: str(args.requestId, 'requestId') } : {}),
           ...(args.grant !== undefined ? { grant: args.grant as never } : {}),
         });
       case 'get_pending_pings':
@@ -343,35 +351,73 @@ export class PortalAgent {
       case 'list_unread':
         return this.client.call('list_unread', {});
       case 'channel_missed':
-        return this.client.call('channel_missed', { channelId: str(args.channelId) });
+        return this.client.call('channel_missed', { channelId: str(args.channelId, 'channelId') });
       case 'mark_read': {
-        const channelId = str(args.channelId);
-        const uptoCreatedAt = optStr(args.uptoCreatedAt);
+        const channelId = str(args.channelId, 'channelId');
+        const uptoCreatedAt = optStr(args.uptoCreatedAt, 'uptoCreatedAt');
         // Advance the server watermark (durable) and the local live-wake state.
         this.state.markRead(channelId, uptoCreatedAt);
         await this.client.call('mark_read', { channelId, uptoCreatedAt });
         return { ok: true };
       }
       default:
-        throw new Error(`unknown tool ${name}`);
+        throw new Error(unknownToolMessage(name, this.tools));
     }
   }
 }
 
-function str(v: unknown): string {
-  if (typeof v !== 'string') throw new Error('expected string argument');
+/** A string argument, refused by name before anything runs. */
+function str(v: unknown, name: string): string {
+  if (typeof v !== 'string') throw new Error(`Nothing ran: ${name} must be a string, got ${shortJson(v)}.`);
   return v;
 }
-function optStr(v: unknown): string | undefined {
-  return typeof v === 'string' ? v : undefined;
+/** An optional string argument: absent when undefined or null, refused by name when it's anything else. */
+function optStr(v: unknown, name: string): string | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'string') throw new Error(`Nothing ran: ${name} must be a string when given, got ${shortJson(v)}.`);
+  return v;
 }
 /** A caller's value for an error message, bounded so a huge one isn't echoed whole. */
-function shortJson(v: unknown): string {
+export function shortJson(v: unknown): string {
   let s: string;
   try {
     s = JSON.stringify(v) ?? String(v);
   } catch {
     s = String(typeof v);
   }
-  return s.length > 60 ? `${s.slice(0, 60)}…` : s;
+  if (s.length <= 60) return s;
+  // A cut string keeps its closing quote, so the message around it still reads.
+  return s.startsWith('"') ? `${s.slice(0, 59)}…"` : `${s.slice(0, 60)}…`;
+}
+
+/**
+ * The refusal for a tool name the server doesn't have. It names the closest
+ * of the tools this agent can call, so a typo is fixed in one step.
+ */
+export function unknownToolMessage(name: unknown, available: readonly { name: string }[]): string {
+  const asked = typeof name === 'string' ? name : '';
+  const close = available
+    .map((tool) => ({ name: tool.name, distance: editDistance(asked, tool.name) }))
+    .filter((c) => c.distance <= Math.max(2, Math.floor(asked.length / 3)))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 3)
+    .map((c) => `"${c.name}"`);
+  const lead = `There's no Portal tool named ${shortJson(name)}, so nothing ran.`;
+  return close.length > 0
+    ? `${lead} Did you mean ${close.join(' or ')}?`
+    : `${lead} Call one of the tools listed for you.`;
+}
+
+function editDistance(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
 }

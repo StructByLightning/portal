@@ -249,16 +249,21 @@ test('a threadId that names no thread is refused before anything is sent or read
     ] as const) {
       await assert.rejects(
         agent.handleToolCall(tool, { channelId: '100000000000000003', threadId, ...extra }),
-        /threadId must name a thread .*Nothing was sent or read\./,
+        /^Error: Nothing ran: threadId .* isn't a thread id\. A thread is named by its id \(or portal:<id>\)/,
         `${tool} with threadId ${JSON.stringify(threadId)}`,
       );
     }
   }
-  // A name that isn't a known channel is refused by the resolver, naming threadId.
-  await assert.rejects(
-    agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId: '#no-such-thread', content: 'hi' }),
-    /^Error: threadId: /,
-  );
+  // Threads aren't addressable by label, so a name is refused with a thread's own remedy,
+  // even one that names a channel.
+  for (const threadId of ['#no-such-thread', '#lena_dev (Connectome)']) {
+    await assert.rejects(
+      agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId, content: 'hi' }),
+      new RegExp(`^Error: Nothing ran: threadId ${JSON.stringify(threadId).replace(/[()]/g, '\\$&')} isn't a thread id\\. ` +
+        "A thread is named by its id \\(or portal:<id>\\), as create_thread returns it and as a message's threadId shows it; " +
+        'null or no threadId means no thread\\.$'),
+    );
+  }
   assert.deepEqual(sent, []);
   assert.deepEqual(fetched, []);
 });
@@ -267,11 +272,11 @@ test('an ambiguous or unknown name errors and NOTHING is sent', async () => {
   const { agent, sent } = agentWithCache();
   await assert.rejects(
     () => agent.handleToolCall('send_message', { channelId: '#general', content: 'hi' }),
-    /ambiguous.*#general \(Connectome\).*#general \(Anima Mundi\)/,
+    /^Error: Nothing ran: channelId "#general" is ambiguous: 2 channels match\. Call again with one of these: "#general \(Connectome\)", "#general \(Anima Mundi\)"\.$/,
   );
   await assert.rejects(
     () => agent.handleToolCall('send_message', { channelId: '#nope', content: 'hi' }),
-    /No addressable channel named #nope/,
+    /^Error: Nothing ran: channelId "#nope" names no channel you can address\. list_channels, with a guildId from list_guilds, shows each channel's label and id: pass a text or voice channel's label, or any channel's id\.$/,
   );
   assert.equal(sent.length, 0);
 });
@@ -286,4 +291,53 @@ test('list_channels returns the label every channelId argument accepts', async (
   assert.equal(res.channels[0].label, '#lena_dev (Connectome)');
   assert.equal(agent.labelFor('100000000000000003'), '#lena_dev (Connectome)');
   assert.equal(agent.labelFor('nope'), 'nope');
+});
+
+test("a retired tool points to the host's own channel tools without claiming their names", async () => {
+  const { agent } = agentWithCache();
+  for (const [tool, pointer] of [
+    ['subscribe_channel', /^Error: subscribe_channel is retired here: this host opens and closes channels itself, so nothing ran\. .*such as channel_open\.$/],
+    ['unsubscribe_channel', /such as channel_close\.$/],
+    ['list_subscriptions', /such as channel_list\.$/],
+    ['set_reaction_visibility', /^Error: set_reaction_visibility is retired here, so nothing ran: .*such as channel_open and channel_close\.$/],
+  ] as const) {
+    await assert.rejects(agent.handleToolCall(tool, { channelId: '100000000000000003', visible: true }), pointer, tool);
+    // A name the resolver can't place doesn't get ahead of the pointer: the tool won't run anyway.
+    await assert.rejects(agent.handleToolCall(tool, { channelId: '#nope', visible: true }), pointer, `${tool} with a bad name`);
+  }
+});
+
+test('an unknown tool is answered with its nearest names before its arguments are looked at', async () => {
+  const { agent, sent } = agentWithCache();
+  await assert.rejects(
+    agent.handleToolCall('send_mesage', { channelId: '#nope', content: 'hi' }),
+    /^Error: There's no Portal tool named "send_mesage", so nothing ran\. Did you mean "send_message"\?$/,
+  );
+  // Retired tools aren't offered where they're retired.
+  await assert.rejects(
+    agent.handleToolCall('subscribe_channe', {}),
+    /^Error: There's no Portal tool named "subscribe_channe", so nothing ran\. Call one of the tools listed for you\.$/,
+  );
+  assert.deepEqual(sent, []);
+});
+
+test('an optional string argument of another type is refused by name, and nothing runs', async () => {
+  const { agent, sent, client } = agentWithCache();
+  const fetched: unknown[] = [];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async (p: unknown) => {
+    fetched.push(p);
+    return { messages: [] };
+  };
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi', replyToId: 42 }),
+    /^Error: Nothing ran: replyToId must be a string when given, got 42\.$/,
+  );
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', before: 7 }),
+    /^Error: Nothing ran: before must be a string when given, got 7\.$/,
+  );
+  // Absent and null still mean absent.
+  await agent.handleToolCall('fetch_history', { channelId: '100000000000000003', before: null });
+  assert.deepEqual(sent, []);
+  assert.equal(fetched.length, 1);
 });
