@@ -275,7 +275,10 @@ const GUILD_TABS = new Set(['personas', 'invites', 'roles', 'audit']);
 
 async function render() {
   const view = $('#view');
-  if (GUILD_TABS.has(state.tab) && !state.guildId) {
+  // Super-admins reach the global persona list (profile, token) without a
+  // guild — e.g. before the relay has joined any.
+  const globalPersonas = state.tab === 'personas' && state.me && state.me.isSuper;
+  if (GUILD_TABS.has(state.tab) && !state.guildId && !globalPersonas) {
     clear(view);
     view.appendChild(el('div', { class: 'empty' }, [
       el('p', { text: 'Select a guild to manage.' }),
@@ -346,7 +349,7 @@ function rowClick(tr) { tr.classList.add('clickable'); return tr; }
 
 async function renderPersonas(view) {
   const isSuper = !!(state.me && state.me.isSuper);
-  const all = isSuper && state.personaScope === 'all';
+  const all = isSuper && (state.personaScope === 'all' || !state.guildId);
   const meta = state.guildId ? await guildMeta() : null;
   const data = all
     ? await api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }))
@@ -354,7 +357,7 @@ async function renderPersonas(view) {
   clear(view);
 
   const actions = [];
-  if (isSuper) {
+  if (isSuper && state.guildId) {
     const scope = el('select', { class: 'scope-select', title: 'Which personas to list' }, [
       el('option', { value: 'guild', text: 'With access in ' + currentGuildName() }),
       el('option', { value: 'all', text: 'All personas' }),
@@ -413,12 +416,24 @@ async function openPersonaDrawer(id, meta) {
   const displayName = (global && global.displayName) || (local && local.displayName) || id;
   const body = el('div', { class: 'drawer-sections' });
 
+  // "Access in every guild" is rebuilt after any change made in this drawer,
+  // so the two sections never disagree.
+  const everywhere = el('div', {});
+  const refreshEverywhere = async () => {
+    if (!isSuper) return;
+    try {
+      const fresh = await api('GET', '/admin/personas/' + encodeURIComponent(id));
+      clear(everywhere);
+      everywhere.appendChild(everywhereSection(fresh));
+    } catch { /* keep what is shown; the next open refreshes */ }
+  };
   if (global) body.appendChild(profileSection(id, global));
   if (state.guildId && meta && (local || global)) {
-    body.appendChild(guildAccessSection(id, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta));
+    body.appendChild(guildAccessSection(id, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta, refreshEverywhere));
   }
   if (global) {
-    body.appendChild(everywhereSection(global));
+    everywhere.appendChild(everywhereSection(global));
+    body.appendChild(everywhere);
     body.appendChild(tokenSection(id));
   }
 
@@ -452,12 +467,12 @@ function profileSection(id, d) {
 }
 
 /** Access in the selected guild: access roles, claiming an invite, direct grants. */
-function guildAccessSection(id, detail, meta) {
+function guildAccessSection(id, detail, meta, onChange = () => {}) {
   const roleTags = el('div', { class: 'tags' });
   function drawRoles(roles) {
     clear(roleTags);
     (roles || []).forEach((r) => roleTags.appendChild(el('span', { class: 'tag' }, [
-      r, el('span', { class: 'x', text: '✕', title: 'revoke', onclick: () => revokeRole(id, r, drawRoles) }),
+      r, el('span', { class: 'x', text: '✕', title: 'revoke', onclick: () => revokeRole(id, r, drawRoles, onChange) }),
     ])));
     if (!roles || !roles.length) roleTags.appendChild(el('span', { class: 'muted', text: 'no access roles' }));
   }
@@ -467,7 +482,7 @@ function guildAccessSection(id, detail, meta) {
     roleNames.map((n) => el('option', { value: n, text: n }))));
   addRole.addEventListener('change', async () => {
     if (!addRole.value) return;
-    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/roles', { role: addRole.value }); drawRoles(r.roles); banner('Access role assigned'); addRole.value = ''; }
+    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/roles', { role: addRole.value }); drawRoles(r.roles); banner('Access role assigned'); addRole.value = ''; onChange(); }
     catch (e) { banner('Assign failed: ' + e.message, 'err'); }
   });
 
@@ -475,7 +490,7 @@ function guildAccessSection(id, detail, meta) {
   const claimBtn = el('button', { class: 'btn btn-sm', text: 'Claim' });
   claimBtn.addEventListener('click', async () => {
     if (!claimCode.value.trim()) return banner('Enter an invite code.', 'err');
-    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/claim', { code: claimCode.value.trim() }); drawRoles(r.roles); banner('Invite applied'); claimCode.value = ''; }
+    try { const r = await api('POST', G() + '/personas/' + encodeURIComponent(id) + '/claim', { code: claimCode.value.trim() }); drawRoles(r.roles); banner('Invite applied'); claimCode.value = ''; onChange(); }
     catch (e) { banner('Claim failed: ' + e.message, 'err'); }
   });
 
@@ -483,7 +498,7 @@ function guildAccessSection(id, detail, meta) {
     el('h3', { text: 'Access in ' + currentGuildName() }),
     el('div', { class: 'field' }, [el('label', { text: 'Access roles' }), el('div', { class: 'inline' }, [roleTags, addRole])]),
     el('div', { class: 'field' }, [el('label', { text: 'Claim an invite for it' }), el('div', { class: 'inline' }, [claimCode, claimBtn])]),
-    grantEditor(id, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels)),
+    grantEditor(id, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange),
   ]);
 }
 
@@ -541,7 +556,7 @@ function tokenSection(id) {
   ]);
 }
 
-function grantEditor(id, policy0, channels, names) {
+function grantEditor(id, policy0, channels, names, onChange = () => {}) {
   const det = el('details', { class: 'advanced' }, [el('summary', { text: 'Direct grants (this guild only)' })]);
   const body = el('div', {});
   function draw(policy) {
@@ -550,11 +565,11 @@ function grantEditor(id, policy0, channels, names) {
     const chans = (policy && policy.channels) || {};
     const keys = Object.keys(chans).sort((a, b) => byName(chanText(a, names), chanText(b, names)));
     const rows = [];
-    if (gd.length) rows.push(el('tr', {}, [el('td', { text: 'guild-default' }), el('td', { class: 'cell-roles', text: capsSummary(gd) }), el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, null, draw) })])]));
+    if (gd.length) rows.push(el('tr', {}, [el('td', { text: 'guild-default' }), el('td', { class: 'cell-roles', text: capsSummary(gd) }), el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, null, draw, onChange) })])]));
     for (const cid of keys) rows.push(el('tr', {}, [
       el('td', {}, [chanNode(cid, names)]),
       el('td', { class: 'cell-roles', text: capsSummary(chans[cid] || []) }),
-      el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, cid, draw) })]),
+      el('td', {}, [el('button', { class: 'btn btn-sm btn-danger', text: 'clear', onclick: () => clearGrant(id, cid, draw, onChange) })]),
     ]));
     body.appendChild(table([{ label: 'Target' }, { label: 'Caps' }, { label: '', cls: 'col-narrow' }], rows));
 
@@ -565,7 +580,7 @@ function grantEditor(id, policy0, channels, names) {
     setBtn.addEventListener('click', async () => {
       const reqBody = { caps: caps.values() };
       if (target.value) reqBody.channelId = target.value;
-      try { const r = await api('PUT', G() + '/personas/' + encodeURIComponent(id) + '/grants', reqBody); draw(r.guildPolicy); banner('Grant updated'); }
+      try { const r = await api('PUT', G() + '/personas/' + encodeURIComponent(id) + '/grants', reqBody); draw(r.guildPolicy); banner('Grant updated'); onChange(); }
       catch (e) { banner('Grant failed: ' + e.message, 'err'); }
     });
     body.appendChild(el('div', { class: 'field' }, [el('label', { text: 'Target' }), target]));
@@ -577,14 +592,14 @@ function grantEditor(id, policy0, channels, names) {
   return det;
 }
 
-async function clearGrant(id, channelId, draw) {
+async function clearGrant(id, channelId, draw, onChange = () => {}) {
   let path = G() + '/personas/' + encodeURIComponent(id) + '/grants';
   if (channelId) path += '?channelId=' + encodeURIComponent(channelId);
-  try { const r = await api('DELETE', path); draw(r.guildPolicy); banner('Grant cleared'); }
+  try { const r = await api('DELETE', path); draw(r.guildPolicy); banner('Grant cleared'); onChange(); }
   catch (e) { banner('Clear failed: ' + e.message, 'err'); }
 }
-async function revokeRole(id, role, drawRoles) {
-  try { const r = await api('DELETE', G() + '/personas/' + encodeURIComponent(id) + '/roles/' + encodeURIComponent(role)); drawRoles(r.roles); banner('Role revoked'); }
+async function revokeRole(id, role, drawRoles, onChange = () => {}) {
+  try { const r = await api('DELETE', G() + '/personas/' + encodeURIComponent(id) + '/roles/' + encodeURIComponent(role)); drawRoles(r.roles); banner('Access role revoked'); onChange(); }
   catch (e) { banner('Revoke failed: ' + e.message, 'err'); }
 }
 
