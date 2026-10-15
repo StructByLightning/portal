@@ -24,6 +24,7 @@ import {
 } from './channel-names.js';
 import { chunkText } from './chunk.js';
 import { toolDefinitions } from './tools.js';
+import { resolveOutgoingFiles, type ResolveFilesOptions } from './files.js';
 
 /**
  * Tools retired where the host opens and closes channels itself
@@ -55,6 +56,8 @@ export interface PortalAgentOptions {
    *  disables the legacy subscription tools and mention auto-subscribe while
    *  leaving the standalone Claude Code channel behavior unchanged. */
   hostOwnsChannelLifecycle?: boolean;
+  /** How `send_message.files` paths/URLs are resolved to bytes (see files.ts). */
+  files?: ResolveFilesOptions;
   /** Called after this persona does something PUBLIC (posts, reacts, edits) —
    *  a beacon for supervisors that can't see every channel it acts in. */
   onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
@@ -64,6 +67,7 @@ export class PortalAgent {
   readonly state: AgentState;
   private onPing?: (ping: PendingPing) => void;
   private hostOwnsChannelLifecycle: boolean;
+  private fileOpts: ResolveFilesOptions;
   private onPublicActivity?: (kind: 'message' | 'reaction' | 'edit') => void;
 
   constructor(
@@ -73,6 +77,7 @@ export class PortalAgent {
     this.state = opts.state ?? new AgentState();
     this.onPing = opts.onPing;
     this.hostOwnsChannelLifecycle = opts.hostOwnsChannelLifecycle === true;
+    this.fileOpts = opts.files ?? {};
     this.onPublicActivity = opts.onPublicActivity;
     this.client.on('message', (e) => this.ingest(e.message, e.addressedToMe, e.reasons));
     this.client.on('messageUpdate', (e) => {
@@ -215,6 +220,10 @@ export class PortalAgent {
         // sequential sends (files/reply/mentions ride on the first chunk).
         const content = optStr(args.content, 'content');
         const chunks = content !== undefined ? chunkText(content) : [content];
+        // Paths/URLs become inline bytes here, on the resident's host — the
+        // relay only ever sees `bytes` (RFC-003 keeps its own disk closed).
+        const files = await resolveOutgoingFiles(args.files, this.fileOpts);
+        if (!files && content === undefined) throw new Error('send_message needs content or files');
         const posted: string[] = [];
         let first: unknown;
         for (let i = 0; i < chunks.length; i++) {
@@ -228,7 +237,7 @@ export class PortalAgent {
               content: chunks[i],
               ...(i === 0
                 ? {
-                    files: args.files as never,
+                    files,
                     replyToId: optStr(args.replyToId, 'replyToId'),
                     mentionPersonaIds: args.mentionPersonaIds as string[] | undefined,
                   }
