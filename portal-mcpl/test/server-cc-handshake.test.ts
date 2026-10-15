@@ -18,7 +18,11 @@ test('handshake answers a pre-initialize server/discover probe, then still initi
   const server = new PortalCcChannelServer(client, new PortalAgent(client, {}));
   const serving = server.serve(McplConnection.fromStreams(toServer, fromServer));
 
-  type Reply = { id: number; result?: { capabilities: { experimental: Record<string, unknown> } }; error?: { code: number } };
+  type Reply = {
+    id: number;
+    result?: { capabilities?: { experimental: Record<string, unknown> }; tools?: Array<{ name: string }> };
+    error?: { code: number };
+  };
   const replies: Reply[] = [];
   let buf = '';
   fromServer.on('data', (chunk: Buffer) => {
@@ -43,11 +47,14 @@ test('handshake answers a pre-initialize server/discover probe, then still initi
   send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
   const init = await reply(2);
   assert.equal(init.id, 1);
-  assert.ok(init.result && 'claude/channel' in init.result.capabilities.experimental);
+  assert.ok(init.result?.capabilities && 'claude/channel' in init.result.capabilities.experimental);
 
   send({ jsonrpc: '2.0', method: 'notifications/initialized' });
   send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-  assert.equal((await reply(3)).id, 2);
+  const tools = await reply(3);
+  assert.equal(tools.id, 2);
+  assert.equal(tools.error, undefined, 'tools/list answers with a result, not an error');
+  assert.ok(tools.result?.tools?.some((t) => t.name === 'send_message'), 'the tool surface is listed');
 
   toServer.end();
   await serving;
