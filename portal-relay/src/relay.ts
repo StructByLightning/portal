@@ -35,6 +35,7 @@ import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
+import { ChannelNameResolver } from './admin/names.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -142,6 +143,12 @@ export class Relay implements GatewayHooks {
     // admin module stays decoupled from discord.js and is unit-testable.
     if (config.admin) {
       this.audit = new AuditLog(config.admin.auditPath);
+      // Names for ids the gateway cache can't name (archived threads, deleted
+      // channels) — REST-backed, memoised, never touches the bot's cache.
+      const channelNames = new ChannelNameResolver({
+        cached: (id) => this.bot.channelMetaFromCache(id),
+        fetch: (id) => this.bot.fetchChannelMetaUncached(id),
+      });
       const deps: AdminDeps = {
         config: config.admin,
         identity: this.identity,
@@ -162,7 +169,10 @@ export class Relay implements GatewayHooks {
             id: c.id,
             name: c.name ?? undefined,
             type: c.type,
+            ...(c.parentId ? { parentId: c.parentId } : {}),
           })),
+        resolveChannels: (ids) => channelNames.resolve(ids),
+        discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
         applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
