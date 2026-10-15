@@ -13,8 +13,18 @@ const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 writeFileSync(join(dir, 'dot.png'), png);
 writeFileSync(join(dir, 'notes.txt'), 'hello');
 
+/** Local paths are opt-in: these tests allow the fixture dir. */
+const inDir = { allowedRoots: [dir] };
+
+test('local paths are refused unless roots are configured (before touching the filesystem)', async () => {
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')]), /local file paths are off/);
+  await assert.rejects(resolveOutgoingFiles([{ path: '/etc/definitely-not-a-file-xyz' }]), /local file paths are off/);
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')], { allowedRoots: [] }), /local file paths are off/);
+  assert.equal(fileOptionsFromEnv({}).allowedRoots, undefined);
+});
+
 test('bare path string → bytes with inferred name + mime', async () => {
-  const out = await resolveOutgoingFiles([join(dir, 'dot.png')]);
+  const out = await resolveOutgoingFiles([join(dir, 'dot.png')], inDir);
   assert.equal(out!.length, 1);
   assert.equal(out![0].name, 'dot.png');
   assert.equal(out![0].contentType, 'image/png');
@@ -23,14 +33,14 @@ test('bare path string → bytes with inferred name + mime', async () => {
 });
 
 test('object path, relative to cwd, with override name', async () => {
-  const out = await resolveOutgoingFiles([{ path: 'notes.txt', name: 'renamed.md' }], { cwd: dir });
+  const out = await resolveOutgoingFiles([{ path: 'notes.txt', name: 'renamed.md' }], { cwd: dir, ...inDir });
   assert.equal(out![0].name, 'renamed.md');
   assert.equal(out![0].contentType, 'text/markdown');
   assert.equal(Buffer.from(out![0].bytes!, 'base64').toString(), 'hello');
 });
 
 test('missing file gives a legible error', async () => {
-  await assert.rejects(resolveOutgoingFiles([join(dir, 'nope.bin')]), /no such file/);
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'nope.bin')], inDir), /no such file/);
 });
 
 test('allowedRoots fences paths', async () => {
@@ -69,8 +79,8 @@ test('url in `path` slot is treated as a url; http error is legible', async () =
 });
 
 test('per-message budget and file count are enforced', async () => {
-  await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')], { maxTotalBytes: 3 }), /exceed the per-message budget/);
-  await assert.rejects(resolveOutgoingFiles(new Array(11).fill(join(dir, 'dot.png'))), /too many files/);
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')], { maxTotalBytes: 3, ...inDir }), /exceed the per-message budget/);
+  await assert.rejects(resolveOutgoingFiles(new Array(11).fill(join(dir, 'dot.png')), inDir), /too many files/);
 });
 
 test('empty/null files → undefined', async () => {
@@ -142,16 +152,16 @@ test('url: v4-mapped and NAT64 v6 literals are refused THROUGH the URL path (the
   assert.equal((await resolveOutgoingFiles(['http://[::ffff:8.8.8.8]/x.png'], o))!.length, 1);
 });
 
-test('credentials and identity files are never attachable, roots or not', async () => {
+test('credentials and identity files are never attachable, whatever the roots', async () => {
   for (const name of ['lena46.creds.json', 'root.identities.json', 'p1.state.json']) {
     writeFileSync(join(dir, name), '{"token":"SECRET"}');
-    await assert.rejects(resolveOutgoingFiles([join(dir, name)]), /refusing to attach a credentials/, name);
-    await assert.rejects(resolveOutgoingFiles([join(dir, name)], { allowedRoots: [dir] }), /refusing to attach/, name);
-    await assert.rejects(resolveOutgoingFiles([{ path: join(dir, name), name: 'innocent.txt' }]), /refusing to attach/, name);
+    await assert.rejects(resolveOutgoingFiles([join(dir, name)], inDir), /refusing to attach a credentials/, name);
+    await assert.rejects(resolveOutgoingFiles([join(dir, name)], { allowedRoots: ['/'] }), /refusing to attach/, name);
+    await assert.rejects(resolveOutgoingFiles([{ path: join(dir, name), name: 'innocent.txt' }], inDir), /refusing to attach/, name);
   }
   // Via a symlink with an innocent name, too.
   symlinkSync(join(dir, 'lena46.creds.json'), join(dir, 'readme.txt'));
-  await assert.rejects(resolveOutgoingFiles([join(dir, 'readme.txt')]), /refusing to attach/);
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'readme.txt')], inDir), /refusing to attach/);
 });
 
 test('a path outside the roots learns nothing about whether it exists', async () => {

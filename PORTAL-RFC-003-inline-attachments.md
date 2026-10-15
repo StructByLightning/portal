@@ -200,7 +200,8 @@ send: `send_message.files` items may be a bare string (local path or http(s)
 URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
 locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
 per-message budget checked with a legible error, and only `bytes` ever reach
-the relay. Knobs: `PORTAL_FILE_ROOTS` (fence paths), `PORTAL_MAX_FILE_BYTES`,
+the relay. Knobs: `PORTAL_FILE_ROOTS` (the directories `path` items may come
+from — unset, `path` items are refused; see below), `PORTAL_MAX_FILE_BYTES`,
 `PORTAL_ALLOW_URL_FILES=false`, `PORTAL_ALLOW_PRIVATE_URLS=true`. Tests:
 `portal-mcpl/test/files.test.ts`.
 
@@ -212,3 +213,11 @@ lying `Content-Length` can't buffer an unbounded body. `PORTAL_FILE_ROOTS`
 fences the `realpath` of the file, so a symlink inside a root can't reach
 outside it. `bytes` must be strict base64 (Node's lenient decoder would turn a
 mistyped payload into a silently truncated attachment).
+
+Local paths are opt-in (2026-10-15). With `PORTAL_FILE_ROOTS` unset, a `path`
+item is refused before anything touches the filesystem. A send that reads the
+file itself goes around whatever the host fences file access with (an MCPL
+host's tool grants and mounts, Claude Code's permission prompts), and any
+channel message can ask for one — so the operator names the directories.
+Credentials, identity and state files (`*.creds.json`, `*.identities.json`,
+`*.state.json`) are refused under any setting.

@@ -13,7 +13,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { BlockList, isIP } from 'node:net';
 import { homedir } from 'node:os';
-import { basename, extname, isAbsolute, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import type { OutgoingFile } from '@animalabs/portal-protocol';
 
 /** What the tool schema accepts per item: a bare path/URL string, or an object. */
@@ -35,7 +35,10 @@ export interface ResolveFilesOptions {
   maxFiles?: number;
   /** Base directory for relative paths (default: process.cwd()). */
   cwd?: string;
-  /** If set, `path` must resolve inside one of these directories. */
+  /** Directories a `path` item must resolve inside. Unset or empty ⇒ `path`
+   *  items are refused: reading local files is opt-in (PORTAL_FILE_ROOTS),
+   *  because a send that reads the file itself bypasses whatever fences the
+   *  host puts on file access, and any channel message can ask for one. */
   allowedRoots?: string[];
   /** Allow `url` fetches (default true). */
   allowUrls?: boolean;
@@ -91,6 +94,24 @@ function expandHome(p: string): string {
   if (p === '~') return homedir();
   if (p.startsWith('~/')) return resolve(homedir(), p.slice(2));
   return p;
+}
+
+/** Where `abs` would be on disk: its realpath, or — when it doesn't exist —
+ *  the realpath of its deepest existing ancestor plus the rest. Fencing this
+ *  rather than the raw path keeps a missing file under a symlinked root (e.g.
+ *  macOS /var → /private/var) inside that root, so it reads "no such file",
+ *  while a path outside the roots still reads "outside" whether or not it exists. */
+async function onDiskPath(abs: string): Promise<string> {
+  const rest: string[] = [];
+  let cur = abs;
+  for (;;) {
+    const real = await realpath(cur).catch(() => undefined);
+    if (real !== undefined) return rest.length ? join(real, ...rest.reverse()) : real;
+    const parent = dirname(cur);
+    if (parent === cur) return abs;
+    rest.push(basename(cur));
+    cur = parent;
+  }
 }
 
 function insideRoot(file: string, root: string): boolean {
@@ -290,20 +311,25 @@ export async function resolveOutgoingFiles(
     }
 
     if (spec.path != null) {
+      // Fail closed, before touching the filesystem (no existence oracle).
+      if (!opts.allowedRoots?.length) {
+        throw new Error(
+          `files[${i}]: local file paths are off on this server — set PORTAL_FILE_ROOTS to the ` +
+            'directories attachments may come from, or attach a url or bytes instead',
+        );
+      }
       const raw = expandHome(spec.path);
       const abs = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
       // Resolve what the OS will actually open (a symlink inside a root pointing
       // outside it must not pass), then fence, then stat — in that order, so a
       // path outside the roots learns nothing about whether it exists.
       const real = await realpath(abs).catch(() => undefined);
-      if (opts.allowedRoots?.length) {
-        const roots = await Promise.all(
-          opts.allowedRoots.map((r) => realpath(expandHome(r)).catch(() => resolve(expandHome(r)))),
-        );
-        const target = real ?? abs;
-        if (!roots.some((r) => insideRoot(target, r))) {
-          throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}${real && real !== abs ? ` (→ ${real})` : ''}`);
-        }
+      const roots = await Promise.all(
+        opts.allowedRoots.map((r) => realpath(expandHome(r)).catch(() => resolve(expandHome(r)))),
+      );
+      const target = real ?? (await onDiskPath(abs));
+      if (!roots.some((r) => insideRoot(target, r))) {
+        throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}${real && real !== abs ? ` (→ ${real})` : ''}`);
       }
       if (real === undefined) throw new Error(`files[${i}]: no such file: ${abs}`);
       if (NEVER_ATTACH.some((re) => re.test(basename(real)) || re.test(basename(abs)))) {
@@ -377,8 +403,10 @@ export async function resolveOutgoingFiles(
 }
 
 /** Build resolver options from the standard PORTAL_* env knobs:
- *  - PORTAL_FILE_ROOTS      comma-separated dirs `path` must live under (default: unrestricted —
- *                           the server runs with the resident's own privileges anyway)
+ *  - PORTAL_FILE_ROOTS      comma-separated dirs `path` items must live under. Unset ⇒ `path`
+ *                           items are refused (opt-in: a send that reads the file itself goes
+ *                           around the host's own file fences, and any channel message can ask).
+ *                           Credentials/identity/state files stay refused under any setting.
  *  - PORTAL_MAX_FILE_BYTES  per-message decoded budget (default 8 MiB; match the relay's cap)
  *  - PORTAL_ALLOW_URL_FILES "false" to refuse `url` items
  *  - PORTAL_ALLOW_PRIVATE_URLS "true" to let `url` reach loopback/private addresses */

@@ -21,7 +21,8 @@ const FILES_PROP = {
     'plain string (a local file path like "~/out/plot.png" or an http(s) URL) OR ' +
     'an object with exactly one of `path` / `url` / `bytes`. Paths are read and ' +
     'URLs fetched HERE on your host and uploaded for you — you never need to ' +
-    'base64 anything yourself. `name` defaults to the file/URL basename; ' +
+    'base64 anything yourself. Local paths work only under the directories the ' +
+    'server allows (PORTAL_FILE_ROOTS; none by default). `name` defaults to the file/URL basename; ' +
     '`contentType` is inferred from the extension. (The discord-mcpl surface ' +
     'takes host paths only.)',
   items: {
