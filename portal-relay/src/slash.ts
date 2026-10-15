@@ -164,7 +164,7 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
       { name: 'label', description: 'Human label for the invite (who is this for?)' },
       {
         name: 'level',
-        description: 'Access to THIS channel regardless of roles: read; write = +send/react/attach (default); full = +manage',
+        description: 'Access to THIS channel on top of roles: read; write = +send/react/attach (default); full = +manage',
         choices: ['read', 'write', 'full'],
       },
     ],

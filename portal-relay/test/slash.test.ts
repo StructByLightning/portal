@@ -359,3 +359,22 @@ test('run in a thread, a slash command acts on the thread\'s parent channel', ()
     t.cleanup();
   }
 });
+
+test("every slash command fits Discord's limits (a violation fails the whole registration)", async () => {
+  const { SLASH_COMMANDS } = await import('../src/slash.js');
+  const NAME = /^[-_\p{Ll}\p{N}]{1,32}$/u;
+  for (const cmd of SLASH_COMMANDS) {
+    assert.match(cmd.name, NAME, `command name ${cmd.name}`);
+    assert.ok(cmd.description.length >= 1 && cmd.description.length <= 100, `/${cmd.name} description is ${cmd.description.length} chars`);
+    const options = cmd.options ?? [];
+    assert.ok(options.length <= 25, `/${cmd.name} has ${options.length} options`);
+    let seenOptional = false;
+    for (const o of options) {
+      assert.match(o.name, NAME, `/${cmd.name} option ${o.name}`);
+      assert.ok(o.description.length >= 1 && o.description.length <= 100, `/${cmd.name} ${o.name}: description is ${o.description.length} chars`);
+      if (o.required) assert.ok(!seenOptional, `/${cmd.name}: required option ${o.name} after an optional one`);
+      else seenOptional = true;
+      for (const c of (o as { choices?: string[] }).choices ?? []) assert.ok(c.length >= 1 && c.length <= 100, `/${cmd.name} ${o.name} choice ${c}`);
+    }
+  }
+});
