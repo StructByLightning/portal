@@ -56,6 +56,21 @@ export interface ChannelMissed {
   lastMessageId?: RelayMessageId;
   /** "author: text" preview of the most recent missed message. */
   lastPreview?: string;
+  /** Threads under this channel with missed replies (their messages are part
+   *  of `messages`, but a read of the channel's own history doesn't include
+   *  them — fetch each with fetch_history's `threadId`). */
+  threads?: ThreadMissed[];
+  /** More threads had missed replies than the relay tracks per channel; the
+   *  `threads` list is incomplete. */
+  threadsTruncated?: boolean;
+}
+
+/** One thread's share of a channel's missed tally. */
+export interface ThreadMissed {
+  threadId: ThreadId;
+  messages: number;
+  /** createdAt of the thread's most recent missed message. */
+  lastAt: string;
 }
 
 // ── RPC param/result shapes ──
@@ -73,6 +88,14 @@ export interface MarkReadParams {
   threadId?: ThreadId;
   /** Mark read only up to this createdAt (ISO-8601). Omit to mark read to now. */
   uptoCreatedAt?: string;
+  /** With `uptoCreatedAt` short of the latest unread: how many of the unread
+   *  messages this mark covers, so the relay keeps an accurate count of what
+   *  is left (it stores no bodies to count from). Without it, a partial mark
+   *  keeps the previous count. */
+  count?: number;
+  /** Leave pending pings in place: advance the watermark for ambient traffic
+   *  without acknowledging addressed messages the agent hasn't handled. */
+  keepPings?: boolean;
 }
 
 export interface ChannelMissedParams {

@@ -1398,7 +1398,10 @@ export class Relay implements GatewayHooks {
         };
       case 'mark_read': {
         const p = params as RpcParams<'mark_read'>;
-        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt);
+        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt, {
+          ...(typeof p.count === 'number' ? { count: p.count } : {}),
+          ...(p.keepPings === true ? { keepPings: true } : {}),
+        });
         return {};
       }
       case 'channel_missed': {

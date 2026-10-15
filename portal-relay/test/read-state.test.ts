@@ -92,3 +92,61 @@ test('persistence round-trips across instances', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Partial marks, threads, keepPings (#35 review) ──
+
+test('a partial mark keeps the channel listed with what is left (count from the caller)', () => {
+  const rs = new ReadStateStore();
+  const ms = Array.from({ length: 10 }, (_, i) => msg({ channelId: 'c', content: `m${i}` }));
+  for (const m of ms) rs.record('p1', m, false, []);
+  rs.markRead('p1', 'c', ms[3].createdAt, { count: 4 });
+  const u = rs.unread('p1');
+  assert.equal(u.length, 1, 'still listed — the rest is still unread');
+  assert.equal(u[0].count, 6);
+  assert.equal(rs.missed('p1', 'c').since, ms[3].createdAt);
+  // Without a count the previous tally stays (never less than one).
+  rs.markRead('p1', 'c', ms[5].createdAt);
+  assert.equal(rs.unread('p1')[0].count, 6);
+  // A mark through the newest clears it.
+  rs.markRead('p1', 'c', ms[9].createdAt, { count: 4 });
+  assert.deepEqual(rs.unread('p1'), []);
+});
+
+test('thread replies are tallied per thread under their channel', () => {
+  const rs = new ReadStateStore();
+  rs.record('p1', msg({ channelId: 'c', content: 'parent' }), false, []);
+  const t1 = msg({ channelId: 'c', threadId: 't1', content: 'reply' });
+  rs.record('p1', t1, false, []);
+  rs.record('p1', msg({ channelId: 'c', threadId: 't1', content: 'reply 2' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.messages, 3);
+  assert.deepEqual(m.threads?.map((t) => [t.threadId, t.messages]), [['t1', 2]]);
+  assert.equal(m.threadsTruncated, undefined);
+  // A partial mark past a thread's last reply drops it from the list.
+  const later = msg({ channelId: 'c', content: 'later' });
+  rs.record('p1', later, false, []);
+  rs.markRead('p1', 'c', rs.missed('p1', 'c').threads![0].lastAt, { count: 3 });
+  assert.equal(rs.missed('p1', 'c').threads, undefined);
+  assert.equal(rs.unread('p1')[0].count, 1);
+});
+
+test('the thread list is bounded and says when it is incomplete', () => {
+  const rs = new ReadStateStore();
+  for (let i = 0; i < 60; i++) rs.record('p1', msg({ channelId: 'c', threadId: `t${i}`, content: 'r' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.threads?.length, 50);
+  assert.equal(m.threadsTruncated, true);
+  assert.ok(m.threads!.some((t) => t.threadId === 't59') && !m.threads!.some((t) => t.threadId === 't0'), 'newest kept');
+});
+
+test('keepPings advances the watermark without acknowledging pending pings', () => {
+  const rs = new ReadStateStore();
+  const p = msg({ channelId: 'c', content: '@me' });
+  rs.record('p1', p, true, ['mention']);
+  rs.record('p1', msg({ channelId: 'c', content: 'after' }), false, []);
+  rs.markRead('p1', 'c', undefined, { keepPings: true });
+  assert.equal(rs.pendingPings('p1').length, 1, 'the ping is still pending');
+  assert.deepEqual(rs.unread('p1'), []);
+  rs.markRead('p1', 'c');
+  assert.equal(rs.pendingPings('p1').length, 0);
+});
