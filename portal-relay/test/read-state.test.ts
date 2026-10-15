@@ -126,7 +126,7 @@ test('thread replies are tallied per thread under their channel', () => {
   const later = msg({ channelId: 'c', content: 'later' });
   rs.record('p1', later, false, []);
   rs.markRead('p1', 'c', rs.missed('p1', 'c').threads![0].lastAt, { count: 3 });
-  assert.equal(rs.missed('p1', 'c').threads, undefined);
+  assert.deepEqual(rs.missed('p1', 'c').threads, [], 'a known-empty list, not an absent one (absent = older relay)');
   assert.equal(rs.unread('p1')[0].count, 1);
 });
 
@@ -177,4 +177,18 @@ test('a repeated or overlapping partial mark does not subtract the same messages
   // Counted from exactly where the watermark is: applied.
   rs.markRead('p1', 'c', ms[7].createdAt, { count: 2, since: ms[5].createdAt });
   assert.equal(rs.unread('p1')[0].count, 4);
+});
+
+test('channel_missed says where the tally started (the lower bound with no watermark), per channel and thread', () => {
+  const rs = new ReadStateStore();
+  const first = msg({ channelId: 'c', content: 'first' });
+  rs.record('p1', first, false, []);
+  const reply = msg({ channelId: 'c', threadId: 't1', content: 'reply' });
+  rs.record('p1', reply, false, []);
+  rs.record('p1', msg({ channelId: 'c', content: 'later' }), false, []);
+  const m = rs.missed('p1', 'c');
+  assert.equal(m.since, undefined, 'never marked read');
+  assert.equal(m.firstAt, first.createdAt);
+  assert.equal(m.threads?.[0].firstAt, reply.createdAt);
+  assert.deepEqual(rs.missed('p1', 'none').threads, [], 'no tally: still a (known-empty) list');
 });

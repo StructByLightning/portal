@@ -31,6 +31,8 @@ interface Tally {
   threadId?: string;
   messages: number;
   characters: number;
+  /** createdAt of the oldest tallied message (see ChannelMissed.firstAt). */
+  firstAt?: string;
   lastAt: string;
   lastMessageId: string;
   lastPreview: string;
@@ -38,7 +40,7 @@ interface Tally {
    *  A thread reply counts toward the channel (it shares the channel's
    *  watermark) but isn't in the channel's own history, so a reader needs to
    *  know which threads to fetch. */
-  threads?: Record<string, { messages: number; lastAt: string }>;
+  threads?: Record<string, { messages: number; firstAt?: string; lastAt: string }>;
   threadsTruncated?: boolean;
 }
 
@@ -116,6 +118,7 @@ export class ReadStateStore {
     if (t) {
       t.messages += 1;
       t.characters += len;
+      if (!t.firstAt || message.createdAt < t.firstAt) t.firstAt = message.createdAt;
       t.lastAt = message.createdAt;
       t.lastMessageId = message.id;
       t.lastPreview = this.preview(message);
@@ -125,6 +128,7 @@ export class ReadStateStore {
         threadId: message.threadId,
         messages: 1,
         characters: len,
+        firstAt: message.createdAt,
         lastAt: message.createdAt,
         lastMessageId: message.id,
         lastPreview: this.preview(message),
@@ -211,7 +215,7 @@ export class ReadStateStore {
     const ib = this.inboxes.get(personaId);
     const t = ib?.tallies[channelId];
     if (!t) {
-      return { channelId, messages: 0, characters: 0, since: ib?.watermarks[channelId] };
+      return { channelId, messages: 0, characters: 0, since: ib?.watermarks[channelId], threads: [] };
     }
     return {
       channelId,
@@ -222,13 +226,17 @@ export class ReadStateStore {
       lastAt: t.lastAt,
       lastMessageId: t.lastMessageId,
       lastPreview: t.lastPreview,
-      ...(t.threads && Object.keys(t.threads).length
-        ? {
-            threads: Object.entries(t.threads).map(
-              ([threadId, th]): ThreadMissed => ({ threadId, messages: th.messages, lastAt: th.lastAt }),
-            ),
-          }
-        : {}),
+      ...(t.firstAt ? { firstAt: t.firstAt } : {}),
+      // Always a list (empty when no thread has replies): its absence is how a
+      // reader tells an older relay, which tracked only the latest thread.
+      threads: Object.entries(t.threads ?? {}).map(
+        ([threadId, th]): ThreadMissed => ({
+          threadId,
+          messages: th.messages,
+          ...(th.firstAt ? { firstAt: th.firstAt } : {}),
+          lastAt: th.lastAt,
+        }),
+      ),
       ...(t.threadsTruncated ? { threadsTruncated: true } : {}),
     };
   }
@@ -245,10 +253,11 @@ export class ReadStateStore {
     const th = threads[threadId];
     if (th) {
       th.messages += 1;
+      if (!th.firstAt || at < th.firstAt) th.firstAt = at;
       th.lastAt = at;
       return;
     }
-    threads[threadId] = { messages: 1, lastAt: at };
+    threads[threadId] = { messages: 1, firstAt: at, lastAt: at };
     const ids = Object.keys(threads);
     if (ids.length <= THREADS_CAP) return;
     ids

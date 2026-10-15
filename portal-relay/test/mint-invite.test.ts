@@ -86,6 +86,7 @@ function makeRelay(opts: { minters?: string[]; realRateLimit?: boolean } = {}) {
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
     // Guild members, for the enrollment name check: a human and a bot.
+    membersComplete: () => true,
     memberNameMatches: (gid: string, key: string, o: { bots: boolean }) =>
       gid === GUILD && (key === nameKey('Antra') || (o.bots && key === nameKey('MythosBot'))),
   };
@@ -431,6 +432,12 @@ test('nameKey folds case, accents, invisibles, separators and look-alike letters
     assert.equal(nameKey(v), k, JSON.stringify(v));
   }
   assert.notEqual(nameKey('antra2'), k);
+  // Round-3 forms: small capitals, Cherokee, capital I for l, rn for m.
+  assert.equal(nameKey('ᴀɴᴛʀᴀ'), k);
+  assert.equal(nameKey(String.fromCodePoint(0xab7a) + 'ntra' /* Cherokee small GO */), k);
+  assert.equal(nameKey('Iinn'), nameKey('linn'));
+  assert.equal(nameKey('rnara'), nameKey('mara'));
+  assert.equal(nameKey('aqent1'), nameKey('aqentl'));
   assert.equal(nameKey('🙂 —'), '', 'no letters or digits → empty key (not checked)');
 });
 
@@ -469,6 +476,38 @@ test('enroll: persona and bot-name clashes are refused only when uniqueName is a
     }
     const fresh = await t.relay.enroll({ invite: 'inv_n2', desiredName: 'brand-new-name', uniqueName: true });
     assert.ok(!('error' in fresh), JSON.stringify(fresh));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a runtime mint waits for a complete member list; plain enrollment goes ahead best-effort', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.bot.membersComplete = () => false;
+    t.relay.invites.mint({ code: 'inv_n3', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD, maxUses: 10 });
+    const minted = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'fresh-name', uniqueName: true });
+    assert.ok('error' in minted);
+    assert.match(minted.error, /member list is still loading/);
+    const plain = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'fresh-name' });
+    assert.ok(!('error' in plain), JSON.stringify(plain));
+    // The human check still runs on what IS cached.
+    const human = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'antra' });
+    assert.ok('error' in human);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('mark_read passes count, since and keepPings through to the read-state store', async () => {
+  const t = makeRelay();
+  try {
+    const calls: unknown[] = [];
+    t.relay.readState.markRead = (...args: unknown[]) => void calls.push(args);
+    await t.relay.dispatchRpc({ personaId: RANDO }, 'mark_read', {
+      channelId: CHAN_A, uptoCreatedAt: '2026-01-01T00:00:00.000Z', count: 3, since: '2025-12-31T00:00:00.000Z', keepPings: true,
+    });
+    assert.deepEqual(calls, [[RANDO, CHAN_A, '2026-01-01T00:00:00.000Z', { count: 3, since: '2025-12-31T00:00:00.000Z', keepPings: true }]]);
   } finally {
     t.cleanup();
   }

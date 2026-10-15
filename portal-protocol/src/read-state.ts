@@ -56,9 +56,14 @@ export interface ChannelMissed {
   lastMessageId?: RelayMessageId;
   /** "author: text" preview of the most recent missed message. */
   lastPreview?: string;
+  /** createdAt of the OLDEST missed message — where the tally started. With
+   *  no `since` (the persona never marked this channel read), this is the
+   *  lower bound of what it missed: older history was never unread. */
+  firstAt?: string;
   /** Threads under this channel with missed replies (their messages are part
    *  of `messages`, but a read of the channel's own history doesn't include
-   *  them — fetch each with fetch_history's `threadId`). */
+   *  them — fetch each with fetch_history's `threadId`). Always present from a
+   *  relay that tracks threads (empty when none); absent from an older relay. */
   threads?: ThreadMissed[];
   /** More threads had missed replies than the relay tracks per channel; the
    *  `threads` list is incomplete. */
@@ -69,6 +74,8 @@ export interface ChannelMissed {
 export interface ThreadMissed {
   threadId: ThreadId;
   messages: number;
+  /** createdAt of the thread's oldest missed message. */
+  firstAt?: string;
   /** createdAt of the thread's most recent missed message. */
   lastAt: string;
 }

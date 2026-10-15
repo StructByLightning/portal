@@ -682,6 +682,16 @@ export class Relay implements GatewayHooks {
     const key = nameKey(name);
     if (!key) return null;
     const guilds = this.bot.listGuilds().map((g) => g.id);
+    // The human-name check reads the member cache; membersComplete() also
+    // kicks a (throttled) re-warm when it's short. A runtime mint (`unique`)
+    // waits for a complete roster rather than pass on a partial one; plain
+    // enrollment — an agent recovering its own persona — goes ahead
+    // best-effort rather than be locked out by a slow warm.
+    const incomplete = guilds.filter((gid) => !this.bot.membersComplete(gid));
+    if (incomplete.length) {
+      if (unique) return `can't check name "${name}" right now — the member list is still loading; try again in a minute`;
+      console.error(`[portal-relay] enroll name check is best-effort: member list incomplete in ${incomplete.length} guild(s)`);
+    }
     if (guilds.some((gid) => this.bot.memberNameMatches(gid, key, { bots: false }))) {
       return `name "${name}" reads like a server member's name — choose a different name`;
     }
