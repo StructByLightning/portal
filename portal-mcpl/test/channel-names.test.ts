@@ -342,6 +342,24 @@ test('an optional string argument of another type is refused by name, and nothin
   assert.equal(fetched.length, 1);
 });
 
+test('a send split into parts carries the resolved files on its first part only', async () => {
+  const { agent, client } = agentWithCache();
+  const parts: Array<Record<string, unknown>> = [];
+  (client as unknown as { sendMessage: unknown }).sendMessage = async (p: Record<string, unknown>) => {
+    parts.push(p);
+    return { messageId: `m${parts.length}` };
+  };
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    content: 'x'.repeat(2500),
+    files: [{ bytes: 'aGk=', name: 'a.json' }],
+  });
+  assert.equal(parts.length, 2);
+  // Resolved here: the content type is inferred from the name.
+  assert.deepEqual(parts[0].files, [{ bytes: 'aGk=', name: 'a.json', contentType: 'application/json' }]);
+  assert.equal('files' in parts[1], false);
+});
+
 test('a send split into parts says which parts went out when a later part fails', async () => {
   const { agent, client } = agentWithCache();
   const activity: string[] = [];

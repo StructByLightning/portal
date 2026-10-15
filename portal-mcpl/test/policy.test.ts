@@ -11,6 +11,7 @@ import { PortalClient } from '@animalabs/portal-client';
 import { PortalAgent, shortJson, unknownToolMessage } from '../src/agent.js';
 import { PortalMcplServer, voiceReceiptLine } from '../src/server.js';
 import { featureSets, TOOL_FEATURE_SETS, toolFeatureSetCoverage } from '../src/feature-sets.js';
+import type { IdentityToolHandler } from '../src/identity.js';
 import {
   CAPABILITY_PATHS,
   MalformedPolicyError,
@@ -261,9 +262,9 @@ test('the receipt is consequence testimony, never a claim of entitlement (§6.7)
 
 // ── Server binding ──
 
-function serverHarness() {
+function serverHarness(opts: { identity?: IdentityToolHandler } = {}) {
   const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
-  const server = new PortalMcplServer(client, new PortalAgent(client, { hostOwnsChannelLifecycle: true }));
+  const server = new PortalMcplServer(client, new PortalAgent(client, { hostOwnsChannelLifecycle: true }), opts);
   const responses: unknown[] = [];
   const errors: Array<{ code: number; message: string }> = [];
   const internal = server as unknown as {
@@ -402,6 +403,61 @@ test("a retired tool reaches its pointer even when its feature set is disabled",
   const result = h.responses[0] as { content: Array<{ text: string }>; isError: boolean };
   assert.equal(result.isError, true);
   assert.match(result.content[0].text, /^set_reaction_visibility is retired here, so nothing ran: .*such as channel_open and channel_close\.$/);
+});
+
+test('persona tools, legacy names included, are gated by their feature set, and no inherited name reaches them', async () => {
+  const called: string[] = [];
+  const h = serverHarness({
+    identity: {
+      async handleToolCall(name) {
+        called.push(name);
+        return {};
+      },
+    },
+  });
+  h.internal.policy.applyRequest({ effectiveCapabilities: ALL_USES, disabled: ['portal.identity'] });
+  await h.internal.handleRequest({ id: 1, method: 'tools/call', params: { name: 'list_personas', arguments: {} } });
+  await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'list_identities', arguments: {} } });
+  assert.deepEqual(
+    h.errors.map((e) => e.code),
+    [-32001, -32001],
+  );
+  assert.match(h.errors[0].message, /^list_personas isn't enabled for this host, so the call didn't run/);
+  assert.match(h.errors[1].message, /^list_identities isn't enabled for this host, so the call didn't run/);
+  await h.internal.handleRequest({ id: 3, method: 'tools/call', params: { name: 'constructor', arguments: {} } });
+  assert.match(h.errors[2].message, /^There's no Portal tool named "constructor", so nothing ran\./);
+  // Without the MCPL gate, an inherited name still isn't a persona tool.
+  h.internal.mcplEnabled = false;
+  await h.internal.handleRequest({ id: 4, method: 'tools/call', params: { name: 'constructor', arguments: {} } });
+  const answer = h.responses.at(-1) as { content: Array<{ text: string }>; isError: boolean };
+  assert.equal(answer.isError, true);
+  assert.match(answer.content[0].text, /^There's no Portal tool named "constructor", so nothing ran\./);
+  assert.deepEqual(called, []);
+});
+
+test('the Claude Code server sends no inherited name to the persona handler', async () => {
+  const { PortalCcChannelServer } = await import('../src/server-cc.js');
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+  const called: string[] = [];
+  const server = new PortalCcChannelServer(client, new PortalAgent(client), {
+    identity: {
+      async handleToolCall(name) {
+        called.push(name);
+        return {};
+      },
+    },
+  });
+  const sent: Array<{ content?: Array<{ text: string }>; isError?: boolean }> = [];
+  const internal = server as unknown as { conn: unknown; handleRequest(req: unknown): Promise<void> };
+  internal.conn = {
+    sendResponse: (_id: unknown, result: never) => void sent.push(result),
+    sendError() {},
+    sendNotification() {},
+  };
+  await internal.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'constructor', arguments: {} } });
+  assert.deepEqual(called, []);
+  assert.equal(sent[0].isError, true);
+  assert.match(sent[0].content![0].text, /^There's no Portal tool named "constructor", so nothing ran\./);
 });
 
 test('channels/open and channels/close name the id they were given, and the form ids take', async () => {
