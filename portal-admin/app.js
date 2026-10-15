@@ -419,10 +419,13 @@ async function openPersonaDrawer(id, meta) {
   // "Access in every guild" is rebuilt after any change made in this drawer,
   // so the two sections never disagree.
   const everywhere = el('div', {});
+  let refreshSeq = 0; // only the latest refresh may draw: replies can land out of order
   const refreshEverywhere = async () => {
     if (!isSuper) return;
+    const seq = ++refreshSeq;
     try {
       const fresh = await api('GET', '/admin/personas/' + encodeURIComponent(id));
+      if (seq !== refreshSeq) return;
       clear(everywhere);
       everywhere.appendChild(everywhereSection(fresh));
     } catch { /* keep what is shown; the next open refreshes */ }
