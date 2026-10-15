@@ -39,7 +39,7 @@ import { nameKey } from './name-policy.js';
 import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
-import { SLASH_COMMANDS, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
+import { SLASH_COMMANDS, slashTarget, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
 
 export interface ChannelMeta {
   id: string;
@@ -807,6 +807,19 @@ export class DiscordBot implements WebhookOps, RoleOps {
     };
   }
 
+  /** Where a slash command acts — a thread's parent channel (see slashTarget). */
+  private slashTargetOf(channel: Interaction['channel'], channelId: string): ReturnType<typeof slashTarget> {
+    const isThread = !!channel && channel.isThread();
+    const thread = isThread ? (channel as AnyThreadChannel) : null;
+    return slashTarget({
+      channelId,
+      name: channel && 'name' in channel ? channel.name : null,
+      isThread,
+      parentId: thread?.parentId ?? null,
+      parentName: thread?.parent?.name ?? null,
+    });
+  }
+
   /** A Discord role's name + guild, from the gateway cache of any joined guild. */
   roleLabel(roleId: string): { name: string; guildId: string } | null {
     for (const g of this.client.guilds.cache.values()) {
@@ -968,7 +981,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const choices = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        channelId: this.slashTargetOf(interaction.channel, interaction.channelId).channelId,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,
@@ -988,9 +1001,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       for (const o of interaction.options.data) {
         if (o.value !== undefined) options[o.name] = String(o.value);
       }
-      const channel = interaction.channel;
-      const channelName =
-        channel && 'name' in channel && channel.name ? channel.name : interaction.channelId;
+      const target = this.slashTargetOf(interaction.channel, interaction.channelId);
       // Defer BEFORE running the handler: /list-style commands can walk
       // personas × mirror caches, and the raw-reply window is only 3s —
       // deferring first (the await yields, letting the ACK go out) buys 15
@@ -999,8 +1010,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const content = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        channelName,
+        ...target,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,

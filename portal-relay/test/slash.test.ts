@@ -11,7 +11,7 @@ import type { Capability } from '@animalabs/portal-protocol';
 import { IdentityStore } from '../src/identity.js';
 import { PermissionsStore } from '../src/permissions.js';
 import { InviteStore } from '../src/invites.js';
-import { SlashHandler, LEVEL_CAPS, type SlashInvocation } from '../src/slash.js';
+import { SlashHandler, LEVEL_CAPS, slashTarget, type SlashInvocation } from '../src/slash.js';
 
 const GUILD = 'g1';
 const CHAN = 'chan-1';
@@ -332,6 +332,29 @@ test('denied invocations do not mutate anything', () => {
     assert.deepEqual(t.permissions.getRoleNames('ash-1'), ['chan-role']);
     t.handler.handle(t.inv('add', { identity: 'evander-1' }, RANDO));
     assert.equal(t.permissions.resolve('evander-1', GUILD, CHAN).size, 0);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('run in a thread, a slash command acts on the thread\'s parent channel', () => {
+  assert.deepEqual(
+    slashTarget({ channelId: 'th1', name: 'design', isThread: true, parentId: CHAN, parentName: 'general' }),
+    { channelId: CHAN, channelName: 'general', thread: { id: 'th1', name: 'design' } },
+  );
+  assert.deepEqual(slashTarget({ channelId: CHAN, name: 'general', isThread: false }), { channelId: CHAN, channelName: 'general' });
+
+  // /invite from a thread: the grant lands on the parent, where Portal checks
+  // a thread's access — and the reply says so.
+  const t = makeHandler();
+  try {
+    const inThread: SlashInvocation = {
+      ...t.inv('invite', { role: 'guild-role' }),
+      ...slashTarget({ channelId: 'th1', name: 'design', isThread: true, parentId: CHAN, parentName: 'general' }),
+    };
+    const reply = t.handler.handle(inThread);
+    assert.deepEqual(t.invites.get('inv_TESTCODE')!.grant!.scope, { channels: [CHAN] });
+    assert.match(reply, /write access to #general \(the channel thread "design" is in/);
   } finally {
     t.cleanup();
   }

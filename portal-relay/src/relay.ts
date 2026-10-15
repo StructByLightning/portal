@@ -978,19 +978,24 @@ export class Relay implements GatewayHooks {
     }
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
+    // Roles AND grant: an /invite carries roles plus a direct grant on the
+    // channel it was run in, and an augment must apply both. Validate ALL of
+    // it before changing anything: a rejection must leave the persona as it
+    // was and the invite unconsumed — otherwise a rejected claim still grants
+    // its roles, and can be repeated past maxUses.
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    if (grant && isMirrorScope(grant.scope) && !checked.guildId) {
+      throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+    }
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
     }
-    // Roles AND grant: an /invite carries roles plus a direct grant on the
-    // channel it was run in, and an augment must apply both.
-    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
     if (grant && isMirrorScope(grant.scope)) {
       // Same live-role materialization as enroll; a silent snapshot here is
       // strictly worse because an augmented persona has no reason to suspect
-      // its shiny new scope is already fossilizing. Missing guildId is a
-      // hard reject (augment already throws on malformed invites).
+      // its shiny new scope is already fossilizing.
       const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-      if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+      if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
       this.permissions.addPersonaRoles(personaId, [role]);
     } else if (grant) {
       const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
