@@ -60,7 +60,7 @@ export class PortalCcChannelServer {
      *  from here, where the relay already delivers this persona's mentions. */
     private readonly opts: {
       wakeSink?: WakeSink;
-      /** Attach to expose list/mint/switch_identity (see identity.ts). */
+      /** Attach to expose list/mint/switch_persona (see identity.ts). */
       identity?: IdentityToolHandler;
     } = {},
   ) {}
