@@ -74,10 +74,17 @@ export class PortalCcChannelServer {
 
   private async handleInitialize(): Promise<void> {
     const conn = this.conn!;
-    const msg = await conn.nextMessage();
-    if (msg.type !== 'request' || msg.request.method !== 'initialize') {
-      conn.close();
-      return;
+    // Clients on the 2026-07-28 MCP revision (Claude Code >= 2.1.282) open with
+    // a `server/discover` era probe and only fall back to this legacy handshake
+    // once the probe is ANSWERED. Reject whatever precedes `initialize` and keep
+    // waiting: closing silently here left the client hanging until its connect
+    // timeout, with this process alive and never replying.
+    let msg = await conn.nextMessage();
+    while (msg.type !== 'request' || msg.request.method !== 'initialize') {
+      if (msg.type === 'request') {
+        conn.sendError(msg.request.id, -32601, `method not found: ${msg.request.method}`);
+      }
+      msg = await conn.nextMessage();
     }
     // Advertise the Claude Code channel capability alongside tools.
     const result = {
