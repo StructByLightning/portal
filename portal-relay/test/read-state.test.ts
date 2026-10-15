@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PortalMessage } from '@animalabs/portal-protocol';
@@ -191,4 +191,22 @@ test('channel_missed says where the tally started (the lower bound with no water
   assert.equal(m.firstAt, first.createdAt);
   assert.equal(m.threads?.[0].firstAt, reply.createdAt);
   assert.deepEqual(rs.missed('p1', 'none').threads, [], 'no tally: still a (known-empty) list');
+});
+
+test('tallies saved by an older relay: no invented lower bound, and threads listed only if known', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-rs-legacy-'));
+  const path = join(dir, 'read-state.json');
+  const legacyTally = (threadId?: string) => ({
+    ...(threadId ? { threadId } : {}), messages: 3, characters: 9,
+    lastAt: '2026-01-01T00:00:03.000Z', lastMessageId: 'm3', lastPreview: 'x',
+  });
+  writeFileSync(path, JSON.stringify({ p1: { watermarks: {}, pings: [], tallies: { quiet: legacyTally(), threaded: legacyTally('t9') } } }));
+  const rs = new ReadStateStore({ path });
+  rs.record('p1', msg({ channelId: 'quiet', content: 'new' }), false, []);
+  const q = rs.missed('p1', 'quiet');
+  assert.equal(q.firstAt, undefined, "the next message isn't where the older unread began");
+  assert.deepEqual(q.threads, [], 'no thread activity before: a complete, empty list');
+  const t = rs.missed('p1', 'threaded');
+  assert.equal(t.threads, undefined, "thread replies from before can't be listed — so the list is omitted");
+  rmSync(dir, { recursive: true, force: true });
 });

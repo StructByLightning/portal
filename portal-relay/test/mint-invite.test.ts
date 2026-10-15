@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
 import type { RelayConfig } from '../src/config.js';
 import { AuditLog } from '../src/admin/audit.js';
-import { nameKey } from '../src/name-policy.js';
+import { nameKey, nameKeys } from '../src/name-policy.js';
 
 const GUILD = 'g1';
 const OTHER_GUILD = 'g2';
@@ -87,8 +87,10 @@ function makeRelay(opts: { minters?: string[]; realRateLimit?: boolean } = {}) {
     isGuildAllowed: (gid: string) => gid === GUILD,
     // Guild members, for the enrollment name check: a human and a bot.
     membersComplete: () => true,
-    memberNameMatches: (gid: string, key: string, o: { bots: boolean }) =>
-      gid === GUILD && (key === nameKey('Antra') || (o.bots && key === nameKey('MythosBot'))),
+    memberNameMatches: (gid: string, keys: ReadonlySet<string>, o: { bots: boolean }) => {
+      const reads = (n: string) => nameKeys(n).some((k) => keys.has(k));
+      return gid === GUILD && (reads('Antra') || (o.bots && reads('MythosBot')));
+    },
   };
   relay.roles = {
     getRoleFor: () => 'role', roleByGuildFor: () => ({}),
@@ -435,7 +437,10 @@ test('nameKey folds case, accents, invisibles, separators and look-alike letters
   // Round-3 forms: small capitals, Cherokee, capital I for l, rn for m.
   assert.equal(nameKey('ᴀɴᴛʀᴀ'), k);
   assert.equal(nameKey(String.fromCodePoint(0xab7a) + 'ntra' /* Cherokee small GO */), k);
-  assert.equal(nameKey('Iinn'), nameKey('linn'));
+  const alike = (a: string, b: string) => nameKeys(a).some((k) => nameKeys(b).includes(k));
+  assert.ok(alike('Iinn', 'linn'), 'capital I read as l');
+  assert.ok(alike('iris', 'Iris') && alike('IRIS', 'iris'), 'and plain case-insensitivity still holds');
+  assert.ok(!alike('lris', 'iris'));
   assert.equal(nameKey('rnara'), nameKey('mara'));
   assert.equal(nameKey('aqent1'), nameKey('aqentl'));
   assert.equal(nameKey('🙂 —'), '', 'no letters or digits → empty key (not checked)');

@@ -49,13 +49,23 @@ const SEQUENCES: Array<[RegExp, string]> = [
 ];
 
 /** The comparison key for a display name: equal keys = names that read alike.
- *  Empty when the name has no letters or digits at all. */
-export function nameKey(name: string): string {
-  // Capital I is folded to l BEFORE lower-casing: "Iinn" reads as "linn".
-  const folded = name.normalize('NFKC').replace(/I/g, 'l').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+ *  Empty when the name has no letters or digits at all. `capitalIAsL` folds
+ *  capital I to l before lower-casing ("Iinn" reads as "linn"); that fold is
+ *  case-dependent, so names are compared on both keys (see nameKeys). */
+export function nameKey(name: string, opts: { capitalIAsL?: boolean } = {}): string {
+  let s = name.normalize('NFKC');
+  if (opts.capitalIAsL) s = s.replace(/I/g, 'l');
+  const folded = s.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
   let out = '';
   for (const ch of folded) out += LOOKALIKES[ch] ?? ch;
   out = out.replace(/[^\p{L}\p{N}]/gu, '');
   for (const [re, to] of SEQUENCES) out = out.replace(re, to);
   return out;
+}
+
+/** Every key a name compares by: plain (case-insensitive) and with capital I
+ *  read as l. Two names read alike when their key sets meet — so "iris" still
+ *  matches "Iris", and "Iinn" matches "linn". Empty keys are left out. */
+export function nameKeys(name: string): string[] {
+  return [...new Set([nameKey(name), nameKey(name, { capitalIAsL: true })])].filter(Boolean);
 }

@@ -36,7 +36,7 @@ import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
 import { ChannelNameResolver } from './admin/names.js';
-import { nameKey } from './name-policy.js';
+import { nameKeys } from './name-policy.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -679,8 +679,8 @@ export class Relay implements GatewayHooks {
    * own bot. The message never says which member or guild matched.
    */
   private nameClash(name: string, unique: boolean): string | null {
-    const key = nameKey(name);
-    if (!key) return null;
+    const keys = new Set(nameKeys(name));
+    if (!keys.size) return null;
     const guilds = this.bot.listGuilds().map((g) => g.id);
     // The human-name check reads the member cache; membersComplete() also
     // kicks a (throttled) re-warm when it's short. A runtime mint (`unique`)
@@ -692,14 +692,14 @@ export class Relay implements GatewayHooks {
       if (unique) return `can't check name "${name}" right now — the member list is still loading; try again in a minute`;
       console.error(`[portal-relay] enroll name check is best-effort: member list incomplete in ${incomplete.length} guild(s)`);
     }
-    if (guilds.some((gid) => this.bot.memberNameMatches(gid, key, { bots: false }))) {
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: false }))) {
       return `name "${name}" reads like a server member's name — choose a different name`;
     }
     if (!unique) return null;
-    if (this.identity.all().some((p) => nameKey(p.displayName) === key)) {
+    if (this.identity.all().some((p) => nameKeys(p.displayName).some((k) => keys.has(k)))) {
       return `name "${name}" reads like an existing persona's name — choose a different name`;
     }
-    if (guilds.some((gid) => this.bot.memberNameMatches(gid, key, { bots: true }))) {
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: true }))) {
       return `name "${name}" reads like a server member's name — choose a different name`;
     }
     return null;

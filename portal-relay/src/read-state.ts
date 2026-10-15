@@ -42,6 +42,10 @@ interface Tally {
    *  know which threads to fetch. */
   threads?: Record<string, { messages: number; firstAt?: string; lastAt: string }>;
   threadsTruncated?: boolean;
+  /** True when `threads` is complete — the tally was created by a relay that
+   *  tracks threads, or (loaded from an older one) had no thread activity.
+   *  A tally from an older relay with thread replies can't list them. */
+  tracksThreads?: boolean;
 }
 
 /** Threads tracked per channel tally; past this the oldest drop and the
@@ -118,7 +122,9 @@ export class ReadStateStore {
     if (t) {
       t.messages += 1;
       t.characters += len;
-      if (!t.firstAt || message.createdAt < t.firstAt) t.firstAt = message.createdAt;
+      // Only ever LOWERED: a tally saved by an older relay has no firstAt, and
+      // its first message here is not where its unread began — leave unknown.
+      if (t.firstAt && message.createdAt < t.firstAt) t.firstAt = message.createdAt;
       t.lastAt = message.createdAt;
       t.lastMessageId = message.id;
       t.lastPreview = this.preview(message);
@@ -132,6 +138,7 @@ export class ReadStateStore {
         lastAt: message.createdAt,
         lastMessageId: message.id,
         lastPreview: this.preview(message),
+        tracksThreads: true,
       };
       this.evictChannels(ib);
     }
@@ -227,16 +234,17 @@ export class ReadStateStore {
       lastMessageId: t.lastMessageId,
       lastPreview: t.lastPreview,
       ...(t.firstAt ? { firstAt: t.firstAt } : {}),
-      // Always a list (empty when no thread has replies): its absence is how a
-      // reader tells an older relay, which tracked only the latest thread.
-      threads: Object.entries(t.threads ?? {}).map(
+      // A list (empty when no thread has replies) whenever it is complete. Its
+      // absence tells the reader the thread replies can't be enumerated — an
+      // older relay, or a tally it saved with thread replies already in it.
+      ...(t.tracksThreads ? { threads: Object.entries(t.threads ?? {}).map(
         ([threadId, th]): ThreadMissed => ({
           threadId,
           messages: th.messages,
           ...(th.firstAt ? { firstAt: th.firstAt } : {}),
           lastAt: th.lastAt,
         }),
-      ),
+      ) } : {}),
       ...(t.threadsTruncated ? { threadsTruncated: true } : {}),
     };
   }
@@ -314,6 +322,14 @@ export class ReadStateStore {
     if (!this.path) return;
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Record<string, Inbox>;
+      // Tallies saved by a relay that didn't track threads: one with no thread
+      // activity has a complete (empty) thread list from here on; one that had
+      // thread replies can't list them, and says so by omitting `threads`.
+      for (const ib of Object.values(raw)) {
+        for (const t of Object.values(ib.tallies ?? {})) {
+          if (t.tracksThreads === undefined && !t.threadId) t.tracksThreads = true;
+        }
+      }
       this.inboxes = new Map(
         Object.entries(raw).map(([id, ib]) => [
           id,

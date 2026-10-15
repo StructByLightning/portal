@@ -35,7 +35,7 @@ import {
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { Capability } from '@animalabs/portal-protocol';
-import { nameKey } from './name-policy.js';
+import { nameKeys } from './name-policy.js';
 import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
@@ -540,18 +540,18 @@ export class DiscordBot implements WebhookOps, RoleOps {
 
   /**
    * Whether any cached member of `guildId` has a name (username, global
-   * display name, or server nickname) whose comparison key is `key` — humans
+   * display name, or server nickname) that reads like one of `keys` — humans
    * always, bots only when `bots`. Reads the member cache, which holds the
    * full roster only with the GuildMembers intent; without it this sees the
    * members the bot has met, so the check is best-effort.
    */
-  memberNameMatches(guildId: string, key: string, opts: { bots: boolean }): boolean {
+  memberNameMatches(guildId: string, keys: ReadonlySet<string>, opts: { bots: boolean }): boolean {
     const guild = this.client.guilds.cache.get(guildId);
     if (!guild) return false;
     for (const m of guild.members.cache.values()) {
       if (m.user.bot && !opts.bots) continue;
       for (const n of [m.user.username, m.user.globalName, m.nickname]) {
-        if (n && nameKey(n) === key) return true;
+        if (n && nameKeys(n).some((k) => keys.has(k))) return true;
       }
     }
     return false;
