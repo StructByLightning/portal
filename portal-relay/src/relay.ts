@@ -36,6 +36,7 @@ import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
 import { ChannelNameResolver } from './admin/names.js';
+import { nameKey } from './name-policy.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -640,6 +641,11 @@ export class Relay implements GatewayHooks {
     if (staleMint) return { error: staleMint };
 
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
+    const clash = this.nameClash(displayName, d.uniqueName === true);
+    if (clash) {
+      console.error(`[portal-relay] enroll refused (${checked.label ?? 'invite'}): ${clash}`);
+      return { error: clash };
+    }
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
     const token = generateToken(); // plaintext, returned to the agent
     const identity: PersonaIdentity = {
@@ -659,6 +665,34 @@ export class Relay implements GatewayHooks {
 
     console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
     return { personaId, token, persona: this.identity.toPersona(identity) };
+  }
+
+  /**
+   * Why `name` can't be a new persona's display name, or null if it can. Names
+   * compare by nameKey (case, accents, invisible characters, separators and
+   * look-alike letters folded). Always refused: a name that reads like a HUMAN
+   * member's in any guild the relay serves — that is impersonation of a
+   * person. With `unique` (runtime minting, where a model picks the name and
+   * channel text can steer it), also an existing persona's or a bot member's.
+   * Plain self-enrollment doesn't ask for that: an agent that lost its token
+   * re-enrolls under its own name, and an agent may share its name with its
+   * own bot. The message never says which member or guild matched.
+   */
+  private nameClash(name: string, unique: boolean): string | null {
+    const key = nameKey(name);
+    if (!key) return null;
+    const guilds = this.bot.listGuilds().map((g) => g.id);
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, key, { bots: false }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    if (!unique) return null;
+    if (this.identity.all().some((p) => nameKey(p.displayName) === key)) {
+      return `name "${name}" reads like an existing persona's name — choose a different name`;
+    }
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, key, { bots: true }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    return null;
   }
 
   /**

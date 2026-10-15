@@ -70,6 +70,7 @@ function makeRelay() {
         : undefined,
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
+    memberNameMatches: () => false,
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
   };

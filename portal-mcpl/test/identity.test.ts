@@ -38,6 +38,7 @@ function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown
   const dir = mkdtempSync(join(tmpdir(), 'portal-identity-'));
   const sessions: FakeSession[] = [];
   const swaps: string[] = [];
+  const enrolls: Array<{ desiredName: string; uniqueName?: boolean }> = [];
   let minted = 0;
   const make = () =>
     new IdentityManager({
@@ -53,12 +54,15 @@ function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown
         sessions.push(s);
         return s;
       },
-      enroll: async ({ desiredName }) => ({ personaId: `p_${++minted}`, token: `tok_${desiredName}_SECRET` }),
+      enroll: async ({ desiredName, uniqueName }) => {
+        enrolls.push({ desiredName, uniqueName });
+        return { personaId: `p_${++minted}`, token: `tok_${desiredName}_SECRET` };
+      },
     });
   const manager = make();
   const rootSession = fakeSession(ROOT, () => Promise.resolve({}));
   manager.bind(rootSession, async (next) => { if (opts.onSwitch) await opts.onSwitch(next); swaps.push(next.creds.personaId); });
-  return { dir, manager, make, sessions, swaps, rootSession };
+  return { dir, manager, make, sessions, swaps, rootSession, enrolls };
 }
 
 test('mint creates a 0600 creds file, switches by default, and never returns a token', async () => {
@@ -73,6 +77,12 @@ test('mint creates a 0600 creds file, switches by default, and never returns a t
   assert.equal((listed as { active: string }).active, 'Night Shift');
   // The roster holds paths and ids — never tokens.
   assert.doesNotMatch(readFileSync(join(h.dir, 'root.identities.json'), 'utf8'), /SECRET|tok_/);
+});
+
+test('a minted name must be unique on the relay (the model picked it)', async () => {
+  const h = harness({ invite: 'inv' });
+  await h.manager.handleToolCall('mint_identity', { name: 'Night Shift' });
+  assert.deepEqual(h.enrolls, [{ desiredName: 'Night Shift', uniqueName: true }]);
 });
 
 test('mint refuses to adopt a creds file it did not write', async () => {

@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
 import type { RelayConfig } from '../src/config.js';
 import { AuditLog } from '../src/admin/audit.js';
+import { nameKey } from '../src/name-policy.js';
 
 const GUILD = 'g1';
 const OTHER_GUILD = 'g2';
@@ -84,6 +85,9 @@ function makeRelay(opts: { minters?: string[]; realRateLimit?: boolean } = {}) {
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
+    // Guild members, for the enrollment name check: a human and a bot.
+    memberNameMatches: (gid: string, key: string, o: { bots: boolean }) =>
+      gid === GUILD && (key === nameKey('Antra') || (o.bots && key === nameKey('MythosBot'))),
   };
   relay.roles = {
     getRoleFor: () => 'role', roleByGuildFor: () => ({}),
@@ -414,6 +418,57 @@ test('an invite carrying roles AND a channel grant enrolls with the union (/invi
     assert.deepEqual(t.relay.permissions.getRoleNames(RANDO), ['b-reader']);
     assert.deepEqual([...t.relay.permissions.resolve(RANDO, GUILD, CHAN_A)].sort(), [...RW].sort(), 'existing grant kept');
     assert.ok(t.relay.permissions.resolve(RANDO, GUILD, CHAN_B).has('VIEW_CHANNEL'));
+  } finally {
+    t.cleanup();
+  }
+});
+
+// ── Display-name collisions at enrollment ──
+
+test('nameKey folds case, accents, invisibles, separators and look-alike letters', () => {
+  const k = nameKey('antra');
+  for (const v of ['Antra', 'ANTRA', 'antra.', 'an tra', 'an_tra', 'ántra', 'an\u200btra', 'ａｎｔｒａ', '\u0430ntra' /* Cyrillic а */, 'аntrа']) {
+    assert.equal(nameKey(v), k, JSON.stringify(v));
+  }
+  assert.notEqual(nameKey('antra2'), k);
+  assert.equal(nameKey('🙂 —'), '', 'no letters or digits → empty key (not checked)');
+});
+
+test('enroll refuses a name that reads like a human member\'s — always, without saying who', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_n1', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD });
+    for (const name of ['antra', 'Аntra' /* Cyrillic А */, 'an.tra']) {
+      const res = await t.relay.enroll({ invite: 'inv_n1', desiredName: name });
+      assert.ok('error' in res, name);
+      assert.match(res.error, /reads like a server member's name/);
+      // Echoes the requested name, never the member's own spelling or the guild.
+      assert.doesNotMatch(res.error, /Antra/, 'member not named');
+      assert.doesNotMatch(res.error, /guild|\bG\b/i, 'guild not named');
+    }
+    assert.equal(t.relay.invites.get('inv_n1').uses ?? 0, 0, 'a refused name consumes no use');
+    assert.equal(t.relay.identity.all().length, 2, 'no persona minted');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('enroll: persona and bot-name clashes are refused only when uniqueName is asked', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_n2', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD, maxUses: 10 });
+    // An existing persona ("Spawner") and a bot member ("MythosBot").
+    for (const name of ['spawner', 'Mythos Bot']) {
+      const strict = await t.relay.enroll({ invite: 'inv_n2', desiredName: name, uniqueName: true });
+      assert.ok('error' in strict, name);
+      assert.match(strict.error, /reads like an existing persona's name|reads like a server member's name/);
+      // Plain self-enrollment (an agent re-enrolling under its own name, or
+      // sharing its bot's name) still works.
+      const plain = await t.relay.enroll({ invite: 'inv_n2', desiredName: name });
+      assert.ok(!('error' in plain), JSON.stringify(plain));
+    }
+    const fresh = await t.relay.enroll({ invite: 'inv_n2', desiredName: 'brand-new-name', uniqueName: true });
+    assert.ok(!('error' in fresh), JSON.stringify(fresh));
   } finally {
     t.cleanup();
   }

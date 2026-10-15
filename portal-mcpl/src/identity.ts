@@ -276,7 +276,9 @@ export class IdentityManager implements IdentityToolHandler {
     const code = invite ?? this.opts.invite;
     if (!code) throw new Error('no invite available — pass `invite`, or configure PORTAL_INVITE');
 
-    const creds = await this.enrollFn({ url: this.opts.url, invite: code, desiredName: name });
+    // uniqueName: the name came from the model, so channel text can steer it —
+    // the relay also refuses one that reads like an existing persona's.
+    const creds = await this.enrollFn({ url: this.opts.url, invite: code, desiredName: name, uniqueName: true });
     try {
       // `wx`-equivalent guard was the existsSync above; the store writes 0600.
       await fileCredsStore(credsPath).save(creds);
