@@ -383,8 +383,8 @@ export async function resolveOutgoingFiles(
       // Fail closed, before touching the filesystem (no existence oracle).
       if (!opts.allowedRoots?.length) {
         throw new Error(
-          `files[${i}]: local file paths are off on this server — set PORTAL_FILE_ROOTS to the ` +
-            'directories attachments may come from, or attach a url or bytes instead',
+          `files[${i}]: local file paths are off on this server (PORTAL_FILE_ROOTS) — attach a url ` +
+            'or bytes instead, or ask the operator to set PORTAL_FILE_ROOTS',
         );
       }
       const raw = expandHome(spec.path);
@@ -493,18 +493,52 @@ export async function resolveOutgoingFiles(
   return out;
 }
 
+/**
+ * Where `path` items may come from when PORTAL_FILE_ROOTS is unset — the same
+ * places the mcpl-bridge reads `$file:` arguments from: the working directory,
+ * the Claude Code project (CLAUDE_PROJECT_DIR) and its per-session scratchpads.
+ * A default that would be the home directory or the filesystem root is dropped:
+ * a process started by launchd (or from ~) would otherwise fence nothing, and
+ * any channel message can ask for a file.
+ */
+export function defaultFileRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  where: { cwd?: string; home?: string; uid?: number | null } = {},
+): string[] {
+  const cwd = where.cwd ?? process.cwd();
+  const home = resolve(where.home ?? homedir());
+  const uid = where.uid !== undefined ? where.uid : typeof process.getuid === 'function' ? process.getuid() : null;
+  const roots = new Set<string>();
+  if (env.CLAUDE_PROJECT_DIR) roots.add(resolve(env.CLAUDE_PROJECT_DIR));
+  roots.add(resolve(cwd));
+  if (uid !== null) {
+    roots.add(`/private/tmp/claude-${uid}`);
+    roots.add(`/tmp/claude-${uid}`);
+  }
+  return [...roots].filter((r) => r !== home && r !== resolve('/'));
+}
+
 /** Build resolver options from the standard PORTAL_* env knobs:
- *  - PORTAL_FILE_ROOTS      comma-separated dirs `path` items must live under. Unset ⇒ `path`
- *                           items are refused (opt-in: a send that reads the file itself goes
- *                           around the host's own file fences, and any channel message can ask).
+ *  - PORTAL_FILE_ROOTS      comma-separated dirs `path` items must live under. Unset ⇒ the
+ *                           defaults (defaultFileRoots: working dir, Claude Code project and
+ *                           scratchpads — never ~ or /). "off" ⇒ local paths are refused.
  *                           Credentials/identity/state files stay refused under any setting.
  *  - PORTAL_CREDENTIALS, PORTAL_IDENTITIES, PORTAL_STATE  — the configured credentials,
  *                           roster and state files are never attachable, whatever their names
  *  - PORTAL_MAX_FILE_BYTES  per-message decoded budget (default 8 MiB; match the relay's cap)
  *  - PORTAL_ALLOW_URL_FILES "false" to refuse `url` items
  *  - PORTAL_ALLOW_PRIVATE_URLS "true" to let `url` reach loopback/private addresses */
-export function fileOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): ResolveFilesOptions {
-  const roots = (env.PORTAL_FILE_ROOTS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+export function fileOptionsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  where: { cwd?: string; home?: string; uid?: number | null } = {},
+): ResolveFilesOptions {
+  const configured = (env.PORTAL_FILE_ROOTS ?? '').trim();
+  const roots =
+    configured === ''
+      ? defaultFileRoots(env, where)
+      : /^(off|none|false|0)$/i.test(configured)
+        ? []
+        : configured.split(',').map((s) => s.trim()).filter(Boolean);
   const max = Number(env.PORTAL_MAX_FILE_BYTES);
   const deny = [env.PORTAL_CREDENTIALS, env.PORTAL_IDENTITIES, env.PORTAL_STATE]
     .map((p) => (p ?? '').trim())

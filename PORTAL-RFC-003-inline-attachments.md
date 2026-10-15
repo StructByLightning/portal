@@ -201,7 +201,7 @@ URL) or `{path|url|bytes, name?, contentType?, description?}`. Paths are read
 locally (`~` and cwd-relative OK), URLs fetched, name/MIME inferred, the
 per-message budget checked with a legible error, and only `bytes` ever reach
 the relay. Knobs: `PORTAL_FILE_ROOTS` (the directories `path` items may come
-from — unset, `path` items are refused; see below), `PORTAL_MAX_FILE_BYTES`,
+from — see below for the default), `PORTAL_MAX_FILE_BYTES`,
 `PORTAL_ALLOW_URL_FILES=false`, `PORTAL_ALLOW_PRIVATE_URLS=true`. Tests:
 `portal-mcpl/test/files.test.ts`.
 
@@ -214,10 +214,16 @@ fences the `realpath` of the file, so a symlink inside a root can't reach
 outside it. `bytes` must be strict base64 (Node's lenient decoder would turn a
 mistyped payload into a silently truncated attachment).
 
-Local paths are opt-in (2026-10-15). With `PORTAL_FILE_ROOTS` unset, a `path`
-item is refused before anything touches the filesystem. A send that reads the
-file itself goes around whatever the host fences file access with (an MCPL
-host's tool grants and mounts, Claude Code's permission prompts), and any
-channel message can ask for one — so the operator names the directories.
-Credentials, identity and state files (`*.creds.json`, `*.identities.json`,
-`*.state.json`) are refused under any setting.
+Local paths are fenced (2026-10-15). A send that reads the file itself goes
+around whatever the host fences file access with (an MCPL host's tool grants
+and mounts, Claude Code's permission prompts), and any channel message can ask
+for one. With `PORTAL_FILE_ROOTS` unset, `path` items may come from the same
+places the mcpl-bridge reads `$file:` arguments from: the working directory,
+the Claude Code project (`CLAUDE_PROJECT_DIR`) and its per-session
+scratchpads (`/private/tmp/claude-<uid>`, `/tmp/claude-<uid>`) — but a default
+that would be the home directory or `/` is dropped (a process started by
+launchd, or from `~`, would otherwise fence nothing). `PORTAL_FILE_ROOTS=off`
+refuses local paths entirely; any other value replaces the defaults. Whatever
+the roots: the credentials directory, the configured credentials/roster/state
+files (by path and by inode), and `*.creds.json`, `*.identities.json`,
+`*.state.json` (copies included) are never attachable.
