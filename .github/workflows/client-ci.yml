@@ -105,7 +105,10 @@ jobs:
 
       # portal-mcpl links portal-protocol and portal-client from this
       # checkout (file:../portal-protocol, file:../portal-client), and its
-      # tsconfig references both projects, so they're built first.
+      # tsconfig references both projects, so they're built first. The
+      # client's own imports still resolve to the published protocol its
+      # lockfile pins, as the client job's comment says, so mcpl runs against
+      # this checkout's protocol and client, with the client on that release.
       - name: Build protocol and client
         run: |
           (cd portal-protocol && npm ci && npm run build)
