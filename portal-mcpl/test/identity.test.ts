@@ -88,8 +88,36 @@ test('a minted name must be unique on the relay (the model picked it)', async ()
 test('mint refuses to adopt a creds file it did not write', async () => {
   const h = harness({ invite: 'inv' });
   writeFileSync(join(h.dir, 'lena46.creds.json'), JSON.stringify({ personaId: 'p_lena', token: 'someone-elses' }));
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Lena46' }), /already taken/);
+  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Lena46' }), /already exists on this host/);
   assert.deepEqual(h.swaps, []);
+  assert.match(readFileSync(join(h.dir, 'lena46.creds.json'), 'utf8'), /someone-elses/, 'the existing file is untouched');
+});
+
+test('two processes minting names that slug alike: one wins, the other is refused, no token overwritten', async () => {
+  const h = harness({ invite: 'inv' });
+  const other = h.make(); // a second process sharing the credentials directory
+  const results = await Promise.allSettled([
+    h.manager.handleToolCall('mint_identity', { name: 'Écho', switch: false }),
+    other.handleToolCall('mint_identity', { name: 'Cho', switch: false }),
+  ]);
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
+  const rejected = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+  assert.match(rejected.reason.message, /already exists on this host/);
+  assert.equal(h.enrolls.length, 1, 'the loser never enrolled a persona it could not keep');
+  const saved = JSON.parse(readFileSync(join(h.dir, 'cho.creds.json'), 'utf8'));
+  assert.equal(saved.personaId, 'p_1');
+});
+
+test('a failed enrollment releases the reserved creds file', async () => {
+  const h = harness({ invite: 'inv' });
+  const manager = new IdentityManager({
+    url: 'ws://test', credsDir: h.dir, rosterPath: join(h.dir, 'other.identities.json'), invite: 'inv',
+    root: { name: 'Root', creds: ROOT, credsPath: null },
+    createSession: () => { throw new Error('unused'); },
+    enroll: async () => { throw new Error('enroll rejected: name "Night" reads like a server member\'s name'); },
+  });
+  await assert.rejects(manager.handleToolCall('mint_identity', { name: 'Night', switch: false }), /reads like a server member/);
+  assert.equal(existsSync(join(h.dir, 'night.creds.json')), false);
 });
 
 test('switching is limited to the roster', async () => {
@@ -342,4 +370,17 @@ test('identity switching is on by default and off only on an explicit 0/false/no
   for (const v of ['0', 'false', 'NO', 'off', ' off ']) {
     assert.equal(identitySwitchingEnabled({ PORTAL_IDENTITY_SWITCHING: v }), false, v);
   }
+});
+
+test('the subscription seed is handed out once per process (a switch back to root does not re-follow)', async () => {
+  const { seedOnce, buildSession } = await import('../src/session.js');
+  const dir = mkdtempSync(join(tmpdir(), 'portal-seed-'));
+  const next = seedOnce(['111', '222']);
+  const first = buildSession(ROOT, { url: 'ws://test', stateDir: dir, seedSubscriptions: next() });
+  assert.deepEqual(first.agent.state.subscriptionList().sort(), ['111', '222']);
+  first.agent.state.unsubscribe('222'); // the persona leaves a seeded channel
+  first.close?.();
+  const again = buildSession(ROOT, { url: 'ws://test', stateDir: dir, seedSubscriptions: next() });
+  assert.deepEqual(again.agent.state.subscriptionList(), ['111'], 'the unsubscribe holds across the rebuild');
+  assert.equal(next(), undefined);
 });

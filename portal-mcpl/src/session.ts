@@ -24,6 +24,21 @@ export interface BuildSessionOptions {
   logPrefix?: string;
 }
 
+/**
+ * PORTAL_SUBSCRIPTIONS is a ONE-TIME seed per process: hand it to the root
+ * persona's first session only. A switch back to the root rebuilds its
+ * session, and seeding again would re-follow channels the persona has since
+ * unsubscribed from.
+ */
+export function seedOnce(seed: string[]): () => string[] | undefined {
+  let left: string[] | undefined = seed.length ? seed : undefined;
+  return () => {
+    const out = left;
+    left = undefined;
+    return out;
+  };
+}
+
 /** Build a session. NOT connected — the caller decides when. */
 export function buildSession(creds: PortalCredentials, opts: BuildSessionOptions): PortalSession {
   const tag = opts.logPrefix ?? '[portal-mcpl]';

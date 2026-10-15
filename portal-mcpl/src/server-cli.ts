@@ -49,7 +49,7 @@ import { loadOrEnrollCreds, type PortalCredentials } from '@animalabs/portal-cli
 import { fileOptionsFromEnv } from './files.js';
 import { PortalMcplServer } from './server.js';
 import { IdentityManager, identitySwitchingEnabled, slugName, type PortalSession } from './identity.js';
-import { buildSession } from './session.js';
+import { buildSession, seedOnce } from './session.js';
 
 interface RootIdentity {
   name: string;
@@ -95,13 +95,14 @@ async function main(): Promise<void> {
   // The MCPL host owns channel lifecycle in Chronicle. Existing file-backed
   // subscriptions are advertised once as `initiallyOpen`, then removed after
   // the host acknowledges channels/register; the remaining state stays local.
+  const rootSeed = seedOnce(seedSubscriptions);
   const sessionFor = (creds: PortalCredentials): PortalSession =>
     buildSession(creds, {
       url,
       stateDir: credsDir,
       agent: { hostOwnsChannelLifecycle: true, files: fileOptionsFromEnv() },
       ...(creds.personaId === root.creds.personaId
-        ? { statePath: process.env.PORTAL_STATE, seedSubscriptions }
+        ? { statePath: process.env.PORTAL_STATE, seedSubscriptions: rootSeed() }
         : {}),
     });
 

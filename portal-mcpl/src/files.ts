@@ -10,7 +10,7 @@
  * message reaches the client. The relay never sees a path.
  */
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import { BlockList, isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -211,6 +211,29 @@ async function defaultLookup(host: string): Promise<string[]> {
 
 /** Read a response body with a hard byte cap, aborting the transfer the moment
  *  it is exceeded — no Content-Length required, nothing buffered past the cap. */
+/** Read a local file, refusing once it passes `cap` bytes (it may be growing).
+ *  @internal exported for tests. */
+export async function readFileCapped(path: string, cap: number, label: string): Promise<Buffer> {
+  const fh = await open(path, 'r');
+  try {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for (;;) {
+      const buf = Buffer.alloc(Math.min(64 * 1024, Math.max(1, cap - size + 1)));
+      const { bytesRead } = await fh.read(buf, 0, buf.length, null);
+      if (bytesRead === 0) break;
+      size += bytesRead;
+      if (size > cap) {
+        throw new Error(`${label}: attachments exceed the per-message budget (the file grew past ${cap} bytes while being read)`);
+      }
+      chunks.push(buf.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, size);
+  } finally {
+    await fh.close();
+  }
+}
+
 async function readCapped(res: Response, cap: number, ctrl: AbortController, label: string): Promise<Buffer> {
   if (!res.body) return Buffer.alloc(0);
   const chunks: Buffer[] = [];
@@ -329,7 +352,9 @@ export async function resolveOutgoingFiles(
       );
       const target = real ?? (await onDiskPath(abs));
       if (!roots.some((r) => insideRoot(target, r))) {
-        throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}${real && real !== abs ? ` (→ ${real})` : ''}`);
+        // Never echo where a denied path resolves: that would tell the caller
+        // a link outside the roots exists and where it points.
+        throw new Error(`files[${i}]: path is outside the allowed roots: ${abs}`);
       }
       if (real === undefined) throw new Error(`files[${i}]: no such file: ${abs}`);
       if (NEVER_ATTACH.some((re) => re.test(basename(real)) || re.test(basename(abs)))) {
@@ -338,7 +363,11 @@ export async function resolveOutgoingFiles(
       const st = await stat(real);
       if (!st.isFile()) throw new Error(`files[${i}]: not a regular file: ${abs}`);
       account(st.size, `files[${i}] (${abs})`);
-      const data = await readFile(real);
+      // Read under what the budget has left (the stat size is already charged),
+      // and charge what was actually read: a file that grows between the stat
+      // and the read can't slip past the cap.
+      const data = await readFileCapped(real, budget - total + st.size, `files[${i}] (${abs})`);
+      account(data.length - st.size, `files[${i}] (${abs})`);
       const name = spec.name || basename(abs);
       out.push({
         name,

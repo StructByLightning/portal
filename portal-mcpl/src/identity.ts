@@ -30,8 +30,8 @@
  * restart comes back as whoever the agent last chose to be rather than silently
  * reverting to the configured name mid-conversation.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   enroll as defaultEnroll,
   fileCredsStore,
@@ -267,20 +267,35 @@ export class IdentityManager implements IdentityToolHandler {
     if (Object.keys(this.roster.identities).length >= this.maxIdentities) {
       throw new Error(`identity limit reached (${this.maxIdentities}); ask an operator to raise PORTAL_IDENTITY_MAX`);
     }
-    const credsPath = join(this.opts.credsDir, `${key}.creds.json`);
-    // A creds file we did not mint belongs to someone else. loadOrEnrollCreds
-    // would silently ADOPT it — exactly the impersonation this module refuses.
-    if (existsSync(credsPath)) {
-      throw new Error(`the name "${name}" is already taken on this host — choose another`);
-    }
     const code = invite ?? this.opts.invite;
     if (!code) throw new Error('no invite available — pass `invite`, or configure PORTAL_INVITE');
+    const credsPath = join(this.opts.credsDir, `${key}.creds.json`);
+    // Reserve the creds file BEFORE enrolling, with an exclusive create: two
+    // processes sharing this directory, or two names that slug alike ("Écho",
+    // "Cho"), can't both mint into it and have the second overwrite the first's
+    // token. A file we didn't create belongs to someone else — loadOrEnrollCreds
+    // would silently ADOPT it, exactly the impersonation this module refuses.
+    mkdirSync(this.opts.credsDir, { recursive: true });
+    try {
+      writeFileSync(credsPath, '{}\n', { flag: 'wx', mode: 0o600 });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      throw new Error(
+        `a persona file for "${name}" already exists on this host (${basename(credsPath)}) — choose a different name`,
+      );
+    }
 
     // uniqueName: the name came from the model, so channel text can steer it —
     // the relay also refuses one that reads like an existing persona's.
-    const creds = await this.enrollFn({ url: this.opts.url, invite: code, desiredName: name, uniqueName: true });
+    let creds: PortalCredentials;
     try {
-      // `wx`-equivalent guard was the existsSync above; the store writes 0600.
+      creds = await this.enrollFn({ url: this.opts.url, invite: code, desiredName: name, uniqueName: true });
+    } catch (err) {
+      try { unlinkSync(credsPath); } catch { /* best effort: release the reservation */ }
+      throw err;
+    }
+    try {
+      // Fills the reservation (ours); the store writes 0600.
       await fileCredsStore(credsPath).save(creds);
     } catch (err) {
       // The persona now exists on the relay but we could not keep its token.

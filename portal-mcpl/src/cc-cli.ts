@@ -72,7 +72,7 @@ import { loadOrEnrollCreds, type PortalCredentials } from '@animalabs/portal-cli
 import { fileOptionsFromEnv } from './files.js';
 import { IdentityManager, identitySwitchingEnabled, slugName, type PortalSession } from './identity.js';
 import { PortalCcChannelServer } from './server-cc.js';
-import { buildSession } from './session.js';
+import { buildSession, seedOnce } from './session.js';
 import { wakeSinkFromEnv } from './wake-sink.js';
 
 async function main(): Promise<void> {
@@ -121,6 +121,7 @@ async function main(): Promise<void> {
 
   // Durable agent state (watermarks + pending pings + subscriptions) is keyed
   // to the persona, so each identity keeps its own across switches and restarts.
+  const rootSeed = seedOnce(seedSubscriptions);
   const sessionFor = (creds: PortalCredentials): PortalSession =>
     buildSession(creds, {
       url,
@@ -128,7 +129,7 @@ async function main(): Promise<void> {
       logPrefix: '[portal-cc]',
       agent: { files: fileOptionsFromEnv(), onPublicActivity },
       ...(creds.personaId === rootCreds.personaId
-        ? { statePath: process.env.PORTAL_STATE, seedSubscriptions }
+        ? { statePath: process.env.PORTAL_STATE, seedSubscriptions: rootSeed() }
         : {}),
     });
 

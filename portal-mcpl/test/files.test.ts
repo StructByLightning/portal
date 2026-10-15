@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveOutgoingFiles, fileOptionsFromEnv, isPrivateAddress } from '../src/files.js';
+import { resolveOutgoingFiles, fileOptionsFromEnv, isPrivateAddress, readFileCapped } from '../src/files.js';
 
 /** DNS double: everything public unless the host says otherwise. */
 const publicDns = async (host: string) => (host.startsWith('internal') ? ['10.0.0.5'] : ['93.184.216.34']);
@@ -111,7 +111,7 @@ test('allowedRoots fences the real file, not the symlink name', async () => {
   symlinkSync(join(outside, 'secret.txt'), join(inside, 'innocent.txt'));
   await assert.rejects(
     resolveOutgoingFiles([join(inside, 'innocent.txt')], { allowedRoots: [inside] }),
-    /outside the allowed roots.*→/,
+    (err: Error) => /outside the allowed roots/.test(err.message) && !err.message.includes('secret.txt'),
   );
   writeFileSync(join(inside, 'real.txt'), 'ok');
   assert.equal((await resolveOutgoingFiles([join(inside, 'real.txt')], { allowedRoots: [inside] }))!.length, 1);
@@ -185,4 +185,22 @@ test('url: a body with no Content-Length is cut off at the budget, not buffered 
 
 test('fileOptionsFromEnv: private URLs opt-in', () => {
   assert.deepEqual(fileOptionsFromEnv({ PORTAL_ALLOW_PRIVATE_URLS: 'true' }), { allowPrivateUrls: true });
+});
+
+test('a denied path never says where it resolves', async () => {
+  const inside = mkdtempSync(join(tmpdir(), 'portal-files-in-'));
+  const outside = mkdtempSync(join(tmpdir(), 'portal-files-out-'));
+  writeFileSync(join(outside, 'secret.txt'), 'x');
+  symlinkSync(join(outside, 'secret.txt'), join(outside, 'link.txt'));
+  await assert.rejects(
+    resolveOutgoingFiles([join(outside, 'link.txt')], { allowedRoots: [inside] }),
+    (err: Error) => /outside the allowed roots/.test(err.message) && !err.message.includes('secret.txt') && !err.message.includes('→'),
+  );
+});
+
+test('local files are read under the cap (a file larger than what is left is refused while reading)', async () => {
+  const p = join(dir, 'big.bin');
+  writeFileSync(p, Buffer.alloc(1000, 7));
+  assert.equal((await readFileCapped(p, 1000, 'x')).length, 1000);
+  await assert.rejects(readFileCapped(p, 999, 'x'), /grew past 999 bytes/);
 });
