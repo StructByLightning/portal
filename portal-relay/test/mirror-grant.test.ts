@@ -70,6 +70,8 @@ function makeRelay() {
         : undefined,
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
+    memberNameMatches: () => false,
+    membersComplete: () => true,
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
   };
@@ -155,6 +157,26 @@ test('mirror grant without guildId: enroll denies, augment rejects loudly', asyn
     assert.deepEqual(t.caps(enrolled.personaId, CHAN_A), []);
 
     assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-noguild'), /missing guildId/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a rejected augment changes nothing: no roles granted, invite not consumed', () => {
+  const t = makeRelay();
+  try {
+    // Roles plus a mirror grant missing its guild: the whole claim is invalid.
+    t.relay.invites.mint({
+      code: 'roles-and-bad-mirror', label: 'x', mode: 'augment', maxUses: 1, roles: ['some-role'],
+      grant: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' } },
+    });
+    t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
+    const before = t.relay.permissions.getRoleNames(EXISTING);
+    for (let i = 0; i < 2; i++) {
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-bad-mirror'), /missing guildId/);
+    }
+    assert.deepEqual(t.relay.permissions.getRoleNames(EXISTING), before, 'no roles granted by a rejected claim');
+    assert.equal(t.relay.invites.get('roles-and-bad-mirror').uses ?? 0, 0, 'no use consumed');
   } finally {
     t.cleanup();
   }

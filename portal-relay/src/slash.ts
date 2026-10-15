@@ -34,11 +34,43 @@ export interface SlashInvoker {
 export interface SlashInvocation {
   command: string;
   guildId: string;
+  /** The channel the command acts on. Run inside a thread, this is the
+   *  thread's PARENT: Portal checks a thread's access on its parent channel,
+   *  so a grant stored under the thread's own id would grant nothing. */
   channelId: string;
   /** Channel display name, for reply text. */
   channelName: string;
+  /** Set when the command was run inside a thread (see channelId). */
+  thread?: { id: string; name: string };
   invoker: SlashInvoker;
   options: Record<string, string | undefined>;
+}
+
+/** Where a slash command acts, from where it was run: a thread acts on its
+ *  parent channel (see SlashInvocation.channelId). discord.js-free so it can
+ *  be tested; discord-bot.ts supplies the channel facts. */
+export function slashTarget(where: {
+  channelId: string;
+  name?: string | null;
+  isThread: boolean;
+  parentId?: string | null;
+  parentName?: string | null;
+}): Pick<SlashInvocation, 'channelId' | 'channelName' | 'thread'> {
+  if (where.isThread && where.parentId) {
+    return {
+      channelId: where.parentId,
+      channelName: where.parentName || where.parentId,
+      thread: { id: where.channelId, name: where.name || where.channelId },
+    };
+  }
+  return { channelId: where.channelId, channelName: where.name || where.channelId };
+}
+
+/** "#channel", or — run in a thread — "#parent (thread "x" takes its access)". */
+function placeLabel(inv: SlashInvocation): string {
+  return inv.thread
+    ? `#${inv.channelName} (the channel thread "${inv.thread.name}" is in — threads take their channel's access)`
+    : `#${inv.channelName}`;
 }
 
 export interface AutocompleteRequest {
@@ -124,12 +156,17 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   },
   {
     name: 'invite',
-    description: 'Mint a single-use enrollment invite granting access roles',
+    description: 'Mint a single-use enrollment invite granting access roles, plus access to this channel',
     options: [
       { name: 'role', description: 'Access role the new persona will hold', required: true, autocomplete: true },
       { name: 'role2', description: 'Additional access role', autocomplete: true },
       { name: 'role3', description: 'Additional access role', autocomplete: true },
       { name: 'label', description: 'Human label for the invite (who is this for?)' },
+      {
+        name: 'level',
+        description: 'Access to THIS channel regardless of roles: read; write = +send/react/attach (default); full = +manage',
+        choices: ['read', 'write', 'full'],
+      },
     ],
   },
   {
@@ -283,7 +320,7 @@ export class SlashHandler {
     const effective = this.deps.capsFor(persona.id, inv.channelId, inv.guildId);
     this.audit(inv, 'slash.add', persona.id, true, { level });
     return (
-      `Granted **${persona.displayName}** (\`${persona.id}\`) ${level} access to #${inv.channelName}.\n` +
+      `Granted **${persona.displayName}** (\`${persona.id}\`) ${level} access to ${placeLabel(inv)}.\n` +
       `Effective now: ${capsLabel(effective)}.`
     );
   }
@@ -364,16 +401,28 @@ export class SlashHandler {
       this.audit(inv, 'slash.invite', undefined, false, { roles: names, reason: 'guild-containment' });
       return `Role${uncontained.length === 1 ? '' : 's'} ${uncontained.map((n) => `\`${n}\``).join(', ')} not scoped to this guild — only a portal superadmin can mint invites carrying them.`;
     }
+    // The channel the command was run in is pinned as a direct grant on top of
+    // the roles: "/invite here" should mean the new persona can talk HERE, even
+    // when none of the roles happen to cover this channel. Same containment as
+    // /add — the admin is authorized for this guild, and the grant is scoped to
+    // exactly this channel in it.
+    const level = inv.options.level && LEVEL_CAPS[inv.options.level] ? inv.options.level : 'write';
     const code = this.deps.newInviteCode();
     this.deps.invites.mint({
       code,
       label: inv.options.label ?? `slash-invite by ${inv.invoker.name}`,
       roles: [...new Set(names)],
+      grant: { caps: LEVEL_CAPS[level], scope: { channels: [inv.channelId] } },
+      guildId: inv.guildId,
       maxUses: 1,
     });
-    this.audit(inv, 'slash.invite', code, true, { roles: names, label: inv.options.label });
+    this.audit(inv, 'slash.invite', code, true, {
+      roles: names, label: inv.options.label, channelLevel: level,
+      ...(inv.thread ? { ranInThread: inv.thread.id } : {}),
+    });
     return (
-      `Single-use invite minted (roles: ${names.map((n) => `\`${n}\``).join(', ')}):\n\`${code}\`\n` +
+      `Single-use invite minted (roles: ${names.map((n) => `\`${n}\``).join(', ')}; ` +
+      `plus ${level} access to ${placeLabel(inv)}):\n\`${code}\`\n` +
       `This message is only visible to you — hand the code to the enrolling agent.`
     );
   }

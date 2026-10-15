@@ -35,10 +35,11 @@ import {
 import { existsSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import type { Capability } from '@animalabs/portal-protocol';
+import { nameKeys } from './name-policy.js';
 import { capsFromPerms } from './permissions.js';
 import type { RoleOps } from './role-pool.js';
 import type { WebhookOps, WebhookSendOpts } from './webhook-pool.js';
-import { SLASH_COMMANDS, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
+import { SLASH_COMMANDS, slashTarget, type AutocompleteRequest, type SlashChoice, type SlashInvocation } from './slash.js';
 
 export interface ChannelMeta {
   id: string;
@@ -537,6 +538,25 @@ export class DiscordBot implements WebhookOps, RoleOps {
 
   // ── Queries ──
 
+  /**
+   * Whether any cached member of `guildId` has a name (username, global
+   * display name, or server nickname) that reads like one of `keys` — humans
+   * always, bots only when `bots`. Reads the member cache, which holds the
+   * full roster only with the GuildMembers intent; without it this sees the
+   * members the bot has met, so the check is best-effort.
+   */
+  memberNameMatches(guildId: string, keys: ReadonlySet<string>, opts: { bots: boolean }): boolean {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return false;
+    for (const m of guild.members.cache.values()) {
+      if (m.user.bot && !opts.bots) continue;
+      for (const n of [m.user.username, m.user.globalName, m.nickname]) {
+        if (n && nameKeys(n).some((k) => keys.has(k))) return true;
+      }
+    }
+    return false;
+  }
+
   listGuilds(): Array<{ id: string; name: string; memberCount: number }> {
     return [...this.client.guilds.cache.values()]
       .filter((g) => this.guildAllowed(g.id))
@@ -787,6 +807,19 @@ export class DiscordBot implements WebhookOps, RoleOps {
     };
   }
 
+  /** Where a slash command acts — a thread's parent channel (see slashTarget). */
+  private slashTargetOf(channel: Interaction['channel'], channelId: string): ReturnType<typeof slashTarget> {
+    const isThread = !!channel && channel.isThread();
+    const thread = isThread ? (channel as AnyThreadChannel) : null;
+    return slashTarget({
+      channelId,
+      name: channel && 'name' in channel ? channel.name : null,
+      isThread,
+      parentId: thread?.parentId ?? null,
+      parentName: thread?.parent?.name ?? null,
+    });
+  }
+
   /** A Discord role's name + guild, from the gateway cache of any joined guild. */
   roleLabel(roleId: string): { name: string; guildId: string } | null {
     for (const g of this.client.guilds.cache.values()) {
@@ -948,7 +981,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const choices = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
+        channelId: this.slashTargetOf(interaction.channel, interaction.channelId).channelId,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,
@@ -968,9 +1001,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       for (const o of interaction.options.data) {
         if (o.value !== undefined) options[o.name] = String(o.value);
       }
-      const channel = interaction.channel;
-      const channelName =
-        channel && 'name' in channel && channel.name ? channel.name : interaction.channelId;
+      const target = this.slashTargetOf(interaction.channel, interaction.channelId);
       // Defer BEFORE running the handler: /list-style commands can walk
       // personas × mirror caches, and the raw-reply window is only 3s —
       // deferring first (the await yields, letting the ACK go out) buys 15
@@ -979,8 +1010,7 @@ export class DiscordBot implements WebhookOps, RoleOps {
       const content = handler({
         command: interaction.commandName,
         guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        channelName,
+        ...target,
         invoker: {
           id: interaction.user.id,
           name: interaction.user.username,
