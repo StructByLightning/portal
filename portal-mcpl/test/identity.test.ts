@@ -171,7 +171,7 @@ function readyClient(personaId: string, channels: PortalChannel[]): PortalClient
   return client;
 }
 
-test('swapSession retracts unseen channels, reopens shared ones, and detaches the old client', async () => {
+test('swapSession drops every channel: retracts the old set, registers the new view closed, detaches the old client', async () => {
   const shared = chan('100', 'shared');
   const oldOnly = chan('200', 'old-only');
   const newOnly = chan('300', 'new-only');
@@ -227,10 +227,15 @@ test('swapSession retracts unseen channels, reopens shared ones, and detaches th
 
   const removed = notifications.flatMap((n) => (n.params.removed as string[] | undefined) ?? []);
   const added = notifications.flatMap((n) => ((n.params.added as Array<{ id: string }> | undefined) ?? []).map((d) => d.id));
-  assert.deepEqual(removed, ['portal:200']);
-  assert.deepEqual(added, ['portal:300']);
-  assert.deepEqual(subscribed, ['100']);
-  assert.deepEqual([...internal.openChannels], ['100']);
+  // The old identity's whole set is retracted — the shared channel too — and
+  // the new identity's view is offered fresh, so the host holds it closed.
+  assert.deepEqual(removed.sort(), ['portal:100', 'portal:200']);
+  assert.deepEqual(added.sort(), ['portal:100', 'portal:300']);
+  const removedAt = notifications.findIndex((n) => n.params.removed);
+  const addedAt = notifications.findIndex((n) => n.params.added);
+  assert.ok(removedAt < addedAt, 'retraction goes out before the re-registration');
+  assert.deepEqual(subscribed, [], 'nothing the old identity had open is reopened');
+  assert.deepEqual([...internal.openChannels], []);
 
   // The outgoing client must no longer drive this server.
   const before = notifications.length;
@@ -252,7 +257,7 @@ test('identity tools are absent — and undeclared — unless a manager is attac
 
 // ── Claude Code channel binding ──
 
-test('CC swapSession carries followed channels over where visible, and detaches the old client', async () => {
+test('CC swapSession drops the old follows (the new identity keeps its own), and detaches the old client', async () => {
   const { PortalCcChannelServer } = await import('../src/server-cc.js');
   const shared = chan('100', 'shared');
   const oldOnly = chan('200', 'old-only');
@@ -273,6 +278,7 @@ test('CC swapSession carries followed channels over where visible, and detaches 
   oldState.subscribe('100');
   oldState.subscribe('200');
   const newState = new AgentState();
+  newState.subscribe('300'); // the new identity's own follow (identify replays it)
   const server = new PortalCcChannelServer(oldClient, new PortalAgent(oldClient, { state: oldState }), {
     identity: { handleToolCall: async () => ({ ok: 'identity' }) },
   });
@@ -296,8 +302,9 @@ test('CC swapSession carries followed channels over where visible, and detaches 
 
   await server.swapSession(newClient, new PortalAgent(newClient, { state: newState }));
   await new Promise((r) => setImmediate(r));
-  assert.deepEqual(subscribed, ['100'], 'only channels the new identity can see are followed');
-  assert.deepEqual(newState.subscriptionList(), ['100']);
+  assert.deepEqual(subscribed, [], 'nothing the old identity followed is followed under the new one');
+  assert.deepEqual(newState.subscriptionList(), ['300'], "the new identity's saved follows are untouched");
+  assert.deepEqual(oldState.subscriptionList().sort(), ['100', '200'], "the old identity's follows stay its own");
   assert.equal(pingFetches, 1, 'catch-up runs for the new identity');
 
   // A ping on the OLD client must no longer wake this session.

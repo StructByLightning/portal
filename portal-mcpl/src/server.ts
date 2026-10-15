@@ -759,10 +759,13 @@ export class PortalMcplServer {
    * What carries over and what does not:
    *   - The MCPL connection, the host's grant and the tool surface are the
    *     host's, not the persona's — untouched.
-   *   - `openChannels` is the HOST's desired state. It is re-asserted as relay
-   *     subscriptions under the new identity wherever that identity can see the
-   *     channel, and dropped where it cannot.
-   *   - `advertised` is reconciled against the new view (see below).
+   *   - Channels are DROPPED on a switch: nothing the old identity had open
+   *     carries over. With `channels.register` granted, every channel the host
+   *     holds from the old identity is retracted and the new identity's view
+   *     is registered fresh (see below), so the host's registry and this
+   *     server agree. Without it the host can't be told a channel closed, so
+   *     its open set is kept where the new identity can see it rather than
+   *     silently drifting from what the host believes.
    *   - Woken-ping sets are per persona, so pings the new identity accrued
    *     while inactive surface as one catch-up, and switching back does not
    *     re-deliver.
@@ -785,46 +788,42 @@ export class PortalMcplServer {
 
     const visible = new Set(client.cache.allChannels().map((channel) => channel.id));
 
-    // Retract channels the new identity cannot see. Elsewhere this file refuses
-    // to derive removals by diffing an enumeration against `advertised`, because
-    // a PARTIAL enumeration would mass-retract live channels. That reasoning
-    // does not apply here: the comparison is against a fresh `ready` snapshot
-    // for a different persona, and leaving the old persona's channels registered
-    // would advertise places this connection can no longer read or post to.
-    // Only done when the grant lets us tell the host — our belief must not
-    // drift from what the host holds (§14.5).
     const conn = this.conn;
     if (conn && this.canRegister()) {
-      const removed: string[] = [];
-      for (const id of [...this.advertised.keys()]) {
-        const raw = parsePortalChannelId(id);
-        if (raw && visible.has(raw)) continue;
-        this.advertised.delete(id);
-        removed.push(id);
-      }
-      for (const id of [...this.rejected.keys()]) {
-        const raw = parsePortalChannelId(id);
-        if (!raw || !visible.has(raw)) this.rejected.delete(id);
-      }
+      // Channels are dropped on a switch. Retract EVERY channel the host holds
+      // from the old identity — visible to the new one or not, open or not —
+      // and let registerChannels() below offer the new identity's view fresh.
+      // The host deletes a retracted channel and registers a re-added one
+      // closed, then reconciles it against its own open policy, so host and
+      // server agree that nothing carried over. (Elsewhere this file refuses to
+      // derive removals from an enumeration, because a PARTIAL one would
+      // mass-retract live channels; here the retraction is of the old
+      // identity's whole set, which this connection no longer speaks for.)
+      const removed = [...this.advertised.keys()];
+      this.advertised.clear();
+      this.rejected.clear(); // verdicts were about the old identity's descriptors
       if (removed.length) {
         conn.sendNotification(method.CHANNELS_CHANGED, { removed } satisfies ChannelsChangedParams);
       }
-    }
-
-    // Re-assert host-open channels as subscriptions on the new relay session
-    // (a fresh session starts with none). A channel the new identity cannot see
-    // is no longer open in any meaningful sense.
-    for (const channelId of [...this.openChannels]) {
-      if (!visible.has(channelId)) {
-        this.openChannels.delete(channelId);
-        continue;
+      // The new relay session starts with no subscriptions of its own beyond
+      // what its identify replayed; none of the old host-open set is reasserted.
+      this.openChannels.clear();
+    } else {
+      // No channels.register: the host can't be told a channel closed, so keep
+      // its open set where the new identity can see it (a fresh relay session
+      // starts with none, so reassert those) and drop what it can't see.
+      for (const channelId of [...this.openChannels]) {
+        if (!visible.has(channelId)) {
+          this.openChannels.delete(channelId);
+          continue;
+        }
+        void client.subscribe(channelId).catch((err) =>
+          console.error(
+            `[portal-mcpl] failed to reopen ${channelId} under the new identity:`,
+            (err as Error).message,
+          ),
+        );
       }
-      void client.subscribe(channelId).catch((err) =>
-        console.error(
-          `[portal-mcpl] failed to reopen ${channelId} under the new identity:`,
-          (err as Error).message,
-        ),
-      );
     }
 
     // The new client's `ready` fired before we were listening, so run what the

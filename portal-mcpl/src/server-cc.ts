@@ -196,15 +196,15 @@ export class PortalCcChannelServer {
    * Contract: `client` is already connected and `ready` (the identity manager
    * only swaps after `connect()` resolves); the caller closes the old client.
    *
-   * This binding has no host-side channel registry, so there is nothing to
-   * retract. What does carry over is the set of channels being FOLLOWED: a
-   * Claude Code session that switches persona is still the same session, and
-   * silently going deaf to the rooms it was in would be a surprise. They are
-   * added to the new identity's durable subscriptions wherever it can see the
-   * channel. `seeded` is kept for the same reason — it records what is already
-   * in this session's context, which the switch did not change. Woken-ping
-   * sets are per persona, so pings the new identity accrued while inactive
-   * arrive as one catch-up, and switching back does not re-deliver.
+   * Channels are dropped on a switch: the new identity follows exactly what
+   * it follows on its own (its durable subscriptions, replayed by identify),
+   * and nothing the old identity followed carries over — follows belong to a
+   * persona, and copying them across would grow the new persona's saved set
+   * with rooms it never chose, for good. Switching back restores the old
+   * identity's follows from its own state. `seeded` is kept: it records what
+   * is already in this session's context, which the switch did not change.
+   * Woken-ping sets are per persona, so pings the new identity accrued while
+   * inactive arrive as one catch-up, and switching back does not re-deliver.
    *
    * Runs on the wake chain: a wake queued before the swap completes against
    * the client and agent it was queued for, never against the next persona's.
@@ -214,19 +214,9 @@ export class PortalCcChannelServer {
   }
 
   private swapNow(client: PortalClient, agent: PortalAgent): void {
-    const following = this.agent.state.subscriptionList();
     this.client = client;
     this.agent = agent;
     this.wireClient(); // detaches the outgoing client's listeners first
-
-    const visible = new Set(client.cache.allChannels().map((channel) => channel.id));
-    for (const channelId of following) {
-      // subscribe() is false when already followed — identify replayed those.
-      if (!visible.has(channelId) || !agent.state.subscribe(channelId)) continue;
-      void client.subscribe(channelId).catch((err) =>
-        console.error(`[portal-cc] failed to follow ${channelId} under the new identity:`, (err as Error).message),
-      );
-    }
     // The new client's `ready` fired before we were listening.
     void this.catchUp().catch((err) =>
       console.error('[portal-cc] catch-up failed:', (err as Error).message),
@@ -392,6 +382,15 @@ export class PortalCcChannelServer {
    * carried a ping are left alone: their watermark is the agent's to advance
    * with mark_read once it has actually handled the ping, so a turn that dies
    * mid-way keeps the ping pending on the relay.
+   *
+   * "Delivered" means handed over, not read: without a wake sink this runs as
+   * soon as the channel notification is SENT, because Claude Code sends nothing
+   * back once a turn has handled it. If the session dies, restarts or is
+   * mid-compaction before the model reads the wake, the folded messages count
+   * as read and the next catch-up won't surface them again. Accepted for
+   * ambient traffic: it is bounded by one wake (contextCap), the messages stay
+   * in the channel for fetch_history, and pings — the traffic that must not be
+   * lost — are exempt above. (Same shape as discord-mcpl #30.)
    */
   private settleFolded(folded: FoldedChannel[], keep: Set<string>, delivered: PortalMessage[]): void {
     for (const f of folded) {
