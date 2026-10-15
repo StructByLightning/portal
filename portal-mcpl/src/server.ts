@@ -774,13 +774,8 @@ export class PortalMcplServer {
    *     persona's (one relay round trip wide).
    */
   async swapSession(client: PortalClient, agent: PortalAgent): Promise<void> {
-    // Let any registration finish against the OLD view first: its ack stamps
-    // `advertised`, and reconciliation below needs that to be what the host
-    // actually holds. (`registerChannels` re-arms itself, hence the loop; there
-    // is no await between the loop exiting and the swap, so nothing interleaves.)
-    while (this.registrationInFlight) await this.registrationInFlight.catch(() => {});
-
     this.swapEpoch++;
+    const epoch = this.swapEpoch;
     this.client = client;
     this.agent = agent;
     this.pendingRemovals.clear(); // observations about the old identity's view
@@ -788,25 +783,10 @@ export class PortalMcplServer {
 
     const visible = new Set(client.cache.allChannels().map((channel) => channel.id));
 
-    const conn = this.conn;
-    if (conn && this.canRegister()) {
-      // Channels are dropped on a switch. Retract EVERY channel the host holds
-      // from the old identity — visible to the new one or not, open or not —
-      // and let registerChannels() below offer the new identity's view fresh.
-      // The host deletes a retracted channel and registers a re-added one
-      // closed, then reconciles it against its own open policy, so host and
-      // server agree that nothing carried over. (Elsewhere this file refuses to
-      // derive removals from an enumeration, because a PARTIAL one would
-      // mass-retract live channels; here the retraction is of the old
-      // identity's whole set, which this connection no longer speaks for.)
-      const removed = [...this.advertised.keys()];
-      this.advertised.clear();
-      this.rejected.clear(); // verdicts were about the old identity's descriptors
-      if (removed.length) {
-        conn.sendNotification(method.CHANNELS_CHANGED, { removed } satisfies ChannelsChangedParams);
-      }
-      // The new relay session starts with no subscriptions of its own beyond
-      // what its identify replayed; none of the old host-open set is reasserted.
+    if (this.conn && this.canRegister()) {
+      // Channels are dropped on a switch: none of the old host-open set is
+      // reasserted on the new relay session (which has only what its identify
+      // replayed). The host is told below, in reconcileAfterSwap.
       this.openChannels.clear();
     } else {
       // No channels.register: the host can't be told a channel closed, so keep
@@ -826,12 +806,11 @@ export class PortalMcplServer {
       }
     }
 
-    // The new client's `ready` fired before we were listening, so run what the
-    // ready handler would have: announce added/updated channels, then catch up.
-    // Not awaited: this runs inside the host's own tools/call, and a host that
-    // answers serially would not reply to channels/register until we return.
+    // Neither is awaited: this runs inside the host's own tools/call, and a
+    // host that answers serially would not reply to a pending channels/register
+    // (or anything else) until we return — waiting for it here would deadlock.
     if (this.canRegister()) {
-      void this.registerChannels().catch((err) =>
+      void this.reconcileAfterSwap(epoch).catch((err) =>
         console.error('[portal-mcpl] channel registration failed:', (err as Error).message),
       );
     }
@@ -840,6 +819,34 @@ export class PortalMcplServer {
         console.error('[portal-mcpl] catch-up failed:', (err as Error).message),
       );
     }
+  }
+
+  /**
+   * Bring the host's channel registry over to the new identity, once any
+   * registration already in flight has settled — its ack stamps `advertised`
+   * with what the host actually holds, and the retraction must cover that.
+   * Retract EVERY channel the host holds from the old identity (visible to the
+   * new one or not, open or not), then register the new identity's view
+   * fresh: the host deletes a retracted channel and registers a re-added one
+   * closed, then reconciles it against its own open policy, so host and
+   * server agree that nothing carried over. (Elsewhere this file refuses to
+   * derive removals from an enumeration, because a PARTIAL one would
+   * mass-retract live channels; here the retraction is of the old identity's
+   * whole set, which this connection no longer speaks for.) A later switch
+   * owns reconciliation from then on.
+   */
+  private async reconcileAfterSwap(epoch: number): Promise<void> {
+    while (this.registrationInFlight) await this.registrationInFlight.catch(() => {});
+    if (this.swapEpoch !== epoch) return;
+    const conn = this.conn;
+    if (!conn || !this.canRegister()) return;
+    const removed = [...this.advertised.keys()];
+    this.advertised.clear();
+    this.rejected.clear(); // verdicts were about the old identity's descriptors
+    if (removed.length) {
+      conn.sendNotification(method.CHANNELS_CHANGED, { removed } satisfies ChannelsChangedParams);
+    }
+    await this.registerChannels();
   }
 
   /**

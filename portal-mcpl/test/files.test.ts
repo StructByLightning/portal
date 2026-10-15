@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveOutgoingFiles, fileOptionsFromEnv, isPrivateAddress, readFileCapped } from '../src/files.js';
@@ -235,4 +235,32 @@ test('a refused download is cancelled, redirects included', async () => {
       : new Response(body('404'), { status: 404 })) as unknown as typeof fetch;
   await assert.rejects(resolveOutgoingFiles(['https://example.com/start'], { fetch: fakeFetch, lookup: publicDns }), /HTTP 404/);
   assert.deepEqual(cancelled.sort(), ['404', 'redirect']);
+});
+
+test('a dangling symlink inside a root that points outside reads "outside", not "no such file"', async () => {
+  const inside = mkdtempSync(join(tmpdir(), 'portal-files-dangle-'));
+  symlinkSync('/definitely/elsewhere/missing.txt', join(inside, 'dangling.txt'));
+  await assert.rejects(resolveOutgoingFiles([join(inside, 'dangling.txt')], { allowedRoots: [inside] }), /outside the allowed roots/);
+  symlinkSync(join(inside, 'not-yet.txt'), join(inside, 'dangling-inside.txt'));
+  await assert.rejects(resolveOutgoingFiles([join(inside, 'dangling-inside.txt')], { allowedRoots: [inside] }), /no such file/);
+});
+
+test('nothing from the credentials directory, and no hard link to its files, is attachable', async () => {
+  const credsDir = mkdtempSync(join(tmpdir(), 'portal-files-creds-'));
+  const work = mkdtempSync(join(tmpdir(), 'portal-files-work-'));
+  writeFileSync(join(credsDir, 'token-store'), 'SECRET');
+  writeFileSync(join(credsDir, 'notes.txt'), 'x');
+  const o = { allowedRoots: [work, credsDir], denyDirs: [credsDir] };
+  await assert.rejects(resolveOutgoingFiles([join(credsDir, 'notes.txt')], o), /refusing to attach a credentials/);
+  linkSync(join(credsDir, 'token-store'), join(work, 'innocent.bin'));
+  await assert.rejects(resolveOutgoingFiles([join(work, 'innocent.bin')], o), /refusing to attach a credentials/, 'same inode, other name');
+  writeFileSync(join(work, 'x.creds.json.bak'), 'SECRET');
+  await assert.rejects(resolveOutgoingFiles([join(work, 'x.creds.json.bak')], o), /refusing to attach a credentials/, 'a copy by name');
+  writeFileSync(join(work, 'fine.txt'), 'ok');
+  assert.equal((await resolveOutgoingFiles([join(work, 'fine.txt')], o))!.length, 1);
+});
+
+test('v4-compatible, v4-translated and local-use NAT64 v6 forms are private', () => {
+  for (const a of ['::7f00:1', '::ffff:0:7f00:1', '64:ff9b:1::7f00:1']) assert.equal(isPrivateAddress(a), true, a);
+  assert.equal(isPrivateAddress('2606:4700::6810:85e5'), false);
 });

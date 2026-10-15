@@ -127,7 +127,7 @@ async function main(): Promise<void> {
       url,
       stateDir: credsDir,
       logPrefix: '[portal-cc]',
-      agent: { files: fileOptionsFromEnv(), onPublicActivity },
+      agent: { files: { ...fileOptionsFromEnv(), denyDirs: [credsDir] }, onPublicActivity },
       ...(creds.personaId === rootCreds.personaId
         ? { statePath: process.env.PORTAL_STATE, seedSubscriptions: rootSeed() }
         : {}),

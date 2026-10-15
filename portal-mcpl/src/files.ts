@@ -10,7 +10,7 @@
  * message reaches the client. The relay never sees a path.
  */
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { open, realpath, stat } from 'node:fs/promises';
+import { lstat, open, readdir, readlink, realpath, stat } from 'node:fs/promises';
 import { BlockList, isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -44,6 +44,10 @@ export interface ResolveFilesOptions {
    *  configured credentials, identity roster and state files, which can have
    *  any name (the NEVER_ATTACH patterns only catch the default names). */
   denyPaths?: string[];
+  /** Directories nothing is attachable from (the credentials directory): a
+   *  path inside one is refused, and so is any file that IS one of their files
+   *  under another name (a hard link elsewhere — same device and inode). */
+  denyDirs?: string[];
   /** Allow `url` fetches (default true). */
   allowUrls?: boolean;
   /** Fetch timeout for `url` items, ms. */
@@ -105,7 +109,16 @@ function expandHome(p: string): string {
  *  rather than the raw path keeps a missing file under a symlinked root (e.g.
  *  macOS /var → /private/var) inside that root, so it reads "no such file",
  *  while a path outside the roots still reads "outside" whether or not it exists. */
-async function onDiskPath(abs: string): Promise<string> {
+async function onDiskPath(abs: string, depth = 0): Promise<string> {
+  // A dangling symlink is fenced by where it POINTS, not where it sits — else
+  // one inside a root aimed outside reads "no such file" instead of "outside".
+  if (depth < 40) {
+    const link = await lstat(abs).catch(() => undefined);
+    if (link?.isSymbolicLink()) {
+      const target = await readlink(abs).catch(() => undefined);
+      if (target !== undefined) return onDiskPath(resolve(dirname(abs), target), depth + 1);
+    }
+  }
   const rest: string[] = [];
   let cur = abs;
   for (;;) {
@@ -116,6 +129,27 @@ async function onDiskPath(abs: string): Promise<string> {
     rest.push(basename(cur));
     cur = parent;
   }
+}
+
+/** The configured credential files and the credentials directory: refused by
+ *  path, and by (device, inode) so a hard link under another name is too. */
+async function isDenied(real: string, opts: ResolveFilesOptions): Promise<boolean> {
+  if (!opts.denyPaths?.length && !opts.denyDirs?.length) return false;
+  const resolveReal = (p: string) => realpath(expandHome(p)).catch(() => resolve(expandHome(p)));
+  const dirs = await Promise.all((opts.denyDirs ?? []).map(resolveReal));
+  if (dirs.some((d) => insideRoot(real, d))) return true;
+  const files = await Promise.all((opts.denyPaths ?? []).map(resolveReal));
+  if (files.includes(real)) return true;
+  for (const d of dirs) {
+    for (const name of await readdir(d).catch(() => [] as string[])) files.push(join(d, name));
+  }
+  const target = await stat(real).catch(() => undefined);
+  if (!target) return false;
+  for (const f of files) {
+    const st = await stat(f).catch(() => undefined);
+    if (st && st.isFile() && st.dev === target.dev && st.ino === target.ino) return true;
+  }
+  return false;
 }
 
 function insideRoot(file: string, root: string): boolean {
@@ -147,7 +181,12 @@ for (const [net, bits] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
   ['172.16.0.0', 12], ['192.168.0.0', 16], ['224.0.0.0', 3],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
-for (const [net, bits] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]] as const) {
+for (const [net, bits] of [
+  ['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+  // v4-compatible (::a.b.c.d, deprecated), v4-translated (::ffff:0:a.b.c.d)
+  // and local-use NAT64 (RFC 8215): no public fetch needs them.
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b:1::', 48],
+] as const) {
   PRIVATE.addSubnet(net, bits, 'ipv6');
 }
 
@@ -193,7 +232,10 @@ export function isPrivateAddress(addr: string): boolean {
 /** Files that are never attachable, whatever the roots: other residents' (and
  *  this one's) portal credentials and identity rosters. A hard floor —
  *  identity.ts refuses to load these on a model's say-so for the same reason. */
-const NEVER_ATTACH = [/\.creds\.json$/i, /\.identities\.json$/i, /\.state\.json$/i];
+/** Credentials / roster / state files by name — copies like `x.creds.json.bak`
+ *  included. (Configured paths and the creds directory are refused separately,
+ *  by path and inode: see denyPaths / denyDirs.) */
+const NEVER_ATTACH = [/\.creds\.json(\.|$)/i, /\.identities\.json(\.|$)/i, /\.state\.json(\.|$)/i];
 
 /** Refuse a URL whose host is, or resolves to, a private address. Checked at
  *  every redirect hop. (DNS is looked up here and again inside fetch, so a
@@ -213,8 +255,6 @@ async function defaultLookup(host: string): Promise<string[]> {
   return (await dnsLookup(host, { all: true })).map((r) => r.address);
 }
 
-/** Read a response body with a hard byte cap, aborting the transfer the moment
- *  it is exceeded — no Content-Length required, nothing buffered past the cap. */
 /** Read a local file, refusing once it passes `cap` bytes (it may be growing).
  *  @internal exported for tests. */
 export async function readFileCapped(path: string, cap: number, label: string): Promise<Buffer> {
@@ -238,6 +278,8 @@ export async function readFileCapped(path: string, cap: number, label: string): 
   }
 }
 
+/** Read a response body with a hard byte cap, aborting the transfer the moment
+ *  it is exceeded — no Content-Length required, nothing buffered past the cap. */
 async function readCapped(res: Response, cap: number, ctrl: AbortController, label: string): Promise<Buffer> {
   if (!res.body) return Buffer.alloc(0);
   const chunks: Buffer[] = [];
@@ -364,11 +406,8 @@ export async function resolveOutgoingFiles(
       if (NEVER_ATTACH.some((re) => re.test(basename(real)) || re.test(basename(abs)))) {
         throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
       }
-      if (opts.denyPaths?.length) {
-        const denied = await Promise.all(
-          opts.denyPaths.map((d) => realpath(expandHome(d)).catch(() => resolve(expandHome(d)))),
-        );
-        if (denied.includes(real)) throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
+      if (await isDenied(real, opts)) {
+        throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
       }
       const st = await stat(real);
       if (!st.isFile()) throw new Error(`files[${i}]: not a regular file: ${abs}`);

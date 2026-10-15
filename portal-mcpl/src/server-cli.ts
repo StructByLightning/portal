@@ -100,7 +100,7 @@ async function main(): Promise<void> {
     buildSession(creds, {
       url,
       stateDir: credsDir,
-      agent: { hostOwnsChannelLifecycle: true, files: fileOptionsFromEnv() },
+      agent: { hostOwnsChannelLifecycle: true, files: { ...fileOptionsFromEnv(), denyDirs: [credsDir] } },
       ...(creds.personaId === root.creds.personaId
         ? { statePath: process.env.PORTAL_STATE, seedSubscriptions: rootSeed() }
         : {}),

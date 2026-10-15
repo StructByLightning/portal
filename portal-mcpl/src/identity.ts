@@ -49,6 +49,43 @@ export function slugName(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64) || 'agent';
 }
 
+/** Whether a process is alive (EPERM: alive, just not ours to signal). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Reserve a creds file for a mint with an exclusive create. The reservation
+ * names its process, so one left behind by a process that died mid-enroll (or
+ * older than any enrollment) is taken over rather than blocking the name for
+ * good. Anything else already there is someone's creds file: false.
+ */
+function reserveCredsFile(path: string): boolean {
+  const mark = () => JSON.stringify({ reserving: true, pid: process.pid, at: new Date().toISOString() }) + '\n';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(path, mark(), { flag: 'wx', mode: 0o600 });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    let held: { reserving?: boolean; pid?: number; at?: string } | null = null;
+    try { held = JSON.parse(readFileSync(path, 'utf8')); } catch { return false; }
+    const abandoned =
+      held?.reserving === true &&
+      ((typeof held.pid === 'number' && !pidAlive(held.pid)) ||
+        (typeof held.at === 'string' && Date.now() - Date.parse(held.at) > 10 * 60_000));
+    if (!abandoned) return false;
+    try { unlinkSync(path); } catch { /* raced */ }
+  }
+  return false;
+}
+
 /** Identity switching is ON by default; PORTAL_IDENTITY_SWITCHING=0 (false/no/off)
  *  turns it off for a process. Shared by both entry points. */
 export function identitySwitchingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -277,10 +314,7 @@ export class IdentityManager implements IdentityToolHandler {
     // token. A file we didn't create belongs to someone else — loadOrEnrollCreds
     // would silently ADOPT it, exactly the impersonation this module refuses.
     mkdirSync(this.opts.credsDir, { recursive: true });
-    try {
-      writeFileSync(credsPath, '{}\n', { flag: 'wx', mode: 0o600 });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    if (!reserveCredsFile(credsPath)) {
       throw new Error(
         `a persona file for "${name}" already exists on this host (${basename(credsPath)}) — choose a different name`,
       );
@@ -310,7 +344,16 @@ export class IdentityManager implements IdentityToolHandler {
       credsPath,
       mintedAt: new Date().toISOString(),
     };
-    this.saveRoster();
+    // A roster that can't be written would lose this identity at restart (and
+    // its creds file would then block minting it again) — say so, don't report
+    // success. It stays usable in this process and is saved with the next change.
+    const saved = this.saveRoster();
+    if (!saved.ok) {
+      throw new Error(
+        `minted "${name}" (${creds.personaId}) but could not record it in the identity roster (${saved.error}); ` +
+          'it is usable until restart and will be recorded with the next roster change',
+      );
+    }
     console.error(`[portal-mcpl] minted identity "${name}" (${creds.personaId})`);
 
     if (!thenSwitch) return { minted: { name, personaId: creds.personaId }, active: this.activeName() };
@@ -395,20 +438,22 @@ export class IdentityManager implements IdentityToolHandler {
    *  read-merge-write it at once. A lock older than 10s is taken as stale. */
   private withRosterLock(fn: () => void): void {
     const lock = `${this.opts.rosterPath}.lock`;
-    const deadline = Date.now() + 2000;
+    const deadline = Date.now() + 5000;
     for (;;) {
       try {
         writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        // Abandoned: its holder died (pid gone), or it's older than any save.
         try {
-          if (Date.now() - statSync(lock).mtimeMs > 10_000) {
+          const holder = Number(readFileSync(lock, 'utf8').trim());
+          if ((holder > 0 && !pidAlive(holder)) || Date.now() - statSync(lock).mtimeMs > 10_000) {
             unlinkSync(lock);
             continue;
           }
         } catch {
-          continue; // released between the open and the stat
+          continue; // released between the open and the read
         }
         if (Date.now() > deadline) throw new Error('identity roster is locked by another process');
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
@@ -470,7 +515,7 @@ export class IdentityManager implements IdentityToolHandler {
    *  sharing it has added, so its records aren't dropped by our whole-file
    *  write (it would then be unable to switch to, or re-mint, its identities).
    *  `active` is this process's own. */
-  private saveRoster(): void {
+  private saveRoster(): { ok: true } | { ok: false; error: string } {
     try {
       mkdirSync(dirname(this.opts.rosterPath), { recursive: true });
       this.withRosterLock(() => {
@@ -479,8 +524,10 @@ export class IdentityManager implements IdentityToolHandler {
         writeFileSync(tmp, JSON.stringify(this.roster, null, 2) + '\n', { mode: 0o600 });
         renameSync(tmp, this.opts.rosterPath);
       });
+      return { ok: true };
     } catch (err) {
       console.error('[portal-mcpl] identity roster write failed:', (err as Error).message);
+      return { ok: false, error: (err as Error).message };
     }
   }
 

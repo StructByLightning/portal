@@ -88,8 +88,9 @@ function relayClient(opts: RelayOpts) {
             t.messages++; t.lastAt = m.createdAt; threads.set(m.threadId, t);
           }
           return {
-            channelId: c, messages: un.length, characters: 0, since: watermarks[c], lastAt: un.at(-1)?.createdAt,
-            ...(threads.size ? { threads: [...threads.values()] } : {}),
+            channelId: c, messages: un.length, characters: 0, since: watermarks[c],
+            firstAt: un[0]?.createdAt, lastAt: un.at(-1)?.createdAt,
+            threads: [...threads.values()],
           };
         }
         case 'mark_read': {
@@ -256,8 +257,8 @@ test('a wake delivered after a switch settles the persona it was built for', asy
   assert.equal(rb.marked.length, 0, 'nothing was marked on B');
 });
 
-test('a read position never ends inside a group of messages sharing a timestamp', async () => {
-  // b2 and b3 share a millisecond; the cap shows only up to b2.
+test('a fold never splits a group of messages sharing a timestamp', async () => {
+  // b2 and b3 share a millisecond; the cap has room for b1 and one twin.
   const r = relayClient({
     messages: [msg('b1', B, S(1)), msg('b2', B, S(2)), msg('b3', B, S(2)), msg('b4', B, S(3)), msg('a0', A, S(0))],
     watermarks: { [B]: S(0) },
@@ -265,16 +266,27 @@ test('a read position never ends inside a group of messages sharing a timestamp'
   const h = serverFor(r.client, { cap: 4 }); // trigger + A backfill + 2 of B
   ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
   await h.settle();
-  const shownB = shownIds(h.wakes[0].content).filter((id) => id.startsWith('b'));
-  assert.equal(shownB.length, 2);
-  assert.equal(shownB[0], 'b1');
-  const unshownTwin = shownB[1] === 'b2' ? 'b3' : 'b2'; // same-timestamp order is unspecified
-  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(1), count: 1, since: S(0), keepPings: true },
-    'stops before the shared timestamp, so its unshown twin is not marked read unseen');
+  assert.deepEqual(shownIds(h.wakes[0].content).filter((id) => id.startsWith('b')), ['b1'], 'stops before the pair');
+  assert.deepEqual(r.marked.find((m) => m.channelId === B), { channelId: B, uptoCreatedAt: S(1), count: 1, since: S(0), keepPings: true });
 
   ping(r.client, msg('a10', A, S(10), { content: '@P again' }));
   await h.settle();
-  assert.ok(shownIds(h.wakes[1].content).includes(unshownTwin), 'the twin folds next time');
+  const next = shownIds(h.wakes[1].content).filter((id) => id.startsWith('b'));
+  assert.ok(next.includes('b2') && next.includes('b3'), 'the pair arrives together');
+});
+
+test('a timestamp group bigger than the room left is taken whole, so the fold always progresses', async () => {
+  const r = relayClient({
+    messages: [msg('b1', B, S(1)), msg('b2', B, S(1)), msg('b3', B, S(2))],
+    watermarks: { [B]: S(0) },
+  });
+  const h = serverFor(r.client, { cap: 2 }); // the trigger + one slot
+  for (let i = 0; i < 3; i++) {
+    ping(r.client, msg(`a${i}`, A, S(10 + i), { content: `@P ${i}` }));
+    await h.settle();
+  }
+  const ever = new Set(h.wakes.flatMap((w) => shownIds(w.content)).filter((id) => id.startsWith('b')));
+  assert.deepEqual([...ever].sort(), ['b1', 'b2', 'b3'], 'every message reached the agent');
 });
 
 test("a relay that can't list threads (only names the latest) gets a note, not a fold that would lose replies", async () => {
@@ -284,7 +296,7 @@ test("a relay that can't list threads (only names the latest) gets a note, not a
   Object.assign(r.client, {
     async call(method: string, params: Record<string, unknown>) {
       const res = (await call(method, params)) as Record<string, unknown>;
-      if (method === 'channel_missed' && res.threads) {
+      if (method === 'channel_missed' && Array.isArray(res.threads) && res.threads.length) {
         const { threads, ...rest } = res;
         return { ...rest, threadId: (threads as Array<{ threadId: string }>)[0].threadId };
       }
@@ -296,4 +308,118 @@ test("a relay that can't list threads (only names the latest) gets a note, not a
   await h.settle();
   assert.match(h.wakes[0].content, /missed in #beta — more than a wake folds/);
   assert.equal(r.marked.filter((m) => m.channelId === B).length, 0);
+});
+
+test('a channel never marked read folds only what the relay counted as missed, not its whole history', async () => {
+  const old = Array.from({ length: 300 }, (_, i) => msg(`o${i}`, B, S(i)));
+  const missed = Array.from({ length: 5 }, (_, i) => msg(`n${i}`, B, S(400 + i)));
+  const r = relayClient({ messages: [...old, ...missed] }); // no watermark for B
+  // The relay started tallying at the first missed message.
+  const call = (r.client as unknown as { call: (m: string, p: Record<string, unknown>) => Promise<unknown> }).call.bind(r.client);
+  Object.assign(r.client, {
+    async call(method: string, params: Record<string, unknown>) {
+      if (method === 'list_unread') return { channels: [{ channelId: B, count: 5, lastAt: S(404) }] };
+      if (method === 'channel_missed') return { channelId: B, messages: 5, characters: 0, firstAt: S(400), lastAt: S(404), threads: [] };
+      return call(method, params);
+    },
+  });
+  const h = serverFor(r.client, { cap: 50 });
+  ping(r.client, msg('a9', A, S(500), { content: '@P hi' }));
+  await h.settle();
+  const shownB = shownIds(h.wakes[0].content).filter((id) => /^[on]\d/.test(id));
+  assert.deepEqual(shownB, ['n0', 'n1', 'n2', 'n3', 'n4'], 'the five missed, none of the older history');
+  assert.doesNotMatch(h.wakes[0].content, /more unread message\(s\) in #beta/);
+});
+
+test('a never-read channel from a relay that does not say where counting started gets a note, not a history crawl', async () => {
+  const r = relayClient({ messages: [msg('o1', B, S(1)), msg('n1', B, S(2))] });
+  const call = (r.client as unknown as { call: (m: string, p: Record<string, unknown>) => Promise<unknown> }).call.bind(r.client);
+  Object.assign(r.client, {
+    async call(method: string, params: Record<string, unknown>) {
+      if (method === 'channel_missed') return { channelId: B, messages: 1, characters: 0, lastAt: S(2), threads: [] };
+      return call(method, params);
+    },
+  });
+  const h = serverFor(r.client);
+  ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
+  await h.settle();
+  assert.match(h.wakes[0].content, /missed in #beta — more than a wake folds/);
+  assert.equal(r.marked.filter((m) => m.channelId === B).length, 0);
+});
+
+test('a catch-up marks only the pings it shows; the rest come in the next catch-up', async () => {
+  const pings = Array.from({ length: 5 }, (_, i) => msg(`p${i}`, A, S(i + 1), { content: `@P ${i}` }));
+  const r = relayClient({ messages: [], pings });
+  const h = serverFor(r.client, { cap: 3 });
+  const internal = h.server as unknown as { catchUp(): Promise<void> };
+  await internal.catchUp();
+  await h.settle();
+  const pingsIn = (c: string) => [...c.matchAll(/Bob: @P (\d)/g)].map((m) => `p${m[1]}`);
+  assert.deepEqual(pingsIn(h.wakes[0].content), ['p2', 'p3', 'p4'], 'the newest fit');
+  await internal.catchUp();
+  await h.settle();
+  assert.deepEqual(pingsIn(h.wakes[1].content), ['p0', 'p1'], 'the ones the cap left out are not skipped');
+});
+
+test("a persona's own posts aren't counted toward what a mark covers (the relay never tallied them)", async () => {
+  const mine: PortalMessage = { ...msg('b2', B, S(2)), author: { kind: 'persona', personaId: 'p', displayName: 'P', avatarUrl: '' } };
+  const r = relayClient({ messages: [msg('b1', B, S(1)), mine, msg('b3', B, S(3))], watermarks: { [B]: S(0) } });
+  const h = serverFor(r.client);
+  ping(r.client, msg('a9', A, S(9), { content: '@P hi' }));
+  await h.settle();
+  assert.equal(r.marked.find((m) => m.channelId === B)!.count, 2);
+});
+
+// ── Switch pins (#35 review, notes 9 and 10) ──
+
+test('A→B→A: a ping already surfaced for A is not delivered again when switching back', async () => {
+  const p1 = msg('p1', A, S(1), { content: '@pa one' });
+  const ra = relayClient({ personaId: 'pa', messages: [], pings: [p1] });
+  const rb = relayClient({ personaId: 'pb', messages: [] });
+  const h = serverFor(ra.client);
+  const internal = h.server as unknown as { catchUp(): Promise<void> };
+  await internal.catchUp();
+  await h.settle();
+  assert.equal(h.wakes.length, 1);
+  await h.server.swapSession(rb.client, new PortalAgent(rb.client, { state: new AgentState() }));
+  await h.settle();
+  // Back to A: a fresh session for the same persona; the relay still holds p1.
+  const ra2 = relayClient({ personaId: 'pa', messages: [], pings: [p1] });
+  await h.server.swapSession(ra2.client, new PortalAgent(ra2.client, { state: new AgentState() }));
+  await h.settle();
+  assert.equal(h.wakes.length, 1, "A's ping was delivered once");
+});
+
+test("a catch-up queued for A behind the switch to B is dropped, not run with A's pings while B is active", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const ra = relayClient({ personaId: 'pa', messages: [], pings: [msg('p1', A, S(1), { content: '@pa queued' })], gate });
+  const rb = relayClient({ personaId: 'pb', messages: [] });
+  const h = serverFor(ra.client);
+  ping(ra.client, msg('a0', A, S(0), { content: '@pa first' })); // holds the chain in list_unread
+  await new Promise((r) => setImmediate(r));
+  const swapped = h.server.swapSession(rb.client, new PortalAgent(rb.client, { state: new AgentState() }));
+  ra.client.emit('ready', {} as never); // A's listener is still attached: its catch-up queues after the swap
+  release();
+  await swapped;
+  await h.settle();
+  assert.doesNotMatch(h.wakes.map((w) => w.content).join('\n'), /@pa queued/);
+});
+
+test('an in-flight wake is delivered before a switch it was queued ahead of', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const ra = relayClient({ personaId: 'pa', messages: [], gate });
+  const rb = relayClient({ personaId: 'pb', messages: [] });
+  const h = serverFor(ra.client);
+  const activeAtSend: string[] = [];
+  const internal = h.server as unknown as { conn: unknown; client: { personaId: string } };
+  internal.conn = { sendNotification: () => void activeAtSend.push(internal.client.personaId) };
+  ping(ra.client, msg('a1', A, S(1), { content: '@pa hi' })); // held mid-fold
+  await new Promise((r) => setImmediate(r));
+  const swapped = h.server.swapSession(rb.client, new PortalAgent(rb.client, { state: new AgentState() }));
+  release();
+  await swapped;
+  await h.settle();
+  assert.deepEqual(activeAtSend, ['pa'], "A's wake went out while A was still the active persona");
 });

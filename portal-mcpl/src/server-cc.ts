@@ -250,14 +250,17 @@ export class PortalCcChannelServer {
       const pings = await b.agent.pendingPingsFromRelay();
       const fresh = pings.filter((p) => !b.woken.has(p.message.id));
       if (fresh.length === 0) return;
-      for (const p of fresh) b.woken.add(p.message.id);
       fresh.sort((a, z) => (a.at < z.at ? -1 : a.at > z.at ? 1 : 0));
 
-      const pingIds = new Set(fresh.map((p) => p.message.id));
       const missed = await this.collectMissed(b);
       // Pings first (newest win if even they overflow), then folded backlog in
       // whatever room is left (see planFold).
       const { messages: base, omitted } = this.capped(dedupeById(fresh.map((p) => p.message)));
+      // Only the pings this wake SHOWS count as surfaced. Pings the cap left
+      // out stay eligible: the next catch-up (reconnect, switch back) brings
+      // the next batch rather than skipping them for good.
+      const pingIds = new Set(base.map((m) => m.id));
+      for (const id of pingIds) b.woken.add(id);
       const all = this.planFold(missed, base);
 
       const lines = [`[catch-up] ${fresh.length} message(s) addressed to you while you were away` +
@@ -337,6 +340,14 @@ export class PortalCcChannelServer {
         if (!upto) continue;
         const since = [missed.since, b.seen.get(u.channelId)].filter((w): w is string => !!w).sort().pop();
         if (since && since >= upto) continue; // everything unread was already shown
+        // Never marked read: the lower bound is where the relay started
+        // counting (older history was never unread). Without it — an older
+        // relay — the channel's whole history would page first; note instead.
+        const floor = since ?? (missed.firstAt ? justBefore(missed.firstAt) : undefined);
+        if (!floor) {
+          out.push({ channelId: u.channelId, unseen: [], messages: [], tooMany: missed.messages });
+          continue;
+        }
         // Too much to page safely, or thread replies we can't enumerate: a relay
         // that predates per-thread tallies names only its LATEST thread, so
         // folding would mark the other threads' replies read unseen.
@@ -347,10 +358,11 @@ export class PortalCcChannelServer {
         }
         // The channel's own history, then each thread with replies past `since`.
         const threads = missed.threads ?? [];
-        const pages: Array<PortalMessage[] | null> = [await this.pageBack(b, u.channelId, undefined, since, upto)];
+        const pages: Array<PortalMessage[] | null> = [await this.pageBack(b, u.channelId, undefined, floor, upto)];
         for (const th of threads) {
-          if (since && th.lastAt <= since) continue;
-          pages.push(await this.pageBack(b, u.channelId, th.threadId, since, upto));
+          if (th.lastAt <= floor) continue;
+          const threadFloor = since ?? (th.firstAt ? justBefore(th.firstAt) : floor);
+          pages.push(await this.pageBack(b, u.channelId, th.threadId, threadFloor, upto));
         }
         const unseen = pages.includes(null)
           ? null
@@ -417,8 +429,20 @@ export class PortalCcChannelServer {
     for (const f of folded) {
       if (f.tooMany !== undefined) continue;
       const candidates = f.unseen.filter((m) => !baseIds.has(m.id));
-      f.messages = candidates.slice(0, left);
-      left -= f.messages.length;
+      let take = Math.min(left, candidates.length);
+      // Never cut inside a group of messages sharing a timestamp — a read
+      // position can't fall between them. Back off to before the group; if
+      // that leaves nothing at all, take the whole group, over the cap, so the
+      // fold always makes progress.
+      if (take > 0 && take < candidates.length && candidates[take].createdAt === candidates[take - 1].createdAt) {
+        const at = candidates[take].createdAt;
+        let back = take;
+        while (back > 0 && candidates[back - 1].createdAt === at) back--;
+        if (back > 0) take = back;
+        else while (take < candidates.length && candidates[take].createdAt === at) take++;
+      }
+      f.messages = candidates.slice(0, take);
+      left = Math.max(0, left - take);
       taken.push(...f.messages);
     }
     return [...base, ...taken].sort(byCreatedAt);
@@ -484,7 +508,9 @@ export class PortalCcChannelServer {
       while (run > 0 && run < f.unseen.length && f.unseen[run].createdAt === f.unseen[run - 1].createdAt) run--;
       if (run === 0) continue;
       let upto = f.unseen[run - 1].createdAt;
-      let count = run;
+      // The relay doesn't tally this persona's own posts, but history has them.
+      const own = (m: PortalMessage) => m.author.kind === 'persona' && m.author.personaId === b.client.personaId;
+      let count = f.unseen.slice(0, run).filter((m) => !own(m)).length;
       if (run === f.unseen.length) {
         // The whole backlog was shown: newer live messages shown in this
         // channel are seen too — up to (not including) the oldest live message
@@ -495,7 +521,7 @@ export class PortalCcChannelServer {
           if (m.channelId !== f.channelId || unseenIds.has(m.id) || m.createdAt <= upto) continue;
           if (stop !== undefined && m.createdAt >= stop) break;
           upto = m.createdAt;
-          count++;
+          if (!own(m)) count++;
         }
       }
       const prev = b.seen.get(f.channelId);
@@ -707,6 +733,11 @@ const FOLD_BOUND = 500;
 function sinceCursor(iso: string): string {
   const ms = Date.parse(iso);
   return ((BigInt(ms) - 1420070400000n) << 22n).toString();
+}
+
+/** One millisecond before `iso`: an exclusive bound that still includes `iso`. */
+function justBefore(iso: string): string {
+  return new Date(Date.parse(iso) - 1).toISOString();
 }
 
 function byCreatedAt(a: PortalMessage, b: PortalMessage): number {
