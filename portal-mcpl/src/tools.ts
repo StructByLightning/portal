@@ -22,7 +22,7 @@ const FILES_PROP = {
     'an object with exactly one of `path` / `url` / `bytes`. Paths are read and ' +
     'URLs fetched HERE on your host and uploaded for you — you never need to ' +
     'base64 anything yourself. Local paths work only under the directories the ' +
-    'server allows (PORTAL_FILE_ROOTS; none by default). `name` defaults to the file/URL basename; ' +
+    'server allows (by default the working directory, the Claude Code project and its scratchpads). `name` defaults to the file/URL basename; ' +
     '`contentType` is inferred from the extension. (The discord-mcpl surface ' +
     'takes host paths only.)',
   items: {

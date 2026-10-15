@@ -16,11 +16,30 @@ writeFileSync(join(dir, 'notes.txt'), 'hello');
 /** Local paths are opt-in: these tests allow the fixture dir. */
 const inDir = { allowedRoots: [dir] };
 
-test('local paths are refused unless roots are configured (before touching the filesystem)', async () => {
+test('the resolver itself refuses local paths with no roots (before touching the filesystem)', async () => {
   await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')]), /local file paths are off/);
   await assert.rejects(resolveOutgoingFiles([{ path: '/etc/definitely-not-a-file-xyz' }]), /local file paths are off/);
   await assert.rejects(resolveOutgoingFiles([join(dir, 'dot.png')], { allowedRoots: [] }), /local file paths are off/);
-  assert.equal(fileOptionsFromEnv({}).allowedRoots, undefined);
+});
+
+test('default roots: the working dir, the Claude Code project and scratchpads — never ~ or /', () => {
+  const where = { cwd: '/work/resident', home: '/Users/me', uid: 501 };
+  assert.deepEqual(fileOptionsFromEnv({}, where).allowedRoots, ['/work/resident', '/private/tmp/claude-501', '/tmp/claude-501']);
+  assert.deepEqual(
+    fileOptionsFromEnv({ CLAUDE_PROJECT_DIR: '/code/project' }, where).allowedRoots,
+    ['/code/project', '/work/resident', '/private/tmp/claude-501', '/tmp/claude-501'],
+  );
+  // Started from home (launchd) or /: that default is dropped, not widened to everything.
+  assert.deepEqual(fileOptionsFromEnv({}, { ...where, cwd: '/Users/me' }).allowedRoots, ['/private/tmp/claude-501', '/tmp/claude-501']);
+  assert.deepEqual(fileOptionsFromEnv({}, { ...where, cwd: '/', uid: null }).allowedRoots ?? [], []);
+  // Explicit settings win; "off" refuses local paths.
+  assert.deepEqual(fileOptionsFromEnv({ PORTAL_FILE_ROOTS: '/only/here' }, where).allowedRoots, ['/only/here']);
+  assert.deepEqual(fileOptionsFromEnv({ PORTAL_FILE_ROOTS: 'off' }, where).allowedRoots ?? [], [], 'off: no roots, so local paths are refused');
+});
+
+test('with the default roots, a file in the working directory attaches', async () => {
+  const out = await resolveOutgoingFiles([join(dir, 'dot.png')], fileOptionsFromEnv({}, { cwd: dir, home: '/nowhere', uid: null }));
+  assert.equal(out![0].name, 'dot.png');
 });
 
 test('bare path string → bytes with inferred name + mime', async () => {
@@ -89,7 +108,7 @@ test('empty/null files → undefined', async () => {
 });
 
 test('fileOptionsFromEnv', () => {
-  assert.deepEqual(fileOptionsFromEnv({}), {});
+  assert.deepEqual(fileOptionsFromEnv({}, { cwd: '/', home: '/', uid: null }), {});
   assert.deepEqual(
     fileOptionsFromEnv({ PORTAL_FILE_ROOTS: '/a, /b', PORTAL_MAX_FILE_BYTES: '1024', PORTAL_ALLOW_URL_FILES: 'false' }),
     { allowedRoots: ['/a', '/b'], maxTotalBytes: 1024, allowUrls: false },
@@ -184,7 +203,7 @@ test('url: a body with no Content-Length is cut off at the budget, not buffered 
 });
 
 test('fileOptionsFromEnv: private URLs opt-in', () => {
-  assert.deepEqual(fileOptionsFromEnv({ PORTAL_ALLOW_PRIVATE_URLS: 'true' }), { allowPrivateUrls: true });
+  assert.deepEqual(fileOptionsFromEnv({ PORTAL_ALLOW_PRIVATE_URLS: 'true', PORTAL_FILE_ROOTS: 'off' }), { allowPrivateUrls: true });
 });
 
 test('a denied path never says where it resolves', async () => {
