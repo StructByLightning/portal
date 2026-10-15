@@ -35,8 +35,8 @@
  * The relay must be reachable at PORTAL_URL.
  *
  * Runtime identities (on by default; PORTAL_IDENTITY_SWITCHING=0 disables): the
- * `portal.identity` feature set — list_identities / mint_identity /
- * switch_identity — lets the resident mint personas (with PORTAL_INVITE or an
+ * `portal.identity` feature set — list_personas / mint_persona /
+ * switch_persona — lets the resident mint personas (with PORTAL_INVITE or an
  * invite passed to the tool) and switch between them WITHOUT a restart. The
  * roster lives at PORTAL_IDENTITIES (default <creds-dir>/<name>.identities.json)
  * and remembers the active identity across restarts; PORTAL_IDENTITY_MAX caps

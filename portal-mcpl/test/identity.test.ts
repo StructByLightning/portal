@@ -67,12 +67,12 @@ function harness(opts: { connect?: (creds: PortalCredentials) => Promise<unknown
 
 test('mint creates a 0600 creds file, switches by default, and never returns a token', async () => {
   const h = harness({ invite: 'inv' });
-  const out = await h.manager.handleToolCall('mint_identity', { name: 'Night Shift' });
+  const out = await h.manager.handleToolCall('mint_persona', { name: 'Night Shift' });
   assert.deepEqual(h.swaps, ['p_1']);
   assert.equal(h.rootSession.closed, true, 'old session retired after a successful switch');
   const credsPath = join(h.dir, 'night-shift.creds.json');
   assert.equal(statSync(credsPath).mode & 0o777, 0o600);
-  const listed = await h.manager.handleToolCall('list_identities', {});
+  const listed = await h.manager.handleToolCall('list_personas', {});
   for (const result of [out, listed]) assert.doesNotMatch(JSON.stringify(result), /SECRET|tok_/);
   assert.equal((listed as { active: string }).active, 'Night Shift');
   // The roster holds paths and ids — never tokens.
@@ -81,14 +81,14 @@ test('mint creates a 0600 creds file, switches by default, and never returns a t
 
 test('a minted name must be unique on the relay (the model picked it)', async () => {
   const h = harness({ invite: 'inv' });
-  await h.manager.handleToolCall('mint_identity', { name: 'Night Shift' });
+  await h.manager.handleToolCall('mint_persona', { name: 'Night Shift' });
   assert.deepEqual(h.enrolls, [{ desiredName: 'Night Shift', uniqueName: true }]);
 });
 
 test('mint refuses to adopt a creds file it did not write', async () => {
   const h = harness({ invite: 'inv' });
   writeFileSync(join(h.dir, 'lena46.creds.json'), JSON.stringify({ personaId: 'p_lena', token: 'someone-elses' }));
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Lena46' }), /already exists on this host/);
+  await assert.rejects(h.manager.handleToolCall('mint_persona', { name: 'Lena46' }), /already exists on this host/);
   assert.deepEqual(h.swaps, []);
   assert.match(readFileSync(join(h.dir, 'lena46.creds.json'), 'utf8'), /someone-elses/, 'the existing file is untouched');
 });
@@ -97,8 +97,8 @@ test('two processes minting names that slug alike: one wins, the other is refuse
   const h = harness({ invite: 'inv' });
   const other = h.make(); // a second process sharing the credentials directory
   const results = await Promise.allSettled([
-    h.manager.handleToolCall('mint_identity', { name: 'Écho', switch: false }),
-    other.handleToolCall('mint_identity', { name: 'Cho', switch: false }),
+    h.manager.handleToolCall('mint_persona', { name: 'Écho', switch: false }),
+    other.handleToolCall('mint_persona', { name: 'Cho', switch: false }),
   ]);
   assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
   const rejected = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
@@ -116,24 +116,24 @@ test('a failed enrollment releases the reserved creds file', async () => {
     createSession: () => { throw new Error('unused'); },
     enroll: async () => { throw new Error('enroll rejected: name "Night" reads like a server member\'s name'); },
   });
-  await assert.rejects(manager.handleToolCall('mint_identity', { name: 'Night', switch: false }), /reads like a server member/);
+  await assert.rejects(manager.handleToolCall('mint_persona', { name: 'Night', switch: false }), /reads like a server member/);
   assert.equal(existsSync(join(h.dir, 'night.creds.json')), false);
 });
 
 test('switching is limited to the roster', async () => {
   const h = harness({ invite: 'inv' });
   writeFileSync(join(h.dir, 'spawner.creds.json'), JSON.stringify({ personaId: 'p_spawner', token: 'x' }));
-  await assert.rejects(h.manager.handleToolCall('switch_identity', { name: 'spawner' }), /no identity "spawner"/);
-  await assert.rejects(h.manager.handleToolCall('switch_identity', { name: 'p_spawner' }), /no identity/);
+  await assert.rejects(h.manager.handleToolCall('switch_persona', { name: 'spawner' }), /no persona "spawner"/);
+  await assert.rejects(h.manager.handleToolCall('switch_persona', { name: 'p_spawner' }), /no persona/);
 });
 
 test('a failed connect leaves the old identity live and closes the attempt', async () => {
   let fail = false;
   const h = harness({ invite: 'inv', connect: () => (fail ? new Promise(() => {}) : Promise.resolve({})) });
-  await h.manager.handleToolCall('mint_identity', { name: 'Alt', switch: false });
+  await h.manager.handleToolCall('mint_persona', { name: 'Alt', switch: false });
   assert.deepEqual(h.swaps, []);
   fail = true;
-  await assert.rejects(h.manager.handleToolCall('switch_identity', { name: 'alt' }), /could not connect.*still Root/);
+  await assert.rejects(h.manager.handleToolCall('switch_persona', { name: 'alt' }), /could not connect.*still Root/);
   assert.deepEqual(h.swaps, []);
   assert.equal(h.rootSession.closed, false);
   assert.equal(h.sessions.at(-1)!.closed, true, 'the abandoned session must stop reconnecting');
@@ -143,35 +143,35 @@ test('a failed connect leaves the old identity live and closes the attempt', asy
 test('the server refusing the swap leaves the old session live and the roster unchanged', async () => {
   let refuse = false;
   const h = harness({ invite: 'inv', onSwitch: async () => { if (refuse) throw new Error('host said no'); } });
-  await h.manager.handleToolCall('mint_identity', { name: 'Alt', switch: false });
+  await h.manager.handleToolCall('mint_persona', { name: 'Alt', switch: false });
   refuse = true;
-  await assert.rejects(h.manager.handleToolCall('switch_identity', { name: 'alt' }), /switch to "Alt" failed: host said no — still Root/);
+  await assert.rejects(h.manager.handleToolCall('switch_persona', { name: 'alt' }), /switch to "Alt" failed: host said no — still Root/);
   assert.equal(h.manager.session, h.rootSession, 'still serving the old session');
   assert.equal(h.rootSession.closed, false, 'old socket still open');
   assert.equal(h.sessions.at(-1)!.closed, true, 'the refused session was torn down');
   assert.equal(h.make().startupCreds().personaId, 'p_root', 'roster still names root as active');
   refuse = false;
-  await h.manager.handleToolCall('switch_identity', { name: 'alt' });
+  await h.manager.handleToolCall('switch_persona', { name: 'alt' });
   assert.equal(h.make().startupCreds().personaId, 'p_1');
 });
 
 test('no invite → mint fails cleanly; limit is enforced', async () => {
-  await assert.rejects(harness().manager.handleToolCall('mint_identity', { name: 'A' }), /no invite available/);
+  await assert.rejects(harness().manager.handleToolCall('mint_persona', { name: 'A' }), /no invite available/);
   const h = harness({ invite: 'inv', max: 2 });
-  await h.manager.handleToolCall('mint_identity', { name: 'A', switch: false });
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'B', switch: false }), /identity limit/);
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'a' }), /already have an identity/);
+  await h.manager.handleToolCall('mint_persona', { name: 'A', switch: false });
+  await assert.rejects(h.manager.handleToolCall('mint_persona', { name: 'B', switch: false }), /persona limit/);
+  await assert.rejects(h.manager.handleToolCall('mint_persona', { name: 'a' }), /already have a persona/);
 });
 
 test('the active identity survives a restart; a broken entry falls back to root', async () => {
   const h = harness({ invite: 'inv' });
-  await h.manager.handleToolCall('mint_identity', { name: 'Alt' });
+  await h.manager.handleToolCall('mint_persona', { name: 'Alt' });
   assert.equal(h.make().startupCreds().personaId, 'p_1');
   // Switch back to root by persona id, then restart.
-  await h.manager.handleToolCall('switch_identity', { name: 'p_root' });
+  await h.manager.handleToolCall('switch_persona', { name: 'p_root' });
   assert.equal(h.make().startupCreds().personaId, 'p_root');
   // Creds replaced underneath us → not the identity we minted → root.
-  await h.manager.handleToolCall('switch_identity', { name: 'Alt' });
+  await h.manager.handleToolCall('switch_persona', { name: 'Alt' });
   writeFileSync(join(h.dir, 'alt.creds.json'), JSON.stringify({ personaId: 'p_other', token: 'x' }));
   assert.equal(h.make().startupCreds().personaId, 'p_root');
   assert.ok(existsSync(join(h.dir, 'root.identities.json')));
@@ -245,7 +245,7 @@ test('swapSession drops every channel: retracts the old set, registers the new v
   internal.initialRegistrationComplete = true;
   internal.openChannels.add('100').add('200');
 
-  assert.ok(internal.availableTools().some((t) => t.name === 'switch_identity'));
+  assert.ok(internal.availableTools().some((t) => t.name === 'switch_persona'));
 
   await server.swapSession(
     newClient,
@@ -279,7 +279,7 @@ test('identity tools are absent — and undeclared — unless a manager is attac
     availableTools(): Array<{ name: string }>;
     declared: Record<string, unknown>;
   };
-  assert.equal(internal.availableTools().some((t) => t.name === 'mint_identity'), false);
+  assert.equal(internal.availableTools().some((t) => t.name === 'mint_persona'), false);
   assert.equal('portal.identity' in internal.declared, false);
 });
 
@@ -324,8 +324,8 @@ test('CC swapSession drops the old follows (the new identity keeps its own), and
   internal.wireClient();
 
   await internal.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-  assert.ok(sent[0].result.tools!.some((t) => t.name === 'mint_identity'));
-  await internal.handleRequest({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_identities' } });
+  assert.ok(sent[0].result.tools!.some((t) => t.name === 'mint_persona'));
+  await internal.handleRequest({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list_personas' } });
   assert.match(sent[1].result.content![0].text, /identity/);
 
   await server.swapSession(newClient, new PortalAgent(newClient, { state: newState }));
@@ -360,7 +360,7 @@ test('CC binding exposes no identity tools unless a manager is attached', async 
   const internal = server as unknown as { conn: unknown; handleRequest(req: unknown): Promise<void> };
   internal.conn = { sendResponse: (_id: unknown, result: never) => void sent.push(result) };
   await internal.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
-  assert.equal(sent[0].tools.some((t) => t.name === 'switch_identity'), false);
+  assert.equal(sent[0].tools.some((t) => t.name === 'switch_persona'), false);
 });
 
 test('identity switching is on by default and off only on an explicit 0/false/no/off', async () => {
@@ -388,11 +388,11 @@ test('the subscription seed is handed out once per process (a switch back to roo
 test('two processes sharing a roster both keep their minted identities', async () => {
   const h = harness({ invite: 'inv' });
   const other = h.make();
-  await h.manager.handleToolCall('mint_identity', { name: 'Morning', switch: false });
-  await other.handleToolCall('mint_identity', { name: 'Evening', switch: false });
-  const names = (r: unknown) => (r as { identities: Array<{ name: string }> }).identities.map((i) => i.name).sort();
+  await h.manager.handleToolCall('mint_persona', { name: 'Morning', switch: false });
+  await other.handleToolCall('mint_persona', { name: 'Evening', switch: false });
+  const names = (r: unknown) => (r as { personas: Array<{ name: string }> }).personas.map((i) => i.name).sort();
   // After a restart, both are there.
-  assert.deepEqual(names(await h.make().handleToolCall('list_identities', {})), ['Evening', 'Morning', 'Root']);
+  assert.deepEqual(names(await h.make().handleToolCall('list_personas', {})), ['Evening', 'Morning', 'Root']);
   // And the first process can find the second's without restarting.
   const found = (h.manager as unknown as { find(n: string): unknown }).find('Evening');
   assert.ok(found, "the other process's identity is visible");
@@ -567,19 +567,19 @@ test('a roster lock left by a dead process is recovered at once, and the mint is
   const h = harness({ invite: 'inv' });
   writeFileSync(join(h.dir, 'root.identities.json.lock'), '999999'); // no such process
   const t0 = Date.now();
-  await h.manager.handleToolCall('mint_identity', { name: 'After Crash', switch: false });
+  await h.manager.handleToolCall('mint_persona', { name: 'After Crash', switch: false });
   assert.ok(Date.now() - t0 < 1000, 'did not wait out a dead holder');
-  const listed = await h.make().handleToolCall('list_identities', {});
-  assert.ok((listed as { identities: Array<{ name: string }> }).identities.some((i) => i.name === 'After Crash'));
+  const listed = await h.make().handleToolCall('list_personas', {});
+  assert.ok((listed as { personas: Array<{ name: string }> }).personas.some((i) => i.name === 'After Crash'));
 });
 
 test("a creds reservation left by a process that died mid-mint doesn't block the name; a live one does", async () => {
   const h = harness({ invite: 'inv' });
   writeFileSync(join(h.dir, 'orphan.creds.json'), JSON.stringify({ reserving: true, pid: 999999, at: new Date().toISOString() }));
-  await h.manager.handleToolCall('mint_identity', { name: 'Orphan', switch: false });
+  await h.manager.handleToolCall('mint_persona', { name: 'Orphan', switch: false });
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'orphan.creds.json'), 'utf8')).personaId, 'p_1');
   writeFileSync(join(h.dir, 'busy.creds.json'), JSON.stringify({ reserving: true, pid: process.pid, at: new Date().toISOString() }));
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Busy', switch: false }), /already exists on this host/);
+  await assert.rejects(h.manager.handleToolCall('mint_persona', { name: 'Busy', switch: false }), /already exists on this host/);
 });
 
 test('taking over an abandoned reservation is exclusive: not while another process holds the mint lock', async () => {
@@ -588,11 +588,11 @@ test('taking over an abandoned reservation is exclusive: not while another proce
   // Another live process (this one, as far as the lock can tell) is mid-takeover:
   // the mint waits for it rather than take over the same reservation too.
   writeFileSync(join(h.dir, '.mint.lock'), String(process.pid));
-  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Contested', switch: false }), /locked by another process/);
+  await assert.rejects(h.manager.handleToolCall('mint_persona', { name: 'Contested', switch: false }), /locked by another process/);
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'contested.creds.json'), 'utf8')).reserving, true, 'untouched while locked');
   // Once it lets go, the takeover goes through — once.
   rmSync(join(h.dir, '.mint.lock'));
-  await h.manager.handleToolCall('mint_identity', { name: 'Contested', switch: false });
+  await h.manager.handleToolCall('mint_persona', { name: 'Contested', switch: false });
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'contested.creds.json'), 'utf8')).personaId, 'p_1');
 });
 
@@ -619,4 +619,14 @@ test("MCPL: a register reply that lands after the switch retires the OLD persona
   // that offer, by design — the host owns the open state from then on).
   const offered = h.notifications.flatMap((n) => (n.params.added as Array<{ id: string; initiallyOpen?: boolean }> | undefined) ?? []);
   assert.equal(offered.find((d) => d.id === 'portal:100')?.initiallyOpen, true, "the new persona's hint reaches its offer");
+});
+
+test('the pre-rename tool names still work, but only the persona names are advertised', async () => {
+  const h = harness({ invite: 'inv' });
+  await h.manager.handleToolCall('mint_identity', { name: 'Old Name Path', switch: false });
+  const listed = (await h.manager.handleToolCall('list_identities', {})) as { personas: Array<{ name: string }> };
+  assert.ok(listed.personas.some((p) => p.name === 'Old Name Path'));
+  const { identityToolDefinitions, IDENTITY_TOOL_FEATURE_SETS } = await import('../src/identity.js');
+  assert.deepEqual(identityToolDefinitions.map((t) => t.name), ['list_personas', 'mint_persona', 'switch_persona']);
+  for (const legacy of ['list_identities', 'mint_identity', 'switch_identity']) assert.ok(legacy in IDENTITY_TOOL_FEATURE_SETS, legacy);
 });

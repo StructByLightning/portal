@@ -441,6 +441,7 @@ export class AdminServer {
       out.push({
         id: p.id,
         displayName: p.displayName,
+        avatarUrl: this.deps.identity.avatarUrl(p),
         roles: entry?.roles ?? [],
         hasOverride: !!entry?.policy?.guilds?.[guildId],
       });

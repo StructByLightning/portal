@@ -184,6 +184,8 @@ export interface IdentityToolHandler {
   handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown>;
 }
 
+/** The MCPL feature set name is a wire contract hosts grant by, so it keeps
+ *  its original name even though the tools now speak of personas. */
 export const IDENTITY_FEATURE_SET = 'portal.identity';
 
 /** Declared only by servers that actually have identity switching attached —
@@ -203,20 +205,26 @@ export const identityFeatureSets: Readonly<Record<string, PortalFeatureSet>> = {
  *  base surface; the class is stamped here instead. */
 const CONTROL = { [TOOL_CLASS_META_KEY]: ['control'] };
 
+/**
+ * The persona tools. Portal has one kind of speaker — a persona — and these
+ * tools manage the personas this process holds credentials for. (They were
+ * `*_identity` until 2026-10-15; those names are still accepted, see
+ * LEGACY_TOOL_NAMES, but no longer advertised.)
+ */
 export const identityToolDefinitions: ToolDefinition[] = [
   {
-    name: 'list_identities',
+    name: 'list_personas',
     _meta: CONTROL,
     description:
-      'List the portal identities (personas) available to you — the one you started as plus any ' +
-      'you minted — and which one is active right now.',
+      'List the portal personas you can act as — the one you started as plus any you minted — ' +
+      'and which one is active right now.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'mint_identity',
+    name: 'mint_persona',
     _meta: CONTROL,
     description:
-      'Create a NEW portal persona with the given display name and add it to your identities. ' +
+      'Create a NEW portal persona with the given display name and add it to the personas you can act as. ' +
       'By default you switch to it immediately; pass switch=false to only create it. The new ' +
       "persona's channel access is whatever the invite grants, which may differ from your current one.",
     inputSchema: {
@@ -227,30 +235,43 @@ export const identityToolDefinitions: ToolDefinition[] = [
           type: 'string',
           description: 'Invite code to enroll with. Omit to use the one this server was configured with.',
         },
-        switch: { type: 'boolean', description: 'Switch to the new identity after minting (default true)' },
+        switch: { type: 'boolean', description: 'Switch to the new persona after minting (default true)' },
       },
       required: ['name'],
     },
   },
   {
-    name: 'switch_identity',
+    name: 'switch_persona',
     _meta: CONTROL,
     description:
-      'Switch which of your identities you act as. Takes effect immediately and persists across ' +
+      'Switch which of your personas you act as. Takes effect immediately and persists across ' +
       'restarts. Everything you send afterwards is attributed to the new persona; channels it ' +
       'cannot see are closed, and pings it accrued while inactive are delivered as a catch-up.',
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Name (or persona id) of an identity from list_identities' },
+        name: { type: 'string', description: 'Name (or persona id) of a persona from list_personas' },
       },
       required: ['name'],
     },
   },
 ];
 
+/** The pre-2026-10-15 tool names, still accepted (agents learned them), never
+ *  advertised. */
+export const LEGACY_TOOL_NAMES: Readonly<Record<string, string>> = {
+  list_identities: 'list_personas',
+  mint_identity: 'mint_persona',
+  switch_identity: 'switch_persona',
+};
+
+/** Every name a persona tool answers to (current and legacy) → its feature
+ *  set; both bindings route tool calls through this. */
 export const IDENTITY_TOOL_FEATURE_SETS: Readonly<Record<string, string>> = Object.fromEntries(
-  identityToolDefinitions.map((tool) => [tool.name, IDENTITY_FEATURE_SET]),
+  [...identityToolDefinitions.map((tool) => tool.name), ...Object.keys(LEGACY_TOOL_NAMES)].map((name) => [
+    name,
+    IDENTITY_FEATURE_SET,
+  ]),
 );
 
 export class IdentityManager implements IdentityToolHandler {
@@ -307,17 +328,17 @@ export class IdentityManager implements IdentityToolHandler {
   }
 
   async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
-    switch (name) {
-      case 'list_identities':
+    switch (LEGACY_TOOL_NAMES[name] ?? name) {
+      case 'list_personas':
         return this.describe();
-      case 'mint_identity':
+      case 'mint_persona':
         return this.exclusive(() =>
           this.mint(reqStr(args.name, 'name'), optStr(args.invite), args.switch !== false),
         );
-      case 'switch_identity':
+      case 'switch_persona':
         return this.exclusive(() => this.switchTo(reqStr(args.name, 'name')));
       default:
-        throw new Error(`unknown identity tool ${name}`);
+        throw new Error(`unknown persona tool ${name}`);
     }
   }
 
@@ -326,7 +347,7 @@ export class IdentityManager implements IdentityToolHandler {
   private describe(): unknown {
     return {
       active: this.roster.identities[this.roster.active]?.name ?? this.roster.active,
-      identities: Object.entries(this.roster.identities).map(([key, record]) => ({
+      personas: Object.entries(this.roster.identities).map(([key, record]) => ({
         name: record.name,
         personaId: record.personaId,
         active: key === this.roster.active,
@@ -343,10 +364,10 @@ export class IdentityManager implements IdentityToolHandler {
     const key = slugName(name);
     this.refreshRoster();
     if (this.roster.identities[key]) {
-      throw new Error(`you already have an identity named "${this.roster.identities[key].name}" — switch to it instead`);
+      throw new Error(`you already have a persona named "${this.roster.identities[key].name}" — switch to it instead`);
     }
     if (Object.keys(this.roster.identities).length >= this.maxIdentities) {
-      throw new Error(`identity limit reached (${this.maxIdentities}); ask an operator to raise PORTAL_IDENTITY_MAX`);
+      throw new Error(`persona limit reached (${this.maxIdentities}); ask an operator to raise PORTAL_IDENTITY_MAX`);
     }
     const code = invite ?? this.opts.invite;
     if (!code) throw new Error('no invite available — pass `invite`, or configure PORTAL_INVITE');
@@ -408,17 +429,17 @@ export class IdentityManager implements IdentityToolHandler {
     const found = this.find(nameOrId);
     if (!found) {
       const known = Object.values(this.roster.identities).map((r) => r.name).join(', ');
-      throw new Error(`no identity "${nameOrId}" — you have: ${known}`);
+      throw new Error(`no persona "${nameOrId}" — you have: ${known}`);
     }
     const [key, record] = found;
-    if (!this.current || !this.onSwitch) throw new Error('identity switching is not attached to a live session');
+    if (!this.current || !this.onSwitch) throw new Error('persona switching is not attached to a live session');
     if (this.current.creds.personaId === record.personaId) {
       return { active: record.name, personaId: record.personaId, changed: false };
     }
 
     const next = this.opts.createSession(this.loadCreds(record));
     try {
-      await withTimeout(next.client.connect(), this.connectTimeoutMs, 'relay did not accept the identity in time');
+      await withTimeout(next.client.connect(), this.connectTimeoutMs, 'relay did not accept the persona in time');
     } catch (err) {
       next.close(); // also stops the client's reconnect loop
       throw new Error(`could not connect as "${record.name}": ${(err as Error).message} — still ${this.activeName()}`);

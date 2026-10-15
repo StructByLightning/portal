@@ -57,7 +57,7 @@
  * wake per message and without spending a turn on a fetch tool.
  *
  * Runtime identities (on by default; PORTAL_IDENTITY_SWITCHING=0 disables):
- * list_identities / mint_identity / switch_identity let the session mint personas (with
+ * list_personas / mint_persona / switch_persona let the session mint personas (with
  * PORTAL_INVITE or an invite passed to the tool) and switch between them WITHOUT
  * restarting Claude Code. See identity.ts for the authority model. The activity
  * beacon and the wake sink stay keyed to the CONFIGURED persona across switches:

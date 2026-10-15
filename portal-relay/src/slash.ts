@@ -108,8 +108,8 @@ export interface SlashCommandDef {
   options: SlashOptionDef[];
 }
 
-const IDENTITY = (description: string): SlashOptionDef => ({
-  name: 'identity',
+const PERSONA = (description: string): SlashOptionDef => ({
+  name: 'persona',
   description,
   required: true,
   autocomplete: true,
@@ -118,9 +118,9 @@ const IDENTITY = (description: string): SlashOptionDef => ({
 export const SLASH_COMMANDS: SlashCommandDef[] = [
   {
     name: 'add',
-    description: 'Grant an identity access to this channel',
+    description: 'Grant a persona access to this channel',
     options: [
-      IDENTITY('Persona to grant access to'),
+      PERSONA('Persona to grant access to'),
       {
         name: 'level',
         description: 'read = view+history; write = +send/react/attach; full = +manage (default)',
@@ -130,8 +130,8 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   },
   {
     name: 'remove',
-    description: 'Remove an identity’s direct grant for this channel',
-    options: [IDENTITY('Persona to remove from this channel')],
+    description: 'Remove a persona’s direct grant for this channel',
+    options: [PERSONA('Persona to remove from this channel')],
   },
   {
     name: 'list',
@@ -140,17 +140,17 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   },
   {
     name: 'add-role',
-    description: 'Assign a portal access role to an identity',
+    description: 'Assign a portal access role to a persona',
     options: [
-      IDENTITY('Persona to assign the role to'),
+      PERSONA('Persona to assign the role to'),
       { name: 'role', description: 'Access role from the catalog', required: true, autocomplete: true },
     ],
   },
   {
     name: 'remove-role',
-    description: 'Remove a portal access role from an identity',
+    description: 'Remove a portal access role from a persona',
     options: [
-      IDENTITY('Persona to remove the role from'),
+      PERSONA('Persona to remove the role from'),
       { name: 'role', description: 'Access role the persona holds', required: true, autocomplete: true },
     ],
   },
@@ -171,18 +171,18 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
   },
   {
     name: 'ban',
-    description: 'Strip an identity’s access in this guild (roles + direct grants)',
-    options: [IDENTITY('Persona to strip of all access in this guild')],
+    description: 'Strip a persona’s access in this guild (roles + direct grants)',
+    options: [PERSONA('Persona to strip of all access in this guild')],
   },
   {
     name: 'caps',
-    description: 'Show an identity’s effective capabilities in this channel, and why',
-    options: [IDENTITY('Persona to inspect')],
+    description: 'Show a persona’s effective capabilities in this channel, and why',
+    options: [PERSONA('Persona to inspect')],
   },
   {
     name: 'resync',
-    description: 'Re-push the full channel/rights set to a connected identity',
-    options: [IDENTITY('Persona to resync')],
+    description: 'Re-push the full channel/rights set to a connected persona',
+    options: [PERSONA('Persona to resync')],
   },
 ];
 
@@ -255,7 +255,7 @@ export class SlashHandler {
         default: return `Unknown command: ${inv.command}`;
       }
     } catch (err) {
-      this.audit(inv, `slash.${inv.command}`, inv.options.identity, false, {
+      this.audit(inv, `slash.${inv.command}`, inv.options.persona, false, {
         error: (err as Error).message,
       });
       return `Failed: ${(err as Error).message}`;
@@ -303,11 +303,11 @@ export class SlashHandler {
     });
   }
 
-  /** Resolve the identity option or produce the error reply. */
+  /** Resolve the persona option or produce the error reply. */
   private target(inv: SlashInvocation): PersonaIdentity | string {
-    const id = inv.options.identity ?? '';
+    const id = inv.options.persona ?? '';
     const persona = this.deps.identity.get(id);
-    return persona ?? `No such identity: \`${id}\``;
+    return persona ?? `No such persona: \`${id}\``;
   }
 
   // ── Commands ──
@@ -491,7 +491,7 @@ export class SlashHandler {
     // guild admin widened visibility in Integrations settings) but can't run
     // it must not be able to enumerate personas or the role catalog by typing.
     if (!this.authorized(req.invoker, req.guildId)) return [];
-    if (req.option === 'identity') return this.identityChoices(req);
+    if (req.option === 'persona') return this.personaChoices(req);
     if (req.option === 'role' || req.option === 'role2' || req.option === 'role3') {
       return this.roleChoices(req);
     }
@@ -501,7 +501,7 @@ export class SlashHandler {
   /** Target dropdowns narrow to plausible targets: channel-access holders for
    *  remove/caps, guild-access holders for ban/resync/remove-role, everyone
    *  for add/add-role (the target typically lacks access there). */
-  private identityChoices(req: AutocompleteRequest): SlashChoice[] {
+  private personaChoices(req: AutocompleteRequest): SlashChoice[] {
     const q = req.partial.toLowerCase();
     const pool = this.deps.identity.all().filter((p) => {
       switch (req.command) {
@@ -530,8 +530,8 @@ export class SlashHandler {
     let names = Object.entries(this.deps.permissions.allRoles())
       .filter(([, role]: [string, AccessRole]) => role.guildId === req.guildId)
       .map(([name]) => name);
-    if (req.command === 'remove-role' && req.options.identity) {
-      const held = new Set(this.deps.permissions.getRoleNames(req.options.identity));
+    if (req.command === 'remove-role' && req.options.persona) {
+      const held = new Set(this.deps.permissions.getRoleNames(req.options.persona));
       names = names.filter((n) => held.has(n));
     }
     return names
