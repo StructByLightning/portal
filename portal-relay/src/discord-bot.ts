@@ -17,6 +17,7 @@ import {
   MessageFlags,
   ApplicationCommandOptionType,
   AttachmentBuilder,
+  Routes,
   type Interaction,
   type Guild,
   type GuildMember,
@@ -749,6 +750,50 @@ export class DiscordBot implements WebhookOps, RoleOps {
   channelMetaFromCache(channelId: string): ChannelMeta | null {
     const c = this.client.channels.cache.get(channelId);
     return c && 'guildId' in c ? this.metaOf(c as GuildBasedChannel) : null;
+  }
+
+  /**
+   * Channel meta straight from Discord REST, leaving the gateway cache alone —
+   * for naming channels the cache doesn't hold (archived threads, deleted
+   * channels) in the admin panel. `channels.fetch` would add an archived
+   * thread to the guild + parent caches even with `cache:false`, after which
+   * it shows up in channel lists; the raw route doesn't. 'deleted' = Discord
+   * says unknown (404); 'hidden' = the bot may not see it (403) or it isn't a
+   * guild channel. Throws on anything else so a transient failure isn't
+   * remembered as gone.
+   */
+  async fetchChannelMetaUncached(channelId: string): Promise<ChannelMeta | 'deleted' | 'hidden'> {
+    if (!/^\d{5,25}$/.test(channelId)) return 'deleted';
+    let raw: any;
+    try {
+      raw = await this.client.rest.get(Routes.channel(channelId));
+    } catch (e) {
+      const status = (e as { status?: number }).status;
+      if (status === 404) return 'deleted';
+      if (status === 403) return 'hidden';
+      throw e;
+    }
+    if (!raw || typeof raw !== 'object' || !raw.guild_id) return 'hidden';
+    const type = mapChannelType(raw.type);
+    const isThread = type === 'thread';
+    return {
+      id: String(raw.id),
+      name: typeof raw.name === 'string' ? raw.name : null,
+      type,
+      parentId: isThread && raw.parent_id ? String(raw.parent_id) : undefined,
+      guildId: String(raw.guild_id),
+      archived: isThread ? !!raw.thread_metadata?.archived : undefined,
+      isThread,
+    };
+  }
+
+  /** A Discord role's name + guild, from the gateway cache of any joined guild. */
+  roleLabel(roleId: string): { name: string; guildId: string } | null {
+    for (const g of this.client.guilds.cache.values()) {
+      const r = g.roles.cache.get(roleId);
+      if (r) return { name: r.name, guildId: g.id };
+    }
+    return null;
   }
 
   async createTextChannel(guildId: string, name: string, categoryId?: string): Promise<ChannelMeta> {

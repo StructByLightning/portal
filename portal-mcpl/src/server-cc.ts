@@ -252,10 +252,15 @@ export class PortalCcChannelServer {
         (missed.length ? `, plus what you missed in ${missed.length} followed channel(s):` : ':')];
       lines.push(this.buildContent(all, pingIds, omitted, (p) => {
         const why = fresh.find((f) => f.message.id === p.id)?.reasons ?? [];
-        return why.length ? ` (${why.join(',')})` : '';
+        // A message in a thread names it: a reply goes there only with threadId.
+        const thread = p.threadId ? ` [thread ${p.threadId}]` : '';
+        return (why.length ? ` (${why.join(',')})` : '') + thread;
       }));
       lines.push(...this.remainingNotes(missed, all));
       lines.push('\n[use fetch_history / fetch_around to read surrounding context, then mark_read]');
+      if (fresh.some((p) => p.message.threadId)) {
+        lines.push('[to reply in a thread, call send_message with the channel as channelId and the thread as threadId]');
+      }
 
       const latest = fresh[fresh.length - 1].message;
       const meta: Record<string, string> = {

@@ -35,6 +35,7 @@ import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
+import { ChannelNameResolver } from './admin/names.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -142,6 +143,12 @@ export class Relay implements GatewayHooks {
     // admin module stays decoupled from discord.js and is unit-testable.
     if (config.admin) {
       this.audit = new AuditLog(config.admin.auditPath);
+      // Names for ids the gateway cache can't name (archived threads, deleted
+      // channels) — REST-backed, memoised, never touches the bot's cache.
+      const channelNames = new ChannelNameResolver({
+        cached: (id) => this.bot.channelMetaFromCache(id),
+        fetch: (id) => this.bot.fetchChannelMetaUncached(id),
+      });
       const deps: AdminDeps = {
         config: config.admin,
         identity: this.identity,
@@ -162,7 +169,10 @@ export class Relay implements GatewayHooks {
             id: c.id,
             name: c.name ?? undefined,
             type: c.type,
+            ...(c.parentId ? { parentId: c.parentId } : {}),
           })),
+        resolveChannels: (ids) => channelNames.resolve(ids),
+        discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
         applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
@@ -363,7 +373,8 @@ export class Relay implements GatewayHooks {
   private onPermissionChange(c: PermissionChange): void {
     // Stream-retained, not live-session — a change during a brief drop must
     // land in the resume buffer (see streamPersonas). No stream ⇒ the persona
-    // never identified since boot; its next identify rehydrates everything.
+    // has no live or resumable session (never identified since boot, or its
+    // resume window ended); its next identify rehydrates everything.
     if (!this.gateway.hasStream(c.personaId)) return;
     let channels: ChannelMeta[];
     if (c.scope === 'channel' && c.channelId) {
@@ -556,9 +567,9 @@ export class Relay implements GatewayHooks {
    * Force-push the full channel set (with current caps) to one persona's
    * stream (/resync). Upserts fix missing channels and stale caps; it cannot
    * remove stale extras the client invented — a fresh identify does that.
-   * No-op for personas with no retained stream (never identified since boot):
-   * dispatch() would CREATE a stream, silently flipping them into the
-   * stream-retained fan-out set.
+   * No-op for personas with no retained stream (no live or resumable session):
+   * dispatch() has nowhere to put the channels, and the persona's next identify
+   * sends a fresh set. The count says nothing was pushed.
    */
   resyncPersona(personaId: string): number {
     if (!this.gateway.hasStream(personaId)) return 0;
@@ -994,6 +1005,9 @@ export class Relay implements GatewayHooks {
     if (!cur) throw rpcError('NOT_FOUND', 'no such persona');
     this.identity.upsert({ ...cur, token: hashToken(generateToken()) });
     this.gateway.closePersona(personaId);
+    // Resume authenticates by key, not token, so a kept key would let the
+    // revoked holder back in. Drop the keys and stream, as identity removal does.
+    this.gateway.dropStream(personaId);
   }
 
   /** Slug a display name + short random suffix into a unique persona id. */
@@ -1147,7 +1161,7 @@ export class Relay implements GatewayHooks {
       case 'fetch_history': {
         const p = params as RpcParams<'fetch_history'>;
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(personaId, target.parentChannelId, 'READ_HISTORY');
         const before = this.cursorToSnowflake(p.before);
         const after = this.cursorToSnowflake(p.after);
@@ -1326,7 +1340,7 @@ export class Relay implements GatewayHooks {
         // Typing is the shared bot's indicator, fired wherever the caller can
         // name — gate it exactly like send_message (issue #27).
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(
           personaId,
           target.parentChannelId,
@@ -1412,7 +1426,7 @@ export class Relay implements GatewayHooks {
   ): Promise<{ messageId: string }> {
     const cfg = this.identity.get(personaId)!;
     const target = await this.resolveContainer(p.channelId, p.threadId);
-    if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+    if (!target) throw containerNotFound(p.channelId, p.threadId);
     // Capabilities live on the parent channel; a thread never carries its own
     // grant rows, so checking the raw passed id (which may BE a thread id)
     // refuses personas whose parent-channel rights are complete.
@@ -1945,6 +1959,15 @@ export class Relay implements GatewayHooks {
 
 function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirrorRoles: string[] } {
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
+}
+
+/** resolveContainer's refusal. With a threadId it names the thread and the
+ *  channel, so a caller knows which half to fix: the thread isn't a thread,
+ *  or isn't one of that channel's. */
+function containerNotFound(channelId: string, threadId?: string): Error & { code: string } {
+  return threadId
+    ? rpcError('NOT_FOUND', `thread ${threadId} is not a thread of channel ${channelId}`)
+    : rpcError('NOT_FOUND', 'channel not found');
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {
