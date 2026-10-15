@@ -384,3 +384,72 @@ test('the subscription seed is handed out once per process (a switch back to roo
   assert.deepEqual(again.agent.state.subscriptionList(), ['111'], 'the unsubscribe holds across the rebuild');
   assert.equal(next(), undefined);
 });
+
+test('two processes sharing a roster both keep their minted identities', async () => {
+  const h = harness({ invite: 'inv' });
+  const other = h.make();
+  await h.manager.handleToolCall('mint_identity', { name: 'Morning', switch: false });
+  await other.handleToolCall('mint_identity', { name: 'Evening', switch: false });
+  const names = (r: unknown) => (r as { identities: Array<{ name: string }> }).identities.map((i) => i.name).sort();
+  // After a restart, both are there.
+  assert.deepEqual(names(await h.make().handleToolCall('list_identities', {})), ['Evening', 'Morning', 'Root']);
+  // And the first process can find the second's without restarting.
+  const found = (h.manager as unknown as { find(n: string): unknown }).find('Evening');
+  assert.ok(found, "the other process's identity is visible");
+});
+
+test("MCPL: a message still building (image download) when the identity switches is not pushed as the new persona's", async () => {
+  const shared = chan('100', 'shared');
+  const oldClient = readyClient('p_old', [shared]);
+  const newClient = readyClient('p_new', [shared]);
+  (newClient as unknown as { call: () => Promise<unknown> }).call = async () => ({ pings: [] });
+  const server = new PortalMcplServer(
+    oldClient,
+    new PortalAgent(oldClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }),
+    { identity: { handleToolCall: async () => ({}) } },
+  );
+  const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const internal = server as unknown as {
+    conn: unknown; mcplEnabled: boolean; initialRegistrationComplete: boolean;
+    policy: { applyRequest(p: unknown): unknown }; wireClient(): void;
+    wokenByPersona: Map<string, Set<string>>;
+  };
+  internal.conn = {
+    sendRequest: async (method: string, params: Record<string, unknown>) => { requests.push({ method, params }); return {}; },
+    sendNotification: () => {},
+  };
+  internal.mcplEnabled = true;
+  internal.initialRegistrationComplete = true;
+  internal.policy.applyRequest({
+    effectiveCapabilities: [...new Set(Object.values({ ...featureSets, ...identityFeatureSets }).flatMap((s) => s.uses as string[]))],
+  });
+  internal.wireClient();
+
+  // Hold the image download open across the switch.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { await gate; return new Response(new Uint8Array([1, 2, 3]), { status: 200 }); }) as typeof fetch;
+  try {
+    oldClient.emit('message', {
+      message: {
+        id: 'm_img', nativeId: 'm_img', channelId: '100', guildId: 'g1',
+        author: { kind: 'user', userId: 'u', username: 'bob', displayName: 'Bob', bot: false },
+        content: '@old look', cleanContent: '@old look',
+        attachments: [{ id: 'a1', name: 'x.png', url: 'https://cdn.example/x.png', contentType: 'image/png', size: 3 }],
+        mentions: { personas: [], roles: [], users: [], everyone: false },
+        reactions: [], createdAt: '2026-01-01T00:00:00Z',
+      },
+      addressedToMe: true,
+      reasons: ['mention'],
+    } as never);
+    await server.swapSession(newClient, new PortalAgent(newClient, { state: new AgentState(), hostOwnsChannelLifecycle: true }));
+    release();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const pushed = requests.filter((r) => JSON.stringify(r.params).includes('m_img'));
+  assert.deepEqual(pushed, [], "the old persona's message was not pushed after the switch");
+  assert.equal(internal.wokenByPersona.get('p_old')?.has('m_img') ?? false, false, "left for the old persona's next catch-up");
+});

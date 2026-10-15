@@ -30,7 +30,7 @@
  * restart comes back as whoever the agent last chose to be rather than silently
  * reverting to the configured name mid-conversation.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
   enroll as defaultEnroll,
@@ -261,6 +261,7 @@ export class IdentityManager implements IdentityToolHandler {
     const name = rawName.trim();
     if (!name || name.length > 80) throw new Error('name must be 1–80 characters');
     const key = slugName(name);
+    this.refreshRoster();
     if (this.roster.identities[key]) {
       throw new Error(`you already have an identity named "${this.roster.identities[key].name}" — switch to it instead`);
     }
@@ -369,10 +370,55 @@ export class IdentityManager implements IdentityToolHandler {
   }
 
   private find(nameOrId: string): [string, IdentityRecord] | undefined {
-    const wanted = nameOrId.trim();
-    const byKey = this.roster.identities[slugName(wanted)];
-    if (byKey) return [slugName(wanted), byKey];
-    return Object.entries(this.roster.identities).find(([, record]) => record.personaId === wanted);
+    const look = (): [string, IdentityRecord] | undefined => {
+      const wanted = nameOrId.trim();
+      const byKey = this.roster.identities[slugName(wanted)];
+      if (byKey) return [slugName(wanted), byKey];
+      return Object.entries(this.roster.identities).find(([, record]) => record.personaId === wanted);
+    };
+    const hit = look();
+    if (hit) return hit;
+    this.refreshRoster(); // another process sharing this roster may have minted it
+    return look();
+  }
+
+  /** Adopt identities another process sharing this roster has added since we
+   *  loaded it (the in-memory copy otherwise only ever sees our own mints). */
+  private refreshRoster(): void {
+    const disk = this.loadRoster();
+    for (const [key, record] of Object.entries(disk.identities)) {
+      if (!this.roster.identities[key]) this.roster.identities[key] = record;
+    }
+  }
+
+  /** Run `fn` holding the roster's lock file, so two processes don't both
+   *  read-merge-write it at once. A lock older than 10s is taken as stale. */
+  private withRosterLock(fn: () => void): void {
+    const lock = `${this.opts.rosterPath}.lock`;
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      try {
+        writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        try {
+          if (Date.now() - statSync(lock).mtimeMs > 10_000) {
+            unlinkSync(lock);
+            continue;
+          }
+        } catch {
+          continue; // released between the open and the stat
+        }
+        if (Date.now() > deadline) throw new Error('identity roster is locked by another process');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    }
+    try {
+      fn();
+    } finally {
+      try { unlinkSync(lock); } catch { /* already gone */ }
+    }
   }
 
   private loadCreds(record: IdentityRecord): PortalCredentials {
@@ -420,12 +466,19 @@ export class IdentityManager implements IdentityToolHandler {
     return roster;
   }
 
+  /** Write the roster — merged, under the lock, with whatever another process
+   *  sharing it has added, so its records aren't dropped by our whole-file
+   *  write (it would then be unable to switch to, or re-mint, its identities).
+   *  `active` is this process's own. */
   private saveRoster(): void {
     try {
       mkdirSync(dirname(this.opts.rosterPath), { recursive: true });
-      const tmp = `${this.opts.rosterPath}.tmp`;
-      writeFileSync(tmp, JSON.stringify(this.roster, null, 2) + '\n', { mode: 0o600 });
-      renameSync(tmp, this.opts.rosterPath);
+      this.withRosterLock(() => {
+        this.refreshRoster();
+        const tmp = `${this.opts.rosterPath}.tmp`;
+        writeFileSync(tmp, JSON.stringify(this.roster, null, 2) + '\n', { mode: 0o600 });
+        renameSync(tmp, this.opts.rosterPath);
+      });
     } catch (err) {
       console.error('[portal-mcpl] identity roster write failed:', (err as Error).message);
     }

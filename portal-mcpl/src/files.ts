@@ -40,6 +40,10 @@ export interface ResolveFilesOptions {
    *  because a send that reads the file itself bypasses whatever fences the
    *  host puts on file access, and any channel message can ask for one. */
   allowedRoots?: string[];
+  /** Files never attachable whatever the roots, by resolved path — the
+   *  configured credentials, identity roster and state files, which can have
+   *  any name (the NEVER_ATTACH patterns only catch the default names). */
+  denyPaths?: string[];
   /** Allow `url` fetches (default true). */
   allowUrls?: boolean;
   /** Fetch timeout for `url` items, ms. */
@@ -360,6 +364,12 @@ export async function resolveOutgoingFiles(
       if (NEVER_ATTACH.some((re) => re.test(basename(real)) || re.test(basename(abs)))) {
         throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
       }
+      if (opts.denyPaths?.length) {
+        const denied = await Promise.all(
+          opts.denyPaths.map((d) => realpath(expandHome(d)).catch(() => resolve(expandHome(d)))),
+        );
+        if (denied.includes(real)) throw new Error(`files[${i}]: refusing to attach a credentials/identity file: ${abs}`);
+      }
       const st = await stat(real);
       if (!st.isFile()) throw new Error(`files[${i}]: not a regular file: ${abs}`);
       account(st.size, `files[${i}] (${abs})`);
@@ -396,18 +406,26 @@ export async function resolveOutgoingFiles(
         res = await doFetch(current.toString(), { signal: ctrl.signal, redirect: 'manual' });
         const location = res.headers.get('location');
         if (![301, 302, 303, 307, 308].includes(res.status) || !location) break;
+        // A redirect's own body is never read: release it before the next hop.
+        await res.body?.cancel().catch(() => {});
         if (hop >= MAX_REDIRECTS) throw new Error(`too many redirects`);
         current = new URL(location, current);
         if (!isUrl(current.toString())) throw new Error(`redirected to a non-http(s) URL: ${current}`);
       }
     } catch (err) {
       clearTimeout(timer);
+      ctrl.abort(); // nothing in flight may outlive the refusal
       const msg = (err as Error).message;
       throw new Error(msg.startsWith(`files[${i}]`) ? msg : `files[${i}]: fetch failed for ${url}: ${msg}`);
     }
     try {
       if (!res.ok) throw new Error(`files[${i}]: HTTP ${res.status} fetching ${url}`);
-      const declared = Number(res.headers.get('content-length') ?? '0');
+      // Content-Length is the WIRE size; with a content-encoding (gzip, br…)
+      // the body is decoded on read and can be far smaller — or larger — than
+      // that, so only an unencoded length is charged up front. Either way the
+      // stream is capped and the decoded bytes charged.
+      const encoding = (res.headers.get('content-encoding') ?? 'identity').trim().toLowerCase();
+      const declared = encoding === 'identity' ? Number(res.headers.get('content-length') ?? '0') : 0;
       if (declared > 0) account(declared, label);
       // Stream under the REMAINING budget: a body with no (or a lying)
       // Content-Length is cut off at the cap instead of buffered whole.
@@ -424,6 +442,11 @@ export async function resolveOutgoingFiles(
         ...(contentType ? { contentType } : {}),
         ...extra,
       });
+    } catch (err) {
+      // Refused (status, budget…): stop the download and release the socket.
+      ctrl.abort();
+      await res.body?.cancel().catch(() => {});
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -436,14 +459,20 @@ export async function resolveOutgoingFiles(
  *                           items are refused (opt-in: a send that reads the file itself goes
  *                           around the host's own file fences, and any channel message can ask).
  *                           Credentials/identity/state files stay refused under any setting.
+ *  - PORTAL_CREDENTIALS, PORTAL_IDENTITIES, PORTAL_STATE  — the configured credentials,
+ *                           roster and state files are never attachable, whatever their names
  *  - PORTAL_MAX_FILE_BYTES  per-message decoded budget (default 8 MiB; match the relay's cap)
  *  - PORTAL_ALLOW_URL_FILES "false" to refuse `url` items
  *  - PORTAL_ALLOW_PRIVATE_URLS "true" to let `url` reach loopback/private addresses */
 export function fileOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): ResolveFilesOptions {
   const roots = (env.PORTAL_FILE_ROOTS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   const max = Number(env.PORTAL_MAX_FILE_BYTES);
+  const deny = [env.PORTAL_CREDENTIALS, env.PORTAL_IDENTITIES, env.PORTAL_STATE]
+    .map((p) => (p ?? '').trim())
+    .filter(Boolean);
   return {
     ...(roots.length ? { allowedRoots: roots } : {}),
+    ...(deny.length ? { denyPaths: deny } : {}),
     ...(Number.isFinite(max) && max > 0 ? { maxTotalBytes: max } : {}),
     ...(env.PORTAL_ALLOW_URL_FILES === 'false' ? { allowUrls: false } : {}),
     ...(env.PORTAL_ALLOW_PRIVATE_URLS === 'true' ? { allowPrivateUrls: true } : {}),

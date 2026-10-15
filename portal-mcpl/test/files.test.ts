@@ -204,3 +204,35 @@ test('local files are read under the cap (a file larger than what is left is ref
   assert.equal((await readFileCapped(p, 1000, 'x')).length, 1000);
   await assert.rejects(readFileCapped(p, 999, 'x'), /grew past 999 bytes/);
 });
+
+test('configured credential/roster/state files are refused by resolved path, whatever their names', async () => {
+  const p = join(dir, 'cc-creds.json');
+  writeFileSync(p, '{"token":"SECRET"}');
+  const o = fileOptionsFromEnv({ PORTAL_FILE_ROOTS: dir, PORTAL_CREDENTIALS: p });
+  await assert.rejects(resolveOutgoingFiles([p], o), /refusing to attach a credentials/);
+  // …also through a symlink with an innocent name.
+  symlinkSync(p, join(dir, 'notes-link.txt'));
+  await assert.rejects(resolveOutgoingFiles([join(dir, 'notes-link.txt')], o), /refusing to attach a credentials/);
+});
+
+test('a compressed response is charged its decoded size, not its Content-Length', async () => {
+  const fakeFetch = (async () =>
+    new Response('hello', { status: 200, headers: { 'content-length': '25', 'content-encoding': 'gzip', 'content-type': 'text/plain' } })) as unknown as typeof fetch;
+  const out = await resolveOutgoingFiles(['https://example.com/h.txt'], { fetch: fakeFetch, lookup: publicDns, maxTotalBytes: 5 });
+  assert.equal(Buffer.from(out![0].bytes!, 'base64').toString(), 'hello');
+});
+
+test('a refused download is cancelled, redirects included', async () => {
+  const cancelled: string[] = [];
+  const body = (tag: string) =>
+    new ReadableStream<Uint8Array>({
+      pull(c) { c.enqueue(new Uint8Array(1024)); },
+      cancel() { cancelled.push(tag); },
+    });
+  const fakeFetch = (async (url: string) =>
+    url.endsWith('/start')
+      ? new Response(body('redirect'), { status: 302, headers: { location: 'https://example.com/gone' } })
+      : new Response(body('404'), { status: 404 })) as unknown as typeof fetch;
+  await assert.rejects(resolveOutgoingFiles(['https://example.com/start'], { fetch: fakeFetch, lookup: publicDns }), /HTTP 404/);
+  assert.deepEqual(cancelled.sort(), ['404', 'redirect']);
+});
