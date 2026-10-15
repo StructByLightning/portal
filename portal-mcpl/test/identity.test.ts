@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PortalClient, type PortalCredentials } from '@animalabs/portal-client';
@@ -580,4 +580,43 @@ test("a creds reservation left by a process that died mid-mint doesn't block the
   assert.equal(JSON.parse(readFileSync(join(h.dir, 'orphan.creds.json'), 'utf8')).personaId, 'p_1');
   writeFileSync(join(h.dir, 'busy.creds.json'), JSON.stringify({ reserving: true, pid: process.pid, at: new Date().toISOString() }));
   await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Busy', switch: false }), /already exists on this host/);
+});
+
+test('taking over an abandoned reservation is exclusive: not while another process holds the mint lock', async () => {
+  const h = harness({ invite: 'inv' });
+  writeFileSync(join(h.dir, 'contested.creds.json'), JSON.stringify({ reserving: true, pid: 999999, at: new Date().toISOString() }));
+  // Another live process (this one, as far as the lock can tell) is mid-takeover:
+  // the mint waits for it rather than take over the same reservation too.
+  writeFileSync(join(h.dir, '.mint.lock'), String(process.pid));
+  await assert.rejects(h.manager.handleToolCall('mint_identity', { name: 'Contested', switch: false }), /locked by another process/);
+  assert.equal(JSON.parse(readFileSync(join(h.dir, 'contested.creds.json'), 'utf8')).reserving, true, 'untouched while locked');
+  // Once it lets go, the takeover goes through — once.
+  rmSync(join(h.dir, '.mint.lock'));
+  await h.manager.handleToolCall('mint_identity', { name: 'Contested', switch: false });
+  assert.equal(JSON.parse(readFileSync(join(h.dir, 'contested.creds.json'), 'utf8')).personaId, 'p_1');
+});
+
+test("MCPL: a register reply that lands after the switch retires the OLD persona's bootstrap follows, not the new one's", async () => {
+  let ackRegister!: (v: unknown) => void;
+  const pending = new Promise((r) => { ackRegister = r; });
+  const oldClient = readyClient('p_old', [chan('100', 'shared')]);
+  const newClient = readyClient('p_new', [chan('100', 'shared'), chan('300', 'new-only')]);
+  (newClient as unknown as { call: () => Promise<unknown> }).call = async () => ({ pings: [] });
+  const oldState = new AgentState();
+  oldState.subscribe('100');
+  const newState = new AgentState();
+  newState.subscribe('100'); // the new persona follows the shared channel too
+  const h = mcplHarness(oldClient, { register: () => pending });
+  (h.server as unknown as { agent: PortalAgent }).agent = new PortalAgent(oldClient, { state: oldState, hostOwnsChannelLifecycle: true });
+  void h.internal.registerChannels();
+  await flush();
+  await h.server.swapSession(newClient, new PortalAgent(newClient, { state: newState, hostOwnsChannelLifecycle: true }));
+  ackRegister({ results: [{ id: 'portal:100', accepted: true }] });
+  await flush();
+  assert.deepEqual(oldState.subscriptionList(), [], "the old persona's advertised follow is retired");
+  // The new persona's follow of the shared channel survived the OLD reply long
+  // enough to reach its own offer as an open hint (and is retired only after
+  // that offer, by design — the host owns the open state from then on).
+  const offered = h.notifications.flatMap((n) => (n.params.added as Array<{ id: string; initiallyOpen?: boolean }> | undefined) ?? []);
+  assert.equal(offered.find((d) => d.id === 'portal:100')?.initiallyOpen, true, "the new persona's hint reaches its offer");
 });

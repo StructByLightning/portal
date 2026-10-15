@@ -67,23 +67,66 @@ function pidAlive(pid: number): boolean {
  */
 function reserveCredsFile(path: string): boolean {
   const mark = () => JSON.stringify({ reserving: true, pid: process.pid, at: new Date().toISOString() }) + '\n';
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Under the directory's mint lock: the check that a reservation is abandoned
+  // and its replacement happen as one step, so two processes can't both take
+  // over the same one (the second deleting the first's fresh reservation and
+  // both going on to save credentials into one file).
+  let reserved = false;
+  withFileLock(join(dirname(path), '.mint.lock'), 'credentials directory', () => {
+    // (held for a write or two — a short wait is plenty)
     try {
       writeFileSync(path, mark(), { flag: 'wx', mode: 0o600 });
-      return true;
+      reserved = true;
+      return;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
     let held: { reserving?: boolean; pid?: number; at?: string } | null = null;
-    try { held = JSON.parse(readFileSync(path, 'utf8')); } catch { return false; }
+    try { held = JSON.parse(readFileSync(path, 'utf8')); } catch { return; }
     const abandoned =
       held?.reserving === true &&
       ((typeof held.pid === 'number' && !pidAlive(held.pid)) ||
         (typeof held.at === 'string' && Date.now() - Date.parse(held.at) > 10 * 60_000));
-    if (!abandoned) return false;
-    try { unlinkSync(path); } catch { /* raced */ }
+    if (!abandoned) return;
+    unlinkSync(path);
+    writeFileSync(path, mark(), { flag: 'wx', mode: 0o600 });
+    reserved = true;
+  }, 2000);
+  return reserved;
+}
+
+/**
+ * Run `fn` holding an exclusive lock file. The file names its holder's pid,
+ * so a lock whose process has died is taken over at once (and one older than
+ * 10s — longer than any holder keeps it — regardless). Throws after
+ * `waitMs` if a live process keeps holding it.
+ */
+export function withFileLock(lock: string, what: string, fn: () => void, waitMs = 5000): void {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      try {
+        const holder = Number(readFileSync(lock, 'utf8').trim());
+        if ((holder > 0 && !pidAlive(holder)) || Date.now() - statSync(lock).mtimeMs > 10_000) {
+          unlinkSync(lock);
+          continue;
+        }
+      } catch {
+        continue; // released between the open and the read
+      }
+      if (Date.now() > deadline) throw new Error(`the ${what} is locked by another process`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
   }
-  return false;
+  try {
+    fn();
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
+  }
 }
 
 /** Identity switching is ON by default; PORTAL_IDENTITY_SWITCHING=0 (false/no/off)
@@ -435,35 +478,9 @@ export class IdentityManager implements IdentityToolHandler {
   }
 
   /** Run `fn` holding the roster's lock file, so two processes don't both
-   *  read-merge-write it at once. A lock older than 10s is taken as stale. */
+   *  read-merge-write it at once. */
   private withRosterLock(fn: () => void): void {
-    const lock = `${this.opts.rosterPath}.lock`;
-    const deadline = Date.now() + 5000;
-    for (;;) {
-      try {
-        writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
-        break;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-        // Abandoned: its holder died (pid gone), or it's older than any save.
-        try {
-          const holder = Number(readFileSync(lock, 'utf8').trim());
-          if ((holder > 0 && !pidAlive(holder)) || Date.now() - statSync(lock).mtimeMs > 10_000) {
-            unlinkSync(lock);
-            continue;
-          }
-        } catch {
-          continue; // released between the open and the read
-        }
-        if (Date.now() > deadline) throw new Error('identity roster is locked by another process');
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-      }
-    }
-    try {
-      fn();
-    } finally {
-      try { unlinkSync(lock); } catch { /* already gone */ }
-    }
+    withFileLock(`${this.opts.rosterPath}.lock`, 'identity roster', fn);
   }
 
   private loadCreds(record: IdentityRecord): PortalCredentials {
