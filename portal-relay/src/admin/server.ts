@@ -205,7 +205,7 @@ export class AdminServer {
     // single-segment read so it isn't shadowed.
     const personaDetail = /^\/personas\/([^/]+)$/.exec(sub);
     if (method === 'GET' && personaDetail) {
-      return this.onPersonaDetail(res, guildId, decodeURIComponent(personaDetail[1]));
+      return this.onPersonaDetail(res, session, guildId, decodeURIComponent(personaDetail[1]));
     }
     // Reads: GET /admin/g/:gid/<resource>  (searchable/paginated for lists)
     const readM = /^\/([^/]+)$/.exec(sub);
@@ -283,7 +283,7 @@ export class AdminServer {
         detail: { reason: 'state/code validation failed' },
       });
       clearCookie(res, STATE_COOKIE, '/admin');
-      return sendJson(res, 400, { error: { code: 'BAD_REQUEST', message: 'invalid oauth state' } });
+      return this.loginFailed(res, 'failed');
     }
     clearCookie(res, STATE_COOKIE, '/admin');
 
@@ -305,7 +305,7 @@ export class AdminServer {
         ok: false,
         detail: { reason: (e as Error).message },
       });
-      return sendJson(res, 502, { error: { code: 'OAUTH_FAILED', message: 'discord login failed' } });
+      return this.loginFailed(res, 'discord');
     }
 
     const isSuper = this.deps.config.superadmins.includes(result.user.id);
@@ -326,15 +326,18 @@ export class AdminServer {
     // Only guilds this relay SERVES count: Discord reports admin rights for
     // every server the user owns or runs, and none of those is administered
     // here. Someone who administers no served guild gets no session at all.
-    const adminGuilds = new Set([...claimed].filter((gid) => this.isServed(gid)));
-    if (!isSuper && adminGuilds.size === 0) {
+    // The session keeps everything the user administers; what it may manage is
+    // checked LIVE against the served set (canManageGuild, onMe, onGuilds), so
+    // a guild that becomes served mid-session appears without a re-login.
+    const adminGuilds = claimed;
+    if (!isSuper && ![...adminGuilds].some((gid) => this.isServed(gid))) {
       this.audit.append({
         actor: { id: result.user.id, name: result.user.global_name || result.user.username, kind: 'admin' },
         action: 'login.denied',
         ok: false,
         detail: { reason: 'administers no guild this relay serves' },
       });
-      return sendJson(res, 403, err('FORBIDDEN', 'you are not an admin of any guild portal serves'));
+      return this.loginFailed(res, 'not_admin');
     }
     const session = this.sessions.create({
       userId: result.user.id,
@@ -369,7 +372,9 @@ export class AdminServer {
     sendJson(res, 200, {
       user: { id: session.userId, name: session.userName },
       isSuper: session.isSuper,
-      guilds: [...session.adminGuilds].map((id) => ({ id, name: session.guildNames[id] ?? id })),
+      guilds: [...session.adminGuilds]
+        .filter((id) => session.isSuper || this.isServed(id))
+        .map((id) => ({ id, name: session.guildNames[id] ?? id })),
       // CSRF token the SPA echoes in the X-CSRF-Token header on mutations (P2+).
       csrf: session.csrf,
     });
@@ -381,7 +386,7 @@ export class AdminServer {
     const page = parsePage(url);
     switch (resource) {
       case 'invites': {
-        const body = paginate(this.invitesFor(guildId), page, 'invites');
+        const body = paginate(this.invitesFor(guildId, undefined, session.isSuper), page, 'invites');
         const scopes = (body.invites as any[]).map((inv) => inv?.grant?.scope);
         return sendJson(res, 200, { ...body, names: await this.scopeNames(scopes, guildId) });
       }
@@ -399,7 +404,10 @@ export class AdminServer {
           names.guilds = this.guildNames(roles.map((r) => r.guildId), clip);
         }
         return sendJson(res, 200, {
-          catalog,
+          // The catalog is global; a guild-admin sees only G's own roles.
+          catalog: session.isSuper
+            ? catalog
+            : Object.fromEntries(Object.entries(catalog).filter(([, r]) => (r as { guildId?: string }).guildId === guildId)),
           discordRoles: this.deps.listRoles(guildId),
           // Whether this admin may edit the catalog (super-admin only, §5.3).
           canAuthor: session.isSuper,
@@ -407,7 +415,7 @@ export class AdminServer {
         });
       }
       case 'personas':
-        return sendJson(res, 200, paginate(this.personasFor(guildId, page.q), page, 'personas'));
+        return sendJson(res, 200, paginate(this.personasFor(guildId, page.q, session.isSuper), page, 'personas'));
       case 'channels':
         return sendJson(res, 200, { channels: this.deps.listChannels(guildId) });
       case 'audit': {
@@ -421,7 +429,7 @@ export class AdminServer {
 
   /** Drawer detail for one persona in a guild: roles + the G-scoped policy
    *  block, with names for the channels its ad-hoc grants target. */
-  private async onPersonaDetail(res: ServerResponse, guildId: string, personaId: string): Promise<void> {
+  private async onPersonaDetail(res: ServerResponse, session: AdminSession, guildId: string, personaId: string): Promise<void> {
     const p = this.deps.identity.get(personaId);
     if (!p) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
     const entry = this.deps.permissions.getEntry(personaId);
@@ -430,22 +438,23 @@ export class AdminServer {
     sendJson(res, 200, {
       id: p.id,
       displayName: p.displayName,
-      roles: entry?.roles ?? [],
+      roles: this.rolesVisibleIn(guildId, entry?.roles ?? [], session.isSuper),
       guildPolicy,
       names: { channels: clipToGuild(labels, guildId) } satisfies NameMaps,
     });
   }
 
   /** Invites scoped to a guild (those whose `guildId` matches), optional search. */
-  private invitesFor(guildId: string, q?: string): any[] {
+  private invitesFor(guildId: string, q?: string, isSuper = true): any[] {
     const all = this.deps.invites?.all() ?? [];
     return all
       .filter((inv) => inv.guildId === guildId)
+      .filter((inv) => isSuper || this.rolesAllBoundTo(inv.roles ?? [], guildId))
       .filter((inv) => !q || matches(q, inv.code, inv.label));
   }
 
   /** Personas with any possible access in the guild (trimmed for the table). */
-  private personasFor(guildId: string, q?: string): any[] {
+  private personasFor(guildId: string, q?: string, isSuper = false): any[] {
     const channelIds = new Set(this.deps.listChannels(guildId).map((c) => c.id));
     const inGuild = (cid: string) => channelIds.has(cid);
     const out: any[] = [];
@@ -457,7 +466,7 @@ export class AdminServer {
         id: p.id,
         displayName: p.displayName,
         avatarUrl: this.deps.identity.avatarUrl(p),
-        roles: entry?.roles ?? [],
+        roles: this.rolesVisibleIn(guildId, entry?.roles ?? [], isSuper),
         hasOverride: !!entry?.policy?.guilds?.[guildId],
       });
     }
@@ -591,6 +600,11 @@ export class AdminServer {
     if (typeof code !== 'string' || !code) return sendJson(res, 400, err('INVALID', 'code required'));
     const inv = this.deps.invites?.get(code);
     if (!inv || inv.guildId !== guildId) return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
+    // A guild-admin acts within G only: an invite carrying another guild's
+    // roles (a super-admin can mint one) is not theirs to apply.
+    if (!session.isSuper && !this.rolesAllBoundTo(inv.roles ?? [], guildId)) {
+      return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
+    }
     let result;
     try {
       result = this.deps.applyClaim(personaId, code);
@@ -960,6 +974,24 @@ export class AdminServer {
       channels: clipToGuild(await this.channelLabels(channels), guildId),
       guilds: this.guildNames(records.map((r) => r.target), guildId),
     };
+  }
+
+  /** Land a failed or refused login on the panel with a fixed reason code
+   *  (the SPA maps codes to messages; nothing from the request is echoed). */
+  private loginFailed(res: ServerResponse, code: 'failed' | 'discord' | 'not_admin'): void {
+    const to = this.deps.config.postLoginUrl;
+    redirect(res, `${to}${to.includes('?') ? '&' : '?'}login_error=${code}`);
+  }
+
+  /** Every role is a catalog role bound to `guildId`. */
+  private rolesAllBoundTo(roles: string[], guildId: string): boolean {
+    return roles.every((r) => this.deps.permissions.getRole(r)?.guildId === guildId);
+  }
+
+  /** The role names a guild view may show: all of them to a super-admin, only
+   *  G's own to a guild-admin (another guild's roles are not theirs to see). */
+  private rolesVisibleIn(guildId: string, roles: string[], isSuper: boolean): string[] {
+    return isSuper ? roles : roles.filter((r) => this.deps.permissions.getRole(r)?.guildId === guildId);
   }
 
   /** A guild this relay serves: the bot has joined it and the allow-list admits it. */

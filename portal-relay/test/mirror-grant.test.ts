@@ -98,7 +98,7 @@ test('enroll with a mirror grant materializes a live access role, not a snapshot
     // Assigned a content-addressed role, no frozen inline channel list.
     const roles = t.relay.permissions.getRoleNames(pid) as string[];
     assert.equal(roles.length, 1);
-    assert.match(roles[0], /^mirror-[0-9a-f]{8}$/);
+    assert.match(roles[0], new RegExp(`^mirror-${GUILD}-[0-9a-f]{32}$`));
     const role = t.relay.permissions.getRole(roles[0]);
     assert.deepEqual(role, { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE }, guildId: GUILD });
     assert.equal(t.relay.permissions.getPolicy(pid), undefined);
@@ -136,7 +136,7 @@ test('augment claim adds the live role and leaves the existing inline policy int
     t.relay.applyInviteAugment(EXISTING, 'mirror-aug');
     const roles = t.relay.permissions.getRoleNames(EXISTING) as string[];
     assert.equal(roles.length, 1);
-    assert.match(roles[0], /^mirror-[0-9a-f]{8}$/);
+    assert.match(roles[0], new RegExp(`^mirror-${GUILD}-[0-9a-f]{32}$`));
     // Union semantics: mirror caps arrive, the pre-existing channel grant survives.
     assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
     t.visible.set(CHAN_NEW, [...RW]);
@@ -151,12 +151,14 @@ test('augment claim adds the live role and leaves the existing inline policy int
 test('mirror grant without guildId: enroll denies, augment rejects loudly', async () => {
   const t = makeRelay();
   try {
+    const before = t.relay.identity.all().length;
     const enrolled = await t.relay.enroll({ invite: 'mirror-noguild', desiredName: 'lost' });
-    assert.ok(!('error' in enrolled));
-    assert.deepEqual(t.relay.permissions.getRoleNames(enrolled.personaId), []);
-    assert.deepEqual(t.caps(enrolled.personaId, CHAN_A), []);
+    assert.ok('error' in enrolled, 'refused up front, not a persona with no access');
+    assert.match(enrolled.error, /names no guild/);
+    assert.equal(t.relay.identity.all().length, before, 'no persona created');
+    assert.equal(t.relay.invites.get('mirror-noguild').uses ?? 0, 0, 'no use consumed');
 
-    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-noguild'), /missing guildId/);
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-noguild'), /names no guild/);
   } finally {
     t.cleanup();
   }
@@ -173,10 +175,58 @@ test('a rejected augment changes nothing: no roles granted, invite not consumed'
     t.relay.permissions.setRole('some-role', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: GUILD });
     const before = t.relay.permissions.getRoleNames(EXISTING);
     for (let i = 0; i < 2; i++) {
-      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-bad-mirror'), /missing guildId/);
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'roles-and-bad-mirror'), /names no guild/);
     }
     assert.deepEqual(t.relay.permissions.getRoleNames(EXISTING), before, 'no roles granted by a rejected claim');
     assert.equal(t.relay.invites.get('roles-and-bad-mirror').uses ?? 0, 0, 'no use consumed');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a mirror grant reuses only an IDENTICAL access role; a name hit on anything else is refused before any change', async () => {
+  const t = makeRelay();
+  try {
+    // Find the name this grant materializes to, then plant a DIFFERENT role under it.
+    const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'probe' });
+    const name = t.relay.permissions.getRoleNames(first.personaId)[0];
+    t.relay.permissions.setRole(name, { caps: ['MANAGE_MESSAGES'], scope: { all: true }, guildId: 'some-other-guild' });
+    t.relay.invites.mint({ code: 'mirror-again', grant: { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } }, guildId: GUILD } as any);
+    const count = t.relay.identity.all().length;
+    const res = await t.relay.enroll({ invite: 'mirror-again', desiredName: 'collider' });
+    assert.ok('error' in res && /conflicts with an existing access role/.test(res.error));
+    assert.equal(t.relay.identity.all().length, count, 'no persona created');
+    assert.equal(t.relay.invites.get('mirror-again').uses ?? 0, 0, 'no use consumed');
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'), /conflicts with an existing access role/);
+    assert.ok(!t.relay.permissions.getRoleNames(EXISTING).includes(name), 'the foreign role was not handed out');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('augmenting a persona never narrows what it already had', () => {
+  const t = makeRelay();
+  try {
+    const merge = (base: any, add: any) => t.relay.mergePolicy(base, add);
+    // Guild default [VIEW, READ]; a channel augment adds SEND on chan-x: that
+    // channel keeps VIEW+READ (it would have resolved to the guild default).
+    const ch = merge({ default: [], guilds: { G: { default: ['VIEW_CHANNEL', 'READ_HISTORY'] } } },
+      { default: [], guilds: { G: { channels: { x: ['SEND_MESSAGES'] } } } });
+    assert.deepEqual(ch.guilds.G.channels.x.sort(), ['READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL']);
+    assert.deepEqual(ch.guilds.G.default, ['VIEW_CHANNEL', 'READ_HISTORY'], 'guild default untouched');
+    // A persona-wide default [VIEW, READ, SEND]; an {all} augment for G with [VIEW]
+    // must not narrow G to [VIEW].
+    const all = merge({ default: ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES'] },
+      { default: [], guilds: { G: { default: ['VIEW_CHANNEL'] } } });
+    assert.deepEqual(all.guilds.G.default.sort(), ['READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL']);
+    // An {all} augment reaches a narrower existing channel override; an explicit deny stays.
+    const reach = merge({ default: [], guilds: { G: { channels: { narrow: ['VIEW_CHANNEL'], denied: [] } } } },
+      { default: [], guilds: { G: { default: ['VIEW_CHANNEL', 'SEND_MESSAGES'] } } });
+    assert.deepEqual(reach.guilds.G.channels.narrow.sort(), ['SEND_MESSAGES', 'VIEW_CHANNEL']);
+    assert.deepEqual(reach.guilds.G.channels.denied, []);
+    // A channel-only augment does not pin the guild default (undefined stays transparent).
+    const pin = merge({ default: ['VIEW_CHANNEL'] }, { default: [], guilds: { G: { channels: { y: ['SEND_MESSAGES'] } } } });
+    assert.equal(pin.guilds.G.default, undefined);
   } finally {
     t.cleanup();
   }

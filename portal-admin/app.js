@@ -148,10 +148,28 @@ function showLogin(errMsg) {
   if (errMsg) { e.textContent = errMsg; e.classList.remove('hidden'); } else e.classList.add('hidden');
 }
 
+// Why a sign-in ended back here (the server redirects with a fixed code; the
+// message comes from this table — nothing from the URL is shown).
+const LOGIN_ERRORS = {
+  not_admin: 'This Discord account doesn’t administer any server portal serves. If it should, ask a portal operator to add the server.',
+  failed: 'Sign-in didn’t complete — it may have expired, or been opened twice. Please try again.',
+  discord: 'Discord sign-in failed. Please try again.',
+};
+
 async function boot() {
+  const params = new URLSearchParams(location.search);
+  const loginError = LOGIN_ERRORS[params.get('login_error')] || null;
+  if (params.has('login_error')) {
+    params.delete('login_error');
+    const rest = params.toString();
+    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+  }
   let me;
   try { me = await api('GET', '/admin/me'); }
-  catch (e) { if (e.status === 401) return; return showLogin('Could not reach the admin API: ' + e.message); }
+  catch (e) {
+    if (e.status === 401) { if (loginError) showLogin(loginError); return; }
+    return showLogin('Could not reach the admin API: ' + e.message);
+  }
   state.me = me;
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');

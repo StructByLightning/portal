@@ -934,6 +934,13 @@ export class DiscordBot implements WebhookOps, RoleOps {
    * from non-admins; the authoritative gate is server-side in SlashHandler.
    * No-op unless a slashCommand handler is wired (relay opts in).
    */
+  /** Remove portal's slash commands from a guild (it left the allow-list). */
+  async clearSlashCommands(guildId: string): Promise<void> {
+    const app = this.client.application;
+    if (!app || !this.client.guilds.cache.has(guildId)) return;
+    await app.commands.set([], guildId);
+  }
+
   async syncSlashCommands(guildId?: string): Promise<void> {
     if (!this.handlers.slashCommand) return;
     const app = this.client.application;

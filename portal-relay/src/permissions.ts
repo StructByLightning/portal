@@ -438,6 +438,16 @@ export class PermissionsStore {
     this.personas = new Map(
       Object.entries(next.personas ?? {}).map(([id, raw]) => [id, toEntry(raw)]),
     );
+    // A persona-wide default applies in EVERY guild the relay serves. Nothing
+    // in the relay writes one any more (invite grants are guild-bound); one on
+    // disk was put there by hand or by an older relay — say so loudly.
+    const wide = [...this.personas].filter(([, e]) => (e.policy?.default?.length ?? 0) > 0).map(([id]) => id);
+    if (wide.length) {
+      console.error(
+        `[portal-relay] permissions: ${wide.length} persona(s) hold a persona-wide default, which applies in every ` +
+          `served guild: ${wide.join(', ')} — review, and re-scope to a guild if that was not intended`,
+      );
+    }
     if (this.listeners.length) {
       // A role-catalog edit can change effective caps for any persona that
       // references a role, so treat such an entry as changed too.

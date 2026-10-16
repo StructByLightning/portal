@@ -378,3 +378,26 @@ test("every slash command fits Discord's limits (a violation fails the whole reg
     }
   }
 });
+
+test('nothing runs in a guild the relay does not serve (commands can linger there)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-slash-unserved-'));
+  writeFileSync(join(dir, 'identity.json'), JSON.stringify({ personas: [{ id: 'p1', displayName: 'P', avatar: '', token: 't' }] }));
+  writeFileSync(join(dir, 'permissions.json'), JSON.stringify({ roles: {}, personas: {} }));
+  writeFileSync(join(dir, 'invites.json'), JSON.stringify({ invites: [] }));
+  const permissions = new PermissionsStore(join(dir, 'permissions.json'));
+  const handler = new SlashHandler({
+    identity: new IdentityStore(join(dir, 'identity.json'), ''),
+    permissions,
+    invites: new InviteStore(join(dir, 'invites.json')),
+    superadmins: [], guildAdmins: {},
+    capsFor: () => [], canAccessGuild: () => false, resync: () => 0, newInviteCode: () => 'inv_X',
+    isGuildServed: () => false,
+  });
+  const admin = { id: 'a1', name: 'A', hasManageGuild: true };
+  try {
+    assert.match(handler.handle({ command: 'invite', guildId: 'G', channelId: 'c', channelName: 'c', invoker: admin, options: { role: 'x' } }), /not enabled in this server/);
+    assert.deepEqual(handler.autocomplete({ command: 'add', guildId: 'G', channelId: 'c', invoker: admin, option: 'persona', partial: '', options: {} }), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

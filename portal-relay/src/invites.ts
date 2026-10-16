@@ -97,6 +97,13 @@ export class InviteStore {
       byCode.set(inv.code, inv);
     }
     this.byCode = byCode;
+    // A granting invite that names no guild can't be applied (every scope
+    // resolves within one guild): enroll and claim refuse it. Flag it so it
+    // is re-minted rather than discovered by the agent that tries it.
+    const guildless = [...byCode.values()].filter((i) => (i.grant || i.caps?.length) && !i.guildId).map((i) => i.label ?? i.code.slice(0, 12));
+    if (guildless.length) {
+      console.error(`[portal-relay] invites: ${guildless.length} granting invite(s) name no guild and will be refused: ${guildless.join(', ')}`);
+    }
   }
 
   private persist(): void {

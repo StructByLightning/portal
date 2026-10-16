@@ -231,12 +231,19 @@ export interface SlashDeps {
   /** Re-push the full channel set to a persona; returns channels pushed. */
   resync(personaId: string): number;
   newInviteCode(): string;
+  /** Whether the relay serves this guild (allow-listed). Commands linger in a
+   *  guild until Discord drops them, and a joined-but-not-allowed guild is not
+   *  one portal administers — so nothing runs there. */
+  isGuildServed?(guildId: string): boolean;
 }
 
 export class SlashHandler {
   constructor(private deps: SlashDeps) {}
 
   handle(inv: SlashInvocation): string {
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(inv.guildId)) {
+      return 'Portal is not enabled in this server.';
+    }
     if (!this.authorized(inv.invoker, inv.guildId)) {
       this.audit(inv, 'authz.denied', undefined, false, { command: inv.command });
       return 'Not authorized: requires Manage Server here, or portal superadmin.';
@@ -490,6 +497,7 @@ export class SlashHandler {
     // Same gate as execution: a user who can see the command (e.g. after a
     // guild admin widened visibility in Integrations settings) but can't run
     // it must not be able to enumerate personas or the role catalog by typing.
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(req.guildId)) return [];
     if (!this.authorized(req.invoker, req.guildId)) return [];
     if (req.option === 'persona') return this.personaChoices(req);
     if (req.option === 'role' || req.option === 'role2' || req.option === 'role3') {
