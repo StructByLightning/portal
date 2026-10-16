@@ -374,7 +374,13 @@ function listView(view, opts) {
     let t = null;
     search.addEventListener('input', () => {
       clearTimeout(t);
-      t = setTimeout(() => { state.q = search.value.trim(); state.offset = 0; list.refresh(); }, 250);
+      t = setTimeout(() => {
+        t = null;
+        // Typed, then left (another tab or guild) within the debounce: the
+        // new list's box shows state.q, so this box's text must not land there.
+        if (state.list !== list) return;
+        state.q = search.value.trim(); state.offset = 0; list.refresh();
+      }, 250);
     });
     bar.push(search);
   }

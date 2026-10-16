@@ -5,7 +5,8 @@
 // behaviour of ui.js's feedback helpers: busy() locks a button for exactly one
 // request, onSubmit() ignores a second submit while the first is pending,
 // errors toast stickily (and their ✕ can be reached from the keyboard while
-// the drawer is open), and dirtyTracker() notices edits.
+// the drawer is open), and dirtyTracker() notices edits. app.js is booted
+// against a fake API for the list search.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -549,3 +550,90 @@ test('ui.toast: the ✕ is described by its message', () => {
   assert.equal(msg.textContent, 'Not saved: channel is not in this guild.');
 });
 
+// ── app.js, booted against a fake admin API ──
+
+const G1 = '100000000000000001'; // the preview harness's invented Guild One
+
+/** A sandbox with index.html's shell, signed in as a one-guild admin. Every
+ *  request lands in `calls` as 'METHOD /path?query'. */
+function appSandbox() {
+  const box = sandbox();
+  const { ctx, doc } = box;
+  const calls: string[] = [];
+  Object.assign(ctx, {
+    URLSearchParams,
+    location: { search: '', pathname: '/', hash: '' },
+    history: { replaceState() {} },
+    fetch: async (path: string, req: { method: string }) => {
+      calls.push(req.method + ' ' + path);
+      const route = new URL(path, 'http://panel.invalid').pathname;
+      const g = '/admin/g/' + G1;
+      const routes: Record<string, unknown> = {
+        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+        '/admin/guilds': { guilds: [{ id: G1, name: 'Guild One' }] },
+        [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
+        [g + '/channels']: { channels: [] },
+        [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
+        [g + '/invites']: { invites: [{ code: 'inv_fixtureinvite0000000a', label: 'test', mode: 'mint', uses: 0, roles: ['g1-readers'] }], total: 1, limit: 50, offset: 0 },
+      };
+      const body = req.method === 'DELETE' ? {} : routes[route];
+      if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
+      return { status: 200, ok: true, text: async () => JSON.stringify(body) };
+    },
+  });
+  load(ctx);
+  const { el } = ctx.PA.ui;
+  const tab = (name: string, cls = 'tab') => el('button', { class: cls, 'data-tab': name, text: name });
+  const tabs = { personas: tab('personas'), invites: tab('invites'), roles: tab('roles'), audit: tab('audit'), guilds: tab('guilds', 'tab tab-super hidden') };
+  doc.body.appendChild(el('div', { id: 'login', class: 'hidden' }, [el('p', { id: 'login-error', class: 'hidden' })]));
+  doc.body.appendChild(el('div', { id: 'app', class: 'hidden' }, [
+    el('header', {}, [
+      el('span', { id: 'user-name' }), el('span', { id: 'super-badge', class: 'hidden' }),
+      el('select', { id: 'guild-select' }), el('span', { id: 'guild-static', class: 'hidden' }),
+      el('nav', {}, Object.values(tabs)), el('button', { id: 'logout-btn', text: 'Sign out' }),
+    ]),
+    el('main', { id: 'view' }),
+  ]));
+  drawerDom(doc, el);
+  return { ...box, calls, tabs };
+}
+
+async function settle() {
+  for (let i = 0; i < 30; i++) await tick();
+}
+
+test('app list search: a query typed just before leaving a tab does not follow you to the next one', async () => {
+  const { ctx, doc, advance, calls, tabs } = appSandbox();
+  await ctx.PA.app.boot();
+  await settle();
+  const g = '/admin/g/' + G1;
+  assert.ok(calls.includes(`GET ${g}/personas?limit=50&offset=0`), calls.join('\n'));
+  const search = () => doc.getElementById('list-search')!;
+
+  // Type on Personas, and switch to Invites inside the 250 ms debounce.
+  search().value = 'zz';
+  search().fire('input');
+  tabs.invites.click();
+  await settle();
+  assert.equal(search().getAttribute('placeholder'), 'Search invites…');
+  assert.equal(search().value, '');
+  const mark = calls.length;
+  advance(300);
+  await settle();
+  assert.deepEqual(calls.slice(mark), [], 'the Personas box’s timer sends nothing once Invites has replaced it');
+
+  // The Invites list's next redraw (here after a revoke) is unfiltered, as its empty box says.
+  doc.querySelectorAll('button').find((b) => b.textContent === 'Revoke')!.click();
+  await settle();
+  doc.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(calls.slice(mark), [`DELETE ${g}/invites/inv_fixtureinvite0000000a`, `GET ${g}/invites?limit=50&offset=0`]);
+
+  // Searching on the tab you are on still works.
+  search().value = 'test';
+  search().fire('input');
+  advance(300);
+  await settle();
+  assert.equal(calls.at(-1), `GET ${g}/invites?q=test&limit=50&offset=0`);
+  assert.equal(search().value, 'test');
+});
