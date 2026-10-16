@@ -18,7 +18,7 @@ import { ALL_CAPS } from '../permissions.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
-import type { AuditLog } from './audit.js';
+import type { AuditLog, AuditRecord } from './audit.js';
 import { canManageGuild } from './authz.js';
 import { clipToGuild, type ChannelLabel, type NameMaps, type RoleLabel } from './names.js';
 import { authorizeUrl, completeOAuth, type FetchLike } from './oauth.js';
@@ -419,7 +419,7 @@ export class AdminServer {
       case 'channels':
         return sendJson(res, 200, { channels: this.deps.listChannels(guildId) });
       case 'audit': {
-        const records = this.audit.read({ guildId, limit: page.limit });
+        const records = this.audit.read({ guildId, limit: page.limit }).map((r) => this.auditView(r, guildId, session.isSuper));
         return sendJson(res, 200, { records, names: await this.auditNames(records, guildId) });
       }
       default:
@@ -449,7 +449,7 @@ export class AdminServer {
     const all = this.deps.invites?.all() ?? [];
     return all
       .filter((inv) => inv.guildId === guildId)
-      .filter((inv) => isSuper || this.rolesAllBoundTo(inv.roles ?? [], guildId))
+      .filter((inv) => isSuper || !this.hasForeignRole(inv.roles ?? [], guildId))
       .filter((inv) => !q || matches(q, inv.code, inv.label));
   }
 
@@ -537,6 +537,9 @@ export class AdminServer {
   private revokeInvite(res: ServerResponse, session: AdminSession, guildId: string, code: string): void {
     const inv = this.deps.invites?.get(code);
     if (!inv || inv.guildId !== guildId) return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
+    if (!session.isSuper && this.hasForeignRole(inv.roles ?? [], guildId)) {
+      return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
+    }
     this.deps.invites!.revoke(code);
     this.audit.append({ actor: this.actorOf(session), action: 'invite.revoke', target: code, guildId, ok: true, before: inv });
     sendJson(res, 200, { ok: true });
@@ -548,9 +551,12 @@ export class AdminServer {
     if (typeof name !== 'string' || !name) return sendJson(res, 400, err('INVALID', 'role required'));
     const e = this.roleAssignError(session, guildId, name);
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
+    // An admin granting access in the role's guild ends a /ban there.
+    const roleGuild = this.deps.permissions.getRole(name)?.guildId;
+    const liftedBan = roleGuild ? this.deps.permissions.liftBan(personaId, roleGuild) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name } });
-    sendJson(res, 200, { roles });
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
   }
 
   private revokeRole(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, role: string): void {
@@ -560,7 +566,7 @@ export class AdminServer {
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     const roles = this.deps.permissions.removePersonaRole(personaId, role);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.revoke', target: personaId, guildId, ok: true, before: { role } });
-    sendJson(res, 200, { roles });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
   }
 
   private setGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, body: any): void {
@@ -571,10 +577,12 @@ export class AdminServer {
     if (channelId && !this.deps.channelInGuild(guildId, channelId)) {
       return sendJson(res, 403, err('FORBIDDEN', 'channel is not in this guild'));
     }
+    // An admin granting access here ends a /ban here.
+    const liftedBan = this.deps.permissions.liftBan(personaId, guildId);
     if (channelId) this.deps.permissions.setChannel(personaId, guildId, channelId, caps as any);
     else this.deps.permissions.setGuildDefault(personaId, guildId, caps as any);
     const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.grant.set', target: personaId, guildId, ok: true, after: { channelId, caps } });
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.grant.set', target: personaId, guildId, ok: true, after: { channelId, caps, ...(liftedBan ? { liftedBan } : {}) } });
     sendJson(res, 200, { guildPolicy });
   }
 
@@ -602,7 +610,7 @@ export class AdminServer {
     if (!inv || inv.guildId !== guildId) return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
     // A guild-admin acts within G only: an invite carrying another guild's
     // roles (a super-admin can mint one) is not theirs to apply.
-    if (!session.isSuper && !this.rolesAllBoundTo(inv.roles ?? [], guildId)) {
+    if (!session.isSuper && this.hasForeignRole(inv.roles ?? [], guildId)) {
       return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
     }
     let result;
@@ -612,7 +620,7 @@ export class AdminServer {
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
     this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles } });
-    sendJson(res, 200, { roles: result.roles });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper) });
   }
 
   /** Global persona-token lifecycle (super-admin only; no guildId — it's not a
@@ -983,9 +991,36 @@ export class AdminServer {
     redirect(res, `${to}${to.includes('?') ? '&' : '?'}login_error=${code}`);
   }
 
-  /** Every role is a catalog role bound to `guildId`. */
-  private rolesAllBoundTo(roles: string[], guildId: string): boolean {
-    return roles.every((r) => this.deps.permissions.getRole(r)?.guildId === guildId);
+  /** Some role is bound to a guild other than `guildId`. (A role that no
+   *  longer exists grants nothing, so it doesn't make an invite foreign; if a
+   *  role of that name is created later, this is re-evaluated then.) */
+  private hasForeignRole(roles: string[], guildId: string): boolean {
+    return roles.some((r) => {
+      const g = this.deps.permissions.getRole(r)?.guildId;
+      return g !== undefined && g !== guildId;
+    });
+  }
+
+  /**
+   * A record as a guild's audit view shows it. Invite codes are bearer
+   * credentials (an unauthenticated register claims them), so every reader
+   * sees only a prefix — enough to match a record to an invite; the invite
+   * list is where a code is shown, to whoever may see it. A guild-admin also
+   * doesn't see other guilds' access-role names.
+   */
+  private auditView(rec: AuditRecord, guildId: string, isSuper: boolean): AuditRecord {
+    const r = structuredClone(rec);
+    const short = (c: unknown) => (typeof c === 'string' && c.length > 12 ? `${c.slice(0, 12)}…` : c);
+    if (r.action.startsWith('invite.') || r.action === 'slash.invite') r.target = short(r.target) as string | undefined;
+    const visible = (name: unknown) => isSuper || (typeof name === 'string' && this.deps.permissions.getRole(name)?.guildId === guildId);
+    for (const k of ['before', 'after', 'detail'] as const) {
+      const o = r[k] as Record<string, unknown> | undefined;
+      if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
+      if ('code' in o) o.code = short(o.code);
+      if (Array.isArray(o.roles)) o.roles = o.roles.filter(visible);
+      if ('role' in o && !visible(o.role)) o.role = '(another server’s role)';
+    }
+    return r;
   }
 
   /** The role names a guild view may show: all of them to a super-admin, only

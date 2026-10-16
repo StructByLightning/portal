@@ -231,3 +231,117 @@ test('augmenting a persona never narrows what it already had', () => {
     t.cleanup();
   }
 });
+
+test('a persona banned from a guild cannot give itself access there again; an admin can', () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('g1-staff', { caps: [...RW], scope: { all: true }, guildId: GUILD });
+    t.relay.invites.mint({ code: 'all-aug', mode: 'both', maxUses: 5, guildId: GUILD, grant: { caps: [...RW], scope: { all: true } } } as any);
+    t.relay.invites.mint({ code: 'role-aug', mode: 'augment', maxUses: 5, roles: ['g1-staff'] } as any);
+    t.relay.invites.mint({ code: 'chan-aug', mode: 'augment', maxUses: 5, guildId: GUILD, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } } as any);
+    t.relay.applyInviteAugment(EXISTING, 'all-aug');
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
+
+    t.relay.permissions.removePersonaRole(EXISTING, 'g1-staff');
+    t.relay.permissions.clearGuild(EXISTING, GUILD); // what /ban does
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), []);
+    for (const code of ['all-aug', 'role-aug', 'chan-aug']) {
+      const uses = t.relay.invites.get(code).uses ?? 0;
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, code), /banned from that server/, code);
+      assert.equal(t.relay.invites.get(code).uses ?? 0, uses, `${code}: no use consumed`);
+    }
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), [], 'still nothing');
+    // Nothing granted around the ban counts until an admin acts: a role added
+    // behind its back resolves to nothing in the banned guild.
+    t.relay.permissions.addPersonaRoles(EXISTING, ['g1-staff']);
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), []);
+    t.relay.permissions.removePersonaRole(EXISTING, 'g1-staff');
+
+    // An admin-initiated claim is the admin's decision: it lifts the ban.
+    t.relay.applyInviteAugment(EXISTING, 'chan-aug', { byAdmin: true });
+    assert.equal(t.relay.permissions.isBanned(EXISTING, GUILD), false);
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a ban survives a restart (it is written to permissions.json)', () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.clearGuild(EXISTING, GUILD);
+    const reread = new (t.relay.permissions.constructor as any)(t.relay.config.permissionsPath);
+    assert.equal(reread.isBanned(EXISTING, GUILD), true);
+    assert.equal(reread.resolve(EXISTING, GUILD, CHAN_A).size, 0);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a persona on the file default keeps it everywhere when it is first given something', () => {
+  const t = makeRelay();
+  try {
+    (t.relay.permissions as any).fileDefault = [...RW];
+    for (const id of ['legacy', 'legacy2', 'legacy3']) {
+      t.relay.identity.upsert({ id, displayName: id, avatar: '', token: `tok-${id}` });
+    }
+    t.relay.invites.mint({ code: 'chan-view', mode: 'augment', guildId: GUILD, grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_NEW] } } } as any);
+    t.relay.permissions.setRole('g1-view', { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_NEW] }, guildId: GUILD });
+    t.relay.invites.mint({ code: 'role-view', mode: 'augment', roles: ['g1-view'] } as any);
+    const everywhere = (pid: string) => [...t.relay.permissions.resolve(pid, 'some-other-guild', 'x')].sort();
+
+    t.relay.applyInviteAugment('legacy', 'chan-view');
+    assert.deepEqual(t.caps('legacy', CHAN_A), [...RW], 'the rest of the guild unchanged');
+    assert.deepEqual(everywhere('legacy'), [...RW], 'other guilds unchanged');
+    assert.deepEqual(t.caps('legacy', CHAN_NEW), [...RW], 'and nothing narrowed where it was granted');
+
+    t.relay.applyInviteAugment('legacy2', 'role-view');
+    assert.deepEqual(everywhere('legacy2'), [...RW]);
+
+    t.relay.permissions.setChannel('legacy3', GUILD, CHAN_NEW, ['VIEW_CHANNEL']); // an admin grant
+    assert.deepEqual(everywhere('legacy3'), [...RW]);
+    assert.deepEqual(t.caps('legacy3', CHAN_A), [...RW]);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('an enrolled persona gets exactly what its invite grants, not the file default', async () => {
+  const t = makeRelay();
+  try {
+    (t.relay.permissions as any).fileDefault = [...RW];
+    t.relay.permissions.setRole('g1-view', { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] }, guildId: GUILD });
+    t.relay.invites.mint({ code: 'roles-only', roles: ['g1-view'] } as any);
+    const res = await t.relay.enroll({ invite: 'roles-only', desiredName: 'fresh' });
+    assert.ok(!('error' in res), JSON.stringify(res));
+    assert.equal(t.relay.permissions.resolve(res.personaId, 'some-other-guild', 'x').size, 0);
+    assert.deepEqual(t.caps(res.personaId, CHAN_A), ['VIEW_CHANNEL']);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('an invite whose grant is malformed is refused before anything is created or consumed', async () => {
+  const t = makeRelay();
+  try {
+    const bad: Array<[string, unknown]> = [
+      ['all-false', { caps: [...RW], scope: { all: false } }],
+      ['empty-scope', { caps: [...RW], scope: {} }],
+      ['two-keys', { caps: [...RW], scope: { all: true, channels: [CHAN_A] } }],
+      ['no-caps', { caps: [], scope: { all: true } }],
+      ['empty-channels', { caps: [...RW], scope: { channels: [] } }],
+    ];
+    for (const [code, grant] of bad) t.relay.invites.mint({ code, mode: 'both', guildId: GUILD, grant } as any);
+    const count = t.relay.identity.all().length;
+    for (const [code] of bad) {
+      const res = await t.relay.enroll({ invite: code, desiredName: `n-${code}` });
+      assert.ok('error' in res && /invite grant/.test(res.error), `${code}: ${JSON.stringify(res)}`);
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, code), /invite grant/, code);
+      assert.equal(t.relay.invites.get(code).uses ?? 0, 0, `${code}: no use consumed`);
+    }
+    assert.equal(t.relay.identity.all().length, count, 'no persona created');
+  } finally {
+    t.cleanup();
+  }
+});
+

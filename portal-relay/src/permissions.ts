@@ -34,15 +34,19 @@ export type MirrorLookup = (guildId: string, roleId: string) => ReadonlyMap<stri
 /** A bare PersonaPolicy on disk (legacy) lacks `roles`/`policy` keys. Normalise
  *  it to the entry shape so the store always holds `PersonaEntry`. */
 function toEntry(raw: PersonaFileEntry): PersonaEntry {
-  if (raw && ('roles' in raw || 'policy' in raw)) return raw as PersonaEntry;
+  if (raw && ('roles' in raw || 'policy' in raw || 'bans' in raw)) return raw as PersonaEntry;
   return { policy: raw as PersonaPolicy };
 }
 
 /** Inverse of {@link toEntry}: persist a policy-only entry in the legacy inline
  *  shape (keeps existing files stable); use the new shape only when roles exist. */
 function fromEntry(e: PersonaEntry): PersonaFileEntry {
-  if (!e.roles?.length) return e.policy ?? { default: [] };
-  return e.policy ? { roles: e.roles, policy: e.policy } : { roles: e.roles };
+  if (!e.roles?.length && !e.bans?.length) return e.policy ?? { default: [] };
+  return {
+    ...(e.roles?.length ? { roles: e.roles } : {}),
+    ...(e.policy ? { policy: e.policy } : {}),
+    ...(e.bans?.length ? { bans: e.bans } : {}),
+  };
 }
 
 export type PermissionChange = {
@@ -102,6 +106,7 @@ export class PermissionsStore {
   resolve(personaId: string, guildId: string | null, channelId: string): Set<Capability> {
     const entry = this.personas.get(personaId);
     if (!entry) return new Set(this.fileDefault);
+    if (guildId && entry.bans?.includes(guildId)) return new Set();
     const out = this.resolveForRoles(entry.roles ?? [], guildId, channelId);
     if (entry.policy) {
       for (const c of this.resolvePolicy(entry.policy, guildId, channelId)) out.add(c);
@@ -198,6 +203,32 @@ export class PermissionsStore {
     return this.personas.get(personaId)?.policy;
   }
 
+  /** The inline policy a merge should start from: the persona's own, or —
+   *  for a persona with no entry yet — the file default it resolves to
+   *  today (so creating its entry does not take that away). Cloned. */
+  basePolicy(personaId: string): PersonaPolicy {
+    const e = this.personas.get(personaId);
+    if (!e) return { default: [...this.fileDefault] };
+    return e.policy ? structuredClone(e.policy) : { default: [] };
+  }
+
+  /** Was this persona banned from `guildId` (and not granted access there since)? */
+  isBanned(personaId: string, guildId: string): boolean {
+    return this.personas.get(personaId)?.bans?.includes(guildId) ?? false;
+  }
+
+  /** An admin of `guildId` granted this persona access there again: the ban
+   *  no longer applies. Returns whether there was one. */
+  liftBan(personaId: string, guildId: string): boolean {
+    const e = this.personas.get(personaId);
+    if (!e?.bans?.includes(guildId)) return false;
+    e.bans = e.bans.filter((g) => g !== guildId);
+    if (!e.bans.length) delete e.bans;
+    this.persist();
+    this.emit({ personaId, scope: 'guild', guildId });
+    return true;
+  }
+
   getRoleNames(personaId: string): string[] {
     return this.personas.get(personaId)?.roles ?? [];
   }
@@ -234,6 +265,7 @@ export class PermissionsStore {
   ): boolean {
     const entry = this.personas.get(personaId);
     if (!entry) return this.fileDefault.length > 0; // file default applies everywhere
+    if (entry.bans?.includes(guildId)) return false;
     for (const name of entry.roles ?? []) {
       const role = this.roles.get(name);
       if (!role || role.caps.length === 0) continue;
@@ -286,14 +318,14 @@ export class PermissionsStore {
 
   /** Replace a persona's entire inline policy (RFC-004 scoped-grant enrollment). */
   setPersonaPolicy(personaId: string, policy: PersonaPolicy): void {
-    this.ensure(personaId).policy = policy;
+    this.ensure(personaId, false).policy = policy;
     this.persist();
     this.emit({ personaId, scope: 'reload' });
   }
 
   /** Assign access roles to a persona (RFC-004 role-based enrollment). */
   setPersonaRoles(personaId: string, roles: string[]): void {
-    this.ensure(personaId).roles = roles;
+    this.ensure(personaId, false).roles = roles;
     this.persist();
     this.emit({ personaId, scope: 'reload' });
   }
@@ -340,26 +372,23 @@ export class PermissionsStore {
     }
   }
 
-  /** Hard-deny a persona's inline policy in one guild: drops every channel
-   *  grant and pins the guild default to [] (an explicit deny — deleting the
-   *  subtree would fall back to the persona default instead). Used by /ban;
-   *  guild-scoped access ROLES are removed separately by the caller. */
+  /** Ban a persona from one guild (/ban): drops every channel grant, pins the
+   *  guild default to [] (an explicit deny — deleting the subtree would fall
+   *  back to the persona default instead), and records the ban, so nothing
+   *  the persona does itself (claiming an invite again) restores access
+   *  there; only an admin of that guild granting access lifts it. Guild-
+   *  scoped access ROLES are removed separately by the caller. */
   clearGuild(personaId: string, guildId: string): void {
     // ensureGuild (not personas.get) so a persona with NO permissions entry
     // gets one pinned to deny — otherwise a /ban of a file-default persona
-    // would silently no-op and the file default would keep applying.
-    //
-    // Guild containment of the side effect: creating the entry stops the
-    // FILE default from applying to this persona ANYWHERE (resolve() only
-    // consults it for entry-less personas). Seed the persona default from a
-    // snapshot of it so a guild-scoped ban denies exactly this guild and
-    // leaves the persona's standing in every other guild unchanged.
-    if (!this.personas.has(personaId) && this.fileDefault.length > 0) {
-      this.ensurePolicy(personaId).default = [...this.fileDefault];
-    }
+    // would silently no-op and the file default would keep applying. (ensure
+    // seeds the new entry from the file default, so the ban denies exactly
+    // this guild and the persona's standing elsewhere is unchanged.)
     const g = this.ensureGuild(personaId, guildId);
     g.default = [];
     delete g.channels;
+    const e = this.ensure(personaId);
+    if (!e.bans?.includes(guildId)) e.bans = [...(e.bans ?? []), guildId];
     this.persist();
     this.emit({ personaId, scope: 'guild', guildId });
   }
@@ -394,9 +423,19 @@ export class PermissionsStore {
     }
   }
 
-  private ensure(personaId: string): PersonaEntry {
+  /**
+   * The persona's entry, created if missing. A persona with no entry resolves
+   * to the FILE default everywhere, and once it has an entry that default no
+   * longer applies — so a new entry starts from a copy of it (`seed`), and an
+   * edit in one guild leaves the persona's access everywhere else as it was.
+   * Enrollment, which sets the whole entry from an invite, does not seed.
+   */
+  private ensure(personaId: string, seed = true): PersonaEntry {
     let e = this.personas.get(personaId);
-    if (!e) this.personas.set(personaId, (e = {}));
+    if (!e) {
+      e = seed && this.fileDefault.length ? { policy: { default: [...this.fileDefault] } } : {};
+      this.personas.set(personaId, e);
+    }
     return e;
   }
   private ensurePolicy(personaId: string): PersonaPolicy {

@@ -401,3 +401,38 @@ test('nothing runs in a guild the relay does not serve (commands can linger ther
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("/add-role and /remove-role replies list only this guild's roles to a guild admin", () => {
+  const t = makeHandler();
+  try {
+    t.permissions.addPersonaRoles('evander-1', ['g2-role']);
+    const added = t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'guild-role' }));
+    assert.match(added, /`guild-role`/);
+    assert.doesNotMatch(added, /g2-role/);
+    const removed = t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'guild-role' }));
+    assert.doesNotMatch(removed, /g2-role/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'guild-role' }, SUPER)), /g2-role/, 'a superadmin sees them all');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('/ban holds until an admin grants access again; /add or /add-role lifts it', () => {
+  const t = makeHandler();
+  try {
+    t.handler.handle(t.inv('ban', { persona: 'rhys-1' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), true);
+    t.handler.handle(t.inv('add', { persona: 'rhys-1', level: 'read' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), false);
+    assert.ok(t.permissions.resolve('rhys-1', GUILD, CHAN).has('READ_HISTORY'));
+    assert.equal(t.permissions.resolve('rhys-1', GUILD, OTHER_CHAN).size, 0, 'only what was granted');
+
+    t.handler.handle(t.inv('ban', { persona: 'ash-1' }));
+    t.handler.handle(t.inv('add-role', { persona: 'ash-1', role: 'guild-role' }));
+    assert.equal(t.permissions.isBanned('ash-1', GUILD), false);
+    assert.ok(t.permissions.resolve('ash-1', GUILD, OTHER_CHAN).has('VIEW_CHANNEL'));
+  } finally {
+    t.cleanup();
+  }
+});
+

@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore } from './invites.js';
+import { InviteStore, grantShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
@@ -212,7 +212,7 @@ export class Relay implements GatewayHooks {
         discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
-        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
+        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code, { byAdmin: true }),
         rotatePersonaToken: (personaId) => this.rotatePersonaToken(personaId),
         revokePersonaToken: (personaId) => this.revokePersonaToken(personaId),
         newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
@@ -823,14 +823,16 @@ export class Relay implements GatewayHooks {
   /**
    * Why an invite's grant can't be applied, or null. Checked BEFORE a persona
    * is created or a use is consumed, so a bad invite fails loudly instead of
-   * minting a persona with no access. Any grant (or legacy blanket caps) must
-   * name its guild — every scope resolves within one guild — and a mirror
-   * grant must not collide with a different access role of the same name.
+   * minting a persona with no access. The grant (or legacy blanket caps) must
+   * be well-formed and name its guild — every scope resolves within one guild
+   * (grantShapeProblem) — and a mirror grant must not collide with a
+   * different access role of the same name.
    */
   private inviteGrantProblem(inv: InviteTemplate): string | null {
+    const shape = grantShapeProblem(inv);
+    if (shape) return shape;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
-    if (!grant) return null;
-    if (!inv.guildId) return 'invite grants access but names no guild — it must be re-minted with a guild';
+    if (!grant || !inv.guildId) return null;
     if (isMirrorScope(grant.scope)) {
       const { name, role } = mirrorRoleFor(inv.guildId, grant.scope, grant.caps);
       const existing = this.permissions.getRole(name);
@@ -1045,7 +1047,7 @@ export class Relay implements GatewayHooks {
    * grant, consumes a use, and returns the resulting role set. Throws rpcError on
    * any rejection. Auditing is the caller's responsibility (actor differs).
    */
-  private applyInviteAugment(personaId: string, code: string): { roles: string[] } {
+  private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
     if (!this.identity.get(personaId)) throw rpcError('NOT_FOUND', 'no such persona');
     const checked = this.invites.check(code, Date.now());
@@ -1068,20 +1070,36 @@ export class Relay implements GatewayHooks {
     const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
     const grantProblem = this.inviteGrantProblem(checked);
     if (grantProblem) throw rpcError('INVALID_PARAMS', grantProblem);
-    if (checked.roles?.length) {
-      this.permissions.addPersonaRoles(personaId, checked.roles);
+    // A persona banned from a guild (/ban) can't give itself access there
+    // again by claiming an invite — only an admin can (an admin-initiated
+    // claim is that admin's decision, and lifts the ban).
+    const touched = new Set<string>();
+    if (grant && checked.guildId) touched.add(checked.guildId);
+    for (const r of checked.roles ?? []) {
+      const g = this.permissions.getRole(r)?.guildId;
+      if (g) touched.add(g);
     }
+    const banned = [...touched].filter((g) => this.permissions.isBanned(personaId, g));
+    if (banned.length && !opts.byAdmin) {
+      throw rpcError('FORBIDDEN', 'this persona was banned from that server; only an admin there can give it access again');
+    }
+    let mirrorRole: string | null = null;
     if (grant && isMirrorScope(grant.scope)) {
       // Same live-role materialization as enroll; a silent snapshot here is
       // strictly worse because an augmented persona has no reason to suspect
       // its shiny new scope is already fossilizing.
-      const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-      if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
-      this.permissions.addPersonaRoles(personaId, [role]);
+      mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+      if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
+    }
+    for (const g of banned) this.permissions.liftBan(personaId, g);
+    if (checked.roles?.length) {
+      this.permissions.addPersonaRoles(personaId, checked.roles);
+    }
+    if (mirrorRole) {
+      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
     } else if (grant) {
       const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-      const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
     }
     this.invites.consume(code);
     return { roles: this.permissions.getRoleNames(personaId) };
