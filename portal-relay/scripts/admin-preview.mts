@@ -13,10 +13,20 @@
 //   node --import tsx scripts/admin-preview.mts [--scale small|large] [--ttl ms] [--no-avatars] [--port 8833]
 //
 // Then open http://127.0.0.1:8833/dev-login?as=op   (op | gwen | dee | otto)
-//   /dev-login?as=<user>[&deny=1]  sign in as a fixture user (deny=1: cancel at "Discord")
-//   /dev-authorize[?deny=1]        stands in for Discord's authorize page
+//   /dev-login?as=<user>[&deny=1][&hold=1]
+//                                  sign in as a fixture user (deny=1: cancel at
+//                                  "Discord"; hold=1: stop at a consent page, as
+//                                  Discord does the first time, until it is reset
+//                                  by a /dev-login without hold=1)
+//   /dev-authorize[?deny=1][&hold=1]  stands in for Discord's authorize page
 //   /dev-restart                   rebuild the AdminServer over the same stores
-//                                  (ends every session, like a relay restart)
+//                                  (ends every session and every sign-in in flight,
+//                                  like a relay restart)
+//
+// The front passes X-Forwarded-For through untouched, so a request from the
+// browser counts as 127.0.0.1 for the sign-in rate limit, and a curl can pick
+// its own address:
+//   curl -si -H 'X-Forwarded-For: 203.0.113.5' 'http://127.0.0.1:8833/admin/callback?code=x&state=y'
 //
 // Fixture users:
 //   op    super-admin (PORTAL_SUPERADMINS)
@@ -250,7 +260,7 @@ const AUDIT: AuditLine[] = [
   { ts: iso(NOW - 1 * DAY), actor: admin('gwen'), action: 'invite.mint', target: INVITES[0].code as string, guildId: G1, ok: true, after: INVITES[0] },
   { ts: iso(NOW - 20 * 3_600_000), actor: admin('op'), action: 'persona.role.revoke', target: 'cass', guildId: G1, ok: true, before: { role: 'g1-readers' } },
   { ts: iso(NOW - 6 * 3_600_000), actor: admin('otto'), action: 'authz.denied', guildId: G1, ok: false, detail: { via: 'slash', channelId: C.general, command: 'add' } },
-  { ts: iso(NOW - 5 * 3_600_000), actor: admin('otto'), action: 'login.denied', ok: false, detail: { reason: 'administers no guild this relay serves' } },
+  { ts: iso(NOW - 5 * 3_600_000), actor: admin('otto'), action: 'login.denied', ok: false, detail: { reason: 'no_manageable_guild' } },
   { ts: iso(NOW - 3 * 3_600_000), actor: admin('op'), action: 'invite.mint', target: INVITES[4].code as string, guildId: G1, ok: true, after: INVITES[4] },
 ];
 
@@ -538,6 +548,25 @@ function serveStatic(res: ServerResponse, pathname: string) {
   res.end(readFileSync(file));
 }
 
+const escapeHtml = (t: string) =>
+  t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
+/** The stand-in for Discord's consent screen (hold mode): two links, as the
+ *  real one has two buttons. Nothing on it comes from the request but the
+ *  callback addresses, escaped. */
+function consentPage(res: ServerResponse, name: string, allow: string, cancel: string) {
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorize (preview)</title>
+<style>body{font:16px system-ui,sans-serif;margin:0;padding:48px 16px;background:#f4f4f6;color:#1d1d22}
+main{max-width:420px;margin:auto;background:#fff;border-radius:12px;padding:24px;box-shadow:0 1px 3px #0002}
+a{display:inline-block;margin:16px 12px 0 0;padding:10px 18px;border-radius:8px;text-decoration:none}
+#allow{background:#4b55d6;color:#fff}#cancel{color:#4b55d6}</style>
+<main><h1>Discord (preview stand-in)</h1>
+<p>Portal admin wants to know who you are and which servers you manage. Signing in as <b>${escapeHtml(name)}</b>.</p>
+<a id="allow" href="${escapeHtml(allow)}">Authorize</a><a id="cancel" href="${escapeHtml(cancel)}">Cancel</a></main>`);
+}
+
 async function restartApi() {
   await api.close();
   api = new AdminServer(deps, fakeDiscord);
@@ -550,14 +579,12 @@ const front = createServer((req, res) => {
   if (path === '/dev-login') {
     const as = url.searchParams.get('as') ?? '';
     if (!(as in USERS)) return send(res, 400, `Pick a fixture user: /dev-login?as=${Object.keys(USERS).join('|')}`);
-    const deny = url.searchParams.get('deny') === '1';
+    const flag = (name: string) =>
+      url.searchParams.get(name) === '1' ? `dev_${name}=1; Path=/; HttpOnly; SameSite=Lax` : `dev_${name}=; Path=/; Max-Age=0`;
     res.writeHead(302, {
       location: '/admin/login',
       'cache-control': 'no-store',
-      'set-cookie': [
-        `dev_user=${as}; Path=/; HttpOnly; SameSite=Lax`,
-        deny ? 'dev_deny=1; Path=/; HttpOnly; SameSite=Lax' : 'dev_deny=; Path=/; Max-Age=0',
-      ],
+      'set-cookie': [`dev_user=${as}; Path=/; HttpOnly; SameSite=Lax`, flag('deny'), flag('hold')],
     });
     return res.end();
   }
@@ -565,9 +592,12 @@ const front = createServer((req, res) => {
     const who = cookie(req, 'dev_user');
     if (!who || !(who in USERS)) return send(res, 400, 'No fixture user chosen: start at /dev-login?as=op');
     const state = url.searchParams.get('state') ?? '';
+    const back = (q: Record<string, string>) => `/admin/callback?${new URLSearchParams({ ...q, state })}`;
+    const allow = back({ code: `dev-${who}` });
+    const cancel = back({ error: 'access_denied' });
+    if (url.searchParams.get('hold') === '1' || cookie(req, 'dev_hold') === '1') return consentPage(res, USERS[who as UserKey].global_name, allow, cancel);
     const deny = url.searchParams.get('deny') === '1' || cookie(req, 'dev_deny') === '1';
-    const q = new URLSearchParams(deny ? { error: 'access_denied', state } : { code: `dev-${who}`, state });
-    res.writeHead(302, { location: `/admin/callback?${q}`, 'cache-control': 'no-store' });
+    res.writeHead(302, { location: deny ? cancel : allow, 'cache-control': 'no-store' });
     return res.end();
   }
   if (path === '/dev-restart') {
