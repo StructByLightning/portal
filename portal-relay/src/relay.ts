@@ -780,7 +780,10 @@ export class Relay implements GatewayHooks {
         this.permissions.setPersonaPolicy(personaId, { default: [] }); // malformed mirror grant → deny
         return;
       }
-      this.permissions.addPersonaRoles(personaId, [role]);
+      // setPersonaRoles, not addPersonaRoles: this persona has no entry yet
+      // unless the invite carried roles, and enrollment sets exactly what the
+      // invite grants (no copy of the file default).
+      this.permissions.setPersonaRoles(personaId, [...new Set([...this.permissions.getRoleNames(personaId), role])]);
       return;
     }
     this.permissions.setPersonaPolicy(personaId, this.scopeToPolicy(inv.guildId, grant.scope, grant.caps));
@@ -831,6 +834,12 @@ export class Relay implements GatewayHooks {
   private inviteGrantProblem(inv: InviteTemplate): string | null {
     const shape = grantShapeProblem(inv);
     if (shape) return shape;
+    // A role name that resolves to nothing is refused, not stored: a name
+    // left on a persona would come alive if a role of that name were created
+    // later — possibly in another guild, by someone the invite's minter
+    // never meant to delegate to.
+    const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
+    if (missing.length) return `invite names access role(s) that no longer exist: ${missing.join(', ')} — it must be re-minted`;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
     if (!grant || !inv.guildId) return null;
     if (isMirrorScope(grant.scope)) {

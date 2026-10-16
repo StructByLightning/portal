@@ -345,3 +345,35 @@ test('an invite whose grant is malformed is refused before anything is created o
   }
 });
 
+test('enrolling through a mirror-only invite sets exactly the mirror role, not the file default', async () => {
+  const t = makeRelay();
+  try {
+    (t.relay.permissions as any).fileDefault = ['VIEW_CHANNEL'];
+    const res = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'mirror-only' });
+    assert.ok(!('error' in res), JSON.stringify(res));
+    assert.equal(t.relay.permissions.getPolicy(res.personaId), undefined, 'no inline policy');
+    assert.equal(t.relay.permissions.resolve(res.personaId, 'some-other-guild', 'x').size, 0);
+    assert.deepEqual(t.caps(res.personaId, CHAN_A), [...RW]);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('an invite naming an access role that no longer exists is refused, so the name is never stored', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('h-staff', { caps: [...RW], scope: { all: true }, guildId: 'H' });
+    t.relay.invites.mint({ code: 'dangling', mode: 'both', maxUses: 5, guildId: GUILD, roles: ['h-staff'] } as any);
+    t.relay.permissions.removeRole('h-staff');
+    const count = t.relay.identity.all().length;
+    const res = await t.relay.enroll({ invite: 'dangling', desiredName: 'dangler' });
+    assert.ok('error' in res && /no longer exist/.test(res.error), JSON.stringify(res));
+    assert.equal(t.relay.identity.all().length, count);
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'dangling', { byAdmin: true }), /no longer exist/);
+    assert.ok(!t.relay.permissions.getRoleNames(EXISTING).includes('h-staff'));
+    assert.equal(t.relay.invites.get('dangling').uses ?? 0, 0);
+  } finally {
+    t.cleanup();
+  }
+});
+

@@ -158,7 +158,8 @@ const LOGIN_ERRORS = {
 
 async function boot() {
   const params = new URLSearchParams(location.search);
-  const loginError = LOGIN_ERRORS[params.get('login_error')] || null;
+  const code = params.get('login_error');
+  const loginError = code && Object.prototype.hasOwnProperty.call(LOGIN_ERRORS, code) ? LOGIN_ERRORS[code] : null;
   if (params.has('login_error')) {
     params.delete('login_error');
     const rest = params.toString();
@@ -925,7 +926,14 @@ async function renderAudit(view) {
   clear(view);
   view.appendChild(toolbar('Filter audit…', []));
   const q = state.q.toLowerCase();
-  const filtered = (records || []).filter((r) => !q || (JSON.stringify(r) + ' ' + auditTargetText(r, names)).toLowerCase().includes(q));
+  // Invite codes appear here as their first 12 characters: a pasted whole
+  // code finds its records by that prefix.
+  const qCode = q.length > 12 && q.startsWith('inv_') ? q.slice(0, 12) : null;
+  const filtered = (records || []).filter((r) => {
+    if (!q) return true;
+    const hay = (JSON.stringify(r) + ' ' + auditTargetText(r, names)).toLowerCase();
+    return hay.includes(q) || (qCode !== null && hay.includes(qCode));
+  });
   const rows = filtered.map((r) => el('tr', {}, [
     el('td', { class: 'mono', text: r.ts ? new Date(r.ts).toLocaleString() : '—' }),
     el('td', {}, [(r.actor && r.actor.name) || '?', ' ', el('span', { class: 'muted', text: r.actor ? '(' + r.actor.kind + ')' : '' })]),

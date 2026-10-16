@@ -552,8 +552,8 @@ export class AdminServer {
     const e = this.roleAssignError(session, guildId, name);
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     // An admin granting access in the role's guild ends a /ban there.
-    const roleGuild = this.deps.permissions.getRole(name)?.guildId;
-    const liftedBan = roleGuild ? this.deps.permissions.liftBan(personaId, roleGuild) : false;
+    const role = this.deps.permissions.getRole(name);
+    const liftedBan = role?.guildId && role.caps.length ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
@@ -577,8 +577,8 @@ export class AdminServer {
     if (channelId && !this.deps.channelInGuild(guildId, channelId)) {
       return sendJson(res, 403, err('FORBIDDEN', 'channel is not in this guild'));
     }
-    // An admin granting access here ends a /ban here.
-    const liftedBan = this.deps.permissions.liftBan(personaId, guildId);
+    // An admin granting access here ends a /ban here (an explicit deny doesn't).
+    const liftedBan = caps.length > 0 && this.deps.permissions.liftBan(personaId, guildId);
     if (channelId) this.deps.permissions.setChannel(personaId, guildId, channelId, caps as any);
     else this.deps.permissions.setGuildDefault(personaId, guildId, caps as any);
     const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
@@ -991,14 +991,13 @@ export class AdminServer {
     redirect(res, `${to}${to.includes('?') ? '&' : '?'}login_error=${code}`);
   }
 
-  /** Some role is bound to a guild other than `guildId`. (A role that no
-   *  longer exists grants nothing, so it doesn't make an invite foreign; if a
-   *  role of that name is created later, this is re-evaluated then.) */
+  /** Some role isn't one of `guildId`'s own. A role that doesn't resolve
+   *  (deleted, or quarantined) counts as foreign: it may have been another
+   *  guild's, and a name can come back. Such an invite is refused at use
+   *  anyway (the relay won't apply a role that doesn't exist), so hiding it
+   *  from a guild admin hides nothing live; a super-admin still sees it. */
   private hasForeignRole(roles: string[], guildId: string): boolean {
-    return roles.some((r) => {
-      const g = this.deps.permissions.getRole(r)?.guildId;
-      return g !== undefined && g !== guildId;
-    });
+    return roles.some((r) => this.deps.permissions.getRole(r)?.guildId !== guildId);
   }
 
   /**
@@ -1010,15 +1009,26 @@ export class AdminServer {
    */
   private auditView(rec: AuditRecord, guildId: string, isSuper: boolean): AuditRecord {
     const r = structuredClone(rec);
-    const short = (c: unknown) => (typeof c === 'string' && c.length > 12 ? `${c.slice(0, 12)}…` : c);
+    // Relay-made codes are inv_ + 24 random characters: 12 shown leave 96
+    // bits unknown. A shorter (hand-chosen) code is hidden outright, since a
+    // prefix of it could be most of it. Already-shortened ones stay as they are.
+    const short = (c: unknown) =>
+      typeof c !== 'string' || c.endsWith('…') ? c : c.length >= 28 ? `${c.slice(0, 12)}…` : '(code hidden)';
     if (r.action.startsWith('invite.') || r.action === 'slash.invite') r.target = short(r.target) as string | undefined;
-    const visible = (name: unknown) => isSuper || (typeof name === 'string' && this.deps.permissions.getRole(name)?.guildId === guildId);
+    // For a guild admin: another guild's role names are dropped; a role that
+    // no longer exists is shown as such (its name may have been another
+    // guild's, so it isn't shown).
+    const label = (name: unknown): string | null => {
+      if (isSuper || typeof name !== 'string') return name as string;
+      const g = this.deps.permissions.getRole(name)?.guildId;
+      return g === guildId ? name : g === undefined ? '(deleted role)' : null;
+    };
     for (const k of ['before', 'after', 'detail'] as const) {
       const o = r[k] as Record<string, unknown> | undefined;
       if (!o || typeof o !== 'object' || Array.isArray(o)) continue;
       if ('code' in o) o.code = short(o.code);
-      if (Array.isArray(o.roles)) o.roles = o.roles.filter(visible);
-      if ('role' in o && !visible(o.role)) o.role = '(another server’s role)';
+      if (Array.isArray(o.roles)) o.roles = o.roles.map(label).filter((n) => n !== null);
+      if ('role' in o) o.role = label(o.role) ?? '(another server’s role)';
     }
     return r;
   }

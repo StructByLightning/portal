@@ -1198,11 +1198,11 @@ test("a guild admin's role changes answer with their guild's roles only", async 
   }
 });
 
-test("an invite stays visible to its guild's admins after one of its roles is deleted", async () => {
+test("an invite whose role no longer resolves is hidden from guild admins (it is dead: the relay refuses it)", async () => {
   const { deps, permissions, invites, cleanup } = setupDeps([]);
-  permissions.setRole('r-g1-temp', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G1' });
-  invites.mint({ code: 'temp-inv', guildId: 'G1', roles: ['r-g1-temp'], grant: { caps: ['VIEW_CHANNEL'], scope: { channels: ['c1'] } }, uses: 0 } as any);
-  permissions.removeRole('r-g1-temp');
+  permissions.setRole('r-temp', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G2' });
+  invites.mint({ code: 'temp-inv', guildId: 'G1', roles: ['r-temp'], mode: 'both', uses: 0 } as any);
+  permissions.removeRole('r-temp'); // was another guild's; a name can come back
   const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
   await server.listen();
   const base = `http://127.0.0.1:${server.boundPort}`;
@@ -1210,10 +1210,57 @@ test("an invite stays visible to its guild's admins after one of its roles is de
     const session = await login(base, []);
     const auth = { headers: { cookie: `portal_admin_session=${session}` } };
     const list = await (await fetch(`${base}/admin/g/G1/invites`, auth)).json();
-    assert.ok(list.invites.some((i: { code: string }) => i.code === 'temp-inv'), 'listed');
+    assert.ok(!list.invites.some((i: { code: string }) => i.code === 'temp-inv'), 'not listed');
     const me = await (await fetch(`${base}/admin/me`, auth)).json();
-    const del = await fetch(`${base}/admin/g/G1/invites/temp-inv`, { method: 'DELETE', headers: { ...auth.headers, 'x-csrf-token': me.csrf } });
-    assert.equal(del.status, 200, 'and revocable');
+    const claim = await fetch(`${base}/admin/g/G1/personas/p1/claim`, {
+      method: 'POST', headers: { ...auth.headers, 'content-type': 'application/json', 'x-csrf-token': me.csrf }, body: JSON.stringify({ code: 'temp-inv' }),
+    });
+    assert.equal(claim.status, 404, 'not claimable');
+    assert.ok(!permissions.getRoleNames('p1').includes('r-temp'));
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test('an explicit deny does not lift a ban; a grant does', async () => {
+  const { deps, permissions, cleanup } = setupDeps([]);
+  permissions.clearGuild('p1', 'G1');
+  const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const hdr = { cookie: `portal_admin_session=${session}`, 'content-type': 'application/json', 'x-csrf-token': me.csrf };
+    const put = (body: unknown) => fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
+    assert.equal((await put({ channelId: 'c1', caps: [] })).status, 200);
+    assert.equal(permissions.isBanned('p1', 'G1'), true, 'a deny keeps the ban');
+    assert.equal((await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'] })).status, 200);
+    assert.equal(permissions.isBanned('p1', 'G1'), false, 'a grant lifts it');
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test('audit view: short hand-chosen codes are hidden outright; deleted roles are labelled as deleted', async () => {
+  const { deps, permissions, cleanup } = setupDeps([]);
+  const actor = { id: 'super', name: 'Super', kind: 'admin' as const };
+  deps.audit.append({ actor, action: 'invite.mint', target: 'g2-guests-0001', guildId: 'G1', ok: true, after: { code: 'g2-guests-0001' } });
+  permissions.setRole('r-g1-old', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G1' });
+  deps.audit.append({ actor, action: 'persona.role.assign', target: 'p1', guildId: 'G1', ok: true, after: { role: 'r-g1-old' } });
+  permissions.removeRole('r-g1-old');
+  const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const body = await (await fetch(`${base}/admin/g/G1/audit`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const text = JSON.stringify(body);
+    assert.ok(!text.includes('g2-guests'), 'no part of a short code');
+    const assign = body.records.find((r: { action: string }) => r.action === 'persona.role.assign');
+    assert.equal(assign.after.role, '(deleted role)');
   } finally {
     await server.close();
     cleanup();
