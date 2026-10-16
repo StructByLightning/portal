@@ -138,6 +138,9 @@ export class AdminServer {
   private audit: AuditLog;
   /** Callbacks per client address (never global). */
   private callbackLimit = new LoginRateLimit();
+  /** Sign-ins started (/admin/login) per client address, apart from the
+   *  callbacks: each start holds a state in memory until it is used. */
+  private loginLimit = new LoginRateLimit();
   private limitTimer?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -155,6 +158,7 @@ export class AdminServer {
     // into one more record once its minute is over.
     this.limitTimer = setInterval(() => {
       for (const { ip, count } of this.callbackLimit.sweep()) this.recordRateLimited(ip, count);
+      for (const { ip, count } of this.loginLimit.sweep()) this.recordRateLimited(ip, count, 'login');
     }, 60_000);
     this.limitTimer.unref?.();
     this.server = createServer((req, res) => {
@@ -340,10 +344,18 @@ export class AdminServer {
    * Start a sign-in: a fresh state, kept server-side and in this browser's
    * state cookie next to the (at most two) other live sign-ins it has in
    * flight, so a second tab doesn't break the first. ?reauth=1 only marks
-   * the login.ok record.
+   * the login.ok record. Rate limited per client address, and the state is
+   * counted against that address (SessionStore.issueState), so no one can
+   * start enough sign-ins to push out everyone else's.
    */
   private onLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
-    const state = this.sessions.issueState({ reauth: url.searchParams.get('reauth') === '1' });
+    const ip = clientIp(req);
+    const take = this.loginLimit.take(ip);
+    if (!take.ok) {
+      if (take.report) this.recordRateLimited(ip, take.report.count, 'login');
+      return this.loginFailed(res, 'rate_limited');
+    }
+    const state = this.sessions.issueState({ reauth: url.searchParams.get('reauth') === '1', client: ip });
     const others = this.liveStates(cookieStates(req));
     this.setStateCookie(res, [state, ...others]);
     redirect(res, authorizeUrl(this.deps.config.oauthClientId, this.deps.config.redirectUri, state));
@@ -518,9 +530,11 @@ export class AdminServer {
     this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.failed', ok: false, detail });
   }
 
-  /** At most one a minute per address (LoginRateLimit decides when). */
-  private recordRateLimited(ip: string, count: number): void {
-    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.rate_limited', ok: false, detail: { ip, count } });
+  /** At most one a minute per address and step (LoginRateLimit decides
+   *  when). A refused start of a sign-in says step 'login'; a refused
+   *  callback says nothing more. */
+  private recordRateLimited(ip: string, count: number, step?: 'login'): void {
+    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.rate_limited', ok: false, detail: { ip, count, ...(step ? { step } : {}) } });
   }
 
   private onLogout(req: IncomingMessage, res: ServerResponse, session: AdminSession): void {

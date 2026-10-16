@@ -423,6 +423,37 @@ test('rate limit: the 21st callback from one address within a minute is refused,
   }
 });
 
+test('rate limit: a flood of /admin/login from one address is refused past 20 a minute and cancels no one else’s sign-in', async () => {
+  const w = await world();
+  try {
+    const admin = new Browser(w, '198.51.100.20');
+    const s = await admin.startLogin();
+    const flood = new Browser(w, '203.0.113.9');
+    let started = 0;
+    let refused = 0;
+    for (let i = 0; i < 60; i++) {
+      flood.cookies.clear(); // a cookie-less client
+      const res = await flood.get('/admin/login');
+      assert.equal(res.status, 302);
+      const to = res.headers.get('location') ?? '';
+      if (to === '/done?login_error=rate_limited') refused++;
+      else if (to.startsWith('https://')) started++;
+      else assert.fail('unexpected redirect ' + to);
+    }
+    assert.equal(started, 20, 'twenty a minute per address');
+    assert.equal(refused, 40);
+    const limited = records(w, 'login.rate_limited');
+    assert.equal(limited.length, 1, 'one record for the minute');
+    assert.deepEqual(limited[0].detail, { ip: '203.0.113.9', count: 1, step: 'login' });
+    // The callback has its own limit: the flood's address can still finish
+    // a sign-in started before the flood, and the admin's goes through.
+    assert.equal((await admin.finish(s)).headers.get('location'), '/done');
+    assert.equal(await admin.me(), 200);
+  } finally {
+    await w.close();
+  }
+});
+
 test('every callback lands on one of seven fixed addresses, whatever the query', async () => {
   const w = await world();
   try {

@@ -155,15 +155,20 @@ plain sentence and **Try again** — never an error page:
   in flight are kept in memory for ten minutes, so one that spans a relay
   restart comes back as `expired`.
 
-The callback is rate limited per client address, 20 a minute (never
-globally). The address is the rightmost `X-Forwarded-For` entry, which Caddy's
+Starting a sign-in (`/admin/login`) and the callback are each rate limited
+per client address, 20 a minute (never globally). Each sign-in in flight is
+counted against the address that started it: one address holds at most 100,
+making room from its own oldest, and when every address together holds
+10,000 the address holding the most gives way first — so a flood can't cancel
+another admin's sign-in. The address is the rightmost `X-Forwarded-For` entry, which Caddy's
 `reverse_proxy` sets to the address it saw, so keep the admin API reachable
 only through Caddy. (Behind another proxy, such as a CDN, the limit applies
 per address of that proxy.) The audit log records each failed callback as
 `login.failed` with a fixed `reason` (`cancelled`, `expired`, `mismatch`,
 `discord_error` — with the step and HTTP status when Discord failed the code
 exchange), a refused sign-in as `login.denied`, and refusals over the limit as
-at most one `login.rate_limited` record per address per minute, with a count.
+at most one `login.rate_limited` record per address per minute, with a count
+(and `step: login` for refused starts).
 
 Browser storage is a convenience only (the panel works without it):
 `localStorage` keeps `pa.lastGuild:<user>` and `pa.lastTab:<user>` (cleared on

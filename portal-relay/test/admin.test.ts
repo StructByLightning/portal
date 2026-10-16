@@ -90,6 +90,35 @@ test('SessionStore: TTL expiry and single-use state', () => {
   assert.deepEqual(store.consumeState(re), { ok: true, reauth: true });
 });
 
+test('SessionStore: one address holds only its share of sign-ins in flight; a full store makes room from the busiest', () => {
+  let now = 1000;
+  const store = new SessionStore(5000, () => now, { maxPending: 6, maxPendingPerClient: 3 });
+  const admin = store.issueState({ client: '198.51.100.7' });
+  // A flood from one address pushes out only its own oldest.
+  const flood = Array.from({ length: 50 }, () => store.issueState({ client: '203.0.113.5' }));
+  assert.equal(store.stateStatus(admin), 'live', 'the admin’s sign-in is untouched');
+  assert.deepEqual(flood.map((s) => store.stateStatus(s)).filter((x) => x === 'live').length, 3);
+  assert.equal(store.stateStatus(flood.at(-1)), 'live', 'the newest of the flood are the ones kept');
+  assert.equal(store.stateStatus(flood[0]), 'unknown');
+  // Every address together at the cap: the address holding the most gives way.
+  const b = store.issueState({ client: '198.51.100.8' });
+  const c = store.issueState({ client: '198.51.100.9' });
+  assert.equal(store.stateStatus(admin), 'live');
+  assert.equal(store.stateStatus(b), 'live');
+  const d = store.issueState({ client: '198.51.100.10' });
+  for (const s of [admin, b, c, d]) assert.equal(store.stateStatus(s), 'live');
+  assert.equal(flood.filter((s) => store.stateStatus(s) === 'live').length, 2, 'one of the flood’s made room');
+  // A used state no longer counts against its address.
+  assert.deepEqual(store.consumeState(admin), { ok: true, reauth: false });
+  const again = Array.from({ length: 2 }, () => store.issueState({ client: '198.51.100.7' }));
+  for (const s of again) assert.equal(store.stateStatus(s), 'live');
+  assert.equal(flood.filter((s) => store.stateStatus(s) === 'live').length, 1, 'the flood gave way again');
+  // Expired ones go before anything live.
+  now += 10 * 60_000;
+  const fresh = store.issueState({ client: '203.0.113.5' });
+  assert.equal(store.stateStatus(fresh), 'live');
+});
+
 // ── Audit log ──
 
 test('AuditLog: append, newest-first read, guild filter', () => {
