@@ -228,6 +228,9 @@
   // ── One request per click ─────────────────────────────────────────────────
 
   const busyButtons = new WeakSet();
+  // The button busy() took focus from, while its work runs: disabling it
+  // dropped focus to <body>, so a dialog the work opens returns there.
+  let busyFocus = null;
 
   /**
    * Lock `button` while `work` (a promise, or a function returning one) runs:
@@ -238,6 +241,7 @@
     const prev = { text: button.textContent, disabled: button.disabled };
     // Disabling a focused button drops focus to <body>; hand it back after.
     const hadFocus = document.activeElement === button;
+    if (hadFocus) busyFocus = button;
     busyButtons.add(button);
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
@@ -250,11 +254,12 @@
     }
     const done = () => {
       busyButtons.delete(button);
+      if (busyFocus === button) busyFocus = null;
       button.disabled = prev.disabled;
       button.removeAttribute('aria-busy');
       button.textContent = prev.text;
       const a = document.activeElement;
-      if (hadFocus && button.isConnected && !button.disabled && (!a || a === document.body)) button.focus();
+      if (hadFocus && button.isConnected && !button.disabled && (!a || a === document.body || !a.isConnected)) button.focus();
     };
     return p.then(
       (v) => {
@@ -313,6 +318,17 @@
     return Array.from(root.querySelectorAll(FOCUSABLE)).filter(shown);
   }
 
+  /** Focus the first of `nodes` that takes it (on the page, shown, enabled;
+   *  never <body>). Returns whether one did. */
+  function focusFirst(nodes) {
+    for (const n of nodes) {
+      if (!n || n === document.body || !n.isConnected || n.disabled || typeof n.focus !== 'function' || !shown(n)) continue;
+      n.focus();
+      if (document.activeElement === n) return true;
+    }
+    return false;
+  }
+
   /**
    * Keep Tab inside `roots`: a dialog, then any layer that joins its cycle
    * (the toast stack). Within a root the browser moves focus as usual; past a
@@ -346,7 +362,9 @@
    * Open a modal: { title, body (nodes), actions (buttons), role, onEscape,
    * initialFocus, returnFocus }. Focus moves in, Tab stays in, Esc calls
    * onEscape, and on close focus returns to returnFocus, or else to where it
-   * was. Returns { box, close }.
+   * was — the button whose work opened it, when disabling that button had
+   * dropped focus to <body> — or else into the open drawer. Returns
+   * { box, close }.
    */
   function modal(opts) {
     const titleId = uid('modal-title');
@@ -357,7 +375,8 @@
       el('div', { class: 'modal-actions' }, opts.actions || []),
     ]);
     const backdrop = el('div', { class: 'modal-backdrop' }, [box]);
-    const opener = document.activeElement;
+    const was = document.activeElement;
+    const opener = (!was || was === document.body) && busyFocus && busyFocus.isConnected ? busyFocus : was;
     const entry = { box, onEscape: opts.onEscape };
     // index.html's #modals keeps the layer in one place; any page without it
     // still gets one.
@@ -371,8 +390,12 @@
       if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
       const i = modals.indexOf(entry);
       if (i >= 0) modals.splice(i, 1);
-      const back = [opts.returnFocus, opener].find((n) => n && n !== document.body && n.isConnected && typeof n.focus === 'function');
-      if (back) back.focus();
+      if (focusFirst([opts.returnFocus, opener])) return;
+      // Its button is still at work: busy() gives focus back when it is done.
+      if (opener && isBusy(opener)) return;
+      // Nothing to go back to: stay in the drawer (a dialog itself) if it is
+      // open, so a screen reader is still in it.
+      if (current) focusFirst([drawerEls().title]);
     }
     return {
       box,
@@ -684,7 +707,8 @@
     open(opts) {
       bindDrawer();
       const d = drawerEls();
-      const returnFocus = current ? current.returnFocus : document.activeElement;
+      const a = document.activeElement;
+      const returnFocus = current ? current.returnFocus : a && !d.drawer.contains(a) ? a : null;
       current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus };
       const token = current.token;
       const handle = {
@@ -744,7 +768,12 @@
       d.drawer.setAttribute('aria-hidden', 'true');
       d.scrim.classList.add('hidden');
       clear(d.body);
-      if (c.returnFocus && c.returnFocus.isConnected && typeof c.returnFocus.focus === 'function') c.returnFocus.focus();
+      // Back to what opened it; failing that, off the control it just hid
+      // (a browser leaves focus there), so onClose can find a place for it.
+      if (!focusFirst([c.returnFocus])) {
+        const a = document.activeElement;
+        if (a && a !== document.body && d.drawer.contains(a) && typeof a.blur === 'function') a.blur();
+      }
       if (c.onClose) c.onClose(reason);
     },
 

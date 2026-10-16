@@ -910,10 +910,13 @@ function onDrawerClosed(reason) {
   state.drawerPushed = false;
   // Focus goes back to the link that opened it (ui.drawer does that); when
   // there was none (a row click, a link from elsewhere) or the list was
-  // redrawn, to the row's link.
+  // redrawn, to the row's link (for a drawer of the toolbar's, its button).
+  // Focus left on the hidden drawer counts as lost; a drawer opened since
+  // keeps it.
   const focusRow = () => {
     const a = document.activeElement;
-    if (!key || (a && a !== document.body && a.isConnected)) return;
+    if (!key || ui.drawer.isOpen()) return;
+    if (a && a !== document.body && a.isConnected && !a.closest('#drawer')) return;
     const row = Array.from(document.querySelectorAll('[data-key]')).find((n) => n.dataset.key === key);
     if (row) row.focus();
   };
@@ -1743,7 +1746,7 @@ async function renderInvites(view, stale) {
   const meta = await guildMeta();
   if (stale()) return;
   // A link: the mint drawer has an address (#/g/{gid}/invites/new).
-  const mintBtn = el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'invites', { kind: 'mint' })), text: '+ Mint invite' });
+  const mintBtn = el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'invites', { kind: 'mint' })), 'data-key': 'mint', text: '+ Mint invite' });
   const list = listView(view, {
     placeholder: 'Search invites…',
     actions: [mintBtn],
@@ -1841,7 +1844,7 @@ function mirrorRoleList(discordRoles) {
  * r (access roles), or c (a channel) with lvl — 'Invite a new agent here'.
  */
 async function openMintDrawer(prefill = {}) {
-  const d = openDrawer({ title: 'Mint invite' });
+  const d = openDrawer({ title: 'Mint invite', key: 'mint' });
   let meta;
   try { meta = await guildMeta(); } catch (e) {
     if (d.isCurrent() && !e.handled) d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this guild’s access roles and channels', e), () => openMintDrawer(prefill)));
@@ -2067,7 +2070,7 @@ async function renderRoles(view, stale) {
   const actions = [];
   if (meta.canAuthor) {
     // A link: defining a role has an address (#/g/{gid}/roles/new).
-    actions.push(el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'roles', { kind: 'newRole' })), text: '+ Define access role' }));
+    actions.push(el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'roles', { kind: 'newRole' })), 'data-key': 'newRole', text: '+ Define access role' }));
   }
   const list = listView(view, {
     placeholder: 'Filter access roles…',
@@ -2120,7 +2123,7 @@ async function openRoleDrawer() {
   // channels and roles, so the role must be saved to it whatever happens to
   // the scope switcher meanwhile.
   const gid = state.guildId;
-  const d = openDrawer({ title: 'Define access role' });
+  const d = openDrawer({ title: 'Define access role', key: 'newRole' });
   let meta;
   try { meta = await guildMeta(); } catch (e) {
     if (d.isCurrent() && !e.handled) d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this guild’s channels', e), () => openRoleDrawer()));

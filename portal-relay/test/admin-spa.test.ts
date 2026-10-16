@@ -102,9 +102,11 @@ class FakeElement extends FakeNode {
   get disabled() {
     return this.attrs.has('disabled');
   }
+  /** Disabling the focused control drops focus to <body>, as Chrome does. */
   set disabled(v: boolean) {
     if (v) this.attrs.set('disabled', '');
     else this.attrs.delete('disabled');
+    if (v && this.doc.activeElement === this) this.doc.activeElement = this.doc.body;
   }
   get dataset(): Record<string, string | undefined> {
     return new Proxy({}, {
@@ -211,8 +213,14 @@ class FakeElement extends FakeNode {
   set elements(v: FakeElement[] | undefined) {
     this.ownElements = v;
   }
+  /** <body>, a disabled or a hidden control can't take focus; the call does
+   *  nothing. (Hiding the focused one leaves it focused, as Chrome reports it.) */
   focus() {
+    if (this === this.doc.body || this.disabled || !this.checkVisibility()) return;
     this.doc.activeElement = this;
+  }
+  blur() {
+    if (this.doc.activeElement === this) this.doc.activeElement = this.doc.body;
   }
   get isConnected(): boolean {
     let n: FakeNode | null = this;
@@ -776,6 +784,70 @@ test('ui.toast: the ✕ is described by its message', () => {
   const x = t.node.querySelector('.toast-x')!;
   const msg = doc.getElementById(x.getAttribute('aria-describedby')!)!;
   assert.equal(msg.textContent, 'Not saved: channel is not in this guild.');
+});
+
+test('ui.modal: closing gives focus back to the button busy() took it from, or else into the open drawer', async () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, busy, modal, drawer } = ctx.PA.ui;
+  const dom = drawerDom(doc, el);
+  doc.body.appendChild(el('div', { id: 'modals' }));
+  const submit = el('button', { type: 'submit', text: 'Mint invite' });
+  drawer.open({ title: 'Mint invite', body: el('form', {}, [submit]) });
+  const dialog = () => modal({ title: 'Your session ended.', actions: [el('button', { text: 'Close' })] });
+
+  // The work opens a dialog: disabling the focused button dropped focus to
+  // <body>, so the dialog's opener is the button, not <body>.
+  submit.focus();
+  let release!: () => void;
+  let p = busy(submit, new Promise<void>((r) => (release = r)));
+  assert.equal(doc.activeElement, doc.body);
+  const m = dialog();
+  release();
+  await p;
+  assert.notEqual(doc.activeElement, submit, 'the dialog keeps focus while it is up');
+  m.close();
+  assert.equal(doc.activeElement, submit);
+
+  // Closed before the work ends: the button can't take focus yet; busy()
+  // hands it back when it is enabled again.
+  submit.focus();
+  p = busy(submit, new Promise<void>((r) => (release = r)));
+  dialog().close();
+  release();
+  await p;
+  assert.equal(doc.activeElement, submit);
+
+  // Nothing to go back to (a click on nothing): into the drawer, the dialog
+  // underneath, at its title.
+  doc.activeElement = doc.body;
+  dialog().close();
+  assert.equal(doc.activeElement, dom.title);
+});
+
+test('ui.drawer: closed with nothing to go back to, focus doesn’t stay on a control it hid', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, drawer } = ctx.PA.ui;
+  const dom = drawerDom(doc, el);
+  let seen: unknown = null;
+  // Opened from nothing (a deep link, a click on a row's text).
+  drawer.open({ title: 'Aria', onClose: () => (seen = doc.activeElement) });
+  dom.close.focus();
+  drawer.close();
+  assert.equal(doc.activeElement, doc.body, 'not the hidden ✕');
+  assert.equal(seen, doc.body, 'onClose finds focus lost, and can place it');
+  // A drawer opened after that one doesn't take the hidden ✕ for its opener.
+  const back = el('a', { href: '#/x', text: 'Aria' });
+  doc.body.appendChild(back);
+  drawer.open({ title: 'Aria' });
+  dom.close.focus();
+  drawer.close();
+  assert.equal(doc.activeElement, doc.body);
+  back.focus();
+  drawer.open({ title: 'Aria' });
+  drawer.close();
+  assert.equal(doc.activeElement, back, 'an opener still gets it back');
 });
 
 // ── app.js, booted against a fake admin API ──
@@ -1940,6 +2012,46 @@ test('app routes: Esc closes the drawer and gives focus back to the link that op
   assert.equal(here(), g + '/personas');
 });
 
+test('app routes: a drawer with no opener gives focus to its row’s link, or the button that opens it', async () => {
+  const g = '#/g/' + GA;
+  const rowLink = (doc: FakeDocument, key: string) => doc.querySelectorAll('[data-key]').find((n) => n.dataset.key === key)!;
+  // A deep link, closed with ✕ (a click focuses it), and with Esc.
+  for (const how of ['close', 'Escape']) {
+    const { doc, here, drawerOpen } = await panelAt('/' + g + '/personas/p/aria');
+    assert.ok(drawerOpen());
+    if (how === 'close') {
+      const x = doc.getElementById('drawer-close')!;
+      x.focus();
+      x.click();
+    } else doc.key('Escape');
+    await settle();
+    assert.equal(here(), g + '/personas');
+    assert.equal(doc.activeElement, rowLink(doc, 'persona:aria'), how);
+  }
+  // Opened by a click on the row's text (focus on nothing), closed with Esc.
+  {
+    const { doc, drawerOpen } = await panelAt('/' + g + '/personas');
+    const link = rowLink(doc, 'persona:aria');
+    const row = link.closest('tr')!;
+    row.fire('click', { target: row.querySelector('code') });
+    await settle();
+    assert.ok(drawerOpen());
+    doc.key('Escape');
+    await settle();
+    assert.equal(drawerOpen(), false);
+    assert.equal(doc.activeElement, link);
+  }
+  // The mint drawer, reached by a link from elsewhere: + Mint invite.
+  {
+    const { doc, here } = await panelAt('/' + g + '/invites/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }] });
+    doc.getElementById('drawer-title')!.focus();
+    doc.key('Escape');
+    await settle();
+    assert.equal(here(), g + '/invites');
+    assert.equal(doc.activeElement, clickable(doc, '+ Mint invite'));
+  }
+});
+
 test('app routes: a link that isn’t valid goes to the last guild and tab, and says so', async () => {
   const local = { ['pa.lastGuild:' + ME_GWEN.user.id]: GA, ['pa.lastTab:' + ME_GWEN.user.id]: 'roles' };
   const { here, doc, nav } = await panelAt('/#/g/abc/zzz', { local });
@@ -2083,6 +2195,35 @@ test('session: a change refused with 401 says it was NOT saved, over the page; S
   assert.ok(!back.calls.some((c) => c.startsWith('POST')), 'nothing was submitted');
   assert.equal(back.sessionStore.getItem('pa.draft'), null, 'the draft is used once');
   assert.equal(back.sessionStore.getItem('pa.returnTo'), null);
+});
+
+test('session: closing “Your session ended” gives focus back to the button that sent the change', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const { doc, drawerOpen } = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: () => (down ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
+  });
+  const form = fillMint(doc, 'x', 'g1-readers');
+  const submit = form.querySelector('button[type="submit"]')!;
+  down = true;
+  for (const how of ['Close', 'Escape']) {
+    submit.focus();
+    form.fire('submit');
+    await settle();
+    const modal = doc.querySelector('.modal')!;
+    assert.equal(doc.activeElement, clickable(doc, 'Sign in again', modal));
+    if (how === 'Close') {
+      const close = clickable(doc, 'Close', modal);
+      close.focus();
+      close.click();
+    } else doc.key('Escape');
+    await settle();
+    assert.equal(doc.querySelector('.modal'), null);
+    assert.ok(drawerOpen(), 'the drawer stays');
+    assert.equal(doc.activeElement, submit, how);
+    assert.equal(submit.textContent, 'Mint invite');
+  }
 });
 
 test('session: a draft is put back only for the same admin, at the same place', async () => {
