@@ -292,13 +292,14 @@ const tick = () => new Promise((r) => setImmediate(r));
 
 // ── The rules every panel script follows ──
 
-test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .app)', () => {
+test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .app, .CLIENT_API)', () => {
   const { ctx } = sandbox();
   const before = new Set(Object.getOwnPropertyNames(ctx));
   load(ctx);
   const added = Object.getOwnPropertyNames(ctx).filter((k) => !before.has(k));
   assert.deepEqual(added, ['PA']);
-  assert.deepEqual(Object.keys(ctx.PA).sort(), ['app', 'lib', 'ui']);
+  assert.deepEqual(Object.keys(ctx.PA).sort(), ['CLIENT_API', 'app', 'lib', 'ui']);
+  assert.equal(ctx.PA.CLIENT_API, 2);
   assert.equal(typeof ctx.PA.ui.toast, 'function');
   assert.equal(typeof ctx.PA.app.boot, 'function');
 });
@@ -632,8 +633,14 @@ test('ui.toast: the ✕ is described by its message', () => {
 
 const G1 = '100000000000000001'; // the preview harness's invented Guild One
 
-/** Answers a mutation (or overrides a read): a body, or undefined for the default. */
+/** Answers a mutation (or overrides a read): a body, a refuse(), or undefined for the default. */
 type FakeHandler = (method: string, pathAndQuery: string, body: any) => unknown;
+
+class Refusal {
+  constructor(public status: number, public error: Record<string, unknown>) {}
+}
+/** The relay's refusal: {error: {code, message, …extra}} with an HTTP status. */
+const refuse = (status: number, code: string, message = code, extra: Record<string, unknown> = {}) => new Refusal(status, { code, message, ...extra });
 
 /** A sandbox with index.html's shell, signed in as a one-guild admin. Every
  *  request lands in `calls` as 'METHOD /path?query', and every JSON body sent
@@ -666,6 +673,8 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       let body = opts.handle?.(req.method, route + url.search, sent);
       if (body === undefined) body = req.method === 'DELETE' ? {} : req.method === 'GET' ? routes[route] : undefined;
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
+      // refuse(status, code, message, extra) answers as the relay refuses.
+      if (body instanceof Refusal) return { status: body.status, ok: false, text: async () => JSON.stringify({ error: body.error }) };
       return { status: 200, ok: true, text: async () => JSON.stringify(body) };
     },
   });
@@ -962,9 +971,9 @@ const G1_CATALOG = {
   'g2-desk': { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: '100000000000000002' },
 };
 
-async function ariaDrawer() {
+async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>; default?: string[] }; refusePut?: (body: any) => unknown } = {}) {
   const g = '/admin/g/' + G1;
-  const policy: { channels: Record<string, string[]>; default?: string[] } = { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
+  const policy: { channels: Record<string, string[]>; default?: string[] } = opts.policy ?? { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
   const box = appSandbox({
     routes: {
       [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
@@ -973,9 +982,21 @@ async function ariaDrawer() {
       [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters', 'g2-desk'], guildPolicy: policy, names: { channels: {} } },
     },
     handle: (method, path, body) => {
+      // As the relay does: one target, one operation.
       if (method === 'PUT' && path === g + '/personas/aria/grants') {
-        if (body.channelId) policy.channels[body.channelId] = body.caps;
-        else policy.default = body.caps;
+        if (opts.refusePut) return opts.refusePut(body);
+        const caps = body.level ? [...(LEVEL_CAPS as Record<string, string[]>)[body.level]] : body.deny ? [] : body.caps;
+        if (body.channelId) policy.channels[body.channelId] = caps;
+        else if (body.guildDefault === true) policy.default = caps;
+        else return refuse(400, 'TARGET_REQUIRED');
+        return { guildPolicy: policy };
+      }
+      if (method === 'DELETE' && path.startsWith(g + '/personas/aria/grants?')) {
+        const q = new URL(path, 'http://panel.invalid').searchParams;
+        if (q.get('guildDefault') === 'deny') policy.default = [];
+        else if (q.get('guildDefault') === 'unset') delete policy.default;
+        else if (q.get('channelId')) delete policy.channels[q.get('channelId')!];
+        else return refuse(400, 'TARGET_REQUIRED');
         return { guildPolicy: policy };
       }
       return undefined;
@@ -1026,7 +1047,7 @@ test('grant editor: picking a target loads its level; Save waits for a level; Wr
   await settle();
   const g = '/admin/g/' + G1;
   assert.equal(calls.at(-1), `PUT ${g}/personas/aria/grants`);
-  assert.deepEqual(bodies.at(-1), { caps: [...LEVEL_CAPS.write], channelId: CH.labNotes });
+  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, level: 'write' }, 'a preset goes by its name');
   assert.deepEqual(policy.channels[CH.labNotes], [...LEVEL_CAPS.write]);
   const rows = drawer.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
   assert.ok(rows.some((r) => r[0] === '#lab-notes' && r[1] === 'Write'), JSON.stringify(rows));
@@ -1062,7 +1083,7 @@ async function rolesTab() {
   const g = '/admin/g/' + G1;
   const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'] };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
-  const net = { down: false };
+  const net: { down: boolean; beforePost?: (body: any) => void } = { down: false };
   const box = appSandbox({
     routes: {
       '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
@@ -1078,6 +1099,11 @@ async function rolesTab() {
         return { catalog, discordRoles: [], canAuthor: true, names };
       }
       if (method === 'POST' && path === '/admin/roles') {
+        net.beforePost?.(body); // someone else, just before this request lands
+        // As the relay does: a name in use only with replace, in its own guild.
+        const cur = Object.hasOwn(catalog, body.name) ? catalog[body.name] : undefined;
+        if (cur && body.replace !== true) return refuse(409, 'EXISTS', 'exists', { existing: { guildId: cur.guildId } });
+        if (cur && (body.expectedGuildId !== cur.guildId || body.role.guildId !== cur.guildId)) return refuse(409, 'GUILD_MISMATCH', 'mismatch');
         catalog[body.name] = body.role;
         return { ok: true, catalog };
       }
@@ -1130,13 +1156,14 @@ test('role drawer: asks before replacing a role that exists now, not only one th
   await define('g1-test', 'write');
   const dialog = confirm()!;
   assert.ok(dialog, 'a role made during this visit is asked about');
-  assert.equal(dialog.querySelector('h2')!.textContent, 'Replace access role g1-test?');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'A role named g1-test already exists — edit it instead?');
   assert.equal(
     dialog.querySelector('p')!.textContent,
-    'An access role named g1-test already exists in Guild One (Read in every channel of Guild One). ' +
-      'Replacing it gives every persona that holds it Write in every channel of Guild One instead. ' +
+    'It is Guild One’s access role g1-test (Read in every channel of Guild One). ' +
+      'Editing it to this definition gives every persona that holds it Write in every channel of Guild One instead. ' +
       'This can’t be undone; to go back, define it again as it was.',
   );
+  assert.equal(dialog.querySelector('button.btn-danger-solid')!.textContent, 'Edit access role');
   dialog.querySelectorAll('button').find((b) => b.textContent === 'Cancel')!.click();
   await settle();
   assert.equal(bodies.length, posts, 'Cancel sends nothing');
@@ -1160,10 +1187,11 @@ test('role drawer: a role deleted (or made elsewhere) since the tab was drawn is
   catalog['g1-elsewhere'] = { caps: [...LEVEL_CAPS.full], scope: { all: true }, guildId: G1 };
   assert.ok(!rows().some((r) => r[0] === 'g1-elsewhere'), 'the tab has not seen it');
   await define('g1-elsewhere', 'read');
-  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Replace access role g1-elsewhere?');
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'A role named g1-elsewhere already exists — edit it instead?');
   confirm()!.querySelector('button.btn-danger-solid')!.click();
   await settle();
-  assert.deepEqual(catalog['g1-elsewhere'].caps, [...LEVEL_CAPS.read], 'Replace replaces it');
+  assert.deepEqual(catalog['g1-elsewhere'].caps, [...LEVEL_CAPS.read], 'Edit replaces it');
+  assert.deepEqual(bodies.at(-1), { name: 'g1-elsewhere', role: catalog['g1-elsewhere'], replace: true, expectedGuildId: G1 }, 'saying which guild’s role it replaces');
 
   // A name that only an object's prototype has is not an existing role.
   await define('constructor', 'read');
@@ -1217,7 +1245,7 @@ test('role drawer: another guild’s role is named by its guild and not replaced
   input.fire('input');
   form.fire('submit');
   await settle();
-  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Replace access role g1-readers?');
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'A role named g1-readers already exists — edit it instead?');
   assert.equal(status(), '', 'the line about g2-desk is gone');
 });
 
@@ -1229,10 +1257,11 @@ test('lib.roleNameTaken: this guild’s role asks; another guild’s refuses, by
 
   const same = plain(lib.roleNameTaken('g1-chatters', chatters, read, G1, names));
   assert.deepEqual(same, {
-    title: 'Replace access role g1-chatters?',
-    body: 'An access role named g1-chatters already exists in Guild One (Write in #general). ' +
-      'Replacing it gives every persona that holds it Read in every channel of Guild One instead. ' +
+    title: 'A role named g1-chatters already exists — edit it instead?',
+    body: 'It is Guild One’s access role g1-chatters (Write in #general). ' +
+      'Editing it to this definition gives every persona that holds it Read in every channel of Guild One instead. ' +
       'This can’t be undone; to go back, define it again as it was.',
+    confirmLabel: 'Edit access role',
   });
 
   const desk = { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: G2 };
@@ -1249,4 +1278,264 @@ test('lib.roleNameTaken: this guild’s role asks; another guild’s refuses, by
   assert.equal(names.guilds[G9 as keyof typeof names.guilds], undefined, 'the caller’s names are not changed');
   // A role with no guild at all (the relay refuses those at load).
   assert.match(lib.roleNameTaken('old', { caps: LEVEL_CAPS.read, scope: { all: true } }, read, G1, names).refuse, /^Not created: another guild already has an access role named old \(Read in every channel of its guild\), .* Pick another name\.$/);
+});
+
+// ── P3: the relay's model, its refusals in words, explicit guild-wide ──
+
+test('lib.adoptModel: the relay’s levels and capabilities replace the copy; anything malformed is ignored', () => {
+  const { lib } = libOnly();
+  const caps = [...ALL_CAPS, 'PIN_MESSAGES'];
+  const levels = { read: ['VIEW_CHANNEL'], write: [...LEVEL_CAPS.write], full: [...LEVEL_CAPS.full, 'PIN_MESSAGES'] };
+  for (const bad of [
+    [null, caps], [levels, null], [levels, []], [{ ...levels, read: [] }, caps], [{ read: ['VIEW_CHANNEL'], write: LEVEL_CAPS.write }, caps],
+    [levels, ALL_CAPS], // full names a capability the list lacks
+    [levels, [...caps, 'VIEW_CHANNEL']], // repeats
+    [levels, ['view channel']], [{ ...levels, read: ['<b>'] }, caps],
+    [{ read: ['SEND_MESSAGES'], write: ['SEND_MESSAGES'], full: ['SEND_MESSAGES'] }, ['SEND_MESSAGES']], // no View
+  ]) {
+    assert.equal(lib.adoptModel(bad[0], bad[1]), false, JSON.stringify(bad));
+  }
+  assert.deepEqual(plain(lib.LEVEL_CAPS), plain(LEVEL_CAPS), 'still the copy');
+  assert.equal(lib.levelOf(['VIEW_CHANNEL']).level, 'custom');
+
+  assert.equal(lib.adoptModel(levels, caps), true);
+  assert.deepEqual(plain(lib.LEVEL_CAPS), levels);
+  assert.deepEqual(plain(lib.ALL_CAPS), caps);
+  assert.equal(lib.levelOf(['VIEW_CHANNEL']).level, 'read', 'the relay’s Read');
+  assert.equal(lib.levelLabel([...LEVEL_CAPS.full, 'PIN_MESSAGES']), 'Full');
+  assert.deepEqual(plain(lib.CAP_GROUPS.at(-1)), { key: 'other', label: 'Other', caps: ['PIN_MESSAGES'] }, 'one it has no label for is still offered');
+  assert.equal(lib.capsWords(['PIN_MESSAGES']), 'pin messages');
+});
+
+test('ui.levelControl: level() says which preset is picked, so a preset can be sent by name', () => {
+  const { lc, pick } = levelSandbox({ value: LEVEL_CAPS.read });
+  assert.equal(lc.level(), 'read');
+  pick('custom');
+  assert.equal(lc.level(), 'custom');
+  lc.set([]);
+  assert.equal(lc.level(), null);
+});
+
+test('ui.levelControl: a capability the relay added gets a box under Other', () => {
+  const { ctx } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  ctx.PA.lib.adoptModel({ ...plain(LEVEL_CAPS) }, [...ALL_CAPS, 'PIN_MESSAGES']);
+  const lc = ctx.PA.ui.levelControl({ value: [...LEVEL_CAPS.write, 'PIN_MESSAGES'] });
+  const box = (lc.node.querySelectorAll('input') as FakeElement[]).find((i) => i.type === 'checkbox' && i.value === 'PIN_MESSAGES')!;
+  assert.ok(box, 'offered');
+  assert.equal(box.checked, true);
+  assert.equal(lc.level(), 'custom');
+  assert.deepEqual(plain(lc.value()), [...LEVEL_CAPS.write, 'PIN_MESSAGES']);
+});
+
+test('lib.errorText: the relay’s refusal codes in the copy guide’s words', () => {
+  const { lib } = libOnly();
+  const t = (e: object, prefix?: string, ctx?: object) => lib.errorText(e, prefix, ctx);
+  const at = (cid: string) => ({ channelId: cid, names: NAMES });
+  assert.equal(t({ code: 'THREAD_TARGET', status: 400, parentId: C.research }, 'Not saved', at(C.designReview)),
+    'Not saved: design-review is a thread. Threads use #research’s access — give access there.');
+  assert.equal(t({ code: 'THREAD_TARGET', status: 400 }, 'Not saved', at(C.designReview)),
+    'Not saved: design-review is a thread. Threads use #research’s access — give access there.', 'the parent from the names when the relay doesn’t say');
+  assert.equal(t({ code: 'CATEGORY_TARGET', status: 400 }, 'Not saved', at(C.catResearch)), 'Not saved: Research is a category. Pick its channels instead.');
+  assert.equal(t({ code: 'NOT_GRANTABLE', status: 400 }, 'Not saved', at(C.general)), 'Not saved: #general can’t hold access. Pick a text, voice or forum channel.');
+  assert.equal(t({ code: 'EMPTY_CAPS', status: 400 }), 'Not saved: pick a level, or use Remove.');
+  assert.equal(t({ code: 'TARGET_REQUIRED', status: 400 }), 'Not saved: this page is out of date. Reload the page and try again.');
+  assert.equal(t({ code: 'EXISTS', status: 409 }, 'Not created', { roleName: 'g1-chatters' }), 'A role named g1-chatters already exists — edit it instead?');
+  assert.equal(t({ code: 'RATE_LIMITED', status: 429 }), 'Paused for a few seconds (rate limit).');
+  assert.equal(t({ code: 'NETWORK', status: 0 }), 'Couldn’t reach the relay. Nothing was changed. Try again.');
+  assert.equal(t({ code: 'FORBIDDEN', status: 403, reason: 'NOT_GUILD_ADMIN', message: 'not an admin of this guild' }),
+    'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
+  assert.equal(t({ code: 'FORBIDDEN', status: 403, message: 'channel is not in this guild' }), 'Not saved: channel is not in this guild.', 'a route’s own refusal says what it is');
+  assert.equal(t({ code: 'INVALID', status: 400, message: 'level must be read, write or full.' }, 'Not denied'), 'Not denied: level must be read, write or full.');
+});
+
+test('app: a relay newer than the panel asks for a reload', async () => {
+  for (const [apiVersion, shown] of [[3, true], [2, false], [undefined, false]] as const) {
+    const { ctx, doc } = appSandbox({ routes: { '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'c', apiVersion } } });
+    await ctx.PA.app.boot();
+    await settle();
+    const banner = doc.getElementById('update-banner');
+    assert.equal(!!banner, shown, String(apiVersion));
+    if (banner) {
+      assert.equal(banner.textContent, 'The panel was updated — Reload');
+      assert.equal(banner.querySelector('button')!.textContent, 'Reload');
+    }
+  }
+});
+
+test('app: levels come from /admin/me when the relay sends them', async () => {
+  const levels = { read: ['VIEW_CHANNEL'], write: [...LEVEL_CAPS.write], full: [...LEVEL_CAPS.full] };
+  const { ctx } = appSandbox({ routes: { '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'c', levels, caps: [...ALL_CAPS] } } });
+  await ctx.PA.app.boot();
+  await settle();
+  assert.deepEqual(plain(ctx.PA.lib.LEVEL_CAPS.read), ['VIEW_CHANNEL']);
+});
+
+test('grant editor: Custom… is sent as caps, guild-wide as {guildDefault: true}', async () => {
+  const { form, radio, choose, bodies, policy } = await ariaDrawer();
+  choose(CH.general);
+  radio('custom').checked = true;
+  radio('custom').fire('change');
+  const box = (c: string) => form.querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === c)!;
+  box('MENTION_EVERYONE').checked = true;
+  box('MENTION_EVERYONE').fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.general, caps: ['VIEW_CHANNEL', 'READ_HISTORY', 'MENTION_EVERYONE'] });
+  choose('__guild__');
+  radio('read').checked = true;
+  radio('read').fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { guildDefault: true, level: 'read' });
+  assert.deepEqual(policy.default, [...LEVEL_CAPS.read]);
+});
+
+test('grant editor: guild-wide is set, denied or not set — with Unset and Deny guild-wide', async () => {
+  const policy = { channels: {} as Record<string, string[]>, default: [...LEVEL_CAPS.read] };
+  const { drawer, doc, calls } = await ariaDrawer({ policy });
+  const g = '/admin/g/' + G1 + '/personas/aria/grants';
+  const row = () => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
+  const buttons = () => row().querySelectorAll('button').map((b) => b.textContent);
+  const status = () => drawer.querySelector('form.grant-form')!.querySelector('.status-line')!.textContent;
+  assert.equal(row().children[1].textContent, 'Read');
+  assert.deepEqual(buttons(), ['Unset', 'Deny guild-wide']);
+
+  // Unset: asked, then DELETE ?guildDefault=unset.
+  row().querySelectorAll('button').find((b) => b.textContent === 'Unset')!.click();
+  await settle();
+  const dialog = doc.querySelector('.modal')!;
+  assert.equal(dialog.querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One?');
+  assert.match(dialog.textContent, /fall back to Aria’s persona default/);
+  dialog.querySelectorAll('button').find((b) => b.textContent === 'Unset guild-wide')!.click();
+  await settle();
+  assert.equal(calls.at(-1), `DELETE ${g}?guildDefault=unset`);
+  assert.equal(status(), 'Unset Aria’s guild-wide level in Guild One: channels without their own grant fall back to the persona default.');
+  assert.equal(row().children[1].textContent, 'Not set');
+  assert.deepEqual(buttons(), ['Deny guild-wide'], 'nothing to unset; a deny can still be set');
+
+  // Deny: asked, then DELETE ?guildDefault=deny.
+  row().querySelectorAll('button')[0].click();
+  await settle();
+  assert.match(doc.querySelector('.modal')!.textContent, /the deny blocks its persona default here/);
+  doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(calls.at(-1), `DELETE ${g}?guildDefault=deny`);
+  assert.equal(row().children[1].textContent, 'Denied');
+  assert.deepEqual(buttons(), ['Unset']);
+});
+
+test('grant editor: the relay’s refusal is put in words in the section’s line', async () => {
+  const { form, radio, choose, drawer } = await ariaDrawer({
+    refusePut: (body) => (body.channelId === CH.labNotes ? refuse(400, 'THREAD_TARGET', 'thread', { parentId: CH.research }) : refuse(400, 'CATEGORY_TARGET')),
+  });
+  choose(CH.labNotes);
+  radio('write').checked = true;
+  radio('write').fire('change');
+  form.fire('submit');
+  await settle();
+  const line = drawer.querySelector('form.grant-form')!.querySelector('.status-line')!;
+  assert.equal(line.textContent, 'Not saved: lab-notes is a thread. Threads use #research’s access — give access there.');
+  assert.ok(line.classList.contains('status-err'));
+});
+
+test('persona rows: direct grants that give something, a guild-wide deny, or nothing', async () => {
+  const g = '/admin/g/' + G1;
+  const { ctx, doc } = appSandbox({
+    routes: {
+      [g + '/personas']: {
+        personas: [
+          { id: 'aria', displayName: 'Aria', roles: [], directGrants: 'grants', hasOverride: true },
+          { id: 'quill', displayName: 'Quill', roles: [], directGrants: 'denied', hasOverride: false },
+          { id: 'nyx', displayName: 'Nyx', roles: [], directGrants: 'none', hasOverride: false },
+        ],
+        total: 3, limit: 50, offset: 0,
+      },
+    },
+  });
+  await ctx.PA.app.boot();
+  await settle();
+  const cells = doc.getElementById('view')!.querySelectorAll('tr').slice(1).map((tr) => tr.children.at(-1)!.textContent);
+  assert.deepEqual(cells, ['direct grants', 'denied guild-wide', '—']);
+});
+
+test('invites list: each invite’s status; a spent one is deleted, an active one revoked', async () => {
+  const g = '/admin/g/' + G1;
+  const { ctx, doc, calls } = appSandbox({
+    routes: {
+      [g + '/invites']: {
+        invites: [
+          { code: 'inv_fixtureinvite000000new', label: 'newest', uses: 0, maxUses: 1, roles: ['g1-readers'], status: 'active' },
+          { code: 'inv_fixtureinvite000000use', label: 'used-up', uses: 1, maxUses: 1, roles: ['g1-readers'], status: 'used' },
+          { code: 'inv_fixtureinvite000000old', label: 'expired', uses: 0, roles: ['g1-readers'], expiresAt: '2026-01-01T00:00:00Z', status: 'expired' },
+        ],
+        total: 3, limit: 50, offset: 0,
+      },
+    },
+  });
+  await ctx.PA.app.boot();
+  await settle();
+  doc.querySelectorAll('button').find((b) => b.textContent === 'invites')!.click();
+  await settle();
+  const rows = doc.getElementById('view')!.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
+  assert.deepEqual(rows[0].slice(0, 3), ['Code', 'Label', 'Status']);
+  assert.deepEqual(rows.slice(1).map((r) => [r[1], r[2], r.at(-1)]), [['newest', 'Active', 'Revoke'], ['used-up', 'Used up', 'Delete'], ['expired', 'Expired', 'Delete']]);
+  doc.querySelectorAll('button').find((b) => b.textContent === 'Delete')!.click();
+  await settle();
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Delete invite “used-up”?');
+  doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.ok(calls.includes(`DELETE ${g}/invites/inv_fixtureinvite000000use`));
+});
+
+test('persona drawer: Upload is offered only when the relay keeps uploaded pictures', async () => {
+  for (const avatarUploads of [false, true]) {
+    const g = '/admin/g/' + G1;
+    const { ctx, doc } = appSandbox({
+      routes: {
+        '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'c', features: { invites: true, avatarUploads, allowlistEditable: true } },
+        [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: null, names: { channels: {} } },
+        '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatar: '', avatarUrl: '', roles: [], policy: null, guilds: [], names: {} },
+      },
+    });
+    await ctx.PA.app.boot();
+    await settle();
+    doc.querySelectorAll('button').find((b) => b.textContent === 'Aria')!.click();
+    await settle();
+    const drawer = doc.getElementById('drawer-body')!;
+    assert.ok(drawer.querySelectorAll('button').some((b) => b.textContent === 'Save'), 'the URL form is there');
+    assert.equal(drawer.querySelectorAll('button').some((b) => b.textContent === 'Upload image…'), avatarUploads, `avatarUploads: ${avatarUploads}`);
+  }
+});
+
+test('role drawer: a role made between the look and the save is asked about, then edited in its own guild', async () => {
+  const { define, confirm, catalog, net, bodies } = await rolesTab();
+  // Someone defines g1-race in Guild One just after this drawer looked.
+  let raced = false;
+  net.beforePost = (body) => {
+    if (raced || body.replace) return;
+    raced = true;
+    catalog['g1-race'] = { caps: [...LEVEL_CAPS.full], scope: { all: true }, guildId: G1 };
+  };
+  await define('g1-race', 'read');
+  const dialog = confirm();
+  assert.ok(dialog, 'the 409 leads to a fresh look, and the question');
+  assert.equal(dialog!.querySelector('h2')!.textContent, 'A role named g1-race already exists — edit it instead?');
+  dialog!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { name: 'g1-race', role: { caps: [...LEVEL_CAPS.read], scope: { all: true }, guildId: G1 }, replace: true, expectedGuildId: G1 });
+  assert.deepEqual(catalog['g1-race'].caps, [...LEVEL_CAPS.read]);
+});
+
+test('role drawer: a new name must be one the relay accepts', async () => {
+  const { button, doc } = await rolesTab();
+  button('+ Define access role')!.click();
+  await settle();
+  const form = doc.getElementById('drawer-body')!.querySelector('form')!;
+  const input = form.querySelector('input[name="name"]')!;
+  input.value = 'Chatters Two';
+  input.fire('input');
+  const submit = form.querySelector('button[type="submit"]')!;
+  assert.equal(submit.disabled, true);
+  assert.match(form.textContent, /Use lower-case letters, digits, dots, dashes or underscores in the name \(up to 64\) to create it\./);
 });

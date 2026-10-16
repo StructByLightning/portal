@@ -44,10 +44,14 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
   **drawer**:
   - *Access in <guild>* — its direct grants in this guild first: set Read,
     Write, Full or Custom… on one channel (text, voice or forum — a thread
-    uses its parent's access and a category grants nothing) or guild-wide;
-    then this guild's access roles, each with what it means; and, under
+    uses its parent's access and a category grants nothing) or guild-wide.
+    The guild-wide row says whether it is set, denied or not set, with *Unset*
+    (fall back to the persona default) and *Deny guild-wide* (block the
+    persona default here; access roles still apply). Then this guild's access
+    roles, each with what it means; and, under
     *More*, applying an invite made for an existing persona;
-  - *(super-admin)* Profile picture, *Access in every guild* (where it can act,
+  - *(super-admin)* Profile picture (Upload only when the relay keeps uploads,
+    `PORTAL_AVATAR_DIR`), *Access in every guild* (where it can act,
     what each access role confers, its direct grants everywhere) and **Token**
     (rotate / revoke) — a token authenticates a persona everywhere, so it is
     not a per-guild action.
@@ -57,9 +61,12 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
 - **Invites** *(guild-scoped)* — mint (access roles, channels at a level, or a
   mirrored Discord role; single use and 7 days unless changed; who can use
   it under *Advanced*). The code stays on screen with Copy until *Done*.
-  List, revoke. Search + pagination.
+  List, newest first, with each invite's status (Active / Used up / Expired);
+  revoke an active one, delete a spent one. Search (code or label) + pagination.
 - **Access roles** *(read guild-scoped, authoring super-admin)* — the named
   access roles, each bound to one guild, shown by level and where they apply.
+  Defining a name that is taken asks "A role named … already exists — edit it
+  instead?" (another guild's role is not touched from here).
   A guild-admin sees only their guild's; only super-admins may create/delete.
 - **Audit** *(guild-scoped)* — every mutation, newest first.
 
@@ -75,8 +82,9 @@ browser ──HTTPS──▶ Caddy ──┬─ /          → static assets (th
 ```
 
 The browser holds only an httpOnly session cookie (set by the OAuth flow); the
-SPA never sees a token. Every mutating request carries the `X-CSRF-Token` header
-read from `GET /admin/me`.
+SPA never sees a token. Every request but a GET carries the `X-CSRF-Token` header
+read from `GET /admin/me` — sign-out included. The relay checks it once, before
+it routes the request, so a request without it changes nothing.
 
 ## Deploy
 
@@ -128,13 +136,32 @@ read from `GET /admin/me`.
 
 Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }`.
 
-- `GET /admin/me` → `{user, isSuper, guilds:[{id,name}], csrf}`; `POST /admin/logout`
-- `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride}], total,limit,offset}`
-- `GET /admin/g/:gid/personas/:id` → `{id,displayName,roles,guildPolicy}`
-- `POST/DELETE /admin/g/:gid/personas/:id/roles[/:role]`; `PUT/DELETE …/grants`; `POST …/claim`
-- `GET/POST /admin/g/:gid/invites`, `DELETE …/invites/:code`
-- `GET /admin/g/:gid/roles` → `{catalog, discordRoles, canAuthor}`; `GET …/channels`; `GET …/audit`
-- `POST/DELETE /admin/roles[/:name]` *(super-admin, global)*
+- `GET /admin/me` → `{user, isSuper, guilds:[{id,name}], csrf, apiVersion, levels, caps,
+  features:{invites,avatarUploads,allowlistEditable}, session:{expiresAt}}` — `levels`
+  and `caps` are the relay's Read/Write/Full and capability list (the panel keeps a
+  copy for an older relay); a relay whose `apiVersion` is newer than the panel's
+  `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. `POST /admin/logout`
+- `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride,directGrants}], total,limit,offset}`;
+  `directGrants` is `grants` (a direct grant gives something here), `denied` (denied
+  guild-wide, nothing given) or `none`; super-admins also get `otherGuildRoleCount`
+- `GET /admin/g/:gid/personas/:id` → `{id,displayName,roles,guildPolicy}` (+ `otherGuildRoleCount` for super-admins).
+  A guild-admin gets only that guild's access roles.
+- `POST/DELETE /admin/g/:gid/personas/:id/roles[/:role]`; `POST …/claim`
+- `PUT /admin/g/:gid/personas/:id/grants` — one target, `{channelId}` or `{guildDefault:true}`,
+  and one operation, `{level:'read'|'write'|'full'}`, `{caps:[…]}` (non-empty, known) or
+  `{deny:true}`. Refusals: `TARGET_REQUIRED`, `EMPTY_CAPS`, `UNKNOWN_CAP`, `THREAD_TARGET`
+  (with `parentId`), `CATEGORY_TARGET`, `NOT_GRANTABLE` (400); a channel of another guild 403.
+- `DELETE /admin/g/:gid/personas/:id/grants` with exactly one of `?channelId=`,
+  `?guildDefault=deny` (an explicit deny) or `?guildDefault=unset` (fall back to the
+  persona default). Audit records carry `before` and `after`.
+- `GET /admin/g/:gid/invites?q=&status=active|spent|all` → newest first, each with
+  `status` (`active` · `used` · `expired`); `POST …/invites`, `DELETE …/invites/:code`
+- `GET /admin/g/:gid/roles` → `{catalog, discordRoles, canAuthor}` (a guild-admin gets
+  that guild's roles only); `GET …/channels`; `GET …/audit`
+- `POST /admin/roles {name, role, replace?, expectedGuildId?}` *(super-admin, global)* —
+  a name in use is `409 EXISTS` unless `replace:true` names the guild it belongs to
+  (else `409 GUILD_MISMATCH`; replacing never moves a role). New names match
+  `^[a-z0-9][a-z0-9._-]{0,63}$`. `DELETE /admin/roles/:name`
 - `GET /admin/personas` → `{personas:[{id,displayName,roles,guildCount}], total,…}` *(super-admin)*
 - `GET /admin/personas/:id` → `{id,displayName,roles,guilds}`; `POST /admin/personas/:id/token` *(super-admin)*
 

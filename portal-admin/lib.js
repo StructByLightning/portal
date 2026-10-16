@@ -6,6 +6,7 @@
  * that assigns a single global, PA.<module>.
  *
  *   LEVEL_CAPS, ALL_CAPS, CAP_GROUPS   the capability model, as slash speaks it
+ *   adoptModel                         take the relay's own copy from /admin/me
  *   levelOf, levelLabel, capsSummary   caps → 'Write', 'Write +1', 'Custom'
  *   capsTitle, capsWords               the same in words (tooltips)
  *   isGrantableType                    which channels can hold a direct grant
@@ -13,6 +14,8 @@
  *   roleMeaning, roleLevelText         an access role in one line
  *   roleNameTaken                      defining a role under a name in use
  *   grantSummary, inviteSummary        what an invite confers, in one line
+ *   inviteStatusText                   'Active' · 'Used up' · 'Expired'
+ *   errorText                          a refusal from the relay, in words
  */
 (function (root) {
   'use strict';
@@ -21,8 +24,10 @@
 
   // ── The capability model ──────────────────────────────────────────────────
 
-  // mirror of portal-relay/src/slash.ts and permissions.ts; parity-tested
-  const LEVEL_CAPS = Object.freeze({
+  // mirror of portal-relay/src/slash.ts and permissions.ts; parity-tested.
+  // The relay sends its own in /admin/me (adoptModel); this copy is for a
+  // relay too old to.
+  let LEVEL_CAPS = Object.freeze({
     read: Object.freeze(['VIEW_CHANNEL', 'READ_HISTORY']),
     write: Object.freeze([
       'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS',
@@ -36,7 +41,7 @@
   });
 
   // mirror of portal-relay/src/slash.ts and permissions.ts; parity-tested
-  const ALL_CAPS = Object.freeze([
+  let ALL_CAPS = Object.freeze([
     'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS',
     'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN',
     'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'VOICE_LISTEN', 'VOICE_SPEAK',
@@ -73,12 +78,41 @@
   });
 
   /** How Custom… groups the checkboxes. Together they hold ALL_CAPS. */
-  const CAP_GROUPS = Object.freeze([
+  let CAP_GROUPS = Object.freeze([
     Object.freeze({ key: 'read', label: 'Read', caps: Object.freeze(['VIEW_CHANNEL', 'READ_HISTORY']) }),
     Object.freeze({ key: 'write', label: 'Write', caps: Object.freeze(['SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS', 'ATTACH_FILES', 'ADD_REACTIONS', 'EDIT_OWN', 'DELETE_OWN']) }),
     Object.freeze({ key: 'moderation', label: 'Moderation', caps: Object.freeze(['MENTION_EVERYONE', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS']) }),
     Object.freeze({ key: 'voice', label: 'Voice', caps: Object.freeze(['VOICE_LISTEN', 'VOICE_SPEAK']) }),
   ]);
+  const BASE_GROUPS = CAP_GROUPS;
+
+  /**
+   * Take the relay's levels and capabilities (from /admin/me) in place of
+   * this file's copy, so the panel offers what the relay it talks to knows.
+   * Anything malformed is ignored and the copy stays: returns whether it was
+   * taken. A capability this file has no label for is offered under Other.
+   */
+  function adoptModel(levels, caps) {
+    const names = (xs) => Array.isArray(xs) && xs.length > 0 && xs.every((x) => typeof x === 'string' && /^[A-Z][A-Z0-9_]*$/.test(x));
+    if (!names(caps) || new Set(caps).size !== caps.length || !levels || typeof levels !== 'object') return false;
+    const all = new Set(caps);
+    if (!all.has('VIEW_CHANNEL') || !all.has('READ_HISTORY')) return false; // the panel's rules lean on these two
+    for (const k of LEVELS) if (!names(levels[k]) || !levels[k].every((c) => all.has(c))) return false;
+    const lv = {};
+    for (const k of LEVELS) lv[k] = Object.freeze(levels[k].slice());
+    LEVEL_CAPS = Object.freeze(lv);
+    ALL_CAPS = Object.freeze(caps.slice());
+    const groups = BASE_GROUPS.map((g) => Object.freeze({ key: g.key, label: g.label, caps: Object.freeze(g.caps.filter((c) => all.has(c))) }))
+      .filter((g) => g.caps.length);
+    const known = new Set(BASE_GROUPS.flatMap((g) => g.caps));
+    const other = caps.filter((c) => !known.has(c));
+    if (other.length) groups.push(Object.freeze({ key: 'other', label: 'Other', caps: Object.freeze(other) }));
+    CAP_GROUPS = Object.freeze(groups);
+    PA.lib.LEVEL_CAPS = LEVEL_CAPS;
+    PA.lib.ALL_CAPS = ALL_CAPS;
+    PA.lib.CAP_GROUPS = CAP_GROUPS;
+    return true;
+  }
 
   const capIndex = (c) => {
     const i = ALL_CAPS.indexOf(c);
@@ -118,7 +152,7 @@
 
   /** 'view, history, send' — in ALL_CAPS order. */
   function capsWords(caps) {
-    return sortCaps(caps).map((c) => CAP_WORDS[c] || String(c).toLowerCase()).join(', ');
+    return sortCaps(caps).map((c) => CAP_WORDS[c] || String(c).toLowerCase().replace(/_/g, ' ')).join(', ');
   }
 
   /** In a sentence: 'Write', 'Write + mention everyone', 'Custom (view, send)',
@@ -249,7 +283,9 @@
    * belongs, so creating it again from another guild would move it there:
    * its holders would lose its access in its own guild. So:
    *   another guild's role → { refuse: 'Not created: Guild Two already has …' }
-   *   this guild's role    → { title, body } for the Replace confirm.
+   *   this guild's role    → { title, body, confirmLabel } for the confirm
+   *                          that edits it (the relay replaces it only when
+   *                          asked to, naming the guild it belongs to).
    * `names` should name the existing role's guild, channels and Discord roles
    * (the roles endpoint's ?names=1); a guild it can't name is 'another guild'.
    */
@@ -268,10 +304,11 @@
       };
     }
     return {
-      title: 'Replace access role ' + name + '?',
-      body: 'An access role named ' + name + ' already exists in ' + guildText(guildId, names) + ' (' + roleMeaning(existing, names) +
-        '). Replacing it gives every persona that holds it ' + roleMeaning(role, names) +
+      title: 'A role named ' + name + ' already exists — edit it instead?',
+      body: 'It is ' + guildText(guildId, names) + '’s access role ' + name + ' (' + roleMeaning(existing, names) +
+        '). Editing it to this definition gives every persona that holds it ' + roleMeaning(role, names) +
         ' instead. This can’t be undone; to go back, define it again as it was.',
+      confirmLabel: 'Edit access role',
     };
   }
 
@@ -324,10 +361,58 @@
     return [usesText(inv && inv.maxUses), expires, grantSummary(inv, names)].join(' · ');
   }
 
+  /** An invite's status from the relay, as the list shows it. */
+  function inviteStatusText(status) {
+    return status === 'used' ? 'Used up' : status === 'expired' ? 'Expired' : status === 'active' ? 'Active' : '—';
+  }
+
+  // ── Refusals ──────────────────────────────────────────────────────────────
+
+  const NOT_GUILD_ADMIN = 'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.';
+
+  /**
+   * A failed change as its status line: '<prefix>: <reason>. <what to do>.'
+   * `e` is the API error ({status, code, message, …the error body's fields}),
+   * `ctx` what the request was about: { channelId, names } for a grant,
+   * { roleName } for an access role. The relay's codes get the copy guide's
+   * words; anything else says what the relay said.
+   */
+  function errorText(e, prefix, ctx) {
+    const p = prefix || 'Not saved';
+    const c = ctx || {};
+    const code = e && e.code;
+    const label = c.channelId && c.names && c.names.channels ? c.names.channels[c.channelId] : null;
+    const bare = (label && label.name) || 'That channel';
+    switch (code) {
+      case 'NETWORK': return 'Couldn’t reach the relay. Nothing was changed. Try again.';
+      case 'RATE_LIMITED': return 'Paused for a few seconds (rate limit).';
+      case 'CSRF': return p + ': this page’s security token is out of date. Reload the page and try again.';
+      case 'THREAD_TARGET': {
+        const parentId = (e && e.parentId) || (label && label.parentId);
+        const parent = parentId ? chanText(parentId, c.names) : 'its channel';
+        return p + ': ' + bare + ' is a thread. Threads use ' + parent + '’s access — give access there.';
+      }
+      case 'CATEGORY_TARGET': return p + ': ' + bare + ' is a category. Pick its channels instead.';
+      case 'NOT_GRANTABLE': return p + ': ' + (label ? chanText(c.channelId, c.names) : 'that channel') + ' can’t hold access. Pick a text, voice or forum channel.';
+      case 'EMPTY_CAPS': return p + ': pick a level, or use Remove.';
+      case 'UNKNOWN_CAP': return p + ': the relay doesn’t know one of these capabilities. Reload the page and try again.';
+      case 'TARGET_REQUIRED': return p + ': this page is out of date. Reload the page and try again.';
+      case 'EXISTS': return 'A role named ' + (c.roleName || 'that') + ' already exists — edit it instead?';
+      case 'GUILD_MISMATCH': return p + ': ' + (c.roleName ? 'access role ' + c.roleName : 'that access role') + ' belongs to another guild now. Reload the page and try again.';
+      case 'INVALID_NAME': return p + ': an access role name uses lower-case letters, digits, dots, dashes and underscores (up to 64), starting with a letter or digit.';
+      default: break;
+    }
+    if (e && e.status === 401) return p + ': your session ended. Sign in again.';
+    if (code === 'FORBIDDEN' && e.reason === 'NOT_GUILD_ADMIN') return NOT_GUILD_ADMIN;
+    const why = String((e && e.message) || 'something went wrong').trim().replace(/[.\s]+$/, '');
+    return p + ': ' + why + '.';
+  }
+
   PA.lib = {
-    LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS,
+    LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS, adoptModel,
     sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
-    shortDate, usesText, usedText, modeText, inviteSummary,
+    shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
+    NOT_GUILD_ADMIN, errorText,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

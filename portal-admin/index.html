@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="same-origin" />
   <title>Portal Admin</title>
-  <link rel="stylesheet" href="styles.css?v=3" />
+  <link rel="stylesheet" href="styles.css?v=4" />
   <!-- Classic deferred scripts, run in order; each assigns only window.PA.<module>.
        Bump ?v= on a release so browsers don't mix old and new files. -->
-  <script src="lib.js?v=3" defer></script>
-  <script src="ui.js?v=3" defer></script>
-  <script src="app.js?v=3" defer></script>
+  <script src="lib.js?v=4" defer></script>
+  <script src="ui.js?v=4" defer></script>
+  <script src="app.js?v=4" defer></script>
 </head>
 <body>
   <!-- Login screen (shown when /admin/me returns 401) -->
@@ -50,6 +50,9 @@
         <button type="button" id="logout-btn" class="btn btn-ghost btn-sm">Sign out</button>
       </div>
     </header>
+
+    <!-- Notices about the panel itself (a newer relay asks for a reload). -->
+    <div id="notices" class="notices"></div>
 
     <main id="view" class="view"><!-- active tab rendered here --></main>
   </div>

@@ -21,8 +21,12 @@ const { chanText, roleText, guildText, levelLabel, capsSummary, capsTitle } = li
 
 const LIMIT = 50;
 
+/** The admin API this panel speaks. /admin/me says which one the relay
+ *  speaks; when the relay is newer, the panel asks for a reload. */
+const CLIENT_API = 2;
+
 const state = {
-  me: null,        // { user, isSuper, guilds, csrf }
+  me: null,        // /admin/me: { user, isSuper, guilds, csrf, apiVersion, levels, caps, features, session }
   guildId: null,   // selected guild id (null when no guild is selectable)
   tab: 'personas',
   personaScope: 'guild', // super-admins: 'guild' (access here) or 'all' personas
@@ -40,7 +44,13 @@ const $ = (sel, root = document) => root.querySelector(sel);
 // ── API layer ──────────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
-  constructor(status, code, message) { super(message || code || ('HTTP ' + status)); this.status = status; this.code = code; }
+  /** `detail`: the rest of the relay's error body (parentId, reason, existing…). */
+  constructor(status, code, message, detail) {
+    super(message || code || ('HTTP ' + status));
+    this.status = status;
+    this.code = code;
+    for (const k of ['parentId', 'reason', 'existing']) if (detail && detail[k] !== undefined) this[k] = detail[k];
+  }
 }
 
 /** JSON request to the admin API. opts.raw sends `body` as-is with
@@ -62,7 +72,7 @@ async function api(method, path, body, opts = {}) {
   let data = null;
   const text = await res.text();
   if (text) { try { data = JSON.parse(text); } catch { /* non-JSON */ } }
-  if (!res.ok) { const e = (data && data.error) || {}; throw new ApiError(res.status, e.code, e.message); }
+  if (!res.ok) { const e = (data && data.error) || {}; throw new ApiError(res.status, e.code, e.message, e); }
   return data || {};
 }
 
@@ -74,15 +84,16 @@ function qs(params) {
   return s ? '?' + s : '';
 }
 
-const NOT_GUILD_ADMIN = 'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.';
+const NOT_GUILD_ADMIN = lib.NOT_GUILD_ADMIN;
 
-/** A failed change, as a status line: 'Not saved: <reason>. <what to do>.' */
-function notDone(e, prefix = 'Not saved') {
-  if (e && e.code === 'NETWORK') return 'Couldn’t reach the relay. Nothing was changed. Try again.';
-  if (e && e.code === 'CSRF') return prefix + ': this page’s security token is out of date. Reload the page and try again.';
-  if (e && e.status === 401) return prefix + ': your session ended. Sign in again.';
-  const why = String((e && e.message) || 'something went wrong').trim().replace(/[.\s]+$/, '');
-  return prefix + ': ' + why + '.';
+/** New access-role names, as the relay accepts them. */
+const ROLE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** A failed change, as a status line: 'Not saved: <reason>. <what to do>.'
+ *  `ctx` says what it was about ({channelId, names} or {roleName}), so the
+ *  relay's codes can be put in words (lib.errorText). */
+function notDone(e, prefix = 'Not saved', ctx) {
+  return lib.errorText(e, prefix, ctx);
 }
 
 /** A failed read, as a line: 'Couldn’t load <what>: <reason>.' */
@@ -164,6 +175,9 @@ async function boot() {
     return showLogin('Couldn’t reach the admin API: ' + e.message + '. Reload to try again.');
   }
   state.me = me;
+  // The relay's own levels and capabilities, when it sends them.
+  if (me.levels && me.caps) lib.adoptModel(me.levels, me.caps);
+  if (typeof me.apiVersion === 'number' && me.apiVersion > CLIENT_API) showUpdateBanner();
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
 
@@ -191,6 +205,24 @@ async function boot() {
   });
 
   selectTab('personas');
+}
+
+/** The relay speaks a newer admin API than this copy of the panel: say so,
+ *  with a way to load the new one. */
+function showUpdateBanner() {
+  if ($('#update-banner')) return;
+  const host = $('#notices') || $('#app');
+  const reload = el('button', { class: 'btn btn-sm', text: 'Reload', onclick: () => location.reload() });
+  host.appendChild(el('div', { id: 'update-banner', class: 'banner banner-update', role: 'status' }, [
+    el('span', { text: 'The panel was updated — ' }), reload,
+  ]));
+}
+
+/** What the relay has switched on (from /admin/me; all on for a relay too
+ *  old to say). */
+function feature(name) {
+  const f = state.me && state.me.features;
+  return !f || f[name] !== false;
 }
 
 function setupScope(me, guilds) {
@@ -518,7 +550,9 @@ function personaRow(p, meta, all) {
   if (!all && meta) {
     const mine = new Set(guildRoleNames(meta));
     const here = (p.roles || []).filter((r) => mine.has(r));
-    const elsewhere = (p.roles || []).length - here.length;
+    // A super-admin's rows count the roles of other guilds (the relay says
+    // how many); a guild admin's rows hold this guild's only.
+    const elsewhere = typeof p.otherGuildRoleCount === 'number' ? p.otherGuildRoleCount : (p.roles || []).length - here.length;
     rolesText = (here.join(', ') || '—') + (elsewhere ? ' (+' + elsewhere + ' elsewhere)' : '');
   }
   return openableRow(open, [
@@ -528,8 +562,19 @@ function personaRow(p, meta, all) {
     el('td', { class: 'cell-roles', text: rolesText }),
     all
       ? el('td', { class: 'col-narrow', text: String(p.guildCount != null ? p.guildCount : '—') })
-      : el('td', {}, [p.hasOverride ? el('span', { class: 'badge badge-warn', text: 'direct grants' }) : el('span', { class: 'muted', text: '—' })]),
+      : el('td', {}, [directGrantsBadge(p)]),
   ]);
+}
+
+/** A guild list row's 'Direct grants' cell: whether its direct grants give
+ *  anything here, or deny it guild-wide. */
+function directGrantsBadge(p) {
+  const dg = p.directGrants || (p.hasOverride ? 'grants' : 'none');
+  if (dg === 'grants') return el('span', { class: 'badge badge-warn', text: 'direct grants' });
+  if (dg === 'denied') {
+    return el('span', { class: 'badge badge-warn', text: 'denied guild-wide', title: 'Its persona default doesn’t apply in ' + currentGuildName() + '. Access roles still do.' });
+  }
+  return el('span', { class: 'muted', text: '—' });
 }
 
 async function openPersonaDrawer(id, meta, hint = {}) {
@@ -598,21 +643,24 @@ function profileSection(ctx, d) {
   const urlButtons = el('div', { class: 'inline' }, [saveAv, clearAv]);
   const status = ui.statusLine(null);
   let cropping = false;
-  const cropper = avatarCropper(ctx, avImg, avInput, status, (on) => {
+  // Upload only where the relay keeps uploaded pictures (PORTAL_AVATAR_DIR).
+  const uploads = feature('avatarUploads');
+  const cropper = uploads ? avatarCropper(ctx, avImg, avInput, status, (on) => {
     cropping = on;
     urlButtons.classList.toggle('hidden', on);
-  });
+  }) : null;
   const form = el('form', { class: 'section-form', novalidate: true }, [
     el('div', { class: 'avatar-row' }, [avImg, el('div', { class: 'avatar-edit' }, [
       ui.field({ label: 'Picture URL', control: avInput }),
       urlButtons,
     ])]),
-    cropper.node,
-    el('p', { class: 'muted', text: 'Paste an image URL above, or upload + crop a file. Discord fetches it on the next message; past messages keep their old picture.' }),
+    cropper ? cropper.node : null,
+    el('p', { class: 'muted', text: (uploads ? 'Paste an image URL above, or upload + crop a file.' : 'Paste an image URL above.') +
+      ' Discord fetches it on the next message; past messages keep their old picture.' }),
     status.node,
   ]);
   const tracker = ctx.drawer.track(form);
-  cropper.onUploaded = () => tracker.reset();
+  if (cropper) cropper.onUploaded = () => tracker.reset();
 
   async function save(value) {
     try {
@@ -825,11 +873,13 @@ async function tokenAction(ctx, action, button, status) {
 }
 
 /**
- * Direct grants in the selected guild: what is set (one row per channel, plus
- * the guild-wide level), and a form that sets a level on one channel — text,
+ * Direct grants in the selected guild: what is set (the guild-wide level
+ * first — set, denied or not set, with Unset and Deny guild-wide — then one
+ * row per channel), and a form that sets a level on one channel — text,
  * voice or forum; a thread uses its parent's access and a category grants
  * nothing — or guild-wide. Save stays off until a target and a level are
- * picked, so a grant can't be stored empty by accident.
+ * picked, so a grant can't be stored empty by accident. A preset is sent as
+ * {level}, Custom… as {caps}.
  */
 function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
   const { id, displayName } = ctx;
@@ -854,25 +904,38 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     return el('td', { title: capsTitle(caps), text: levelLabel(caps) });
   }
 
+  /** The guild-wide row: its level, 'Denied' or 'Not set', and what can be
+   *  done — Unset (fall back to the persona default) when something is set,
+   *  Deny guild-wide unless it already is. */
+  function guildWideRow(gd) {
+    const buttons = [];
+    if (Array.isArray(gd)) {
+      const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild, title: 'Falls back to the persona default.' });
+      unset.addEventListener('click', () => unsetGuildWide(unset));
+      buttons.push(unset);
+    }
+    if (!Array.isArray(gd) || gd.length) {
+      const deny = el('button', { class: 'btn btn-sm btn-danger', text: 'Deny guild-wide', 'aria-label': 'Deny ' + displayName + ' guild-wide in ' + guild, title: 'Blocks the persona default here; access roles still apply.' });
+      deny.addEventListener('click', () => denyGuildWide(deny));
+      buttons.push(deny);
+    }
+    const level = Array.isArray(gd)
+      ? levelCell(gd, 'Denied', 'Denied guild-wide: ' + displayName + '’s persona default doesn’t apply in ' + guild + '. Access roles and direct grants still do.')
+      : el('td', { class: 'muted', text: 'Not set', title: 'No guild-wide level: channels without their own grant fall back to the persona default.' });
+    return el('tr', {}, [
+      el('td', { text: 'Every channel (guild-wide)' }),
+      level,
+      el('td', { class: 'col-narrow' }, [el('div', { class: 'inline' }, buttons)]),
+    ]);
+  }
+
   function draw(p) {
     policy = p || null;
     clear(tableBox);
     const gd = policy ? policy.default : undefined; // undefined: not set here
     const chans = (policy && policy.channels) || {};
     const keys = Object.keys(chans).sort((a, b) => byName(chanText(a, names), chanText(b, names)));
-    const rows = [];
-    if (Array.isArray(gd)) {
-      let deny = null;
-      if (gd.length) {
-        deny = el('button', { class: 'btn btn-sm btn-danger', text: 'Deny guild-wide', 'aria-label': 'Deny ' + displayName + ' guild-wide in ' + guild });
-        deny.addEventListener('click', () => denyGuildWide(deny));
-      }
-      rows.push(el('tr', {}, [
-        el('td', { text: 'Every channel (guild-wide)' }),
-        levelCell(gd, 'Denied', 'Denied guild-wide: ' + displayName + '’s persona default doesn’t apply in ' + guild + '. Access roles and direct grants still do.'),
-        el('td', { class: 'col-narrow' }, deny ? [deny] : []),
-      ]));
-    }
+    const rows = [guildWideRow(gd)];
     for (const cid of keys) {
       const where = chanText(cid, names);
       const note = inertNote(cid);
@@ -899,12 +962,13 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
   }
 
   async function denyGuildWide(button) {
+    const gd = policy && Array.isArray(policy.default) && policy.default.length ? policy.default : null;
     const go = await ui.confirmDialog({
       title: 'Deny ' + displayName + ' guild-wide in ' + guild + '?',
       body: [
-        displayName + '’s guild-wide ' + levelLabel(policy.default) + ' is replaced by a deny. In every channel of ' + guild +
-          ' without its own direct grant, ' + displayName + ' then gets nothing from its own settings: the deny also blocks its persona default here.',
-        'Access roles and direct grants still apply. To undo it, set a guild-wide level again.',
+        (gd ? displayName + '’s guild-wide ' + levelLabel(gd) + ' is replaced by a deny. ' : '') + 'In every channel of ' + guild +
+          ' without its own direct grant, ' + displayName + ' then gets nothing from its own settings: the deny blocks its persona default here.',
+        'Access roles and direct grants still apply. To undo it, use Unset' + (gd ? ' or set a guild-wide level again' : '') + '.',
       ],
       confirmLabel: 'Deny guild-wide',
       danger: true,
@@ -912,7 +976,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', P());
+        const r = await api('DELETE', P() + '?guildDefault=deny');
         draw(r.guildPolicy);
         target.focus();
         if (target.value === GUILD_WIDE) preload();
@@ -920,6 +984,30 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
         markStale(); onChange();
       } catch (e) { status.err(notDone(e, 'Not denied')); }
     }, 'Denying…');
+  }
+
+  async function unsetGuildWide(button) {
+    const gd = policy && Array.isArray(policy.default) ? policy.default : [];
+    const go = await ui.confirmDialog({
+      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + '?',
+      body: [
+        (gd.length ? displayName + '’s guild-wide ' + levelLabel(gd) : 'The guild-wide deny') + ' is removed: channels of ' + guild +
+          ' without their own direct grant fall back to ' + displayName + '’s persona default.',
+        'Access roles and direct grants still apply. To undo it, ' + (gd.length ? 'set a guild-wide level again' : 'deny guild-wide again') + '.',
+      ],
+      confirmLabel: 'Unset guild-wide',
+    });
+    if (!go) return;
+    await ui.busy(button, async () => {
+      try {
+        const r = await api('DELETE', P() + '?guildDefault=unset');
+        draw(r.guildPolicy);
+        target.focus();
+        if (target.value === GUILD_WIDE) preload();
+        status.ok('Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.');
+        markStale(); onChange();
+      } catch (e) { status.err(notDone(e, 'Not unset')); }
+    }, 'Unsetting…');
   }
 
   const target = el('select', { name: 'target' }, [el('option', { value: '', text: 'Pick a channel…' })]
@@ -964,8 +1052,11 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     const t = target.value;
     const caps = level.value();
     if (!t || !caps.length) return; // Save is off until both are picked
-    const body = { caps };
-    if (t !== GUILD_WIDE) body.channelId = t;
+    // One target and one operation: a preset by name, Custom… as its caps.
+    const body = t === GUILD_WIDE ? { guildDefault: true } : { channelId: t };
+    const k = level.level();
+    if (k && k !== 'custom') body.level = k;
+    else body.caps = caps;
     try {
       const r = await api('PUT', P(), body);
       draw(r.guildPolicy);
@@ -974,7 +1065,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
         ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
         : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.');
       markStale(); onChange();
-    } catch (e) { status.err(notDone(e)); }
+    } catch (e) { status.err(notDone(e, 'Not saved', { channelId: t === GUILD_WIDE ? null : t, names })); }
   });
 
   draw(policy0);
@@ -999,13 +1090,17 @@ async function renderInvites(view, stale) {
       const names = withChannelList(data.names, meta.channels, meta.discordRoles);
       names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
       const now = Date.now();
+      // Newest first, as the relay sends them; each with its status.
       const rows = (data.invites || []).map((inv) => {
-        const revoke = el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke', 'aria-label': 'Revoke invite ' + (inv.label || inv.code) });
+        const spent = inv.status === 'used' || inv.status === 'expired';
+        const verb = spent ? 'Delete' : 'Revoke';
+        const revoke = el('button', { class: 'btn btn-sm btn-danger', text: verb, 'aria-label': verb + ' invite ' + (inv.label || inv.code) });
         revoke.addEventListener('click', () => revokeInvite(inv, revoke, list));
         const grants = lib.grantSummary(inv, names);
         return el('tr', {}, [
           el('td', {}, [el('code', { text: inv.code })]),
           el('td', { text: inv.label || '—' }),
+          el('td', { class: 'col-narrow' }, [el('span', { class: spent ? 'muted' : '', text: lib.inviteStatusText(inv.status) })]),
           el('td', { class: 'col-narrow', text: lib.modeText(inv.mode) }),
           el('td', { class: 'col-narrow', text: lib.usedText(inv) }),
           el('td', { class: 'col-narrow', text: expiryCell(inv.expiresAt, now), title: inv.expiresAt ? new Date(inv.expiresAt).toLocaleString() : undefined }),
@@ -1015,7 +1110,7 @@ async function renderInvites(view, stale) {
       });
       return el('div', {}, [
         table([
-          { label: 'Code' }, { label: 'Label' }, { label: 'Who can use it', cls: 'col-narrow' },
+          { label: 'Code' }, { label: 'Label' }, { label: 'Status', cls: 'col-narrow' }, { label: 'Who can use it', cls: 'col-narrow' },
           { label: 'Uses', cls: 'col-narrow' }, { label: 'Expires', cls: 'col-narrow' }, { label: 'Grants' }, { label: '', cls: 'col-narrow' },
         ], rows, state.q ? 'No invite matches “' + state.q + '”.' : 'No invites in this guild.'),
         pager(data, () => list.refresh()),
@@ -1235,21 +1330,22 @@ function openMintDrawer(meta) {
   d.setBody(form);
 }
 
+/** Revoke an active invite, or delete a used-up or expired one (which no
+ *  agent can use any more) from the list. */
 async function revokeInvite(inv, button, list) {
   const name = inv.label ? '“' + inv.label + '”' : inv.code;
-  const go = await ui.confirmDialog({
-    title: 'Revoke invite ' + name + '?',
-    body: 'Agents can no longer enroll or claim with it. Access already granted stays.',
-    confirmLabel: 'Revoke', danger: true,
-  });
+  const spent = inv.status === 'used' || inv.status === 'expired';
+  const go = await ui.confirmDialog(spent
+    ? { title: 'Delete invite ' + name + '?', body: 'It is ' + lib.inviteStatusText(inv.status).toLowerCase() + ', so no agent can use it; this removes it from the list. Access already granted stays.', confirmLabel: 'Delete', danger: true }
+    : { title: 'Revoke invite ' + name + '?', body: 'Agents can no longer enroll or claim with it. Access already granted stays.', confirmLabel: 'Revoke', danger: true });
   if (!go) return;
   await ui.busy(button, async () => {
     try {
       await api('DELETE', G() + '/invites/' + encodeURIComponent(inv.code));
-      list.status.ok('Revoked invite ' + name + '. Agents can no longer use it.');
+      list.status.ok(spent ? 'Deleted invite ' + name + '.' : 'Revoked invite ' + name + '. Agents can no longer use it.');
       list.refresh();
-    } catch (e) { list.status.err(notDone(e, 'Not revoked')); }
-  }, 'Revoking…');
+    } catch (e) { list.status.err(notDone(e, spent ? 'Not deleted' : 'Not revoked')); }
+  }, spent ? 'Deleting…' : 'Revoking…');
 }
 
 // ── Roles (guild-scoped read, super-admin authoring) ────────────────────────────
@@ -1354,6 +1450,7 @@ function openRoleDrawer(meta) {
   /** What is still missing before Create can be pressed, or ''. */
   function missing() {
     if (!name.value.trim()) return 'Name the role';
+    if (!ROLE_NAME.test(name.value.trim())) return 'Use lower-case letters, digits, dots, dashes or underscores in the name (up to 64)';
     if (kind.value === 'channels' && !chanList.values().length) return 'Pick at least one channel';
     if (kind.value === 'mirrorRole' && !mirror.value()) return 'Pick a Discord role';
     if (kind.value === 'mirrorRoles' && !mirrors.list.values().length) return 'Pick at least one Discord role';
@@ -1385,43 +1482,58 @@ function openRoleDrawer(meta) {
     else if (kind.value === 'mirrorRoles') scope = { mirrorRoles: mirrors.list.values() };
     else scope = { channels: chanList.values() };
     const role = { caps: level.value(), scope, guildId: gid };
-    // The relay replaces a role of the same name: say so before it happens.
-    // Ask the relay what exists now, not what the tab showed when it was
-    // drawn, so a role made or deleted since (here or by another admin) counts.
-    // Names come too: the role found may be another guild's, and the line
-    // about it names that guild, its channels and its Discord roles.
-    let existing = null;
-    let seen = names;
-    try {
+
+    /** The role of that name as the relay has it now (not as the tab showed
+     *  it when drawn, so one made or deleted since, here or by another
+     *  admin, counts), with names: it may be another guild's, and the line
+     *  about it names that guild, its channels and its Discord roles. */
+    async function lookup() {
       const now = await api('GET', '/admin/g/' + encodeURIComponent(gid) + '/roles' + qs({ names: '1' }));
       const catalog = (now && now.catalog) || {};
-      if (Object.prototype.hasOwnProperty.call(catalog, roleName)) {
-        existing = catalog[roleName];
-        seen = withChannelList(now.names, meta.channels, meta.discordRoles);
-        seen.guilds = Object.assign({ [gid]: guildText(gid, names) }, now.names && now.names.guilds);
-      }
-    } catch (e) { status.err(notDone(e, 'Not created')); return; }
-    if (existing) {
-      const taken = lib.roleNameTaken(roleName, existing, role, gid, seen);
-      if (taken.refuse) {
-        // Another guild's role: replacing it from here would move it, and its
-        // holders would lose its access there. Nothing is sent.
-        status.err(taken.refuse);
-        name.focus();
-        return;
-      }
-      const go = await ui.confirmDialog({ title: taken.title, body: taken.body, confirmLabel: 'Replace access role', danger: true });
-      if (!go) return;
+      if (!Object.prototype.hasOwnProperty.call(catalog, roleName)) return { existing: null, seen: names };
+      const seen = withChannelList(now.names, meta.channels, meta.discordRoles);
+      seen.guilds = Object.assign({ [gid]: guildText(gid, names) }, now.names && now.names.guilds);
+      return { existing: catalog[roleName], seen };
     }
-    try {
-      await api('POST', '/admin/roles', { name: roleName, role });
+
+    /** Create it, or — when the name is this guild's role — edit it after
+     *  asking. The relay refuses a name in use (EXISTS) unless asked to
+     *  replace it in the guild it belongs to; if it was made, deleted or
+     *  moved between the look and the save, look again, once. Resolves true
+     *  when the role was saved. */
+    async function attempt(again) {
+      const { existing, seen } = await lookup();
+      const body = { name: roleName, role };
+      if (existing) {
+        const taken = lib.roleNameTaken(roleName, existing, role, gid, seen);
+        if (taken.refuse) {
+          // Another guild's role: replacing it from here would move it, and its
+          // holders would lose its access there. Nothing is sent.
+          status.err(taken.refuse);
+          name.focus();
+          return false;
+        }
+        const go = await ui.confirmDialog({ title: taken.title, body: taken.body, confirmLabel: taken.confirmLabel, danger: true });
+        if (!go) return false;
+        body.replace = true;
+        body.expectedGuildId = existing.guildId;
+      }
+      try {
+        await api('POST', '/admin/roles', body);
+      } catch (e) {
+        if (!again && (e.code === 'EXISTS' || e.code === 'GUILD_MISMATCH')) return attempt(true);
+        throw e;
+      }
       invalidateGuildMeta();
       if (state.list && state.list.invalidate) state.list.invalidate();
       markStale();
       // Through the form's line, so an earlier 'Not created' toast goes too.
-      status.ok('Created access role ' + roleName + ': ' + lib.roleMeaning(role, names) + '.');
-      ui.drawer.close(); // the list redraws with the new role
-    } catch (e) { status.err(notDone(e, 'Not created')); }
+      status.ok((existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.');
+      ui.drawer.close(); // the list redraws with the role
+      return true;
+    }
+
+    try { await attempt(false); } catch (e) { status.err(notDone(e, 'Not created', { roleName })); }
   }, { busyLabel: 'Creating…' });
   d.setBody(form);
 }
@@ -1841,5 +1953,6 @@ function showSecret(token, returnFocus) {
 // ── Go ───────────────────────────────────────────────────────────────────────
 
 window.PA.app = { boot };
+window.PA.CLIENT_API = CLIENT_API;
 document.addEventListener('DOMContentLoaded', boot);
 })();

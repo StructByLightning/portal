@@ -110,6 +110,11 @@ label { display: block; }
 .loading { padding: 8px 2px; }
 .banner { margin: 0 0 10px; padding: 7px 11px; border-radius: 6px; border: 1px solid var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
 .banner.err { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+/* Notices about the panel itself, between the top bar and the view. */
+.notices:empty { display: none; }
+.notices { padding: 10px 14px 0; }
+.notices .banner { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.banner-update { border-color: var(--accent); color: var(--fg); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .hint { margin-top: 10px; font-size: 12px; }
 .load-error { padding: 14px; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .load-error p { margin: 0 0 8px; }

@@ -414,8 +414,9 @@
    * and History too, and leaving View unticked while others are ticked shows
    * 'Without View this only works where a role already gives view.'
    *   opts: { value (caps), allowCustom (default true), label (default 'Level') }
-   * Returns { node, value() → caps ([] when no level is picked), set(caps),
-   * onChange(fn) }. onChange fires on the admin's changes, not on set().
+   * Returns { node, value() → caps ([] when no level is picked), level() →
+   * 'read' | 'write' | 'full' | 'custom' | null, set(caps), onChange(fn) }.
+   * onChange fires on the admin's changes, not on set().
    */
   function levelControl(opts) {
     const o = opts || {};
@@ -444,7 +445,7 @@
         el('div', { class: 'cap-chips' }, g.caps.map((c) => {
           const cb = el('input', { type: 'checkbox', value: c });
           boxes[c] = cb;
-          return el('label', { class: 'cap-chip' }, [cb, el('span', { text: lib.CAP_LABEL[c] })]);
+          return el('label', { class: 'cap-chip' }, [cb, el('span', { text: lib.CAP_LABEL[c] || lib.capsWords([c]) })]);
         })),
       ]));
     }
@@ -454,7 +455,7 @@
     const node = el('div', { class: 'level-control' }, [radioRow, help, custom]);
 
     const kind = () => kinds.find((k) => radios[k].checked) || null;
-    const ticked = () => lib.ALL_CAPS.filter((c) => boxes[c].checked);
+    const ticked = () => lib.ALL_CAPS.filter((c) => boxes[c] && boxes[c].checked);
     function value() {
       const k = kind();
       if (!k) return [];
@@ -462,7 +463,7 @@
     }
     function setBoxes(caps) {
       const set = new Set(caps);
-      for (const c of lib.ALL_CAPS) boxes[c].checked = set.has(c);
+      for (const c of Object.keys(boxes)) boxes[c].checked = set.has(c);
     }
     function sync() {
       const k = kind();
@@ -490,7 +491,7 @@
       });
     }
     const viewImplied = new Set(lib.CAP_GROUPS.filter((g) => g.key === 'write' || g.key === 'moderation').flatMap((g) => g.caps));
-    for (const c of lib.ALL_CAPS) {
+    for (const c of Object.keys(boxes)) {
       boxes[c].addEventListener('change', () => {
         if (boxes[c].checked && viewImplied.has(c)) {
           boxes.VIEW_CHANNEL.checked = true;
@@ -501,7 +502,7 @@
       });
     }
     set(o.value || []);
-    return { node, value, set, onChange: (fn) => listeners.push(fn) };
+    return { node, value, level: kind, set, onChange: (fn) => listeners.push(fn) };
   }
 
   /**
