@@ -11,6 +11,7 @@
  *   isGrantableType                    which channels can hold a direct grant
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
+ *   roleNameTaken                      defining a role under a name in use
  *   grantSummary, inviteSummary        what an invite confers, in one line
  */
 (function (root) {
@@ -243,6 +244,38 @@
   }
 
   /**
+   * Defining an access role under a name that is taken. Names are shared by
+   * every guild and the relay replaces a role of the same name wherever it
+   * belongs, so creating it again from another guild would move it there:
+   * its holders would lose its access in its own guild. So:
+   *   another guild's role → { refuse: 'Not created: Guild Two already has …' }
+   *   this guild's role    → { title, body } for the Replace confirm.
+   * `names` should name the existing role's guild, channels and Discord roles
+   * (the roles endpoint's ?names=1); a guild it can't name is 'another guild'.
+   */
+  function roleNameTaken(name, existing, role, guildId, names) {
+    const owner = existing && existing.guildId;
+    if (owner !== guildId) {
+      const known = owner ? names && names.guilds && names.guilds[owner] : null;
+      // Its meaning, with no id standing in for a guild that has no name.
+      const n = Object.assign({}, names, { guilds: Object.assign({}, names && names.guilds) });
+      if (owner && !known) n.guilds[owner] = 'that guild';
+      const then = known ? ', or switch to ' + known + ' to change it there'
+        : owner ? ', or switch to that guild (id ' + owner + ') to change it there' : '';
+      return {
+        refuse: 'Not created: ' + (known || 'another guild') + ' already has an access role named ' + name +
+          ' (' + roleMeaning(existing, n) + '), and access role names are shared by every guild. Pick another name' + then + '.',
+      };
+    }
+    return {
+      title: 'Replace access role ' + name + '?',
+      body: 'An access role named ' + name + ' already exists in ' + guildText(guildId, names) + ' (' + roleMeaning(existing, names) +
+        '). Replacing it gives every persona that holds it ' + roleMeaning(role, names) +
+        ' instead. This can’t be undone; to go back, define it again as it was.',
+    };
+  }
+
+  /**
    * What an invite confers: 'roles: g1-chatters · Write in #general'.
    * Roles AND grant, whichever it carries (slash /invite stores both).
    */
@@ -294,7 +327,7 @@
   PA.lib = {
     LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS,
     sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType,
-    chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, grantSummary,
+    chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

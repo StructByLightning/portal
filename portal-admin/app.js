@@ -1377,6 +1377,7 @@ function openRoleDrawer(meta) {
   d.track(form);
   ui.onSubmit(form, async () => {
     if (missing()) return; // Create is off until the form is complete
+    status.clear(); // a line about the last try is not about this one
     const roleName = name.value.trim();
     let scope;
     if (kind.value === 'all') scope = { all: true };
@@ -1387,19 +1388,29 @@ function openRoleDrawer(meta) {
     // The relay replaces a role of the same name: say so before it happens.
     // Ask the relay what exists now, not what the tab showed when it was
     // drawn, so a role made or deleted since (here or by another admin) counts.
+    // Names come too: the role found may be another guild's, and the line
+    // about it names that guild, its channels and its Discord roles.
     let existing = null;
+    let seen = names;
     try {
-      const now = await api('GET', '/admin/g/' + encodeURIComponent(gid) + '/roles');
+      const now = await api('GET', '/admin/g/' + encodeURIComponent(gid) + '/roles' + qs({ names: '1' }));
       const catalog = (now && now.catalog) || {};
-      if (Object.prototype.hasOwnProperty.call(catalog, roleName)) existing = catalog[roleName];
+      if (Object.prototype.hasOwnProperty.call(catalog, roleName)) {
+        existing = catalog[roleName];
+        seen = withChannelList(now.names, meta.channels, meta.discordRoles);
+        seen.guilds = Object.assign({ [gid]: guildText(gid, names) }, now.names && now.names.guilds);
+      }
     } catch (e) { status.err(notDone(e, 'Not created')); return; }
     if (existing) {
-      const go = await ui.confirmDialog({
-        title: 'Replace access role ' + roleName + '?',
-        body: 'An access role named ' + roleName + ' already exists (' + lib.roleMeaning(existing, names) + '). Creating it again replaces it for every persona that holds it.',
-        confirmLabel: 'Replace access role',
-        danger: true,
-      });
+      const taken = lib.roleNameTaken(roleName, existing, role, gid, seen);
+      if (taken.refuse) {
+        // Another guild's role: replacing it from here would move it, and its
+        // holders would lose its access there. Nothing is sent.
+        status.err(taken.refuse);
+        name.focus();
+        return;
+      }
+      const go = await ui.confirmDialog({ title: taken.title, body: taken.body, confirmLabel: 'Replace access role', danger: true });
       if (!go) return;
     }
     try {

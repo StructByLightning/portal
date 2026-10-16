@@ -1051,11 +1051,17 @@ test('persona drawer: access roles are this guild’s only, with what each means
 
 // ── The access-role drawer, driven as a super-admin would ──
 
+const G2 = '100000000000000002'; // the preview harness's invented Guild Two
+const G2_LOBBY = '100000000000002011'; // #lobby in Guild Two
+
 /** The Access roles tab as a super-admin, against a role catalog the fake
- *  relay keeps (POST /admin/roles replaces a name, as the relay does). */
+ *  relay keeps (POST /admin/roles replaces a name, as the relay does). With
+ *  ?names=1 it names what a super-admin's catalog references, as the relay
+ *  does: every role's guild it knows, and their channels. */
 async function rolesTab() {
   const g = '/admin/g/' + G1;
   const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'] };
+  const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
   const net = { down: false };
   const box = appSandbox({
     routes: {
@@ -1064,7 +1070,13 @@ async function rolesTab() {
     },
     handle: (method, path, body) => {
       if (net.down) throw new Error('offline');
-      if (method === 'GET' && path.startsWith(g + '/roles')) return { catalog, discordRoles: [], canAuthor: true };
+      if (method === 'GET' && path.startsWith(g + '/roles')) {
+        if (!new URL(path, 'http://panel.invalid').searchParams.has('names')) return { catalog, discordRoles: [], canAuthor: true };
+        const guilds: Record<string, string> = {};
+        for (const r of Object.values(catalog)) if (known[r.guildId]) guilds[r.guildId] = known[r.guildId];
+        const names = { channels: { [G2_LOBBY]: { id: G2_LOBBY, name: 'lobby', type: 'text' } }, discordRoles: {}, guilds };
+        return { catalog, discordRoles: [], canAuthor: true, names };
+      }
       if (method === 'POST' && path === '/admin/roles') {
         catalog[body.name] = body.role;
         return { ok: true, catalog };
@@ -1119,7 +1131,12 @@ test('role drawer: asks before replacing a role that exists now, not only one th
   const dialog = confirm()!;
   assert.ok(dialog, 'a role made during this visit is asked about');
   assert.equal(dialog.querySelector('h2')!.textContent, 'Replace access role g1-test?');
-  assert.match(dialog.textContent, /already exists \(Read in every channel of Guild One\)/);
+  assert.equal(
+    dialog.querySelector('p')!.textContent,
+    'An access role named g1-test already exists in Guild One (Read in every channel of Guild One). ' +
+      'Replacing it gives every persona that holds it Write in every channel of Guild One instead. ' +
+      'This can’t be undone; to go back, define it again as it was.',
+  );
   dialog.querySelectorAll('button').find((b) => b.textContent === 'Cancel')!.click();
   await settle();
   assert.equal(bodies.length, posts, 'Cancel sends nothing');
@@ -1161,4 +1178,75 @@ test('role drawer: a role deleted (or made elsewhere) since the tab was drawn is
   assert.equal(catalog['g1-offline'], undefined);
   const form = doc.getElementById('drawer-body')!.querySelector('form')!;
   assert.match(form.textContent, /Couldn’t reach the relay\. Nothing was changed\. Try again\./);
+});
+
+test('role drawer: another guild’s role is named by its guild and not replaced from here', async () => {
+  const { define, confirm, catalog, calls, bodies, doc } = await rolesTab();
+  const g2desk = { caps: [...LEVEL_CAPS.write], scope: { all: true }, guildId: G2 };
+  const g2lobby = { caps: [...LEVEL_CAPS.read], scope: { channels: [G2_LOBBY] }, guildId: G2 };
+  catalog['g2-desk'] = g2desk;
+  catalog['g2-lobby'] = g2lobby;
+  const status = () => doc.getElementById('drawer-body')!.querySelector('.status-line')!.textContent;
+  const posts = bodies.length;
+
+  // Guild One's drawer, a name Guild Two's role holds: refused, in names.
+  await define('g2-desk', 'read');
+  assert.ok(calls.includes(`GET /admin/g/${G1}/roles?names=1`), 'the check asks for names');
+  assert.equal(confirm(), null, 'no Replace is offered');
+  assert.equal(
+    status(),
+    'Not created: Guild Two already has an access role named g2-desk (Write in every channel of Guild Two), ' +
+      'and access role names are shared by every guild. Pick another name, or switch to Guild Two to change it there.',
+  );
+  assert.ok(!status().includes(G2), 'no raw guild id');
+  assert.equal(doc.activeElement, doc.getElementById('drawer-body')!.querySelector('input[name="name"]'), 'back on the name');
+
+  // Its channels are named too.
+  await define('g2-lobby', 'write');
+  assert.equal(confirm(), null);
+  assert.match(status(), /^Not created: Guild Two already has an access role named g2-lobby \(Read in #lobby\),/);
+
+  assert.equal(bodies.length, posts, 'nothing was sent');
+  assert.deepEqual(catalog['g2-desk'], g2desk, 'Guild Two’s roles are as they were');
+  assert.deepEqual(catalog['g2-lobby'], g2lobby);
+
+  // Another name in the same drawer: the refusal goes, this guild's role asks.
+  const form = doc.getElementById('drawer-body')!.querySelector('form')!;
+  const input = form.querySelector('input[name="name"]')!;
+  input.value = 'g1-readers';
+  input.fire('input');
+  form.fire('submit');
+  await settle();
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Replace access role g1-readers?');
+  assert.equal(status(), '', 'the line about g2-desk is gone');
+});
+
+test('lib.roleNameTaken: this guild’s role asks; another guild’s refuses, by name', () => {
+  const { lib } = libOnly();
+  const names = { ...NAMES, guilds: { [G1]: 'Guild One', [G2]: 'Guild Two' } };
+  const read = { caps: LEVEL_CAPS.read, scope: { all: true }, guildId: G1 };
+  const chatters = { caps: LEVEL_CAPS.write, scope: { channels: [C.general] }, guildId: G1 };
+
+  const same = plain(lib.roleNameTaken('g1-chatters', chatters, read, G1, names));
+  assert.deepEqual(same, {
+    title: 'Replace access role g1-chatters?',
+    body: 'An access role named g1-chatters already exists in Guild One (Write in #general). ' +
+      'Replacing it gives every persona that holds it Read in every channel of Guild One instead. ' +
+      'This can’t be undone; to go back, define it again as it was.',
+  });
+
+  const desk = { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: G2 };
+  assert.deepEqual(plain(lib.roleNameTaken('g2-desk', desk, read, G1, names)), {
+    refuse: 'Not created: Guild Two already has an access role named g2-desk (Write in every channel of Guild Two), ' +
+      'and access role names are shared by every guild. Pick another name, or switch to Guild Two to change it there.',
+  });
+
+  // A guild nobody can name: 'another guild', and its id only as a pointer.
+  const G9 = '100000000000000009';
+  const lost = lib.roleNameTaken('g9-desk', { ...desk, guildId: G9 }, read, G1, names).refuse;
+  assert.equal(lost, 'Not created: another guild already has an access role named g9-desk (Write in every channel of that guild), ' +
+    'and access role names are shared by every guild. Pick another name, or switch to that guild (id ' + G9 + ') to change it there.');
+  assert.equal(names.guilds[G9 as keyof typeof names.guilds], undefined, 'the caller’s names are not changed');
+  // A role with no guild at all (the relay refuses those at load).
+  assert.match(lib.roleNameTaken('old', { caps: LEVEL_CAPS.read, scope: { all: true } }, read, G1, names).refuse, /^Not created: another guild already has an access role named old \(Read in every channel of its guild\), .* Pick another name\.$/);
 });
