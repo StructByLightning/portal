@@ -143,7 +143,11 @@ export class PortalCcChannelServer {
           const out =
             this.opts.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
               ? await this.opts.identity.handleToolCall(toolName, toolArgs)
-              : await this.agent.handleToolCall(toolName, toolArgs);
+              : await this.agent.handleToolCall(
+                  toolName,
+                  toolArgs,
+                  this.opts.identity ? [...this.agent.tools, ...identityToolDefinitions] : this.agent.tools,
+                );
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
           break;
         }

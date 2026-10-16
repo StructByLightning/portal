@@ -330,7 +330,8 @@ export class PortalMcplServer {
           // refused rather than defaulted on (§6.4 fails closed). A declared
           // agent tool this host doesn't list is retired here: the agent
           // answers it with a pointer to the host's own tools, and runs
-          // nothing, so it isn't gated. Identity tools are always gated.
+          // nothing, so it isn't gated. On an MCPL host, identity tools are
+          // always gated; a plain MCP host runs no gate.
           const owningSet = this.toolFeatureSet(toolName);
           const retired =
             Object.hasOwn(TOOL_FEATURE_SETS, toolName) && !this.agent.tools.some((tool) => tool.name === toolName);
@@ -354,7 +355,7 @@ export class PortalMcplServer {
           const out =
             this.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
               ? await this.identity.handleToolCall(toolName, toolArgs)
-              : await this.agent.handleToolCall(toolName, toolArgs);
+              : await this.agent.handleToolCall(toolName, toolArgs, this.availableTools());
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
           break;
         }
@@ -492,16 +493,30 @@ export class PortalMcplServer {
   }
 
   private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {
-    const exact = open.channelId ? parsePortalChannelId(open.channelId) : null;
-    const addr = open.address as { channelId?: string } | undefined;
-    const channelId = exact ?? addr?.channelId;
+    const exact = typeof open.channelId === 'string' ? parsePortalChannelId(open.channelId) : null;
+    const addr = open.address as { channelId?: unknown } | undefined;
+    const fromAddress = !exact && typeof addr?.channelId === 'string' ? addr.channelId : undefined;
+    const channelId = exact ?? fromAddress;
     const channel = channelId ? this.client.cache.getChannel(channelId) : undefined;
     if (!channelId || !channel) {
-      const looked = channelId !== undefined ? portalChannelId(channelId) : (open.channelId ?? null);
-      throw new Error(
-        `No Portal channel matches ${shortJson(looked)}, so nothing was opened. Portal channel ids look like ` +
-          "portal:<id>; your host's channel list shows the ones you can open, so copy one from there.",
-      );
+      // Name the argument that was looked up, with its value as the host sent it.
+      // The two arguments take different forms: channelId a Portal channel id,
+      // and address.channelId the bare id a descriptor's address carries.
+      const [argument, value, remedy] =
+        fromAddress !== undefined
+          ? [
+              'address.channelId',
+              addr?.channelId,
+              "address.channelId takes a channel's bare id, as the address in your host's channel list gives it; " +
+                'copy one from there.',
+            ]
+          : [
+              'channelId',
+              open.channelId ?? null,
+              "Portal channel ids look like portal:<id>; your host's channel list shows the ones you can open, " +
+                'so copy one from there.',
+            ];
+      throw new Error(`No Portal channel matches the ${argument} ${shortJson(value)}, so nothing was opened. ${remedy}`);
     }
 
     const result: ChannelsOpenResult = {
@@ -1433,13 +1448,20 @@ export function voiceReceiptLine(e: Extract<PortalEvent, { type: 'voice_receipt'
     case 'refused':
       // Characters are billed when voicing opens, so a refusal that comes
       // after billing (the output stopping mid-utterance) may have been heard.
-      return e.billedChars > 0
-        ? `[voice] your utterance in ${where} was stopped after the relay began voicing it, so some of it may have been heard: ${reason}.`
-        : `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
+      if (e.billedChars > 0) {
+        const heard = e.voicedText ? ` — heard: "${e.voicedText}"${estimated}` : ', so some of it may have been heard';
+        return `[voice] your utterance in ${where} was stopped after the relay began voicing it${heard}: ${reason}.`;
+      }
+      return `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
     default:
-      return e.voicedText
-        ? `[voice] your utterance in ${where} was cut off by an error: ${reason} — ` +
-          `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}". Call voice_speak with the rest if it still matters.`
+      if (e.voicedText) {
+        return `[voice] your utterance in ${where} was cut off by an error: ${reason} — ` +
+          `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}". Call voice_speak with the rest if it still matters.`;
+      }
+      // An error after billing began can't say nothing was heard.
+      return e.billedChars > 0
+        ? `[voice] your utterance in ${where} was stopped by an error after the relay began voicing it, so some of it ` +
+          `may have been heard: ${reason}. Call voice_speak again if it still matters.`
         : `[voice] your utterance in ${where} was dropped by an error, so nothing was said: ${reason}. ` +
           'Call voice_speak again if it still matters.';
   }

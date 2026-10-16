@@ -167,8 +167,15 @@ export class PortalAgent {
     return formatChannelLabel(c.name ?? c.id, c.guildId ? this.client.cache.getGuild(c.guildId)?.name : undefined);
   }
 
-  /** Dispatch a tool call. Returns a plain JSON-able result. */
-  async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
+  /** Dispatch a tool call. Returns a plain JSON-able result. `offered` is
+   *  what the host was offered, which an unknown name's suggestions come
+   *  from: a server that offers tools above this agent (the persona tools)
+   *  passes its whole list. */
+  async handleToolCall(
+    name: string,
+    args: Record<string, unknown>,
+    offered: readonly { name: string }[] = this.tools,
+  ): Promise<unknown> {
     // A tool that won't run is answered before its arguments are looked at:
     // a retired tool's pointer, or an unknown name's nearest tools, is the
     // whole answer, whatever channel the call names.
@@ -176,7 +183,7 @@ export class PortalAgent {
       throw new Error(RETIRED_WHEN_HOST_OWNS_CHANNELS[name]);
     }
     if (!toolDefinitions.some((tool) => tool.name === name)) {
-      throw new Error(unknownToolMessage(name, this.tools));
+      throw new Error(unknownToolMessage(name, offered));
     }
     // THE chokepoint for channel addressing: every tool that takes a channelId
     // goes through here, so a name is resolved exactly once, before any side
@@ -251,7 +258,7 @@ export class PortalAgent {
             this.onPublicActivity?.('message');
             throw new Error(
               `Only part of the message was sent: the first ${i} of ${chunks.length} parts were posted ` +
-                `(${posted.map((id) => JSON.stringify(id)).join(', ')}), and part ${i + 1} wasn't. ` +
+                `(${posted.map((id) => JSON.stringify(id)).join(', ')}), and part ${i + 1} may not have been. ` +
                 `Its call answered: "${(e as Error).message}" ` +
                 'To send the rest, call send_message with only the text that didn\'t go out; fetch_around shows what did.',
             );
@@ -274,19 +281,19 @@ export class PortalAgent {
         const reacted = await this.client.react(
           str(args.messageId, 'messageId'),
           str(args.emoji, 'emoji'),
-          Boolean(args.visible),
-          Boolean(args.native),
+          optBool(args.visible, 'visible') ?? false,
+          optBool(args.native, 'native') ?? false,
         );
         this.onPublicActivity?.('reaction');
         return reacted;
       }
       case 'unreact':
-        return this.client.unreact(str(args.messageId, 'messageId'), str(args.emoji, 'emoji'), Boolean(args.native));
+        return this.client.unreact(str(args.messageId, 'messageId'), str(args.emoji, 'emoji'), optBool(args.native, 'native') ?? false);
       case 'fetch_history':
         return this.client.fetchHistory({
           channelId: str(args.channelId, 'channelId'),
           threadId: optStr(args.threadId, 'threadId'),
-          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          limit: optNum(args.limit, 'limit'),
           before: optStr(args.before, 'before'),
           after: optStr(args.after, 'after'),
         });
@@ -294,7 +301,7 @@ export class PortalAgent {
         return this.fetchAround(
           str(args.channelId, 'channelId'),
           str(args.messageId, 'messageId'),
-          typeof args.limit === 'number' ? args.limit : 50,
+          optNum(args.limit, 'limit') ?? 50,
           optStr(args.threadId, 'threadId'),
         );
       case 'list_guilds':
@@ -337,7 +344,7 @@ export class PortalAgent {
         return this.client.call('list_members', {
           guildId: str(args.guildId, 'guildId'),
           query: optStr(args.query, 'query'),
-          limit: typeof args.limit === 'number' ? args.limit : undefined,
+          limit: optNum(args.limit, 'limit'),
         });
       case 'resolve_mentions':
         return this.client.call('resolve_mentions', {
@@ -350,7 +357,7 @@ export class PortalAgent {
         return this.client.call('list_emojis', { guildId: optStr(args.guildId, 'guildId') });
       case 'set_reaction_visibility': {
         const channelId = str(args.channelId, 'channelId');
-        const visible = Boolean(args.visible);
+        const visible = optBool(args.visible, 'visible') ?? false;
         // Durable per-channel opt-in; persisted via onChange. Reactions are shown
         // in context but NEVER wake the agent (see server.ts push path).
         this.state.setReactionVisibility(channelId, visible);
@@ -368,7 +375,7 @@ export class PortalAgent {
         return this.client.call('voice_speak', {
           channelId: str(args.channelId, 'channelId'),
           text: str(args.text, 'text'),
-          ...(args.requestId !== undefined ? { requestId: str(args.requestId, 'requestId') } : {}),
+          ...(args.requestId != null ? { requestId: str(args.requestId, 'requestId') } : {}),
           ...(args.grant !== undefined ? { grant: args.grant as never } : {}),
         });
       case 'get_pending_pings':
@@ -388,7 +395,7 @@ export class PortalAgent {
         return { ok: true };
       }
       default:
-        throw new Error(unknownToolMessage(name, this.tools));
+        throw new Error(unknownToolMessage(name, offered));
     }
   }
 }
@@ -404,7 +411,21 @@ function optStr(v: unknown, name: string): string | undefined {
   if (typeof v !== 'string') throw new Error(`Nothing ran: ${name} must be a string when given, got ${shortJson(v)}.`);
   return v;
 }
-/** A caller's value for an error message, bounded so a huge one isn't echoed whole. */
+/** An optional number argument: absent when undefined or null, refused by name when it's anything else. */
+function optNum(v: unknown, name: string): number | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'number') throw new Error(`Nothing ran: ${name} must be a number when given, got ${shortJson(v)}.`);
+  return v;
+}
+/** An optional boolean argument: absent when undefined or null, refused by name when it's anything else. */
+function optBool(v: unknown, name: string): boolean | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== 'boolean') throw new Error(`Nothing ran: ${name} must be true or false when given, got ${shortJson(v)}.`);
+  return v;
+}
+/** A caller's value for an error message, bounded so a huge one isn't echoed
+ *  whole: at most 60 characters, the cut's ellipsis included, counted and cut
+ *  by code points so a cut never splits a character. */
 export function shortJson(v: unknown): string {
   let s: string;
   try {
@@ -412,9 +433,10 @@ export function shortJson(v: unknown): string {
   } catch {
     s = String(typeof v);
   }
-  if (s.length <= 60) return s;
+  const points = Array.from(s);
+  if (points.length <= 60) return s;
   // A cut string keeps its closing quote, so the message around it still reads.
-  return s.startsWith('"') ? `${s.slice(0, 59)}…"` : `${s.slice(0, 60)}…`;
+  return s.startsWith('"') ? `${points.slice(0, 58).join('')}…"` : `${points.slice(0, 59).join('')}…`;
 }
 
 /**
@@ -430,9 +452,10 @@ export function unknownToolMessage(name: unknown, available: readonly { name: st
     .slice(0, 3)
     .map((c) => `"${c.name}"`);
   const lead = `There's no Portal tool named ${shortJson(name)}, so nothing ran.`;
-  return close.length > 0
-    ? `${lead} Did you mean ${close.join(' or ')}?`
-    : `${lead} Call one of the tools listed for you.`;
+  if (close.length > 0) return `${lead} Did you mean ${close.join(' or ')}?`;
+  return available.length > 0
+    ? `${lead} Call one of the tools listed for you.`
+    : `${lead} No Portal tools are enabled for you here; if you need them, ask whoever runs this host.`;
 }
 
 function editDistance(a: string, b: string): number {

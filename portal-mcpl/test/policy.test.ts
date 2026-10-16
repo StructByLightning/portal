@@ -462,11 +462,50 @@ test('the Claude Code server sends no inherited name to the persona handler', as
 
 test('channels/open and channels/close name the id they were given, and the form ids take', async () => {
   const h = serverHarness();
-  h.internal.policy.applyRequest({ effectiveCapabilities: [...ALL_USES, 'channels.lifecycle'] });
+  h.internal.policy.applyRequest({ effectiveCapabilities: [...ALL_USES, 'channels.lifecycle', 'channels.acknowledge'] });
   await h.internal.handleRequest({ id: 1, method: 'channels/open', params: { channelId: 'portal:999' } });
-  assert.match(h.errors[0].message, /^No Portal channel matches "portal:999", so nothing was opened\. Portal channel ids look like portal:<id>/);
+  assert.match(h.errors[0].message, /^No Portal channel matches the channelId "portal:999", so nothing was opened\. Portal channel ids look like portal:<id>/);
   await h.internal.handleRequest({ id: 2, method: 'channels/close', params: {} });
   assert.match(h.errors[1].message, /^Nothing was closed: null isn't a Portal channel id\. Portal channel ids look like portal:<id>/);
+  // An address is named as the argument it is, with its value as sent.
+  await h.internal.handleRequest({ id: 3, method: 'channels/open', params: { address: { channelId: 'portal:999' } } });
+  assert.match(
+    h.errors[2].message,
+    /^No Portal channel matches the address\.channelId "portal:999", so nothing was opened\. address\.channelId takes a channel's bare id, as the address in your host's channel list gives it; copy one from there\.$/,
+  );
+  // An id that isn't a string is refused like any other, not with a TypeError.
+  await h.internal.handleRequest({ id: 4, method: 'channels/open', params: { channelId: 42 } });
+  assert.match(h.errors[3].message, /^No Portal channel matches the channelId 42, so nothing was opened\./);
+  await h.internal.handleRequest({ id: 5, method: 'channels/close', params: { channelId: 42 } });
+  assert.match(h.errors[4].message, /^Nothing was closed: 42 isn't a Portal channel id\./);
+  await h.internal.handleRequest({ id: 6, method: 'channels/acknowledge', params: { channelId: 42, messageId: 'm1' } });
+  assert.deepEqual(h.responses.at(-1), {
+    acknowledged: false,
+    reason: "Nothing was acknowledged: 42 isn't a Portal channel id, which looks like portal:<id>.",
+  });
+});
+
+test('an unknown name near a persona tool is offered it, on the Claude Code server and a plain MCP host', async () => {
+  const identity: IdentityToolHandler = { async handleToolCall() { return {}; } } as unknown as IdentityToolHandler;
+  const { PortalCcChannelServer } = await import('../src/server-cc.js');
+  const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
+  const server = new PortalCcChannelServer(client, new PortalAgent(client), { identity });
+  const sent: Array<{ content?: Array<{ text: string }>; isError?: boolean }> = [];
+  const internal = server as unknown as { conn: unknown; handleRequest(req: unknown): Promise<void> };
+  internal.conn = {
+    sendResponse: (_id: unknown, result: never) => void sent.push(result),
+    sendError() {},
+    sendNotification() {},
+  };
+  await internal.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_persona', arguments: {} } });
+  assert.equal(sent[0].isError, true);
+  assert.match(sent[0].content![0].text, /^There's no Portal tool named "list_persona", so nothing ran\. Did you mean "list_personas"/);
+  const h = serverHarness({ identity });
+  h.internal.mcplEnabled = false;
+  await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'list_persona', arguments: {} } });
+  const answer = h.responses.at(-1) as { content: Array<{ text: string }>; isError: boolean };
+  assert.equal(answer.isError, true);
+  assert.match(answer.content[0].text, /^There's no Portal tool named "list_persona", so nothing ran\. Did you mean "list_personas"/);
 });
 
 test('the unknown-tool refusal lists at most three near names, closest first, within the cutoff', () => {
@@ -483,7 +522,12 @@ test('the unknown-tool refusal lists at most three near names, closest first, wi
   );
   // A longer name allows more edits: fourteen letters allow four, so three deletions still match.
   assert.match(unknownToolMessage('gt_pndng_pings', [{ name: 'get_pending_pings' }]), /Did you mean "get_pending_pings"\?$/);
+  // Twelve letters allow four edits: four still match, five don't, which a cutoff of floor(length/4) would change.
+  assert.match(unknownToolMessage('abcdefghijkl', [{ name: 'abcdefghwxyz' }]), /Did you mean "abcdefghwxyz"\?$/);
+  assert.match(unknownToolMessage('abcdefghijkl', [{ name: 'abcdefgvwxyz' }]), /Call one of the tools listed for you\.$/);
   assert.match(unknownToolMessage('abc', [{ name: 'xyz' }]), /Call one of the tools listed for you\.$/);
+  // With nothing offered, there's nothing listed to call.
+  assert.match(unknownToolMessage('abc', []), /\. No Portal tools are enabled for you here; if you need them, ask whoever runs this host\.$/);
   assert.match(unknownToolMessage(42, [{ name: 'send_message' }]), /^There's no Portal tool named 42, so nothing ran\. Call one of the tools listed for you\.$/);
 });
 
@@ -505,6 +549,16 @@ test('a voice receipt says what was said, and only an error suggests saying it a
     voiceReceiptLine({ ...base, status: 'refused', reason: 'output path stopped', billedChars: 5 }, '#v'),
     '[voice] your utterance in #v was stopped after the relay began voicing it, so some of it may have been heard: output path stopped.',
   );
+  // A refusal after billing shows what was heard when the event carries it.
+  assert.equal(
+    voiceReceiptLine({ ...base, status: 'refused', reason: 'output path stopped', billedChars: 5, voicedText: 'hel', estimated: true }, '#v'),
+    '[voice] your utterance in #v was stopped after the relay began voicing it — heard: "hel" (boundary estimated): output path stopped.',
+  );
+  // An error after billing began can't say nothing was heard.
+  assert.equal(
+    voiceReceiptLine({ ...base, status: 'error', reason: 'stream lost', billedChars: 5 }, '#v'),
+    '[voice] your utterance in #v was stopped by an error after the relay began voicing it, so some of it may have been heard: stream lost. Call voice_speak again if it still matters.',
+  );
   assert.equal(
     voiceReceiptLine({ ...base, status: 'error', reason: 'TTS open failed: x' }, '#v'),
     '[voice] your utterance in #v was dropped by an error, so nothing was said: TTS open failed: x. Call voice_speak again if it still matters.',
@@ -522,6 +576,13 @@ test('a voice receipt says what was said, and only an error suggests saying it a
 test('a long value is cut to sixty characters, and a cut string keeps its closing quote', () => {
   assert.equal(shortJson('abc'), '"abc"');
   const cut = shortJson('x'.repeat(100));
-  assert.equal(cut, `"${'x'.repeat(58)}…"`);
-  assert.equal(shortJson(Array.from({ length: 40 }, (_, i) => i)).endsWith('…'), true);
+  assert.equal(cut, `"${'x'.repeat(57)}…"`);
+  assert.equal(Array.from(cut).length, 60);
+  const list = shortJson(Array.from({ length: 40 }, (_, i) => i));
+  assert.equal(list.endsWith('…'), true);
+  assert.equal(Array.from(list).length, 60);
+  // Counted by code points, a cut never splits a character outside the BMP.
+  const astral = shortJson('a' + '\u{1F600}'.repeat(100));
+  assert.equal(Array.from(astral).length, 60);
+  assert.equal(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(astral), false);
 });

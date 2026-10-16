@@ -360,6 +360,68 @@ test('a send split into parts carries the resolved files on its first part only'
   assert.equal('files' in parts[1], false);
 });
 
+test('an optional number or boolean argument of another type is refused by name, and nothing runs', async () => {
+  const { agent, client } = agentWithCache();
+  const calls: unknown[] = [];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async (p: unknown) => {
+    calls.push(['fetchHistory', p]);
+    return { messages: [] };
+  };
+  (client as unknown as { react: unknown }).react = async (...a: unknown[]) => {
+    calls.push(['react', ...a]);
+    return {};
+  };
+  (client as unknown as { call: unknown }).call = async (m: string, p: unknown) => {
+    calls.push([m, p]);
+    return {};
+  };
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', limit: '5' }),
+    /^Error: Nothing ran: limit must be a number when given, got "5"\.$/,
+  );
+  // Read as found, the string 'false' made a visible reaction.
+  await assert.rejects(
+    agent.handleToolCall('react', { messageId: 'm1', emoji: 'x', visible: 'false' }),
+    /^Error: Nothing ran: visible must be true or false when given, got "false"\.$/,
+  );
+  // Read as found, a numeric uptoCreatedAt marked the whole channel read.
+  await assert.rejects(
+    agent.handleToolCall('mark_read', { channelId: '100000000000000003', uptoCreatedAt: 1760000000000 }),
+    /^Error: Nothing ran: uptoCreatedAt must be a string when given, got 1760000000000\.$/,
+  );
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', after: 5 }),
+    /^Error: Nothing ran: after must be a string when given, got 5\.$/,
+  );
+  assert.deepEqual(calls, []);
+  // Absent and null still mean absent.
+  await agent.handleToolCall('react', { messageId: 'm1', emoji: 'x', visible: null, native: true });
+  assert.deepEqual(calls, [['react', 'm1', 'x', false, true]]);
+  // voice_speak's requestId too, like every other optional string.
+  await agent.handleToolCall('voice_speak', { channelId: '100000000000000003', text: 'hi', requestId: null });
+  assert.deepEqual(calls.at(-1), ['voice_speak', { channelId: '100000000000000003', text: 'hi' }]);
+});
+
+test('a send split into parts replies and mentions on its first part only', async () => {
+  const { agent, client } = agentWithCache();
+  const parts: Array<Record<string, unknown>> = [];
+  (client as unknown as { sendMessage: unknown }).sendMessage = async (p: Record<string, unknown>) => {
+    parts.push(p);
+    return { messageId: `m${parts.length}` };
+  };
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    content: 'x'.repeat(2500),
+    replyToId: 'm9',
+    mentionPersonaIds: ['p1'],
+  });
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].replyToId, 'm9');
+  assert.deepEqual(parts[0].mentionPersonaIds, ['p1']);
+  assert.equal('replyToId' in parts[1], false);
+  assert.equal('mentionPersonaIds' in parts[1], false);
+});
+
 test('a send split into parts says which parts went out when a later part fails', async () => {
   const { agent, client } = agentWithCache();
   const activity: string[] = [];
@@ -372,7 +434,7 @@ test('a send split into parts says which parts went out when a later part fails'
   };
   await assert.rejects(
     agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'x'.repeat(2500) }),
-    /^Error: Only part of the message was sent: the first 1 of 2 parts were posted \("m1"\), and part 2 wasn't\. Its call answered: "Nothing ran: you can't send in this channel now\." To send the rest, call send_message with only the text that didn't go out; fetch_around shows what did\.$/,
+    /^Error: Only part of the message was sent: the first 1 of 2 parts were posted \("m1"\), and part 2 may not have been\. Its call answered: "Nothing ran: you can't send in this channel now\." To send the rest, call send_message with only the text that didn't go out; fetch_around shows what did\.$/,
   );
   assert.deepEqual(activity, ['message'], 'the posted part counts as public activity');
   // A failing first part is that part's own answer: nothing went out.
