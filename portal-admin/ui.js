@@ -11,6 +11,9 @@
  *   statusLine         a section's inline result line (mirrored as a toast)
  *   busy, onSubmit     one request per click: disable, aria-busy, relabel
  *   confirmDialog      an in-page confirm (replaces window.confirm)
+ *   levelControl       Read | Write | Full | Custom… (uses PA.lib)
+ *   checkList, radioGroup   checkbox lists and radio rows
+ *   copyText           clipboard, falling back to selecting the text
  *   modal              the shared modal layer (focus trap, Esc)
  *   dirtyTracker       has this form changed since it was drawn or saved?
  *   drawer             the right-side drawer: focus, Esc, scrim, "Discard changes?"
@@ -397,6 +400,205 @@
     });
   }
 
+  // ── Pickers ───────────────────────────────────────────────────────────────
+
+  /** Call every listener in `list` with `v`. */
+  function emit(list, v) {
+    for (const fn of list) fn(v);
+  }
+
+  /**
+   * The level control: Read | Write | Full | Custom… as radio buttons (a
+   * role=radiogroup). Custom… opens the capabilities, grouped as in
+   * PA.lib.CAP_GROUPS; ticking any Write or Moderation capability ticks View
+   * and History too, and leaving View unticked while others are ticked shows
+   * 'Without View this only works where a role already gives view.'
+   *   opts: { value (caps), allowCustom (default true), label (default 'Level') }
+   * Returns { node, value() → caps ([] when no level is picked), set(caps),
+   * onChange(fn) }. onChange fires on the admin's changes, not on set().
+   */
+  function levelControl(opts) {
+    const o = opts || {};
+    const lib = PA.lib;
+    const allowCustom = o.allowCustom !== false;
+    const name = uid('level');
+    const listeners = [];
+    const radios = {};
+    const kinds = lib.LEVELS.concat(allowCustom ? ['custom'] : []);
+    const radioRow = el('div', { class: 'level-options', role: 'radiogroup', 'aria-label': o.label || 'Level' });
+    for (const k of kinds) {
+      const r = el('input', { type: 'radio', name, value: k });
+      radios[k] = r;
+      radioRow.appendChild(el('label', { class: 'level-option', title: k === 'custom' ? 'Pick the capabilities one by one.' : lib.LEVEL_HELP[k] }, [
+        r, el('span', { text: k === 'custom' ? 'Custom…' : lib.LEVEL_NAME[k] }),
+      ]));
+    }
+    const help = el('p', { class: 'field-hint level-help' });
+
+    const boxes = {};
+    const custom = el('div', { class: 'caps-groups hidden' });
+    for (const g of lib.CAP_GROUPS) {
+      const labelId = uid('caps');
+      custom.appendChild(el('div', { class: 'cap-group', role: 'group', 'aria-labelledby': labelId }, [
+        el('div', { class: 'cap-group-label', id: labelId, text: g.label }),
+        el('div', { class: 'cap-chips' }, g.caps.map((c) => {
+          const cb = el('input', { type: 'checkbox', value: c });
+          boxes[c] = cb;
+          return el('label', { class: 'cap-chip' }, [cb, el('span', { text: lib.CAP_LABEL[c] })]);
+        })),
+      ]));
+    }
+    const warn = el('p', { class: 'warn-line hidden', text: 'Without View this only works where a role already gives view.' });
+    custom.appendChild(warn);
+
+    const node = el('div', { class: 'level-control' }, [radioRow, help, custom]);
+
+    const kind = () => kinds.find((k) => radios[k].checked) || null;
+    const ticked = () => lib.ALL_CAPS.filter((c) => boxes[c].checked);
+    function value() {
+      const k = kind();
+      if (!k) return [];
+      return k === 'custom' ? ticked() : lib.LEVEL_CAPS[k].slice();
+    }
+    function setBoxes(caps) {
+      const set = new Set(caps);
+      for (const c of lib.ALL_CAPS) boxes[c].checked = set.has(c);
+    }
+    function sync() {
+      const k = kind();
+      custom.classList.toggle('hidden', k !== 'custom');
+      const v = value();
+      warn.classList.toggle('hidden', !(k === 'custom' && v.length && !boxes.VIEW_CHANNEL.checked));
+      help.textContent = !k ? '' : k === 'custom' ? (v.length ? lib.capsSummary(v) + '.' : 'Tick at least one capability.') : lib.LEVEL_HELP[k];
+      help.classList.toggle('hidden', !k);
+    }
+    function set(caps) {
+      const l = lib.levelOf(caps);
+      for (const k of kinds) radios[k].checked = false;
+      if (l.level === 'custom' && allowCustom) radios.custom.checked = true;
+      else if (radios[l.level]) radios[l.level].checked = true;
+      setBoxes(caps || []);
+      sync();
+    }
+
+    for (const k of kinds) {
+      radios[k].addEventListener('change', () => {
+        // A preset fills the boxes, so Custom… starts from what was picked.
+        if (k !== 'custom' && radios[k].checked) setBoxes(lib.LEVEL_CAPS[k]);
+        sync();
+        emit(listeners, value());
+      });
+    }
+    const viewImplied = new Set(lib.CAP_GROUPS.filter((g) => g.key === 'write' || g.key === 'moderation').flatMap((g) => g.caps));
+    for (const c of lib.ALL_CAPS) {
+      boxes[c].addEventListener('change', () => {
+        if (boxes[c].checked && viewImplied.has(c)) {
+          boxes.VIEW_CHANNEL.checked = true;
+          boxes.READ_HISTORY.checked = true;
+        }
+        sync();
+        emit(listeners, value());
+      });
+    }
+    set(o.value || []);
+    return { node, value, set, onChange: (fn) => listeners.push(fn) };
+  }
+
+  /**
+   * A list of checkboxes (access roles, channels, Discord roles) in a box that
+   * scrolls; with more than `filterAt` options (default 8) a filter field sits
+   * above it. options: [{ value, text, code (show text in code font), hint }].
+   * Returns { node, values(), setValues(values), setOptions(options), onChange(fn) }.
+   */
+  function checkList(opts) {
+    const o = opts || {};
+    const listeners = [];
+    const list = el('div', { class: 'check-list', role: 'group', 'aria-label': o.label || 'Options' });
+    const filter = el('input', { type: 'search', class: 'check-filter', placeholder: 'Filter…', 'aria-label': 'Filter ' + (o.label || 'options').toLowerCase(), autocomplete: 'off', 'data-no-dirty': true });
+    const node = el('div', { class: 'check-list-wrap' }, [filter, list]);
+    let items = [];
+    function applyFilter() {
+      const q = filter.value.trim().toLowerCase();
+      for (const it of items) it.row.classList.toggle('hidden', !!q && !it.text.toLowerCase().includes(q));
+    }
+    function setOptions(options) {
+      const keep = new Set(values());
+      clear(list);
+      items = (options || []).map((op) => {
+        const cb = el('input', { type: 'checkbox', value: op.value });
+        cb.checked = keep.has(op.value);
+        cb.addEventListener('change', () => emit(listeners, values()));
+        const label = [op.code ? el('code', { text: op.text }) : el('span', { text: op.text })];
+        if (op.hint) label.push(el('span', { class: 'muted', text: ' — ' + op.hint }));
+        const row = el('label', { class: 'check-item', title: op.title || null }, [cb, el('span', {}, label)]);
+        list.appendChild(row);
+        return { cb, row, text: op.text + ' ' + (op.hint || '') };
+      });
+      if (!items.length) list.appendChild(el('p', { class: 'muted check-empty', text: o.empty || 'Nothing to pick.' }));
+      filter.classList.toggle('hidden', items.length <= (o.filterAt == null ? 8 : o.filterAt));
+      applyFilter();
+    }
+    function values() {
+      return items.filter((it) => it.cb.checked).map((it) => it.cb.value);
+    }
+    filter.addEventListener('input', applyFilter);
+    setOptions(o.options);
+    return {
+      node,
+      values,
+      setValues(vs) {
+        const want = new Set(vs || []);
+        for (const it of items) it.cb.checked = want.has(it.cb.value);
+      },
+      setOptions,
+      onChange: (fn) => listeners.push(fn),
+    };
+  }
+
+  /**
+   * Radio buttons for one choice: { label, options: [{ value, text }], value }.
+   * Returns { node, value(), set(v), onChange(fn) }.
+   */
+  function radioGroup(opts) {
+    const name = uid('choice');
+    const listeners = [];
+    const radios = opts.options.map((op) => {
+      const r = el('input', { type: 'radio', name, value: op.value });
+      r.checked = op.value === opts.value;
+      return r;
+    });
+    const node = el('div', { class: 'radio-row', role: 'radiogroup', 'aria-label': opts.label }, opts.options.map((op, i) => el('label', { class: 'level-option', title: op.title || null }, [radios[i], el('span', { text: op.text })])));
+    for (const r of radios) r.addEventListener('change', () => emit(listeners, r.value));
+    return {
+      node,
+      value: () => (radios.find((r) => r.checked) || { value: '' }).value,
+      set(v) {
+        for (const r of radios) r.checked = r.value === v;
+      },
+      onChange: (fn) => listeners.push(fn),
+    };
+  }
+
+  /**
+   * Put `text` on the clipboard. Resolves true when it got there; otherwise
+   * selects `node`'s text (so Ctrl+C / ⌘C copies it) and resolves false.
+   */
+  async function copyText(text, node) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      if (node && typeof document.createRange === 'function') {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      return false;
+    }
+  }
+
   // ── Dirty tracking ────────────────────────────────────────────────────────
 
   function controlValue(c) {
@@ -595,6 +797,10 @@
     modal,
     modalOpen,
     confirmDialog,
+    levelControl,
+    checkList,
+    radioGroup,
+    copyText,
     dirtyTracker,
     drawer,
   };

@@ -5,17 +5,21 @@
 // behaviour of ui.js's feedback helpers: busy() locks a button for exactly one
 // request, onSubmit() ignores a second submit while the first is pending,
 // errors toast stickily (and their ✕ can be reached from the keyboard while
-// the drawer is open), and dirtyTracker() notices edits. app.js is booted
-// against a fake API for the list search.
+// the drawer is open), and dirtyTracker() notices edits. lib.js (pure) is
+// checked against the relay's own capability tables, and ui.levelControl and
+// the persona drawer's direct-grant editor are driven as an admin would.
+// app.js is booted against a fake API.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { LEVEL_CAPS } from '../src/slash.js';
+import { ALL_CAPS } from '../src/permissions.js';
 
 const ADMIN = fileURLToPath(new URL('../../portal-admin/', import.meta.url));
-const SCRIPTS = ['ui.js', 'app.js'];
+const SCRIPTS = ['lib.js', 'ui.js', 'app.js'];
 const source = (f: string) => readFileSync(join(ADMIN, f), 'utf8');
 
 // ── A minimal DOM: enough for ui.js's helpers, and for booting app.js ──
@@ -288,13 +292,13 @@ const tick = () => new Promise((r) => setImmediate(r));
 
 // ── The rules every panel script follows ──
 
-test('panel scripts: the only global they add is PA (window.PA.ui, window.PA.app)', () => {
+test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .app)', () => {
   const { ctx } = sandbox();
   const before = new Set(Object.getOwnPropertyNames(ctx));
   load(ctx);
   const added = Object.getOwnPropertyNames(ctx).filter((k) => !before.has(k));
   assert.deepEqual(added, ['PA']);
-  assert.deepEqual(Object.keys(ctx.PA).sort(), ['app', 'ui']);
+  assert.deepEqual(Object.keys(ctx.PA).sort(), ['app', 'lib', 'ui']);
   assert.equal(typeof ctx.PA.ui.toast, 'function');
   assert.equal(typeof ctx.PA.app.boot, 'function');
 });
@@ -319,12 +323,13 @@ test('panel scripts: data never goes through an HTML parser', () => {
   }
 });
 
-test('index.html loads ui.js then app.js, deferred and versioned', () => {
+test('index.html loads lib.js, ui.js, then app.js, deferred and versioned', () => {
   const html = source('index.html');
   const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
-  assert.equal(scripts.length, 2);
-  assert.match(scripts[0], /src="ui\.js\?v=\d+"/);
-  assert.match(scripts[1], /src="app\.js\?v=\d+"/);
+  assert.equal(scripts.length, 3);
+  assert.match(scripts[0], /src="lib\.js\?v=\d+"/);
+  assert.match(scripts[1], /src="ui\.js\?v=\d+"/);
+  assert.match(scripts[2], /src="app\.js\?v=\d+"/);
   for (const s of scripts) assert.match(s, /\sdefer\b/);
   assert.match(html, /id="toasts"/);
 });
@@ -627,19 +632,25 @@ test('ui.toast: the ✕ is described by its message', () => {
 
 const G1 = '100000000000000001'; // the preview harness's invented Guild One
 
+/** Answers a mutation (or overrides a read): a body, or undefined for the default. */
+type FakeHandler = (method: string, pathAndQuery: string, body: any) => unknown;
+
 /** A sandbox with index.html's shell, signed in as a one-guild admin. Every
- *  request lands in `calls` as 'METHOD /path?query'. */
-function appSandbox() {
+ *  request lands in `calls` as 'METHOD /path?query', and every JSON body sent
+ *  in `bodies`. `routes` adds or replaces GET answers by path. */
+function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandler } = {}) {
   const box = sandbox();
   const { ctx, doc } = box;
   const calls: string[] = [];
+  const bodies: any[] = [];
   Object.assign(ctx, {
     URLSearchParams,
     location: { search: '', pathname: '/', hash: '' },
     history: { replaceState() {} },
-    fetch: async (path: string, req: { method: string }) => {
+    fetch: async (path: string, req: { method: string; body?: string }) => {
       calls.push(req.method + ' ' + path);
-      const route = new URL(path, 'http://panel.invalid').pathname;
+      const url = new URL(path, 'http://panel.invalid');
+      const route = url.pathname;
       const g = '/admin/g/' + G1;
       const routes: Record<string, unknown> = {
         '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
@@ -648,8 +659,12 @@ function appSandbox() {
         [g + '/channels']: { channels: [] },
         [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
         [g + '/invites']: { invites: [{ code: 'inv_fixtureinvite0000000a', label: 'test', mode: 'mint', uses: 0, roles: ['g1-readers'] }], total: 1, limit: 50, offset: 0 },
+        ...opts.routes,
       };
-      const body = req.method === 'DELETE' ? {} : routes[route];
+      const sent = req.body ? JSON.parse(req.body) : undefined;
+      if (sent !== undefined) bodies.push(sent);
+      let body = opts.handle?.(req.method, route + url.search, sent);
+      if (body === undefined) body = req.method === 'DELETE' ? {} : req.method === 'GET' ? routes[route] : undefined;
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
       return { status: 200, ok: true, text: async () => JSON.stringify(body) };
     },
@@ -668,7 +683,7 @@ function appSandbox() {
     el('main', { id: 'view' }),
   ]));
   drawerDom(doc, el);
-  return { ...box, calls, tabs };
+  return { ...box, calls, bodies, tabs };
 }
 
 async function settle() {
@@ -709,4 +724,327 @@ test('app list search: a query typed just before leaving a tab does not follow y
   await settle();
   assert.equal(calls.at(-1), `GET ${g}/invites?q=test&limit=50&offset=0`);
   assert.equal(search().value, 'test');
+});
+
+// ── lib.js: pure, and in step with the relay ──
+
+/** lib.js alone, in a sandbox with nothing in it (no window, no document). */
+function libOnly() {
+  const ctx = vm.createContext({}) as Record<string, any>;
+  const before = new Set(Object.getOwnPropertyNames(ctx));
+  vm.runInContext(source('lib.js'), ctx, { filename: 'lib.js' });
+  return { lib: ctx.PA.lib, added: Object.getOwnPropertyNames(ctx).filter((k) => !before.has(k)), keys: Object.keys(ctx.PA) };
+}
+/** Values from the sandbox's realm, as plain data of this one. */
+const plain = (v: unknown) => JSON.parse(JSON.stringify(v));
+
+test('lib.js runs in an empty sandbox and adds only PA.lib', () => {
+  const { lib, added, keys } = libOnly();
+  assert.deepEqual(added, ['PA']);
+  assert.deepEqual(keys, ['lib']);
+  assert.equal(typeof lib.levelOf, 'function');
+});
+
+test('lib.js: LEVEL_CAPS and ALL_CAPS are the relay’s (slash.ts, permissions.ts)', () => {
+  const { lib } = libOnly();
+  assert.deepEqual(plain(lib.LEVEL_CAPS), plain(LEVEL_CAPS));
+  assert.deepEqual(plain(lib.ALL_CAPS), plain(ALL_CAPS));
+  assert.equal(lib.ALL_CAPS.length, 14);
+  assert.equal(lib.LEVEL_CAPS.write.length, 9);
+  // Custom… offers every capability once, voice included.
+  const grouped = lib.CAP_GROUPS.flatMap((g: { caps: string[] }) => [...g.caps]);
+  assert.deepEqual([...grouped].sort(), [...ALL_CAPS].sort());
+  assert.equal(new Set(grouped).size, grouped.length);
+  assert.deepEqual(plain(lib.CAP_GROUPS.map((g: { label: string }) => g.label)), ['Read', 'Write', 'Moderation', 'Voice']);
+  for (const c of ALL_CAPS) assert.ok(lib.CAP_LABEL[c] && lib.CAP_WORDS[c], c + ' has a label and words');
+});
+
+test('lib.levelOf: presets, supersets and sets that hold no preset', () => {
+  const { lib } = libOnly();
+  const lv = (caps: string[]) => plain(lib.levelOf(caps));
+  assert.deepEqual(lv([]), { level: 'none', base: null, extra: [] });
+  assert.deepEqual(lv(LEVEL_CAPS.read), { level: 'read', base: 'read', extra: [] });
+  assert.deepEqual(lv(LEVEL_CAPS.write), { level: 'write', base: 'write', extra: [] });
+  assert.deepEqual(lv([...LEVEL_CAPS.full].reverse()), { level: 'full', base: 'full', extra: [] }, 'order does not matter');
+  assert.deepEqual(lv([...LEVEL_CAPS.write, 'VIEW_CHANNEL']), { level: 'write', base: 'write', extra: [] }, 'duplicates do not matter');
+  assert.deepEqual(lv(['MENTION_EVERYONE', ...LEVEL_CAPS.write]), { level: 'custom', base: 'write', extra: ['MENTION_EVERYONE'] });
+  assert.deepEqual(lv(['READ_HISTORY', 'VIEW_CHANNEL', 'SEND_MESSAGES']), { level: 'custom', base: 'read', extra: ['SEND_MESSAGES'] });
+  assert.deepEqual(lv(['SEND_MESSAGES']), { level: 'custom', base: null, extra: ['SEND_MESSAGES'] }, 'no View: no preset');
+  assert.deepEqual(lv(['SEND_MESSAGES', 'VIEW_CHANNEL']), { level: 'custom', base: null, extra: ['VIEW_CHANNEL', 'SEND_MESSAGES'] }, 'extras in ALL_CAPS order');
+  assert.deepEqual(lv(['VOICE_SPEAK', 'VOICE_LISTEN', ...LEVEL_CAPS.full]), { level: 'custom', base: 'full', extra: ['VOICE_LISTEN', 'VOICE_SPEAK'] });
+
+  assert.equal(lib.levelLabel([]), 'None');
+  assert.equal(lib.levelLabel(LEVEL_CAPS.full), 'Full');
+  assert.equal(lib.levelLabel([...LEVEL_CAPS.write, 'MENTION_EVERYONE']), 'Write +1');
+  assert.equal(lib.levelLabel(['SEND_MESSAGES']), 'Custom');
+  assert.equal(lib.capsSummary([...LEVEL_CAPS.write, 'MENTION_EVERYONE']), 'Write + mention everyone');
+  assert.equal(lib.capsSummary(['SEND_MESSAGES']), 'Custom (send) — can’t see the channel');
+  assert.match(lib.capsTitle([...LEVEL_CAPS.write, 'MENTION_EVERYONE']), /^Write = Read \+ send.*Also: mention everyone\.$/);
+});
+
+test('lib.isGrantableType: text, voice and forum; never a thread or a category', () => {
+  const { lib } = libOnly();
+  assert.deepEqual(['text', 'voice', 'forum', 'thread', 'category', 'unknown', undefined].map((t) => lib.isGrantableType(t)), [true, true, true, false, false, false, false]);
+});
+
+// Invented, public-safe fixture names (the preview harness's world).
+const C = { general: '100000000000001011', lounge: '100000000000001013', research: '100000000000001021', designReview: '100000000000001022', labNotes: '100000000000001023', ideas: '100000000000001024', catResearch: '100000000000001002' };
+const MODS = '100000000000003001';
+const NAMES = {
+  channels: {
+    [C.general]: { id: C.general, name: 'general', type: 'text' },
+    [C.lounge]: { id: C.lounge, name: 'lounge', type: 'voice' },
+    [C.research]: { id: C.research, name: 'research', type: 'text' },
+    [C.designReview]: { id: C.designReview, name: 'design-review', type: 'thread', parentId: C.research, parentName: 'research' },
+    [C.ideas]: { id: C.ideas, name: 'ideas', type: 'forum' },
+    [C.catResearch]: { id: C.catResearch, name: 'Research', type: 'category' },
+    '100000000000009001': { id: '100000000000009001', name: null, missing: true },
+    '100000000000009002': { id: '100000000000009002', name: null, unavailable: true },
+  },
+  discordRoles: { [MODS]: { name: 'Mods', guildId: G1 }, [G1]: { name: '@everyone', guildId: G1 } },
+  guilds: { [G1]: 'Guild One' },
+};
+
+test('lib.chanText: channels by name, the way the copy guide writes them', () => {
+  const { lib } = libOnly();
+  const t = (id: string) => lib.chanText(id, NAMES);
+  assert.equal(t(C.general), '#general');
+  assert.equal(t(C.lounge), 'lounge (voice)');
+  assert.equal(t(C.ideas), 'ideas (forum)');
+  assert.equal(t(C.catResearch), 'Research (category)');
+  assert.equal(t(C.designReview), 'design-review (thread in #research)');
+  assert.equal(t('100000000000009001'), 'deleted channel');
+  assert.equal(t('100000000000009002'), 'channel the relay can’t see');
+  assert.equal(t('100000000000009999'), '100000000000009999', 'nothing known: the id');
+  assert.equal(lib.roleText(MODS, NAMES), '@Mods');
+  assert.equal(lib.roleText(G1, NAMES), '@everyone');
+});
+
+test('lib.grantSummary: roles AND grant, in words', () => {
+  const { lib } = libOnly();
+  const g = (inv: object) => lib.grantSummary({ guildId: G1, ...inv }, NAMES);
+  // What slash /invite stores: access roles plus a channel grant.
+  assert.equal(g({ roles: ['g1-chatters'], grant: { caps: LEVEL_CAPS.write, scope: { channels: [C.general] } } }), 'roles: g1-chatters · Write in #general');
+  assert.equal(g({ roles: ['g1-readers', 'g1-chatters'] }), 'roles: g1-readers, g1-chatters');
+  assert.equal(g({ grant: { caps: LEVEL_CAPS.read, scope: { channels: [C.general, C.research] } } }), 'Read in #general, #research');
+  assert.equal(g({ grant: { caps: LEVEL_CAPS.read, scope: { channels: ['1', '2', '3', '4'] } } }), 'Read in 4 channels');
+  assert.equal(g({ grant: { caps: LEVEL_CAPS.full, scope: { mirrorRole: MODS } } }), 'Full wherever @Mods can see');
+  assert.equal(g({ grant: { caps: LEVEL_CAPS.read, scope: { all: true } } }), 'Read in every channel of Guild One');
+  assert.equal(g({ caps: LEVEL_CAPS.read }), 'Read everywhere (old-style invite)');
+  assert.equal(g({}), 'no access');
+});
+
+test('lib.roleMeaning and roleLevelText: an access role in one line', () => {
+  const { lib } = libOnly();
+  const chatters = { caps: LEVEL_CAPS.write, scope: { channels: [C.general, C.research] }, guildId: G1 };
+  const readers = { caps: LEVEL_CAPS.read, scope: { all: true }, guildId: G1 };
+  const modsMirror = { caps: LEVEL_CAPS.full, scope: { mirrorRole: MODS }, guildId: G1, mirrorCaps: true };
+  const modsSee = { caps: LEVEL_CAPS.write, scope: { mirrorRole: MODS }, guildId: G1 };
+  assert.equal(lib.roleMeaning(chatters, NAMES), 'Write in 2 channels');
+  assert.equal(lib.roleMeaning({ ...chatters, scope: { channels: [C.general] } }, NAMES), 'Write in #general');
+  assert.equal(lib.roleMeaning(readers, NAMES), 'Read in every channel of Guild One');
+  assert.equal(lib.roleMeaning(modsMirror, NAMES), 'Mirrors @Mods · Full');
+  assert.equal(lib.roleMeaning(modsSee, NAMES), 'Write wherever @Mods can see');
+  assert.equal(lib.roleMeaning(undefined, NAMES), 'no longer defined');
+  assert.equal(lib.roleLevelText(chatters, NAMES), 'Write');
+  assert.equal(lib.roleLevelText(modsMirror, NAMES), 'Mirrors @Mods · Full');
+  assert.equal(lib.wherePhrase(chatters.scope, NAMES, G1), 'in #general, #research');
+});
+
+test('lib.inviteSummary: uses, expiry and grants on one line', () => {
+  const { lib } = libOnly();
+  const now = new Date(2026, 9, 16, 9, 30).getTime(); // local time: a Friday
+  const inSevenDays = new Date(2026, 9, 23, 9, 30).toISOString();
+  assert.equal(lib.shortDate(inSevenDays, now), 'Fri 23 Oct');
+  assert.equal(lib.shortDate(new Date(2027, 0, 4).toISOString(), now), 'Mon 4 Jan 2027');
+  assert.equal(lib.inviteSummary({ roles: ['g1-readers'], maxUses: 1, expiresAt: inSevenDays }, NAMES, now), 'Single use · expires Fri 23 Oct · roles: g1-readers');
+  assert.equal(lib.inviteSummary({ guildId: G1, grant: { caps: LEVEL_CAPS.write, scope: { channels: [C.general] } }, maxUses: 5 }, NAMES, now), 'Up to 5 uses · never expires · Write in #general');
+  assert.equal(lib.usesText(undefined), 'Unlimited uses');
+  assert.equal(lib.usedText({ uses: 1, maxUses: 5 }), '1 of 5 used');
+  assert.equal(lib.usedText({ uses: 3 }), '3 used');
+  assert.deepEqual(['mint', undefined, 'augment', 'both'].map((m) => lib.modeText(m)), ['A new agent', 'A new agent', 'An existing persona', 'Either']);
+});
+
+// ── ui.levelControl ──
+
+function levelSandbox(opts: object = {}) {
+  const { ctx } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const lc = ctx.PA.ui.levelControl(opts);
+  const inputs = lc.node.querySelectorAll('input') as FakeElement[];
+  const radio = (v: string) => inputs.find((i) => i.type === 'radio' && i.value === v)!;
+  const box = (c: string) => inputs.find((i) => i.type === 'checkbox' && i.value === c)!;
+  /** Click a radio: the browser unchecks the others in its group. */
+  const pick = (v: string) => {
+    for (const i of inputs) if (i.type === 'radio') i.checked = i.value === v;
+    radio(v).fire('change');
+  };
+  const tick = (c: string, on = true) => {
+    box(c).checked = on;
+    box(c).fire('change');
+  };
+  const custom = lc.node.querySelector('.caps-groups') as FakeElement;
+  const warn = lc.node.querySelector('.warn-line') as FakeElement;
+  return { lc, radio, box, pick, tick, custom, warn, lib: ctx.PA.lib };
+}
+
+test('ui.levelControl: Read | Write | Full | Custom… as a radiogroup; presets give the relay’s caps', () => {
+  const { lc, radio, pick, custom } = levelSandbox({ value: LEVEL_CAPS.write });
+  assert.equal(lc.node.querySelector('[role="radiogroup"]') !== null, true);
+  assert.equal(radio('write').checked, true);
+  assert.deepEqual(plain(lc.value()), plain(LEVEL_CAPS.write));
+  assert.ok(custom.classList.contains('hidden'), 'Custom… is closed');
+  const seen: string[][] = [];
+  lc.onChange((v: string[]) => seen.push(plain(v)));
+  pick('full');
+  assert.deepEqual(plain(lc.value()), plain(LEVEL_CAPS.full));
+  assert.deepEqual(seen, [plain(LEVEL_CAPS.full)]);
+  lc.set([]);
+  assert.deepEqual(plain(lc.value()), [], 'no level picked: no caps');
+  assert.equal(['read', 'write', 'full', 'custom'].some((k) => radio(k).checked), false);
+  assert.equal(seen.length, 1, 'set() is not an admin change');
+  lc.set([...LEVEL_CAPS.write, 'MENTION_EVERYONE']);
+  assert.equal(radio('custom').checked, true, 'a superset opens Custom…');
+  assert.ok(!custom.classList.contains('hidden'));
+});
+
+test('ui.levelControl: Custom… ticks View and History with any Write or Moderation capability, and warns without View', () => {
+  const { lc, box, pick, tick, custom, warn } = levelSandbox({});
+  pick('write');
+  pick('custom');
+  assert.ok(!custom.classList.contains('hidden'), 'Custom… opens');
+  assert.deepEqual(plain(lc.value()), plain(LEVEL_CAPS.write), 'starting from the level picked before');
+  for (const c of LEVEL_CAPS.write) tick(c, false);
+  assert.deepEqual(plain(lc.value()), []);
+  tick('SEND_MESSAGES');
+  assert.equal(box('VIEW_CHANNEL').checked, true, 'send ticks View');
+  assert.equal(box('READ_HISTORY').checked, true, 'send ticks History');
+  assert.deepEqual(plain(lc.value()), ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES']);
+  assert.ok(warn.classList.contains('hidden'));
+  tick('VIEW_CHANNEL', false);
+  assert.ok(!warn.classList.contains('hidden'), 'unticking View warns');
+  assert.equal(warn.textContent, 'Without View this only works where a role already gives view.');
+  assert.deepEqual(plain(lc.value()), ['READ_HISTORY', 'SEND_MESSAGES']);
+  tick('MANAGE_MESSAGES');
+  assert.equal(box('VIEW_CHANNEL').checked, true, 'a Moderation capability ticks View too');
+  assert.ok(warn.classList.contains('hidden'));
+  // Voice is not in the rule.
+  for (const c of ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'MANAGE_MESSAGES']) tick(c, false);
+  tick('VOICE_LISTEN');
+  assert.equal(box('VIEW_CHANNEL').checked, false);
+});
+
+// ── The persona drawer's direct grants, driven as Gwen would ──
+
+const CH = {
+  welcome: '100000000000001010', catGeneral: '100000000000001001', general: '100000000000001011', random: '100000000000001012',
+  lounge: '100000000000001013', catResearch: '100000000000001002', research: '100000000000001021', designReview: '100000000000001022',
+  labNotes: '100000000000001023', ideas: '100000000000001024', catArchive: '100000000000001003', oldLogs: '100000000000001031',
+};
+const G1_CHANNELS = [
+  { id: CH.welcome, name: 'welcome', type: 'text' },
+  { id: CH.catGeneral, name: 'General', type: 'category' },
+  { id: CH.general, name: 'general', type: 'text' },
+  { id: CH.random, name: 'random', type: 'text' },
+  { id: CH.lounge, name: 'lounge', type: 'voice' },
+  { id: CH.catResearch, name: 'Research', type: 'category' },
+  { id: CH.research, name: 'research', type: 'text' },
+  { id: CH.designReview, name: 'design-review', type: 'thread', parentId: CH.research },
+  { id: CH.labNotes, name: 'lab-notes', type: 'text' },
+  { id: CH.ideas, name: 'ideas', type: 'forum' },
+  { id: CH.catArchive, name: 'Archive', type: 'category' },
+  { id: CH.oldLogs, name: 'old-logs', type: 'text' },
+];
+const G1_CATALOG = {
+  'g1-readers': { caps: LEVEL_CAPS.read, scope: { all: true }, guildId: G1 },
+  'g1-chatters': { caps: LEVEL_CAPS.write, scope: { channels: [CH.general, CH.research] }, guildId: G1 },
+  // Another guild's role, as a super-admin's catalog would hold it.
+  'g2-desk': { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: '100000000000000002' },
+};
+
+async function ariaDrawer() {
+  const g = '/admin/g/' + G1;
+  const policy: { channels: Record<string, string[]>; default?: string[] } = { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
+  const box = appSandbox({
+    routes: {
+      [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
+      [g + '/channels']: { channels: G1_CHANNELS },
+      [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 },
+      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters', 'g2-desk'], guildPolicy: policy, names: { channels: {} } },
+    },
+    handle: (method, path, body) => {
+      if (method === 'PUT' && path === g + '/personas/aria/grants') {
+        if (body.channelId) policy.channels[body.channelId] = body.caps;
+        else policy.default = body.caps;
+        return { guildPolicy: policy };
+      }
+      return undefined;
+    },
+  });
+  await box.ctx.PA.app.boot();
+  await settle();
+  box.doc.querySelectorAll('button').find((b) => b.textContent === 'Aria')!.click();
+  await settle();
+  const drawer = box.doc.getElementById('drawer-body')!;
+  const form = drawer.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  const save = form.querySelector('button[type="submit"]')!;
+  const radio = (v: string) => form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === v)!;
+  const choose = (v: string) => {
+    target.value = v;
+    target.fire('change');
+  };
+  return { ...box, drawer, form, target, save, radio, choose, policy };
+}
+
+test('grant editor: open at the top; targets are channels that can hold a grant, then guild-wide', async () => {
+  const { drawer, target } = await ariaDrawer();
+  const section = drawer.querySelector('section')!;
+  const first = section.children[1];
+  assert.equal(first.tagName, 'DETAILS', 'Direct grants come first in the guild section');
+  assert.equal(first.hasAttribute('open'), true);
+  const texts = target.options.map((o) => o.textContent);
+  assert.equal(texts[0], 'Pick a channel…');
+  assert.equal(texts.at(-1), 'Every channel in Guild One (guild-wide)…');
+  assert.deepEqual(texts.slice(1, -1), ['#general', 'ideas (forum)', '#lab-notes', 'lounge (voice)', '#old-logs', '#random', '#research', '#welcome']);
+  assert.ok(!texts.some((t) => /design-review|category/.test(t)), 'no thread, no category');
+});
+
+test('grant editor: picking a target loads its level; Save waits for a level; Write saves exactly the Write caps', async () => {
+  const { form, target, save, radio, choose, calls, bodies, policy, drawer } = await ariaDrawer();
+  assert.equal(save.disabled, true, 'nothing picked yet');
+  choose(CH.research);
+  assert.equal(radio('write').checked, true, 'its direct grant is Write');
+  assert.equal(save.disabled, false);
+  choose(CH.labNotes);
+  assert.equal(['read', 'write', 'full', 'custom'].some((k) => radio(k).checked), false, 'no grant there: no level');
+  assert.equal(save.disabled, true);
+  radio('write').checked = true;
+  radio('write').fire('change');
+  assert.equal(save.disabled, false);
+  form.fire('submit');
+  await settle();
+  const g = '/admin/g/' + G1;
+  assert.equal(calls.at(-1), `PUT ${g}/personas/aria/grants`);
+  assert.deepEqual(bodies.at(-1), { caps: [...LEVEL_CAPS.write], channelId: CH.labNotes });
+  assert.deepEqual(policy.channels[CH.labNotes], [...LEVEL_CAPS.write]);
+  const rows = drawer.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
+  assert.ok(rows.some((r) => r[0] === '#lab-notes' && r[1] === 'Write'), JSON.stringify(rows));
+  assert.equal(target.value, CH.labNotes);
+  // Guild-wide carries its warning.
+  const warn = form.querySelector('.warn-line')!;
+  assert.ok(warn.classList.contains('hidden'));
+  choose('__guild__');
+  assert.ok(!warn.classList.contains('hidden'));
+  assert.equal(warn.textContent, 'Applies to every channel without its own grant, including new ones.');
+});
+
+test('persona drawer: access roles are this guild’s only, with what each means', async () => {
+  const { drawer } = await ariaDrawer();
+  const picker = drawer.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
+  assert.deepEqual(picker.options.map((o) => o.textContent), ['+ Add access role…', 'g1-readers — Read in every channel of Guild One']);
+  const chips = drawer.querySelectorAll('.tag').map((t) => t.textContent);
+  assert.deepEqual(chips, ['g1-chatters— Write in 2 channels✕']);
+  const note = drawer.querySelectorAll('.field-hint').find((n) => /other guilds/.test(n.textContent))!;
+  assert.equal(note.textContent, '+1 role in other guilds');
 });

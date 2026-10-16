@@ -15,45 +15,9 @@
 'use strict';
 
 const ui = window.PA.ui;
+const lib = window.PA.lib; // levels, summaries, names (pure; see lib.js)
 const { el, clear } = ui;
-
-const CAPS = [
-  'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS',
-  'CREATE_THREADS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE',
-  'EDIT_OWN', 'DELETE_OWN', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS',
-];
-// Capabilities grouped for display/editing (purely a UI grouping — the wire
-// model is still the flat per-cap set). Read / Write / and the three "elevated"
-// singletons that each deserve their own line.
-const CAP_GROUPS = [
-  { label: 'Read', caps: ['VIEW_CHANNEL', 'READ_HISTORY'] },
-  { label: 'Write', caps: ['SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS', 'ATTACH_FILES', 'ADD_REACTIONS', 'EDIT_OWN', 'DELETE_OWN'] },
-  { label: 'Mention everyone', caps: ['MENTION_EVERYONE'] },
-  { label: 'Manage messages', caps: ['MANAGE_MESSAGES'] },
-  { label: 'Manage channels', caps: ['MANAGE_CHANNELS'] },
-];
-const CAP_SHORT = {
-  VIEW_CHANNEL: 'view', READ_HISTORY: 'history', SEND_MESSAGES: 'send',
-  SEND_IN_THREADS: 'in-threads', CREATE_THREADS: 'threads', ATTACH_FILES: 'files',
-  ADD_REACTIONS: 'react', EDIT_OWN: 'edit', DELETE_OWN: 'delete',
-  MENTION_EVERYONE: 'mention', MANAGE_MESSAGES: 'manage-msgs', MANAGE_CHANNELS: 'manage-chans',
-};
-const capShort = (c) => CAP_SHORT[c] || c.toLowerCase();
-
-// Compact read-only summary: a fully-present group shows as its label; partial
-// groups list their present caps (short). e.g. "Read · Write" or "Read · send, files".
-function capsSummary(caps) {
-  const set = new Set(caps || []);
-  if (!set.size) return '—';
-  const out = [];
-  for (const g of CAP_GROUPS) {
-    const present = g.caps.filter((c) => set.has(c));
-    if (!present.length) continue;
-    if (present.length === g.caps.length) out.push(g.label);
-    else out.push(present.map(capShort).join(', '));
-  }
-  return out.join(' · ');
-}
+const { chanText, roleText, guildText, levelLabel, capsSummary, capsTitle } = lib;
 
 const LIMIT = 50;
 
@@ -150,6 +114,21 @@ async function guildMeta() {
   return state.cache[key];
 }
 function invalidateGuildMeta() { delete state.cache[state.guildId]; }
+
+/** Name maps for the selected guild's own pickers: its channels, its Discord
+ *  roles and its name. */
+function metaNames(meta) {
+  const names = withChannelList(null, meta.channels, meta.discordRoles);
+  names.guilds = { [state.guildId]: currentGuildName() };
+  return names;
+}
+
+/** The access roles bound to the selected guild, by name. Pickers and chips
+ *  show only these; another guild's roles are not this guild's to hand out. */
+function guildRoleNames(meta) {
+  const cat = meta.catalog || {};
+  return Object.keys(cat).filter((n) => cat[n] && cat[n].guildId === state.guildId).sort(byName);
+}
 
 // ── Boot / auth ──────────────────────────────────────────────────────────────
 
@@ -534,11 +513,19 @@ async function renderPersonas(view, stale) {
 function personaRow(p, meta, all) {
   const name = p.displayName || p.id;
   const open = () => openPersonaDrawer(p.id, meta, { name });
+  // In a guild's list, the guild's own access roles; others are only counted.
+  let rolesText = (p.roles || []).join(', ') || '—';
+  if (!all && meta) {
+    const mine = new Set(guildRoleNames(meta));
+    const here = (p.roles || []).filter((r) => mine.has(r));
+    const elsewhere = (p.roles || []).length - here.length;
+    rolesText = (here.join(', ') || '—') + (elsewhere ? ' (+' + elsewhere + ' elsewhere)' : '');
+  }
   return openableRow(open, [
     el('td', { class: 'col-narrow' }, [avatarThumb(p.avatarUrl, '')]),
     el('td', {}, [el('button', { class: 'link', 'data-key': 'persona:' + p.id, text: name, onclick: open })]),
     el('td', {}, [el('code', { text: p.id })]),
-    el('td', { class: 'cell-roles', text: (p.roles || []).join(', ') || '—' }),
+    el('td', { class: 'cell-roles', text: rolesText }),
     all
       ? el('td', { class: 'col-narrow', text: String(p.guildCount != null ? p.guildCount : '—') })
       : el('td', {}, [p.hasOverride ? el('span', { class: 'badge badge-warn', text: 'direct grants' }) : el('span', { class: 'muted', text: '—' })]),
@@ -587,11 +574,12 @@ async function openPersonaDrawer(id, meta, hint = {}) {
       everywhere.appendChild(everywhereSection(fresh));
     } catch { /* keep what is shown; the next open refreshes */ }
   };
-  if (global) body.appendChild(profileSection(ctx, global));
+  // This guild first: it is what the drawer was opened for.
   if (state.guildId && meta) {
     body.appendChild(guildAccessSection(ctx, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta, refreshEverywhere));
   }
   if (global) {
+    body.appendChild(profileSection(ctx, global));
     everywhere.appendChild(everywhereSection(global));
     body.appendChild(everywhere);
     body.appendChild(tokenSection(ctx));
@@ -643,27 +631,52 @@ function profileSection(ctx, d) {
   return section('Profile picture', [form]);
 }
 
-/** Access in the selected guild: access roles, claiming an invite, direct grants. */
+/** Access in the selected guild: its direct grants (open, first), its access
+ *  roles, and — folded under More — applying an invite. */
 function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
   const { id, displayName } = ctx;
   const P = () => G() + '/personas/' + encodeURIComponent(id);
+  const guild = currentGuildName();
+  const names = metaNames(meta);
+  const catalog = meta.catalog || {};
+  const mine = guildRoleNames(meta);
+  const mineSet = new Set(mine);
+  const meaning = (r) => lib.roleMeaning(catalog[r], names);
 
-  // Access roles: chips with a remove button each, and a picker that assigns
-  // the moment a role is picked.
+  // Access roles: this guild's, as chips with a remove button each, and a
+  // picker (with what each role means) that assigns the moment one is picked.
   const roleTags = el('div', { class: 'tags' });
+  const roleNote = el('p', { class: 'field-hint hidden' });
   const roleStatus = ui.statusLine(null);
-  const roleNames = Object.keys(meta.catalog || {});
-  const addRole = el('select', { 'aria-label': 'Add an access role to ' + displayName, 'data-no-dirty': true }, [el('option', { value: '', text: '+ add access role…' })].concat(
-    roleNames.map((n) => el('option', { value: n, text: n }))));
+  const addRole = el('select', { 'aria-label': 'Add an access role to ' + displayName, 'data-no-dirty': true });
   function drawRoles(roles) {
+    const held = roles || [];
     clear(roleTags);
-    for (const r of roles || []) {
+    const here = held.filter((r) => mineSet.has(r));
+    for (const r of here) {
       const label = 'Remove access role ' + r + ' from ' + displayName;
       const x = el('button', { class: 'x', text: '✕', 'aria-label': label, title: label });
       x.addEventListener('click', () => ui.busy(x, () => revokeRole(r), '…'));
-      roleTags.appendChild(el('span', { class: 'tag' }, [el('span', { text: r }), x]));
+      roleTags.appendChild(el('span', { class: 'tag', title: capsTitle(catalog[r].caps) }, [
+        el('code', { text: r }), el('span', { class: 'tag-meaning', text: '— ' + meaning(r) }), x,
+      ]));
     }
-    if (!roles || !roles.length) roleTags.appendChild(el('span', { class: 'muted', text: 'No access roles.' }));
+    if (!here.length) roleTags.appendChild(el('span', { class: 'muted', text: 'No access roles in ' + guild + '.' }));
+    // A super-admin sees every role the persona holds; the ones that aren't
+    // this guild's are counted, not offered here.
+    const other = held.filter((r) => !mineSet.has(r));
+    const elsewhere = other.filter((r) => catalog[r]).length;
+    const notes = [];
+    if (elsewhere) notes.push('+' + lib.plural(elsewhere, 'role') + ' in other guilds');
+    if (other.length > elsewhere) notes.push(lib.plural(other.length - elsewhere, 'role') + ' no longer defined');
+    roleNote.textContent = notes.join(' · ');
+    roleNote.classList.toggle('hidden', !notes.length);
+    // The picker offers what isn't held yet.
+    clear(addRole);
+    const free = mine.filter((r) => !held.includes(r));
+    addRole.appendChild(el('option', { value: '', text: free.length ? '+ Add access role…' : mine.length ? 'Holds every access role here' : 'No access roles defined here' }));
+    for (const r of free) addRole.appendChild(el('option', { value: r, text: r + ' — ' + meaning(r) }));
+    addRole.disabled = !free.length;
   }
   async function revokeRole(role) {
     try {
@@ -672,7 +685,7 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
       addRole.focus(); // the chip that had focus is gone
       roleStatus.ok('Removed access role ' + role + ' from ' + displayName + '.');
       markStale(); onChange();
-    } catch (e) { roleStatus.err(notDone(e)); }
+    } catch (e) { roleStatus.err(notDone(e, 'Not removed')); }
   }
   let assigning = false;
   addRole.addEventListener('change', async () => {
@@ -683,24 +696,32 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
     try {
       const r = await api('POST', P() + '/roles', { role });
       drawRoles(r.roles);
-      roleStatus.ok('Gave ' + displayName + ' access role ' + role + '.');
+      // The last free role was just given: the picker is off, so keep focus
+      // on the new chip's ✕ rather than lose it.
+      if (addRole.disabled) {
+        const xs = roleTags.querySelectorAll('button.x');
+        if (xs.length) xs[xs.length - 1].focus();
+      }
+      roleStatus.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').');
       markStale(); onChange();
     } catch (e) { roleStatus.err(notDone(e)); }
     finally { assigning = false; addRole.removeAttribute('aria-busy'); addRole.value = ''; }
   });
   drawRoles(detail.roles);
-  const rolesBlock = el('div', { class: 'subsection', role: 'group', 'aria-label': 'Access roles' }, [
+  const rolesBlock = el('div', { class: 'subsection subsection-sep', role: 'group', 'aria-label': 'Access roles' }, [
     el('div', { class: 'field-label', text: 'Access roles' }),
     el('div', { class: 'inline' }, [roleTags, addRole]),
+    roleNote,
     roleStatus.node,
   ]);
 
-  // Apply an invite to this persona.
-  const claimCode = el('input', { type: 'text', name: 'code', autocomplete: 'off', spellcheck: 'false', placeholder: 'invite code' });
-  const claimBtn = el('button', { type: 'submit', class: 'btn btn-sm', text: 'Claim' });
+  // Apply an invite to this persona (an "augment" invite; a new-agent one
+  // can't be applied to a persona that exists).
+  const claimCode = el('input', { type: 'text', name: 'code', autocomplete: 'off', spellcheck: 'false', placeholder: 'inv_…' });
+  const claimBtn = el('button', { type: 'submit', class: 'btn btn-sm', text: 'Apply' });
   const claimStatus = ui.statusLine(null);
   const claimForm = el('form', { class: 'subsection', novalidate: true }, [
-    ui.field({ label: 'Claim an invite for it', control: claimCode, after: [claimBtn] }),
+    ui.field({ label: 'Apply an invite to ' + displayName, control: claimCode, after: [claimBtn], hint: 'Only invites made for an existing persona can be applied here.' }),
     claimStatus.node,
   ]);
   const claimTracker = ctx.drawer.track(claimForm);
@@ -716,12 +737,13 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
       markStale(); onChange();
     } catch (e) { claimStatus.err(notDone(e, 'Not applied')); }
   }, { busyLabel: 'Applying…' });
+  const more = el('details', { class: 'advanced' }, [el('summary', { text: 'More' }), claimForm]);
 
   return el('section', { class: 'drawer-section' }, [
-    el('h3', { text: 'Access in ' + currentGuildName() }),
-    rolesBlock,
-    claimForm,
+    el('h3', { text: 'Access in ' + guild }),
     grantEditor(ctx, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange),
+    rolesBlock,
+    more,
   ]);
 }
 
@@ -742,10 +764,11 @@ function everywhereSection(d) {
   const roles = d.roles || [];
   kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Access roles' }),
     roles.length
-      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', {}, [
-          el('strong', { text: r.name }),
-          r.scope ? el('span', { class: 'muted', title: scopeIds(r.scope), text: ' — ' + scopeSummary(r.scope, names) + (r.guildId ? ' in ' + guildText(r.guildId, names) : '') }) : null,
-          el('div', { class: 'cell-roles', text: capsSummary(r.caps) }),
+      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', { title: r.caps ? capsTitle(r.caps) : undefined }, [
+          el('code', { text: r.name }),
+          el('span', { class: 'muted', text: ' — ' + (r.scope
+            ? lib.roleMeaning(r, names) + (r.scope.all || !r.guildId ? '' : ' · ' + guildText(r.guildId, names))
+            : 'no longer defined') }),
         ])))
       : el('p', { class: 'muted', text: 'None.' })]));
 
@@ -753,12 +776,12 @@ function everywhereSection(d) {
   const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
   if ((pol && pol.default && pol.default.length) || polGuilds.length) {
     const grantKids = [];
-    if (pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', text: 'everywhere: ' + capsSummary(pol.default) }));
+    if (pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', title: capsTitle(pol.default), text: 'Persona default (applies in every guild): ' + capsSummary(pol.default) }));
     for (const [gid, gp] of polGuilds) {
       const lines = [];
-      if (gp.default && gp.default.length) lines.push(el('div', { class: 'cell-roles', text: 'whole guild: ' + capsSummary(gp.default) }));
+      if (Array.isArray(gp.default)) lines.push(el('div', { class: 'cell-roles', title: gp.default.length ? capsTitle(gp.default) : undefined, text: 'Guild-wide: ' + (gp.default.length ? capsSummary(gp.default) : 'denied') }));
       const rows = Object.entries(gp.channels || {}).sort((a, b) => byName(chanText(a[0], names), chanText(b[0], names)));
-      for (const [cid, caps] of rows) lines.push(el('div', { class: 'grant-line' }, [chanNode(cid, names), el('span', { class: 'muted', text: ' — ' + capsSummary(caps) })]));
+      for (const [cid, caps] of rows) lines.push(el('div', { class: 'grant-line' }, [chanNode(cid, names), el('span', { class: 'muted', title: caps.length ? capsTitle(caps) : undefined, text: ' — ' + (caps.length ? capsSummary(caps) : 'blocked') })]));
       grantKids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: guildText(gid, names), title: gid }), ...lines]));
     }
     kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Direct grants' }), ...grantKids]));
@@ -801,74 +824,161 @@ async function tokenAction(ctx, action, button, status) {
   }, rotate ? 'Rotating…' : 'Revoking…');
 }
 
+/**
+ * Direct grants in the selected guild: what is set (one row per channel, plus
+ * the guild-wide level), and a form that sets a level on one channel — text,
+ * voice or forum; a thread uses its parent's access and a category grants
+ * nothing — or guild-wide. Save stays off until a target and a level are
+ * picked, so a grant can't be stored empty by accident.
+ */
 function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
   const { id, displayName } = ctx;
   const P = () => G() + '/personas/' + encodeURIComponent(id) + '/grants';
-  const det = el('details', { class: 'advanced' }, [el('summary', { text: 'Direct grants (this guild only)' })]);
+  const guild = currentGuildName();
+  const GUILD_WIDE = '__guild__';
+  const det = el('details', { class: 'advanced grants', open: true }, [el('summary', { text: 'Direct grants' })]);
   const tableBox = el('div', {});
   const status = ui.statusLine(null);
-  const where = (cid) => (cid ? chanText(cid, names) : 'every channel of ' + currentGuildName());
+  let policy = policy0 || null;
 
-  function draw(policy) {
+  /** Why a grant on this channel does nothing, or null. */
+  function inertNote(cid) {
+    const l = names.channels && names.channels[cid];
+    if (!l) return null;
+    if (l.type === 'thread') return 'Does nothing: threads use ' + (l.parentName ? '#' + l.parentName : 'their channel') + '’s access.';
+    if (l.type === 'category') return 'Does nothing: a category grants nothing. Pick its channels instead.';
+    return null;
+  }
+  function levelCell(caps, emptyBadge, emptyNote) {
+    if (!caps.length) return el('td', { title: emptyNote }, [el('span', { class: 'badge badge-warn', text: emptyBadge })]);
+    return el('td', { title: capsTitle(caps), text: levelLabel(caps) });
+  }
+
+  function draw(p) {
+    policy = p || null;
     clear(tableBox);
-    const gd = (policy && policy.default) || [];
+    const gd = policy ? policy.default : undefined; // undefined: not set here
     const chans = (policy && policy.channels) || {};
     const keys = Object.keys(chans).sort((a, b) => byName(chanText(a, names), chanText(b, names)));
     const rows = [];
-    const clearBtn = (cid, label) => {
-      const b = el('button', { class: 'btn btn-sm btn-danger', text: 'clear', 'aria-label': label });
-      b.addEventListener('click', () => ui.busy(b, () => clearGrant(cid), '…'));
-      return b;
-    };
-    if (gd.length) rows.push(el('tr', {}, [el('td', { text: 'guild-default' }), el('td', { class: 'cell-roles', text: capsSummary(gd) }), el('td', {}, [clearBtn(null, 'Clear ' + displayName + '’s guild-wide grant')])]));
-    for (const cid of keys) rows.push(el('tr', {}, [
-      el('td', {}, [chanNode(cid, names)]),
-      el('td', { class: 'cell-roles', text: capsSummary(chans[cid] || []) }),
-      el('td', {}, [clearBtn(cid, 'Remove ' + displayName + '’s direct grant in ' + chanText(cid, names))]),
-    ]));
-    tableBox.appendChild(table([{ label: 'Target' }, { label: 'Caps' }, { label: '', cls: 'col-narrow' }], rows, 'No direct grants here.'));
+    if (Array.isArray(gd)) {
+      let deny = null;
+      if (gd.length) {
+        deny = el('button', { class: 'btn btn-sm btn-danger', text: 'Deny guild-wide', 'aria-label': 'Deny ' + displayName + ' guild-wide in ' + guild });
+        deny.addEventListener('click', () => denyGuildWide(deny));
+      }
+      rows.push(el('tr', {}, [
+        el('td', { text: 'Every channel (guild-wide)' }),
+        levelCell(gd, 'Denied', 'Denied guild-wide: ' + displayName + '’s persona default doesn’t apply in ' + guild + '. Access roles and direct grants still do.'),
+        el('td', { class: 'col-narrow' }, deny ? [deny] : []),
+      ]));
+    }
+    for (const cid of keys) {
+      const where = chanText(cid, names);
+      const note = inertNote(cid);
+      const rm = el('button', { class: 'btn btn-sm btn-danger', text: 'Remove', 'aria-label': 'Remove ' + displayName + '’s direct grant in ' + where });
+      rm.addEventListener('click', () => ui.busy(rm, () => removeGrant(cid), 'Removing…'));
+      rows.push(el('tr', {}, [
+        el('td', {}, [chanNode(cid, names), note ? el('div', { class: 'cell-note', text: note }) : null]),
+        levelCell(chans[cid] || [], 'Blocked', 'An empty direct grant: it blocks the guild-wide level and the persona default in this channel. Access roles still apply.'),
+        el('td', { class: 'col-narrow' }, [rm]),
+      ]));
+    }
+    tableBox.appendChild(table([{ label: 'Where' }, { label: 'Level' }, { label: '', cls: 'col-narrow' }], rows, 'No direct grants in ' + guild + '.'));
   }
 
-  async function clearGrant(cid) {
-    let path = P();
-    if (cid) path += '?channelId=' + encodeURIComponent(cid);
+  async function removeGrant(cid) {
     try {
-      const r = await api('DELETE', path);
+      const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid));
       draw(r.guildPolicy);
       target.focus(); // the row whose button had focus is gone
-      status.ok(cid
-        ? 'Removed ' + displayName + '’s direct grant in ' + chanText(cid, names) + '.'
-        : displayName + '’s guild-wide grant is now none: it blocks the persona default in ' + currentGuildName() + '.');
+      if (target.value === cid) preload();
+      status.ok('Removed ' + displayName + '’s direct grant in ' + chanText(cid, names) + '.');
       markStale(); onChange();
-    } catch (e) { status.err(notDone(e)); }
+    } catch (e) { status.err(notDone(e, 'Not removed')); }
   }
 
-  const target = el('select', { name: 'target' }, [el('option', { value: '', text: 'guild-default' })].concat(
-    channelOptions(channels).map((o) => el('option', { value: o.value, text: o.text }))));
-  const caps = capsCheckboxes();
-  const setBtn = el('button', { type: 'submit', class: 'btn btn-sm btn-primary', text: 'Set grant' });
-  const form = el('form', { class: 'subsection', novalidate: true }, [
-    ui.field({ label: 'Target', control: target }),
-    ui.field({ label: 'Capabilities', control: caps.node }),
-    setBtn,
+  async function denyGuildWide(button) {
+    const go = await ui.confirmDialog({
+      title: 'Deny ' + displayName + ' guild-wide in ' + guild + '?',
+      body: [
+        displayName + '’s guild-wide ' + levelLabel(policy.default) + ' is replaced by a deny. In every channel of ' + guild +
+          ' without its own direct grant, ' + displayName + ' then gets nothing from its own settings: the deny also blocks its persona default here.',
+        'Access roles and direct grants still apply. To undo it, set a guild-wide level again.',
+      ],
+      confirmLabel: 'Deny guild-wide',
+      danger: true,
+    });
+    if (!go) return;
+    await ui.busy(button, async () => {
+      try {
+        const r = await api('DELETE', P());
+        draw(r.guildPolicy);
+        target.focus();
+        if (target.value === GUILD_WIDE) preload();
+        status.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.');
+        markStale(); onChange();
+      } catch (e) { status.err(notDone(e, 'Not denied')); }
+    }, 'Denying…');
+  }
+
+  const target = el('select', { name: 'target' }, [el('option', { value: '', text: 'Pick a channel…' })]
+    .concat(channelOptions(channels).map((o) => el('option', { value: o.value, text: o.text })))
+    .concat([el('option', { value: GUILD_WIDE, text: 'Every channel in ' + guild + ' (guild-wide)…' })]));
+  const wideWarn = el('p', { class: 'warn-line hidden', text: 'Applies to every channel without its own grant, including new ones.' });
+  const level = ui.levelControl({ label: 'Level' });
+  const save = el('button', { type: 'submit', class: 'btn btn-sm btn-primary', text: 'Save' });
+  const why = el('span', { class: 'field-hint' });
+  const form = el('form', { class: 'subsection grant-form', novalidate: true }, [
+    ui.field({ label: 'Where', control: target }),
+    wideWarn,
+    ui.field({ label: 'Level', control: level.node }),
+    el('div', { class: 'inline' }, [save, why]),
     status.node,
   ]);
   const tracker = ctx.drawer.track(form);
+
+  /** The target's current setting: caps, or undefined when it has none. */
+  function currentCaps(t) {
+    if (!t || !policy) return undefined;
+    if (t === GUILD_WIDE) return policy.default;
+    return policy.channels ? policy.channels[t] : undefined;
+  }
+  function update() {
+    const missing = !target.value ? 'Pick a channel and a level to save.' : !level.value().length ? 'Pick a level to save.' : '';
+    save.disabled = !!missing;
+    why.textContent = missing;
+  }
+  /** Load the picked target's level; picking alone changes nothing. */
+  function preload() {
+    const caps = currentCaps(target.value);
+    level.set(Array.isArray(caps) ? caps : []);
+    wideWarn.classList.toggle('hidden', target.value !== GUILD_WIDE);
+    tracker.reset();
+    update();
+  }
+  target.addEventListener('change', preload);
+  level.onChange(update);
+
   ui.onSubmit(form, async () => {
-    const reqBody = { caps: caps.values() };
-    if (target.value) reqBody.channelId = target.value;
+    const t = target.value;
+    const caps = level.value();
+    if (!t || !caps.length) return; // Save is off until both are picked
+    const body = { caps };
+    if (t !== GUILD_WIDE) body.channelId = t;
     try {
-      const r = await api('PUT', P(), reqBody);
+      const r = await api('PUT', P(), body);
       draw(r.guildPolicy);
       tracker.reset();
-      status.ok(reqBody.caps.length
-        ? displayName + ' → ' + capsSummary(reqBody.caps) + ' in ' + where(reqBody.channelId) + '.'
-        : displayName + ' is now blocked in ' + where(reqBody.channelId) + ' (an empty grant).');
+      status.ok(t === GUILD_WIDE
+        ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
+        : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.');
       markStale(); onChange();
     } catch (e) { status.err(notDone(e)); }
   });
 
   draw(policy0);
+  update();
   det.appendChild(tableBox);
   det.appendChild(form);
   return det;
@@ -887,23 +997,26 @@ async function renderInvites(view, stale) {
     load: async () => {
       const data = await api('GET', G() + '/invites' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
       const names = withChannelList(data.names, meta.channels, meta.discordRoles);
+      names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
+      const now = Date.now();
       const rows = (data.invites || []).map((inv) => {
         const revoke = el('button', { class: 'btn btn-sm btn-danger', text: 'Revoke', 'aria-label': 'Revoke invite ' + (inv.label || inv.code) });
         revoke.addEventListener('click', () => revokeInvite(inv, revoke, list));
+        const grants = lib.grantSummary(inv, names);
         return el('tr', {}, [
           el('td', {}, [el('code', { text: inv.code })]),
           el('td', { text: inv.label || '—' }),
-          el('td', {}, [el('span', { class: 'badge', text: inv.mode || 'mint' })]),
-          el('td', { text: (inv.uses || 0) + '/' + (inv.maxUses != null ? inv.maxUses : '∞') }),
-          el('td', { text: inv.expiresAt ? new Date(inv.expiresAt).toLocaleDateString() : 'never' }),
-          el('td', { class: 'cell-roles', text: grantSummary(inv, names), title: scopeIds(inv.grant && inv.grant.scope) || undefined }),
+          el('td', { class: 'col-narrow', text: lib.modeText(inv.mode) }),
+          el('td', { class: 'col-narrow', text: lib.usedText(inv) }),
+          el('td', { class: 'col-narrow', text: expiryCell(inv.expiresAt, now), title: inv.expiresAt ? new Date(inv.expiresAt).toLocaleString() : undefined }),
+          el('td', { class: 'cell-roles', text: grants, title: grants + (inv.grant ? '. ' + capsTitle(inv.grant.caps) : '') }),
           el('td', {}, [revoke]),
         ]);
       });
       return el('div', {}, [
         table([
-          { label: 'Code' }, { label: 'Label' }, { label: 'Mode', cls: 'col-narrow' },
-          { label: 'Uses', cls: 'col-narrow' }, { label: 'Expires', cls: 'col-narrow' }, { label: 'Grant' }, { label: '', cls: 'col-narrow' },
+          { label: 'Code' }, { label: 'Label' }, { label: 'Who can use it', cls: 'col-narrow' },
+          { label: 'Uses', cls: 'col-narrow' }, { label: 'Expires', cls: 'col-narrow' }, { label: 'Grants' }, { label: '', cls: 'col-narrow' },
         ], rows, state.q ? 'No invite matches “' + state.q + '”.' : 'No invites in this guild.'),
         pager(data, () => list.refresh()),
       ]);
@@ -911,79 +1024,214 @@ async function renderInvites(view, stale) {
   });
 }
 
+/** 'Fri 23 Oct', 'expired Fri 16 Oct' or 'never'. */
+function expiryCell(expiresAt, now) {
+  if (!expiresAt) return 'never';
+  const at = Date.parse(expiresAt);
+  return (at <= now ? 'expired ' : '') + lib.shortDate(expiresAt, now);
+}
+
+/**
+ * The Discord roles a mirror may follow: the guild's own, without the
+ * relay's pooled addressing roles, and @everyone only on request.
+ */
+function discordRoleChoices(discordRoles, withEveryone) {
+  const isEveryone = (r) => r.id === state.guildId || r.name === '@everyone';
+  return (discordRoles || [])
+    .filter((r) => !r.pooled && (withEveryone || !isEveryone(r)))
+    .sort((a, b) => (isEveryone(a) ? 1 : 0) - (isEveryone(b) ? 1 : 0) || byName(a.name || '', b.name || ''))
+    .map((r) => ({ value: r.id, text: roleText(r.id, { discordRoles: { [r.id]: r } }) }));
+}
+
+/** A 'Show @everyone' toggle for a Discord-role picker, or null when the guild
+ *  has no @everyone role to show. */
+function everyoneToggle(discordRoles, onToggle) {
+  const has = (discordRoles || []).some((r) => !r.pooled && (r.id === state.guildId || r.name === '@everyone'));
+  if (!has) return { node: null, on: () => false };
+  const box = el('input', { type: 'checkbox', 'data-no-dirty': true });
+  box.addEventListener('change', () => onToggle(box.checked));
+  return { node: el('label', { class: 'check-inline' }, [box, el('span', { text: 'Show @everyone' })]), on: () => box.checked };
+}
+
+/** One Discord role to mirror: a select that starts at 'Pick a Discord role…'. */
+function mirrorRolePicker(discordRoles) {
+  const select = el('select', { name: 'mirrorRole' });
+  function fill(withEveryone) {
+    const keep = select.value;
+    clear(select);
+    select.appendChild(el('option', { value: '', text: 'Pick a Discord role…' }));
+    const opts = discordRoleChoices(discordRoles, withEveryone);
+    for (const o of opts) select.appendChild(el('option', { value: o.value, text: o.text }));
+    select.value = opts.some((o) => o.value === keep) ? keep : '';
+  }
+  const listeners = [];
+  const changed = () => { for (const fn of listeners) fn(select.value); };
+  select.addEventListener('change', changed);
+  const toggle = everyoneToggle(discordRoles, (on) => { fill(on); changed(); });
+  fill(false);
+  return { select, toggle: toggle.node, value: () => select.value, onChange: (fn) => listeners.push(fn) };
+}
+
+/** Several Discord roles to mirror: a checkbox list. */
+function mirrorRoleList(discordRoles) {
+  const list = ui.checkList({ label: 'Discord roles', empty: 'This guild has no Discord roles to mirror.', options: discordRoleChoices(discordRoles, false) });
+  const toggle = everyoneToggle(discordRoles, (on) => list.setOptions(discordRoleChoices(discordRoles, on)));
+  return { list, toggle: toggle.node };
+}
+
 function openMintDrawer(meta) {
   const d = openDrawer({ title: 'Mint invite' });
-  const label = el('input', { type: 'text', name: 'label', placeholder: 'label (optional)', autocomplete: 'off' });
-  const mode = el('select', { name: 'mode' }, ['mint', 'augment', 'both'].map((m) => el('option', { value: m, text: m })));
-  const maxUses = el('input', { type: 'number', name: 'maxUses', min: '1', placeholder: 'unlimited' });
-  const expires = el('input', { type: 'number', name: 'expires', min: '1', placeholder: 'never' });
-  const kind = el('select', { name: 'kind' }, [
-    el('option', { value: 'roles', text: 'Access roles' }),
-    el('option', { value: 'channels', text: 'Scope: channels' }),
-    el('option', { value: 'mirrorRole', text: 'Scope: mirror a Discord role' }),
-  ]);
-  const roleSel = multiSelect(Object.keys(meta.catalog || {}), 'No access roles defined.');
-  const chanSel = multiSelect(channelOptions(meta.channels), 'No channels.');
-  const mirrorSel = el('select', { name: 'mirrorRole' }, [...(meta.discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => el('option', { value: r.id, text: r.name + (r.pooled ? ' (pool)' : '') })));
-  const caps = capsCheckboxes();
-  const scopeArea = el('div', {});
-  function sync() {
-    clear(scopeArea);
-    if (kind.value === 'roles') scopeArea.appendChild(ui.field({ label: 'Access roles (union)', control: roleSel.node }));
-    else if (kind.value === 'channels') {
-      scopeArea.appendChild(ui.field({ label: 'Channels', control: chanSel.node }));
-      scopeArea.appendChild(ui.field({ label: 'Capabilities', control: caps.node }));
-    } else {
-      scopeArea.appendChild(ui.field({ label: 'Mirror Discord role', control: mirrorSel }));
-      scopeArea.appendChild(ui.field({ label: 'Capabilities', control: caps.node }));
+  const isSuper = !!(state.me && state.me.isSuper);
+  const guild = currentGuildName();
+  const names = metaNames(meta);
+  const catalog = meta.catalog || {};
+  const mine = guildRoleNames(meta);
+
+  const label = el('input', { type: 'text', name: 'label', maxlength: '120', autocomplete: 'off' });
+
+  // What it grants. An invite carries access roles OR one channel/mirror
+  // grant (the relay takes one or the other), so this is a choice of three.
+  const kind = ui.radioGroup({
+    label: 'What it grants',
+    value: mine.length ? 'roles' : 'channels',
+    options: [
+      { value: 'roles', text: 'Access roles' },
+      { value: 'channels', text: 'Channels' },
+      { value: 'mirror', text: 'Mirror a Discord role' },
+    ],
+  });
+  const roleList = ui.checkList({
+    label: 'Access roles',
+    empty: 'No access roles are defined for ' + guild + '.',
+    options: mine.map((r) => ({ value: r, text: r, code: true, hint: lib.roleMeaning(catalog[r], names), title: capsTitle(catalog[r].caps) })),
+  });
+  const otherRoles = Object.keys(catalog).length - mine.length; // only a super-admin's catalog has any
+  const chanList = ui.checkList({ label: 'Channels', empty: 'The relay sees no channels in ' + guild + '.', options: channelOptions(meta.channels) });
+  const mirror = mirrorRolePicker(meta.discordRoles);
+  const level = ui.levelControl({ value: lib.LEVEL_CAPS.write });
+  const kindArea = el('div', { class: 'kind-area' });
+  function syncKind() {
+    clear(kindArea);
+    const k = kind.value();
+    if (k === 'roles') {
+      kindArea.appendChild(ui.field({ label: 'Access roles', control: roleList.node }));
+      if (isSuper && otherRoles > 0) kindArea.appendChild(el('p', { class: 'field-hint', text: '+' + lib.plural(otherRoles, 'role') + ' in other guilds' }));
+      return;
     }
+    if (k === 'channels') kindArea.appendChild(ui.field({ label: 'Channels', control: chanList.node }));
+    else kindArea.appendChild(ui.field({ label: 'Discord role to mirror', control: mirror.select, after: mirror.toggle ? [mirror.toggle] : null, hint: 'The persona gets the level below wherever members with this role can see.' }));
+    kindArea.appendChild(ui.field({ label: 'Level', control: level.node }));
   }
-  kind.addEventListener('change', sync); sync();
+  kind.onChange(syncKind);
+  syncKind();
+
+  const uses = el('select', { name: 'uses' }, [
+    el('option', { value: '1', text: '1' }), el('option', { value: '5', text: '5' }), el('option', { value: '25', text: '25' }),
+    el('option', { value: 'unlimited', text: 'Unlimited' }), el('option', { value: 'other', text: 'Other…' }),
+  ]);
+  const usesOther = el('input', { type: 'number', name: 'usesOther', min: '1', step: '1', class: 'hidden', 'aria-label': 'How many uses' });
+  uses.addEventListener('change', () => {
+    usesOther.classList.toggle('hidden', uses.value !== 'other');
+    if (uses.value === 'other') usesOther.focus();
+  });
+  const expires = el('select', { name: 'expires' }, [
+    el('option', { value: '1', text: '1 day' }), el('option', { value: '7', text: '7 days' }),
+    el('option', { value: '30', text: '30 days' }), el('option', { value: 'never', text: 'Never' }),
+  ]);
+  expires.value = '7';
+
+  const who = ui.radioGroup({
+    label: 'Who can use it',
+    value: 'mint',
+    options: [
+      { value: 'mint', text: 'A new agent' },
+      { value: 'augment', text: 'An existing persona' },
+      { value: 'both', text: 'Either' },
+    ],
+  });
+  const advanced = el('details', { class: 'advanced' }, [
+    el('summary', { text: 'Advanced' }),
+    ui.field({ label: 'Who can use it', control: who.node, hint: 'An existing persona or Either: anyone holding the code can add this access to a persona that already exists.' }),
+  ]);
 
   const submit = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Mint invite' });
   const status = ui.statusLine(null);
   const form = el('form', { class: 'drawer-sections', novalidate: true }, [
-    ui.field({ label: 'Label', control: label }),
+    ui.field({ label: 'Who is it for?', control: label, hint: 'Optional. Shown in the Invites list.' }),
+    ui.field({ label: 'What it grants', control: kind.node }),
+    kindArea,
     el('div', { class: 'field-row' }, [
-      ui.field({ label: 'Mode', control: mode }),
-      ui.field({ label: 'Max uses', control: maxUses }),
-      ui.field({ label: 'Expires (days)', control: expires }),
+      ui.field({ label: 'Uses', control: uses, after: [usesOther] }),
+      ui.field({ label: 'Expires', control: expires }),
     ]),
-    ui.field({ label: 'Grant kind', control: kind }),
-    scopeArea,
+    advanced,
     el('div', {}, [submit]),
     status.node,
   ]);
   const tracker = d.track(form);
+
   ui.onSubmit(form, async () => {
     const no = (why) => status.err('Not minted: ' + why);
-    const body = { mode: mode.value };
+    const body = { mode: who.value() || 'mint' };
     if (label.value.trim()) body.label = label.value.trim();
-    if (maxUses.value) body.maxUses = parseInt(maxUses.value, 10);
-    if (expires.value) body.expiresInDays = parseInt(expires.value, 10);
-    if (kind.value === 'roles') {
-      const roles = roleSel.values();
+    if (uses.value === 'other') {
+      const n = Number(usesOther.value);
+      if (!Number.isInteger(n) || n < 1) return no('enter how many times the code can be used — a whole number, 1 or more.');
+      body.maxUses = n;
+    } else if (uses.value !== 'unlimited') body.maxUses = Number(uses.value);
+    if (expires.value !== 'never') body.expiresInDays = Number(expires.value);
+    const k = kind.value();
+    if (k === 'roles') {
+      const roles = roleList.values();
       if (!roles.length) return no('pick at least one access role.');
       body.roles = roles;
     } else {
-      const c = caps.values();
-      if (!c.length) return no('pick at least one capability.');
-      if (kind.value === 'channels') {
-        const ch = chanSel.values();
+      const caps = level.value();
+      if (!caps.length) return no('pick a level.');
+      if (k === 'channels') {
+        const ch = chanList.values();
         if (!ch.length) return no('pick at least one channel.');
-        body.grant = { caps: c, scope: { channels: ch } };
+        body.grant = { caps, scope: { channels: ch } };
       } else {
-        if (!mirrorSel.value) return no('pick a Discord role.');
-        body.grant = { caps: c, scope: { mirrorRole: mirrorSel.value } };
+        if (!mirror.value()) return no('pick a Discord role to mirror.');
+        body.grant = { caps, scope: { mirrorRole: mirror.value() } };
       }
     }
     try {
       const r = await api('POST', G() + '/invites', body);
       tracker.reset();
       markStale();
-      status.ok(['Minted ', el('code', { class: 'code-result', text: r.code || '' }), '. Hand this code to the enrolling agent.'], { toastText: 'Invite minted.' });
+      status.clear();
+      ui.toast('Invite minted.');
+      showResult(r.code || '', r.invite || Object.assign({ guildId: state.guildId }, body));
     } catch (e) { status.err(notDone(e, 'Not minted')); }
   }, { busyLabel: 'Minting…' });
+
+  /** The minted code, on screen until Done: Copy, a summary, Mint another.
+   *  The code lives only in this card — never in state, the URL or storage. */
+  function showResult(code, inv) {
+    const headId = ui.uid('invite-ready');
+    const codeEl = el('code', { class: 'invite-code', text: code });
+    const cardStatus = ui.statusLine(null);
+    const copy = el('button', { class: 'btn btn-primary', text: 'Copy' });
+    copy.addEventListener('click', async () => {
+      if (await ui.copyText(code, codeEl)) cardStatus.ok('Copied the code.', { toast: false });
+      else cardStatus.err('Couldn’t copy automatically. The code is selected: copy it with Ctrl+C (⌘C on a Mac).', { toast: false });
+    });
+    const another = el('button', { class: 'btn', text: 'Mint another' });
+    another.addEventListener('click', () => { d.setBody(form); label.focus(); });
+    const done = el('button', { class: 'btn', text: 'Done', onclick: () => ui.drawer.close() });
+    d.setBody(el('section', { class: 'result-card', 'aria-labelledby': headId }, [
+      el('h3', { id: headId, text: 'Invite ready' }),
+      el('p', { class: 'invite-code-wrap' }, [codeEl]),
+      el('p', { class: 'invite-summary', text: lib.inviteSummary(inv, names, Date.now()) }),
+      el('p', { class: 'muted', text: 'Hand this code to the enrolling agent.' }),
+      el('div', { class: 'inline' }, [copy, another, done]),
+      cardStatus.node,
+    ]));
+    copy.focus();
+  }
+
   d.setBody(form);
 }
 
@@ -1004,22 +1252,7 @@ async function revokeInvite(inv, button, list) {
   }, 'Revoking…');
 }
 
-function scopeSummary(scope, names) {
-  if (!scope) return '—';
-  if (scope.all) return 'all channels';
-  if (Array.isArray(scope.channels)) return listSummary(scope.channels.map((c) => chanText(c, names)), 'no channels');
-  if (Array.isArray(scope.mirrorRoles)) return 'mirrors ' + listSummary(scope.mirrorRoles.map((r) => roleText(r, names)), 'no roles');
-  if (typeof scope.mirrorRole === 'string') return 'mirrors ' + roleText(scope.mirrorRole, names);
-  return '?';
-}
-function grantSummary(inv, names) {
-  if (inv.roles && inv.roles.length) return 'roles: ' + inv.roles.join(', ');
-  if (inv.grant) return scopeSummary(inv.grant.scope, names) + ' — ' + capsSummary(inv.grant.caps);
-  if (inv.caps && inv.caps.length) return 'blanket(deprecated): ' + capsSummary(inv.caps);
-  return 'deny';
-}
-
-// ── Roles (guild-scoped read, global authoring) ─────────────────────────────────
+// ── Roles (guild-scoped read, super-admin authoring) ────────────────────────────
 
 async function renderRoles(view, stale) {
   const meta = await guildMeta();
@@ -1028,7 +1261,7 @@ async function renderRoles(view, stale) {
   const actions = [];
   if (meta.canAuthor) {
     const add = el('button', { class: 'btn btn-sm btn-primary', text: '+ Define access role' });
-    add.addEventListener('click', () => openRoleDrawer(meta.discordRoles, meta.channels));
+    add.addEventListener('click', () => openRoleDrawer(meta));
     actions.push(add);
   }
   const list = listView(view, {
@@ -1038,29 +1271,38 @@ async function renderRoles(view, stale) {
       if (!data) data = await api('GET', G() + '/roles' + qs({ names: '1' }));
       const { catalog, discordRoles, canAuthor, names: rawNames } = data;
       const names = withChannelList(rawNames, meta.channels, discordRoles);
-      const roleNames = Object.keys(catalog || {}).filter((n) => !state.q || n.toLowerCase().includes(state.q.toLowerCase()));
+      names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
+      const here = (n) => (catalog[n] && catalog[n].guildId === state.guildId ? 0 : 1);
+      // This guild's roles first (a guild-admin only gets those), then by name.
+      const roleNames = Object.keys(catalog || {})
+        .filter((n) => !state.q || n.toLowerCase().includes(state.q.toLowerCase()))
+        .sort((a, b) => here(a) - here(b) || byName(a, b));
       const rows = roleNames.map((n) => {
         const r = catalog[n];
+        const mirrorsPerChannel = lib.isMirror(r.scope) && r.mirrorCaps;
         const cells = [
           el('td', {}, [el('code', { text: n })]),
-          el('td', { class: 'cell-roles', text: (r.caps || []).join(', ') }),
-          el('td', { class: 'cell-roles', text: scopeSummary(r.scope, names), title: scopeIds(r.scope) }),
-          el('td', {}, [r.guildId ? el('span', { text: guildText(r.guildId, names), title: r.guildId }) : el('span', { class: 'muted', text: '—' })]),
+          el('td', {
+            text: lib.roleLevelText(r, names),
+            title: (mirrorsPerChannel ? 'Each channel’s Discord permissions for the mirrored role, up to this level. ' : '') + capsTitle(r.caps),
+          }),
+          el('td', { class: 'cell-roles', text: lib.wherePhrase(r.scope, names, r.guildId), title: lib.wherePhrase(r.scope, names, r.guildId, Infinity) }),
         ];
         if (canAuthor) {
+          cells.push(el('td', {}, [r.guildId ? el('span', { text: guildText(r.guildId, names) }) : el('span', { class: 'muted', text: '—' })]));
           const del = el('button', { class: 'btn btn-sm btn-danger', text: 'Delete', 'aria-label': 'Delete access role ' + n });
           del.addEventListener('click', () => deleteRole(n, del, list, () => { data = null; }));
           cells.push(el('td', {}, [del]));
         }
         return el('tr', {}, cells);
       });
-      const headers = [{ label: 'Name' }, { label: 'Caps' }, { label: 'Scope' }, { label: 'Guild' }];
-      if (canAuthor) headers.push({ label: '', cls: 'col-narrow' });
+      const headers = [{ label: 'Name' }, { label: 'Level' }, { label: 'Where' }];
+      if (canAuthor) headers.push({ label: 'Guild' }, { label: '', cls: 'col-narrow' });
       return el('div', {}, [
         table(headers, rows, state.q ? 'No access role matches “' + state.q + '”.' : 'No access roles in this guild.'),
         el('p', { class: 'hint muted', text: canAuthor
-          ? 'The access-role catalog is global (shared across all guilds). Editing here is super-admin only.'
-          : 'The role catalog is global and authored by operators. Express access by minting invites that mirror your Discord roles or pick channels.' }),
+          ? 'Each access role belongs to one guild. As a super-admin you see every guild’s roles here, and can define or delete them.'
+          : 'Access roles are defined by the relay’s operators. Give one to a persona from its drawer, or put it in an invite.' }),
       ]);
     },
   });
@@ -1068,65 +1310,98 @@ async function renderRoles(view, stale) {
   list.invalidate = () => { data = null; };
 }
 
-function openRoleDrawer(discordRoles, channels) {
+function openRoleDrawer(meta) {
   // The guild this drawer was opened for — its pickers list this guild's
   // channels and roles, so the role must be saved to it whatever happens to
   // the scope switcher meanwhile.
   const gid = state.guildId;
+  const catalog = meta.catalog || {};
+  const names = metaNames(meta);
   const d = openDrawer({ title: 'Define access role' });
-  const name = el('input', { type: 'text', name: 'name', placeholder: 'role name', autocomplete: 'off' });
-  const caps = capsCheckboxes();
-  // Roles are guild-scoped (the API requires guildId): a role is defined in the
-  // guild being viewed, from that guild's channels and Discord roles. To define
-  // one for another guild, switch the guild scope first.
-  const kind = el('select', { name: 'kind' }, [
-    el('option', { value: 'all', text: 'all channels' }),
-    el('option', { value: 'channels', text: 'channels' }),
-    el('option', { value: 'mirrorRole', text: 'mirror Discord role' }),
-    el('option', { value: 'mirrorRoles', text: 'mirror several Discord roles' }),
+  const name = el('input', { type: 'text', name: 'name', autocomplete: 'off', spellcheck: 'false' });
+  // A role belongs to the guild being viewed and is built from that guild's
+  // channels and Discord roles; to define one for another guild, switch first.
+  const kind = el('select', { name: 'where' }, [
+    el('option', { value: 'all', text: 'All channels' }),
+    el('option', { value: 'channels', text: 'Channels' }),
+    el('option', { value: 'mirrorRole', text: 'Mirror a Discord role' }),
+    el('option', { value: 'mirrorRoles', text: 'Mirror several Discord roles' }),
   ]);
-  const roleOpts = [...(discordRoles || [])].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map((r) => ({ value: r.id, text: r.name }));
-  const mirrorSel = el('select', { name: 'mirrorRole' }, roleOpts.map((o) => el('option', { value: o.value, text: o.text })));
-  const mirrorMulti = multiSelect(roleOpts, 'No Discord roles.');
-  const chanMulti = multiSelect(channelOptions(channels), 'No channels.');
-  const scopeArea = el('div', {});
-  function sync() {
-    clear(scopeArea);
-    if (kind.value === 'mirrorRole') scopeArea.appendChild(ui.field({ label: 'Discord role', control: mirrorSel }));
-    else if (kind.value === 'mirrorRoles') scopeArea.appendChild(ui.field({ label: 'Discord roles', control: mirrorMulti.node }));
-    else if (kind.value === 'channels') scopeArea.appendChild(ui.field({ label: 'Channels', control: chanMulti.node }));
+  const chanList = ui.checkList({ label: 'Channels', empty: 'The relay sees no channels here.', options: channelOptions(meta.channels) });
+  const mirror = mirrorRolePicker(meta.discordRoles);
+  const mirrors = mirrorRoleList(meta.discordRoles);
+  const level = ui.levelControl({});
+  const area = el('div', {});
+  function syncKind() {
+    clear(area);
+    if (kind.value === 'mirrorRole') area.appendChild(ui.field({ label: 'Discord role', control: mirror.select, after: mirror.toggle ? [mirror.toggle] : null }));
+    else if (kind.value === 'mirrorRoles') area.appendChild(ui.field({ label: 'Discord roles', control: mirrors.list.node, after: mirrors.toggle ? [mirrors.toggle] : null }));
+    else if (kind.value === 'channels') area.appendChild(ui.field({ label: 'Channels', control: chanList.node }));
   }
-  kind.addEventListener('change', sync); sync();
 
-  const submit = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Create role' });
+  const submit = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Create access role' });
+  const why = el('span', { class: 'field-hint' });
   const status = ui.statusLine(null);
   const form = el('form', { class: 'drawer-sections', novalidate: true }, [
     ui.field({ label: 'Name', control: name }),
-    ui.field({ label: 'Scope kind', control: kind }),
-    scopeArea,
-    el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Guild' }), el('div', { title: gid, text: currentGuildName() })]),
-    ui.field({ label: 'Capabilities', control: caps.node }),
-    el('div', {}, [submit]),
+    ui.field({ label: 'Where', control: kind }),
+    area,
+    ui.field({ label: 'Level', control: level.node }),
+    el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Guild' }), el('div', { text: guildText(gid, names) })]),
+    el('div', { class: 'inline' }, [submit, why]),
     status.node,
   ]);
+
+  /** What is still missing before Create can be pressed, or ''. */
+  function missing() {
+    if (!name.value.trim()) return 'Name the role';
+    if (kind.value === 'channels' && !chanList.values().length) return 'Pick at least one channel';
+    if (kind.value === 'mirrorRole' && !mirror.value()) return 'Pick a Discord role';
+    if (kind.value === 'mirrorRoles' && !mirrors.list.values().length) return 'Pick at least one Discord role';
+    if (!level.value().length) return 'Pick a level';
+    return '';
+  }
+  function update() {
+    const m = missing();
+    submit.disabled = !!m;
+    why.textContent = m ? m + ' to create it.' : '';
+  }
+  name.addEventListener('input', update);
+  kind.addEventListener('change', () => { syncKind(); update(); });
+  chanList.onChange(update);
+  mirror.onChange(update);
+  mirrors.list.onChange(update);
+  level.onChange(update);
+  syncKind();
+  update();
+
   d.track(form);
   ui.onSubmit(form, async () => {
-    const no = (why) => status.err('Not created: ' + why);
+    if (missing()) return; // Create is off until the form is complete
     const roleName = name.value.trim();
-    if (!roleName) return no('give the role a name.');
     let scope;
     if (kind.value === 'all') scope = { all: true };
-    else if (kind.value === 'mirrorRole') { if (!mirrorSel.value) return no('pick a Discord role.'); scope = { mirrorRole: mirrorSel.value }; }
-    else if (kind.value === 'mirrorRoles') { const ids = mirrorMulti.values(); if (!ids.length) return no('pick at least one Discord role.'); scope = { mirrorRoles: ids }; }
-    else { const ids = chanMulti.values(); if (!ids.length) return no('pick at least one channel.'); scope = { channels: ids }; }
-    const role = { caps: caps.values(), scope, guildId: gid };
+    else if (kind.value === 'mirrorRole') scope = { mirrorRole: mirror.value() };
+    else if (kind.value === 'mirrorRoles') scope = { mirrorRoles: mirrors.list.values() };
+    else scope = { channels: chanList.values() };
+    const role = { caps: level.value(), scope, guildId: gid };
+    // The relay replaces a role of the same name: say so before it happens.
+    if (catalog[roleName]) {
+      const go = await ui.confirmDialog({
+        title: 'Replace access role ' + roleName + '?',
+        body: 'An access role named ' + roleName + ' already exists (' + lib.roleMeaning(catalog[roleName], names) + '). Creating it again replaces it for every persona that holds it.',
+        confirmLabel: 'Replace access role',
+        danger: true,
+      });
+      if (!go) return;
+    }
     try {
       await api('POST', '/admin/roles', { name: roleName, role });
       invalidateGuildMeta();
       if (state.list && state.list.invalidate) state.list.invalidate();
       markStale();
       // Through the form's line, so an earlier 'Not created' toast goes too.
-      status.ok('Created access role ' + roleName + '.');
+      status.ok('Created access role ' + roleName + ': ' + lib.roleMeaning(role, names) + '.');
       ui.drawer.close(); // the list redraws with the new role
     } catch (e) { status.err(notDone(e, 'Not created')); }
   }, { busyLabel: 'Creating…' });
@@ -1430,40 +1705,6 @@ function avatarCropper(ctx, avImg, avInput, status, onStage) {
   return handle;
 }
 
-function capsCheckboxes(selected) {
-  const sel = new Set(selected || []);
-  const node = el('div', { class: 'caps-groups' });
-  const boxes = [];
-  for (const g of CAP_GROUPS) {
-    if (g.caps.length === 1) {
-      // Elevated singleton: one checkbox, labelled with the group name.
-      const cb = el('input', { type: 'checkbox', value: g.caps[0], checked: sel.has(g.caps[0]) });
-      boxes.push(cb);
-      node.appendChild(el('label', { class: 'cap-row' }, [cb, el('span', { class: 'cap-name', text: g.label })]));
-      continue;
-    }
-    // Multi-cap group: a roll-up toggle + the individual caps as small chips.
-    const children = g.caps.map((c) => { const cb = el('input', { type: 'checkbox', value: c, checked: sel.has(c) }); boxes.push(cb); return cb; });
-    const roll = el('input', { type: 'checkbox', 'data-no-dirty': true });
-    const sync = () => { const on = children.filter((b) => b.checked).length; roll.checked = on === children.length; roll.indeterminate = on > 0 && on < children.length; };
-    roll.addEventListener('change', () => { children.forEach((b) => { b.checked = roll.checked; }); });
-    children.forEach((b) => b.addEventListener('change', sync));
-    sync();
-    node.appendChild(el('div', { class: 'cap-group' }, [
-      el('label', { class: 'cap-row' }, [roll, el('span', { class: 'cap-name', text: g.label })]),
-      el('div', { class: 'cap-chips' }, children.map((cb, i) => el('label', { class: 'cap-chip' }, [cb, el('span', { text: capShort(g.caps[i]) })]))),
-    ]));
-  }
-  return { node, values: () => boxes.filter((b) => b.checked).map((b) => b.value) };
-}
-
-function multiSelect(options, emptyText) {
-  const opts = (options || []).map((o) => (typeof o === 'string' ? { value: o, text: o } : o));
-  if (!opts.length) return { node: el('span', { class: 'muted', text: emptyText || 'none' }), values: () => [] };
-  const node = el('select', { multiple: true, size: String(Math.min(6, Math.max(2, opts.length))) }, opts.map((o) => el('option', { value: o.value, text: o.text })));
-  return { node, values: () => Array.from(node.selectedOptions).map((o) => o.value) };
-}
-
 // ── Names ─────────────────────────────────────────────────────────────────────
 // API responses carry `names` maps — {channels, discordRoles, guilds, personas},
 // keyed by id — so the panel shows names and keeps ids in tooltips. Channel
@@ -1488,18 +1729,6 @@ function withChannelList(names, channels, discordRoles) {
   return out;
 }
 
-/** Plain-text channel name: "#general", "#general › thread", or a stand-in. */
-function chanText(cid, names) {
-  const l = names && names.channels && names.channels[cid];
-  if (!l) return cid;
-  if (l.unavailable) return 'unavailable channel';
-  if (l.hidden) return 'channel hidden from the bot';
-  if (l.missing) return 'deleted channel';
-  if (!l.name) return cid;
-  if (l.type === 'category') return l.name + ' (category)';
-  return '#' + (l.parentName ? l.parentName + ' › ' : '') + l.name;
-}
-
 /** Channel name as a node: name + small status tags; the id lives in the tooltip
  *  (and is shown only when there is no name to show). */
 function chanNode(cid, names) {
@@ -1514,20 +1743,8 @@ function chanNode(cid, names) {
     if (l.missing || l.unavailable) kids.push(el('span', { class: 'muted mono', text: cid }));
     if (l.unavailable) title = cid + ' — deleted, hidden from the bot, or in another guild';
     if (l.archived) kids.push(el('span', { class: 'badge', text: 'archived' }));
-    if (l.type === 'voice') kids.push(el('span', { class: 'badge', text: 'voice' }));
   }
   return el('span', { class: 'name-ref', title }, kids);
-}
-
-/** Discord role name ("@Mods"), or the id when unknown. */
-function roleText(rid, names) {
-  const l = names && names.discordRoles && names.discordRoles[rid];
-  if (!l) return rid;
-  return l.name.startsWith('@') ? l.name : '@' + l.name;
-}
-
-function guildText(gid, names) {
-  return (names && names.guilds && names.guilds[gid]) || gid;
 }
 
 /** The scope switcher's label for the selected guild (its name). */
@@ -1536,26 +1753,15 @@ function currentGuildName() {
   return (opt && opt.textContent) || $('#guild-static').textContent || state.guildId;
 }
 
-/** "a, b, c +4 more" — keeps table cells readable. */
-function listSummary(items, empty, max = 3) {
-  if (!items.length) return empty || 'none';
-  const head = items.slice(0, max).join(', ');
-  return items.length > max ? head + ' +' + (items.length - max) + ' more' : head;
-}
-
-/** A scope's raw ids, for tooltips. */
-function scopeIds(scope) {
-  if (!scope) return '';
-  const arr = (v) => (Array.isArray(v) ? v : []);
-  return [].concat(arr(scope.channels), arr(scope.mirrorRoles), typeof scope.mirrorRole === 'string' ? [scope.mirrorRole] : []).join(', ');
-}
-
-/** Channel picker options: named, threads under their parent, sorted. */
+/** Channel picker options: the channels that can hold a grant (text, voice,
+ *  forum — never a thread or a category), by name. */
 function channelOptions(channels) {
   const names = withChannelList(null, channels);
   return (channels || [])
-    .map((c) => ({ value: c.id, text: chanText(c.id, names) }))
-    .sort((a, b) => byName(a.text, b.text));
+    .filter((c) => lib.isGrantableType(c.type))
+    .map((c) => ({ value: c.id, text: chanText(c.id, names), sort: c.name || c.id }))
+    .sort((a, b) => byName(a.sort, b.sort))
+    .map(({ value, text }) => ({ value, text }));
 }
 
 /** Natural order for names ("thread-3" before "thread-11"). */
@@ -1597,16 +1803,8 @@ function showSecret(token, returnFocus) {
   let m = null;
   const copy = el('button', { class: 'btn', text: 'Copy' });
   copy.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(token);
-      status.ok('Copied the token to the clipboard.');
-    } catch {
-      const range = document.createRange();
-      range.selectNodeContents(pre);
-      const sel = window.getSelection();
-      sel.removeAllRanges(); sel.addRange(range);
-      status.err('Couldn’t copy automatically. The token is selected: copy it with Ctrl+C (⌘C on a Mac).');
-    }
+    if (await ui.copyText(token, pre)) status.ok('Copied the token to the clipboard.');
+    else status.err('Couldn’t copy automatically. The token is selected: copy it with Ctrl+C (⌘C on a Mac).');
   });
   const done = el('button', { class: 'btn btn-primary', text: 'Done', onclick: () => { pre.textContent = ''; m.close(); } });
   m = ui.modal({

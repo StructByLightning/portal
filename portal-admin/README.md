@@ -7,8 +7,12 @@ relay's admin HTTP API — **all** authorization is enforced server-side.
 ```
 portal-admin/
 ├── index.html        app shell + login + right-side detail drawer + toast stack
+├── lib.js            pure helpers (window.PA.lib): the Read/Write/Full levels
+│                     and capabilities (a mirror of the relay's, parity-tested),
+│                     channel/role names, one-line summaries of roles and invites
 ├── ui.js             DOM helpers and widgets (window.PA.ui): toasts, status
-│                     lines, busy buttons, confirm dialogs, the drawer
+│                     lines, busy buttons, confirm dialogs, the level control,
+│                     checkbox lists, the drawer
 ├── app.js            API client, resource tabs, dense tables, all mutations
 │                     (window.PA.app)
 ├── styles.css        self-contained styling (dense, dark/light, CSP-clean)
@@ -19,8 +23,9 @@ portal-admin/
 Each script is a classic `defer` script wrapped in one IIFE that assigns a
 single global, `window.PA.<module>`; `index.html` loads them in order with a
 `?v=` release query, which you bump when a release changes them. Nothing sets
-`innerHTML`. `portal-relay/test/admin-spa.test.ts` checks these rules and
-`ui.js`'s helpers in `node:vm`.
+`innerHTML`. `portal-relay/test/admin-spa.test.ts` checks these rules,
+`lib.js` (against the relay's own `LEVEL_CAPS` and `ALL_CAPS`) and `ui.js`'s
+helpers in `node:vm`.
 
 To try the panel locally without Discord, run the preview harness:
 `node --import tsx scripts/admin-preview.mts` in `portal-relay/` (see its
@@ -37,8 +42,11 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
   personas with access in the selected guild; super-admins can switch it to
   **All personas** (with each one's guild count). Click a row → a right-side
   **drawer**:
-  - *Access in <guild>* — assign/revoke access roles (the primary mechanism),
-    claim an invite for the persona, and its direct grants in this guild;
+  - *Access in <guild>* — its direct grants in this guild first: set Read,
+    Write, Full or Custom… on one channel (text, voice or forum — a thread
+    uses its parent's access and a category grants nothing) or guild-wide;
+    then this guild's access roles, each with what it means; and, under
+    *More*, applying an invite made for an existing persona;
   - *(super-admin)* Profile picture, *Access in every guild* (where it can act,
     what each access role confers, its direct grants everywhere) and **Token**
     (rotate / revoke) — a token authenticates a persona everywhere, so it is
@@ -46,11 +54,13 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
 
   "Grant access by id" reaches a persona that has no access yet. (The former
   *Identities* tab was the same personas, globally; it is folded in here.)
-- **Invites** *(guild-scoped)* — mint (roles or a channel/mirror scope + `mode`),
-  list, revoke. Search + pagination.
-- **Access roles** *(read guild-scoped, authoring global/super-admin)* — the named
-  access-role catalog. It is **global** (shared across guilds); only super-admins
-  may create/delete.
+- **Invites** *(guild-scoped)* — mint (access roles, channels at a level, or a
+  mirrored Discord role; single use and 7 days unless changed; who can use
+  it under *Advanced*). The code stays on screen with Copy until *Done*.
+  List, revoke. Search + pagination.
+- **Access roles** *(read guild-scoped, authoring super-admin)* — the named
+  access roles, each bound to one guild, shown by level and where they apply.
+  A guild-admin sees only their guild's; only super-admins may create/delete.
 - **Audit** *(guild-scoped)* — every mutation, newest first.
 
 **Scope control:** if you administer exactly one guild it's shown as a fixed

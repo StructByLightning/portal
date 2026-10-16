@@ -204,6 +204,8 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .drawer-sections { display: flex; flex-direction: column; gap: 16px; }
 .drawer-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .subsection { margin-bottom: 12px; }
+.subsection-sep { border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.grant-form { margin-top: 10px; }
 .field { margin-bottom: 8px; }
 .field > label, .field-label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
 .field-hint { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
@@ -233,14 +235,39 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .cropper-controls { display: flex; flex-direction: column; gap: 8px; min-width: 150px; }
 .cropper-zoom { width: 100%; }
 
-/* Grouped capability editor — vertical, fits the narrow drawer. */
-.caps-groups { display: flex; flex-direction: column; gap: 9px; }
-.cap-row { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--fg); }
-.cap-row .cap-name { font-weight: 600; }
-.cap-row input { width: auto; }
-.cap-chips { display: flex; flex-wrap: wrap; gap: 3px 12px; margin: 4px 0 0 22px; }
-.cap-chip { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
-.cap-chip input { width: auto; }
+/* Level control: Read | Write | Full | Custom… — and, under Custom…, the
+   capabilities in groups. Vertical, so it fits the narrow drawer. */
+.level-options, .radio-row { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.level-option { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--fg); }
+.level-option input, .check-item input, .check-inline input { width: auto; margin: 0; }
+.level-help { margin-top: 4px; }
+.caps-groups { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--line-soft); border-radius: 6px; }
+.cap-group-label { font-size: 12px; font-weight: 600; color: var(--fg); }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 3px 14px; margin-top: 3px; }
+.cap-chip { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--fg); }
+.cap-chip input { width: auto; margin: 0; }
+.warn-line { margin: 4px 0 8px; color: var(--warn); font-size: 12px; }
+.caps-groups .warn-line { margin: 0; }
+
+/* Checkbox lists (access roles, channels, Discord roles). */
+.check-list-wrap { display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; min-width: 0; }
+.check-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: var(--panel); }
+.check-item { display: flex; align-items: baseline; gap: 7px; padding: 3px 0; cursor: pointer; color: var(--fg); }
+.check-empty { margin: 4px 0; }
+.check-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.field .check-filter { width: 100%; }
+/* Boxes and radios keep their size inside a field (and a field's inline row). */
+.field .check-inline input, .field .level-option input, .field .check-item input, .field .cap-chip input { flex: none; width: auto; }
+
+/* A note under a table cell's main text (e.g. why a grant does nothing). */
+.cell-note { color: var(--warn); font-size: 12px; }
+.tag-meaning { color: var(--muted); }
+
+/* The minted invite, shown until Done. */
+.result-card h3 { font-size: 15px; color: var(--fg); text-transform: none; letter-spacing: 0; }
+.invite-code-wrap { margin: 10px 0; }
+.invite-code { display: block; font-size: 18px; padding: 10px 12px; word-break: break-all; user-select: all; }
+.invite-summary { margin: 0 0 6px; }
 
 /* ── Modal (one-time secret) ── */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: grid; place-items: center; z-index: 50; }
