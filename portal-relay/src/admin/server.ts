@@ -46,8 +46,9 @@ import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog, AuditRecord } from './audit.js';
 import { canManageGuild } from './authz.js';
 import { clipToGuild, type ChannelLabel, type NameMaps, type RoleLabel } from './names.js';
-import { authorizeUrl, completeOAuth, type FetchLike } from './oauth.js';
-import { SessionStore, type AdminSession } from './sessions.js';
+import { authorizeUrl, completeOAuth, OAuthError, type FetchLike } from './oauth.js';
+import { SessionStore, STATE_TTL_MS, type AdminSession } from './sessions.js';
+import { LoginRateLimit, clientIp } from './login-limit.js';
 
 /** What /admin/me reports as apiVersion. The panel compares it with its own
  *  PA.CLIENT_API and asks for a reload when the relay is newer. */
@@ -62,7 +63,26 @@ const GRANTABLE_TYPES = new Set(['text', 'voice', 'forum']);
 const ROLE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const SESSION_COOKIE = 'portal_admin_session';
+/** The sign-ins this browser has in flight: up to STATES_PER_BROWSER OAuth
+ *  states, newest first, joined with '.' (base64url never contains one). */
 const STATE_COOKIE = 'portal_admin_state';
+const STATES_PER_BROWSER = 3;
+/** An OAuth state as issued: 32 random bytes, base64url. */
+const STATE_FORMAT = /^[A-Za-z0-9_-]{43}$/;
+
+/** Why a sign-in came back without a session: the only words a callback
+ *  redirect ever adds to postLoginUrl (the panel has a sentence for each,
+ *  PA.lib.loginErrorText). */
+type LoginError = 'cancelled' | 'expired' | 'mismatch' | 'discord_error' | 'rate_limited' | 'not_admin';
+
+/** The ?error= values Discord's authorize step may send (RFC 6749 §4.1.2.1,
+ *  and OpenID's for prompt=none). Anything else is recorded as 'other'. */
+const DISCORD_ERRORS = new Set([
+  'invalid_request', 'unauthorized_client', 'access_denied', 'unsupported_response_type', 'invalid_scope',
+  'server_error', 'temporarily_unavailable', 'interaction_required', 'login_required', 'consent_required',
+]);
+
+const UNKNOWN_ACTOR = { id: 'unknown', name: 'unknown', kind: 'admin' as const };
 
 /** The slice of the relay the admin API needs. Built in relay.ts over the bot /
  *  gateway so this module stays decoupled and unit-testable. */
@@ -116,6 +136,9 @@ export class AdminServer {
   private server?: Server;
   private sessions: SessionStore;
   private audit: AuditLog;
+  /** Callbacks per client address (never global). */
+  private callbackLimit = new LoginRateLimit();
+  private limitTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private deps: AdminDeps,
@@ -128,6 +151,12 @@ export class AdminServer {
 
   async listen(): Promise<void> {
     this.sessions.start();
+    // Refusals counted after an address's last login.rate_limited record go
+    // into one more record once its minute is over.
+    this.limitTimer = setInterval(() => {
+      for (const { ip, count } of this.callbackLimit.sweep()) this.recordRateLimited(ip, count);
+    }, 60_000);
+    this.limitTimer.unref?.();
     this.server = createServer((req, res) => {
       this.handle(req, res).catch((e) => {
         console.error('[portal-admin] request error:', (e as Error).message);
@@ -150,6 +179,8 @@ export class AdminServer {
 
   async close(): Promise<void> {
     this.sessions.stop();
+    if (this.limitTimer) clearInterval(this.limitTimer);
+    this.limitTimer = undefined;
     if (this.server) await new Promise<void>((r) => this.server!.close(() => r()));
     this.server = undefined;
   }
@@ -163,7 +194,7 @@ export class AdminServer {
 
     // Unauthenticated endpoints.
     if (method === 'GET' && path === '/admin/health') return sendJson(res, 200, { ok: true });
-    if (method === 'GET' && path === '/admin/login') return this.onLogin(res);
+    if (method === 'GET' && path === '/admin/login') return this.onLogin(req, res, url);
     if (method === 'GET' && path === '/admin/callback') return this.onCallback(req, res, url);
     // Uploaded avatars are public images (Discord fetches them) — unauthenticated.
     if (method === 'GET' && path.startsWith('/admin/avatars/')) return this.serveAvatar(res, path);
@@ -305,36 +336,82 @@ export class AdminServer {
 
   // ── Auth flow ──
 
-  private onLogin(res: ServerResponse): void {
-    const state = this.sessions.issueState();
-    setCookie(res, STATE_COOKIE, state, {
-      httpOnly: true,
-      secure: this.deps.config.cookieSecure,
-      sameSite: 'Lax',
-      maxAge: 600,
-      path: '/admin',
-    });
+  /**
+   * Start a sign-in: a fresh state, kept server-side and in this browser's
+   * state cookie next to the (at most two) other live sign-ins it has in
+   * flight, so a second tab doesn't break the first. ?reauth=1 only marks
+   * the login.ok record.
+   */
+  private onLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    const state = this.sessions.issueState({ reauth: url.searchParams.get('reauth') === '1' });
+    const others = this.liveStates(cookieStates(req));
+    this.setStateCookie(res, [state, ...others]);
     redirect(res, authorizeUrl(this.deps.config.oauthClientId, this.deps.config.redirectUri, state));
   }
 
+  /**
+   * Discord sends the browser back here. Every outcome is a redirect to the
+   * panel: postLoginUrl, or postLoginUrl with a LoginError. Nothing in the
+   * redirect comes from the request.
+   *
+   * Login CSRF: a state is accepted only if this server issued it, it is
+   * live and unused, AND it is in this browser's HttpOnly state cookie.
+   */
   private async onCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-    const code = url.searchParams.get('code') ?? undefined;
-    const state = url.searchParams.get('state') ?? undefined;
-    const cookieState = getCookie(req, STATE_COOKIE);
-
-    // Double-submit + single-use: query state must match the cookie AND be live.
-    if (!code || !state || state !== cookieState || !this.sessions.consumeState(state)) {
-      this.audit.append({
-        actor: { id: 'unknown', name: 'unknown', kind: 'admin' },
-        action: 'login.failed',
-        ok: false,
-        detail: { reason: 'state/code validation failed' },
-      });
-      clearCookie(res, STATE_COOKIE, '/admin');
-      return this.loginFailed(res, 'failed');
+    // Per client address, before anything else is looked at.
+    const ip = clientIp(req);
+    const take = this.callbackLimit.take(ip);
+    if (!take.ok) {
+      if (take.report) this.recordRateLimited(ip, take.report.count);
+      return this.loginFailed(res, 'rate_limited');
     }
-    clearCookie(res, STATE_COOKIE, '/admin');
 
+    const q = url.searchParams;
+    const state = q.get('state') || undefined;
+    const code = q.get('code') || undefined;
+
+    // 1. Discord says the sign-in didn't happen (Cancel on its consent
+    //    screen, or its own error). The state cookie is left alone: other
+    //    tabs' sign-ins go on.
+    const discordError = q.get('error');
+    if (discordError !== null) {
+      if (discordError === 'access_denied') {
+        this.recordLoginFailed({ reason: 'cancelled' });
+        return this.loginFailed(res, 'cancelled');
+      }
+      this.recordLoginFailed({ reason: 'discord_error', discordError: DISCORD_ERRORS.has(discordError) ? discordError : 'other' });
+      return this.loginFailed(res, 'discord_error');
+    }
+
+    // 2. Back (or a reload) onto a callback already used, while signed in:
+    //    home, as is. The code is never looked at, so a code sent from
+    //    elsewhere can't replace a signed-in browser's session.
+    const inCookie = cookieStates(req);
+    const current = this.sessions.get(getCookie(req, SESSION_COOKIE));
+    if (current && (!state || !inCookie.includes(state) || this.sessions.stateStatus(state) === 'unknown')) {
+      return redirect(res, this.deps.config.postLoginUrl);
+    }
+
+    // 3. The state: started in this browser, by this server, recently. A
+    //    failure leaves the cookie as it was, so a junk callback can't end
+    //    another tab's sign-in.
+    if (!state || !inCookie.includes(state)) {
+      this.recordLoginFailed({ reason: 'mismatch' });
+      return this.loginFailed(res, 'mismatch');
+    }
+    if (!code) {
+      // Discord always sends a code or an error; keep the state for a retry.
+      this.recordLoginFailed({ reason: 'discord_error', step: 'callback' });
+      return this.loginFailed(res, 'discord_error');
+    }
+    // Unknown here: used already, never issued, or issued before a restart.
+    const used = this.sessions.consumeState(state);
+    if (!used.ok) {
+      this.recordLoginFailed({ reason: 'expired', stateStatus: used.why });
+      return this.loginFailed(res, 'expired');
+    }
+
+    // 4. Who is this, and what do they administer?
     let result;
     try {
       result = await completeOAuth(
@@ -347,15 +424,15 @@ export class AdminServer {
         this.fetchImpl,
       );
     } catch (e) {
-      this.audit.append({
-        actor: { id: 'unknown', name: 'unknown', kind: 'admin' },
-        action: 'login.failed',
-        ok: false,
-        detail: { reason: (e as Error).message },
-      });
-      return this.loginFailed(res, 'discord');
+      const why = e instanceof OAuthError
+        ? { step: e.step, failure: e.failure, ...(e.status !== undefined ? { status: e.status } : {}) }
+        : { step: 'unknown', failure: 'other' };
+      this.recordLoginFailed({ reason: 'discord_error', ...why });
+      return this.loginFailed(res, 'discord_error');
     }
+    const userName = result.user.global_name || result.user.username;
 
+    // 5. Eligibility.
     const isSuper = this.deps.config.superadmins.includes(result.user.id);
     // Per-guild operator allowlist (RFC-005 §5.3): grant guild-admin for guilds
     // that explicitly list this user, even when their live Discord perms don't
@@ -380,16 +457,21 @@ export class AdminServer {
     const adminGuilds = claimed;
     if (!isSuper && ![...adminGuilds].some((gid) => this.isServed(gid))) {
       this.audit.append({
-        actor: { id: result.user.id, name: result.user.global_name || result.user.username, kind: 'admin' },
+        actor: { id: result.user.id, name: userName, kind: 'admin' },
         action: 'login.denied',
         ok: false,
-        detail: { reason: 'administers no guild this relay serves' },
+        detail: { reason: 'no_manageable_guild' },
       });
       return this.loginFailed(res, 'not_admin');
     }
+
+    // 6. Signed in. The state is spent; a session this browser already had
+    //    (the same admin signing in again, or another one) ends here.
+    this.setStateCookie(res, this.liveStates(inCookie));
+    if (current) this.sessions.destroy(current.id);
     const session = this.sessions.create({
       userId: result.user.id,
-      userName: result.user.global_name || result.user.username,
+      userName,
       adminGuilds,
       guildNames,
       isSuper,
@@ -405,9 +487,40 @@ export class AdminServer {
       actor: { id: session.userId, name: session.userName, kind: 'admin' },
       action: 'login.ok',
       ok: true,
-      detail: { isSuper, adminGuilds: [...adminGuilds] },
+      detail: { isSuper, adminGuilds: [...adminGuilds], ...(used.reauth ? { reauth: true } : {}) },
     });
     redirect(res, this.deps.config.postLoginUrl);
+  }
+
+  /** The states this server still has in flight, in the order given. */
+  private liveStates(states: string[]): string[] {
+    return states.filter((s) => this.sessions.stateStatus(s) === 'live');
+  }
+
+  /** The state cookie as `states` (newest first, at most STATES_PER_BROWSER),
+   *  or cleared when there are none. Max-Age is a sign-in's lifetime (600 s),
+   *  counted from the newest. */
+  private setStateCookie(res: ServerResponse, states: string[]): void {
+    const keep = [...new Set(states)].slice(0, STATES_PER_BROWSER);
+    if (!keep.length) return clearCookie(res, STATE_COOKIE, '/admin');
+    setCookie(res, STATE_COOKIE, keep.join('.'), {
+      httpOnly: true,
+      secure: this.deps.config.cookieSecure,
+      sameSite: 'Lax',
+      maxAge: Math.floor(STATE_TTL_MS / 1000),
+      path: '/admin',
+    });
+  }
+
+  /** A callback that came back without a session. `detail` holds only fixed
+   *  words and numbers (reason, step, failure, an HTTP status). */
+  private recordLoginFailed(detail: Record<string, string | number>): void {
+    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.failed', ok: false, detail });
+  }
+
+  /** At most one a minute per address (LoginRateLimit decides when). */
+  private recordRateLimited(ip: string, count: number): void {
+    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.rate_limited', ok: false, detail: { ip, count } });
   }
 
   private onLogout(req: IncomingMessage, res: ServerResponse, session: AdminSession): void {
@@ -1176,7 +1289,7 @@ export class AdminServer {
 
   /** Land a failed or refused login on the panel with a fixed reason code
    *  (the SPA maps codes to messages; nothing from the request is echoed). */
-  private loginFailed(res: ServerResponse, code: 'failed' | 'discord' | 'not_admin'): void {
+  private loginFailed(res: ServerResponse, code: LoginError): void {
     const to = this.deps.config.postLoginUrl;
     redirect(res, `${to}${to.includes('?') ? '&' : '?'}login_error=${code}`);
   }
@@ -1542,6 +1655,13 @@ function appendSetCookie(res: ServerResponse, cookie: string): void {
   const list = Array.isArray(prev) ? prev : prev ? [String(prev)] : [];
   list.push(cookie);
   res.setHeader('set-cookie', list);
+}
+
+/** The well-formed states in this browser's state cookie, newest first. */
+function cookieStates(req: IncomingMessage): string[] {
+  const raw = getCookie(req, STATE_COOKIE);
+  if (!raw) return [];
+  return raw.split('.', STATES_PER_BROWSER + 1).filter((s) => STATE_FORMAT.test(s)).slice(0, STATES_PER_BROWSER);
 }
 
 function getCookie(req: IncomingMessage, name: string): string | undefined {

@@ -127,6 +127,44 @@ anything). If the browser is now signed in as another admin, the tab reloads.
 Sign-in errors (`?login_error=`) are shown from a fixed table and removed
 from the address.
 
+## Signing in
+
+Every way back from Discord ends in the panel or on the sign-in card with a
+plain sentence and **Try again** — never an error page:
+
+- Up to three sign-ins can be in flight in one browser (Sign in in two tabs,
+  then finish both): each tab's sign-in completes.
+- After signing in, Back (or a reload) onto the callback — or Discord's page
+  sending the browser back with the same sign-in — goes to the panel, still
+  signed in. Nothing is exchanged or recorded.
+- Signing in again — the same admin, or another one — ends the session that
+  browser had.
+- Otherwise the callback sends the browser to `PORTAL_ADMIN_POST_LOGIN_URL`
+  with one of these `login_error` codes, and the card says:
+
+  | code | the card says |
+  | --- | --- |
+  | `cancelled` | Sign-in was cancelled in Discord. |
+  | `expired` | That sign-in took too long or the relay restarted. Try again. |
+  | `mismatch` | Sign-in was started in another tab. Try again here. |
+  | `discord_error` | Discord didn't respond. Try again in a minute. |
+  | `rate_limited` | Too many sign-in attempts. Wait a minute and try again. |
+  | `not_admin` | You don't manage any guild this relay serves. … |
+
+  A failed callback leaves the browser's other sign-ins as they were. Sign-ins
+  in flight are kept in memory for ten minutes, so one that spans a relay
+  restart comes back as `expired`.
+
+The callback is rate limited per client address, 20 a minute (never
+globally). The address is the rightmost `X-Forwarded-For` entry, which Caddy's
+`reverse_proxy` sets to the address it saw, so keep the admin API reachable
+only through Caddy. (Behind another proxy, such as a CDN, the limit applies
+per address of that proxy.) The audit log records each failed callback as
+`login.failed` with a fixed `reason` (`cancelled`, `expired`, `mismatch`,
+`discord_error` — with the step and HTTP status when Discord failed the code
+exchange), a refused sign-in as `login.denied`, and refusals over the limit as
+at most one `login.rate_limited` record per address per minute, with a count.
+
 Browser storage is a convenience only (the panel works without it):
 `localStorage` keeps `pa.lastGuild:<user>` and `pa.lastTab:<user>` (cleared on
 Sign out), `sessionStorage` keeps `pa.returnTo` and `pa.draft` for one sign-in.
@@ -193,6 +231,8 @@ it routes the request, so a request without it changes nothing.
 
 Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }`.
 
+- `GET /admin/login[?reauth=1]` → Discord; `GET /admin/callback` → the panel (see
+  [Signing in](#signing-in)); `reauth=1` only marks the `login.ok` record.
 - `GET /admin/me` → `{user, isSuper, guilds:[{id,name}], csrf, apiVersion, levels, caps,
   features:{invites,avatarUploads,allowlistEditable}, session:{expiresAt}}` — `levels`
   and `caps` are the relay's Read/Write/Full and capability list (the panel keeps a

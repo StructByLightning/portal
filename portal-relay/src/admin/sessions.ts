@@ -6,7 +6,8 @@
  * re-derived from Discord at every login, never refreshed mid-session).
  *
  * Also holds short-lived OAuth `state` values for CSRF protection of the
- * login→callback round-trip.
+ * login→callback round-trip. They live only in memory: a sign-in that spans a
+ * relay restart comes back as `expired`, and the panel says to try again.
  */
 import { randomBytes } from 'node:crypto';
 
@@ -25,9 +26,24 @@ export interface AdminSession {
   expiresAt: number;
 }
 
+/** How long a sign-in may take between /admin/login and the callback. */
+export const STATE_TTL_MS = 10 * 60_000;
+/** Sign-ins in flight at once, all browsers together; past it the oldest go. */
+const MAX_PENDING_LOGINS = 10_000;
+
+/** A sign-in started at /admin/login, waiting for its callback. */
+interface PendingLogin {
+  expiresAt: number;
+  /** Started with ?reauth=1 (only noted on the login.ok record). */
+  reauth: boolean;
+}
+
+/** What consumeState found. */
+export type StateCheck = { ok: true; reauth: boolean } | { ok: false; why: 'unknown' | 'expired' };
+
 export class SessionStore {
   private sessions = new Map<string, AdminSession>();
-  private states = new Map<string, number>(); // state → expiresAt
+  private states = new Map<string, PendingLogin>();
   private sweepTimer?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -49,19 +65,35 @@ export class SessionStore {
 
   // ── OAuth state (CSRF for the login redirect) ──
 
-  issueState(): string {
+  issueState(opts: { reauth?: boolean } = {}): string {
+    if (this.states.size >= MAX_PENDING_LOGINS) {
+      this.sweep();
+      // Still full: the oldest sign-ins in flight make room (Map keeps
+      // insertion order).
+      for (const k of this.states.keys()) {
+        if (this.states.size < MAX_PENDING_LOGINS) break;
+        this.states.delete(k);
+      }
+    }
     const s = token();
-    this.states.set(s, this.now() + 10 * 60_000); // 10 min to complete login
+    this.states.set(s, { expiresAt: this.now() + STATE_TTL_MS, reauth: opts.reauth === true });
     return s;
   }
 
-  /** Validate-and-consume a state value (single use). */
-  consumeState(state: string | undefined): boolean {
-    if (!state) return false;
-    const exp = this.states.get(state);
-    if (exp === undefined) return false;
-    this.states.delete(state);
-    return exp > this.now();
+  /** 'live': issued here, not used, not expired. 'unknown': never issued
+   *  here, already used, or forgotten (a restart, the sweep). */
+  stateStatus(state: string | undefined): 'live' | 'expired' | 'unknown' {
+    const p = state ? this.states.get(state) : undefined;
+    if (!p) return 'unknown';
+    return p.expiresAt > this.now() ? 'live' : 'expired';
+  }
+
+  /** Validate-and-consume a state value (single use, live or not). */
+  consumeState(state: string | undefined): StateCheck {
+    const p = state ? this.states.get(state) : undefined;
+    if (!p) return { ok: false, why: 'unknown' };
+    this.states.delete(state!);
+    return p.expiresAt > this.now() ? { ok: true, reauth: p.reauth } : { ok: false, why: 'expired' };
   }
 
   // ── Sessions ──
@@ -97,7 +129,7 @@ export class SessionStore {
   private sweep(): void {
     const t = this.now();
     for (const [id, s] of this.sessions) if (s.expiresAt <= t) this.sessions.delete(id);
-    for (const [s, exp] of this.states) if (exp <= t) this.states.delete(s);
+    for (const [s, p] of this.states) if (p.expiresAt <= t) this.states.delete(s);
   }
 }
 

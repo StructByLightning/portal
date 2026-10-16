@@ -76,9 +76,18 @@ test('SessionStore: TTL expiry and single-use state', () => {
   assert.equal(store.get(s.id), undefined);
 
   const state = store.issueState();
-  assert.equal(store.consumeState(state), true);
-  assert.equal(store.consumeState(state), false, 'state is single-use');
-  assert.equal(store.consumeState('never-issued'), false);
+  assert.equal(store.stateStatus(state), 'live');
+  assert.deepEqual(store.consumeState(state), { ok: true, reauth: false });
+  assert.deepEqual(store.consumeState(state), { ok: false, why: 'unknown' }, 'state is single-use');
+  assert.equal(store.stateStatus(state), 'unknown');
+  assert.deepEqual(store.consumeState('never-issued'), { ok: false, why: 'unknown' });
+
+  const slow = store.issueState({ reauth: true });
+  now += 10 * 60_000; // the ten minutes a sign-in may take
+  assert.equal(store.stateStatus(slow), 'expired');
+  assert.deepEqual(store.consumeState(slow), { ok: false, why: 'expired' });
+  const re = store.issueState({ reauth: true });
+  assert.deepEqual(store.consumeState(re), { ok: true, reauth: true });
 });
 
 // ── Audit log ──
@@ -874,13 +883,13 @@ test('integration: tampered oauth state is rejected', async () => {
   await server.listen();
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
-    // Cookie and query state disagree → 400, no session minted.
+    // Cookie and query state disagree → back on the panel, no session minted.
     const res = await fetch(
       `${base}/admin/callback?code=abc&state=forged`,
       { redirect: 'manual', headers: { cookie: 'portal_admin_state=real' } },
     );
     assert.equal(res.status, 302, 'lands back on the panel');
-    assert.match(res.headers.get('location') ?? '', /login_error=failed$/);
+    assert.equal(res.headers.get('location'), '/done?login_error=mismatch');
     assert.equal(parseSetCookie(res, 'portal_admin_session'), undefined);
   } finally {
     await server.close();
