@@ -459,6 +459,19 @@ test('panel scripts: data never goes through an HTML parser', () => {
   }
 });
 
+test('index.html: the session bar has a copy inside the drawer, between its header and its body', () => {
+  // The drawer covers the page and keeps Tab inside itself, so the copy that
+  // can be seen and reached while it is open must be in it (and the
+  // fixture's drawerDom must match).
+  const html = source('index.html');
+  const drawer = /<aside id="drawer"[^>]*>([\s\S]*?)<\/aside>/.exec(html);
+  assert.ok(drawer, 'index.html has the drawer');
+  assert.match(drawer[1], /<\/header>\s*(<!--[\s\S]*?-->\s*)?<div id="drawer-session-bar" class="session-bar hidden" role="status"><\/div>\s*<div id="drawer-body"/);
+  assert.match(html, /<div id="session-bar" class="session-bar hidden" role="status"><\/div>/);
+  const css = source('styles.css');
+  assert.match(css, /body:has\(#drawer:not\(\.hidden\)\) #session-bar \{ visibility: hidden; \}/, 'the page’s copy is not shown behind the drawer');
+});
+
 test('index.html loads lib.js, ui.js, then app.js, deferred and versioned', () => {
   const html = source('index.html');
   const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
@@ -680,17 +693,18 @@ test('ui.dirtyTracker: edits make a form dirty; reset() and data-no-dirty do not
 
 // ── The drawer and the toast stack, from the keyboard ──
 
-/** index.html's drawer markup and toast stack. */
+/** index.html's drawer markup (with its copy of the session bar) and toast stack. */
 function drawerDom(doc: FakeDocument, el: (...a: any[]) => FakeElement) {
   const title = el('h2', { id: 'drawer-title', tabindex: '-1' });
   const close = el('button', { id: 'drawer-close', 'aria-label': 'Close panel', text: '✕' });
+  const bar = el('div', { id: 'drawer-session-bar', class: 'session-bar hidden', role: 'status' });
   const body = el('div', { id: 'drawer-body' });
-  const drawer = el('aside', { id: 'drawer', class: 'drawer hidden', role: 'dialog', tabindex: '-1' }, [el('header', {}, [title, close]), body]);
+  const drawer = el('aside', { id: 'drawer', class: 'drawer hidden', role: 'dialog', tabindex: '-1' }, [el('header', {}, [title, close]), bar, body]);
   doc.body.appendChild(el('div', { id: 'drawer-scrim', class: 'drawer-scrim hidden' }));
   doc.body.appendChild(drawer);
   const toasts = el('div', { id: 'toasts' });
   doc.body.appendChild(toasts);
-  return { title, close, drawer, toasts };
+  return { title, close, bar, drawer, toasts };
 }
 
 test('ui.drawer: Tab reaches a sticky toast’s ✕ from the drawer; ✕ and Esc dismiss it and leave the drawer open', () => {
@@ -2255,4 +2269,91 @@ test('session: tabs tell each other about sign-in and sign-out; coming back to t
   assert.deepEqual(plain(ch.posted.at(-1)), { type: 'signed-out' });
   assert.equal(box.localStore.getItem('pa.lastTab:' + ME_GWEN.user.id), null);
   assert.ok(!box.doc.getElementById('login')!.classList.contains('hidden'));
+});
+
+test('session: with a drawer open the bar is in the drawer, in its Tab cycle; its Sign in again keeps the form', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: { ...ME_OP, session: { expiresAt: Date.now() + 60_000 } },
+    guilds: [{ id: GA, name: 'Guild One' }],
+    handle: () => (down ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
+  });
+  const { doc, nav, sessionStore, drawerOpen } = box;
+  assert.ok(drawerOpen());
+  const pageBar = doc.getElementById('session-bar')!;
+  const bar = doc.getElementById('drawer-session-bar')!;
+  // Within two minutes of the end: both copies say when (styles.css shows
+  // the drawer's while it is open).
+  assert.ok(!bar.classList.contains('hidden'));
+  assert.match(bar.textContent, /^Your session ends at .+\.Sign in again$/);
+  assert.equal(pageBar.textContent, bar.textContent);
+  const signIn = clickable(doc, 'Sign in again', bar);
+
+  // The bar's button is inside the drawer, so Tab reaches it: from ✕ the
+  // browser moves on to it, and from it into the form (a control outside the
+  // drawer would be pulled back to ✕).
+  assert.ok(doc.getElementById('drawer')!.contains(signIn));
+  doc.getElementById('drawer-close')!.focus();
+  assert.equal(doc.key('Tab').defaultPrevented, false);
+  signIn.focus();
+  assert.equal(doc.key('Tab').defaultPrevented, false);
+  assert.equal(doc.activeElement, signIn);
+  assert.equal(doc.key('Tab', { shiftKey: true }).defaultPrevented, false);
+  const label = doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!;
+
+  // The session ends while the admin is on the button: the words change, the
+  // button (and the focus on it) stays.
+  fillMint(doc, 'x', 'g1-readers');
+  signIn.focus();
+  down = true;
+  doc.getElementById('drawer-body')!.querySelector('form')!.fire('submit');
+  await settle();
+  const modal = doc.querySelector('.modal')!;
+  assert.equal(modal.querySelector('h2')!.textContent, 'Your session ended — this change was NOT saved.');
+  clickable(doc, 'Close', modal).click();
+  await settle();
+  assert.equal(doc.querySelector('.modal'), null);
+  assert.ok(drawerOpen(), 'the drawer and its form stay');
+  assert.equal(label.value, 'x');
+  // Closed the modal: the drawer still offers Sign in again, at its top.
+  assert.match(bar.textContent, /^Your session ended\.Sign in again$/);
+  assert.equal(clickable(doc, 'Sign in again', bar), signIn, 'the same button, so focus on it is not lost');
+
+  // And it keeps the form, as the modal's does — no "Discard changes?".
+  signIn.click();
+  assert.equal(doc.querySelector('.modal'), null, 'nothing asks to discard the form');
+  assert.deepEqual(nav.assigned, ['/admin/login']);
+  assert.equal(sessionStore.getItem('pa.returnTo'), g + '/invites/new');
+  const draft = JSON.parse(sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.form, 'mint');
+  assert.equal(draft.fields.label, 'x');
+  assert.deepEqual(draft.fields.roles, ['g1-readers']);
+  assert.equal(nav.dispatch('beforeunload').defaultPrevented, false);
+});
+
+test('ui.expiryBar: shown in both places, words updated in place, hidden in both', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, expiryBar } = ctx.PA.ui;
+  const page = el('div', { id: 'session-bar', class: 'session-bar hidden' });
+  doc.body.appendChild(page);
+  const dom = drawerDom(doc, el);
+  let clicks = 0;
+  expiryBar().show('Your session ends at 3:13 PM.', 'Sign in again', () => clicks++);
+  for (const host of [page, dom.bar]) {
+    assert.ok(!host.classList.contains('hidden'));
+    assert.equal(host.textContent, 'Your session ends at 3:13 PM.Sign in again');
+  }
+  const btn = dom.bar.querySelector('button')!;
+  expiryBar().show('Your session ended at 3:13 PM.', 'Sign in again', () => (clicks += 10));
+  assert.equal(dom.bar.querySelector('button'), btn, 'the button is kept');
+  assert.equal(dom.bar.textContent, 'Your session ended at 3:13 PM.Sign in again');
+  btn.click();
+  assert.equal(clicks, 10, 'and does what the latest show() asked');
+  expiryBar().hide();
+  for (const host of [page, dom.bar]) {
+    assert.ok(host.classList.contains('hidden'));
+    assert.equal(host.textContent, '');
+  }
 });

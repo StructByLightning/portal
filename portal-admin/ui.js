@@ -827,23 +827,46 @@
   }
 
   /**
-   * The bar under the top bar that says when the session ends, with one
-   * action. `host` is index.html's #session-bar. Returns { show(text,
-   * actionLabel, onAction), hide() }.
+   * The bar that says when the session ends, with one action. It is drawn in
+   * two places from index.html: #session-bar under the top bar, and
+   * #drawer-session-bar at the top of the drawer. The drawer covers the page
+   * (on a phone, all of it), a click beside it lands on the scrim, and Tab
+   * stays inside it, so while it is open only its own copy can be seen and
+   * reached (styles.css hides the page's) — and the drawer is where an
+   * unsaved form is. Returns { show(text, actionLabel, onAction), hide() }.
+   * A bar already up keeps its button when the words change ("ends at" →
+   * "ended at"), so a keyboard user on it stays there.
    */
-  function expiryBar(host) {
+  let barAction = null;
+  function expiryBar() {
+    const hosts = ['session-bar', 'drawer-session-bar'].map((id) => document.getElementById(id)).filter(Boolean);
     return {
       show(text, actionLabel, onAction) {
-        if (!host) return;
-        clear(host);
-        host.appendChild(el('span', { class: 'session-bar-text', text }));
-        if (actionLabel) host.appendChild(el('button', { class: 'btn btn-sm', text: actionLabel, onclick: onAction }));
-        host.classList.remove('hidden');
+        barAction = onAction || null;
+        for (const host of hosts) {
+          let span = host.querySelector('.session-bar-text');
+          let btn = host.querySelector('button');
+          if (!span) {
+            clear(host);
+            span = host.appendChild(el('span', { class: 'session-bar-text' }));
+            btn = null;
+          }
+          span.textContent = text;
+          if (actionLabel && !btn) btn = host.appendChild(el('button', { class: 'btn btn-sm', onclick: () => barAction && barAction() }));
+          if (btn && !actionLabel) {
+            host.removeChild(btn);
+            btn = null;
+          }
+          if (btn) btn.textContent = actionLabel;
+          host.classList.remove('hidden');
+        }
       },
       hide() {
-        if (!host) return;
-        host.classList.add('hidden');
-        clear(host);
+        barAction = null;
+        for (const host of hosts) {
+          host.classList.add('hidden');
+          clear(host);
+        }
       },
     };
   }

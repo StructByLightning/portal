@@ -272,10 +272,11 @@ function signInAgain() {
 }
 
 /** The session is over (a 401, or a sign-out in another tab): say so over the
- *  page, which stays as it is — and, once that is closed, in the bar. */
+ *  page, which stays as it is — and, once that is closed, in the bar (the
+ *  drawer's own copy while it is open). */
 function sessionEnded(kind) {
   clearTimeout(state.expiryTimer);
-  ui.expiryBar($('#session-bar')).show(kind === 'elsewhere' ? 'You signed out in another tab.' : 'Your session ended.', 'Sign in again', signInAgain);
+  ui.expiryBar().show(kind === 'elsewhere' ? 'You signed out in another tab.' : 'Your session ended.', 'Sign in again', signInAgain);
   ui.sessionEnded({ kind, onSignIn: signInAgain });
 }
 
@@ -429,12 +430,13 @@ function broadcast(type) {
   try { if (channel) channel.postMessage({ type }); } catch { /* other tabs find out on their next request */ }
 }
 
-/** The bar under the top bar: two minutes before the session ends it says
- *  when, with Sign in again (which keeps the place and the form). */
+/** The bar under the top bar (and at the top of an open drawer): two minutes
+ *  before the session ends it says when, with Sign in again (which keeps the
+ *  place and the form). */
 const EXPIRY_WARN_MS = 2 * 60_000;
 function scheduleExpiry() {
   clearTimeout(state.expiryTimer);
-  const bar = ui.expiryBar($('#session-bar'));
+  const bar = ui.expiryBar();
   const ends = state.me && state.me.session && typeof state.me.session.expiresAt === 'number'
     ? state.me.session.expiresAt - state.clockSkew : null;
   if (ends == null) return bar.hide();
@@ -454,7 +456,7 @@ function scheduleExpiry() {
 }
 function stopExpiry() {
   clearTimeout(state.expiryTimer);
-  ui.expiryBar($('#session-bar')).hide();
+  ui.expiryBar().hide();
 }
 /** '14:05' (or '2:05 PM'), in this browser's way of writing times. */
 function clockText(ms) {

@@ -54,7 +54,8 @@
       </div>
     </header>
 
-    <!-- When the session ends (from two minutes before), with Sign in again. -->
+    <!-- When the session ends (from two minutes before), with Sign in again.
+         While the drawer is open, its own copy (#drawer-session-bar) shows. -->
     <div id="session-bar" class="session-bar hidden" role="status"></div>
 
     <!-- Notices about the panel itself (a newer relay asks for a reload). -->
@@ -70,6 +71,9 @@
       <h2 id="drawer-title" class="drawer-title" tabindex="-1"></h2>
       <button type="button" id="drawer-close" class="btn btn-ghost btn-sm" aria-label="Close panel" title="Close (Esc)">✕</button>
     </header>
+    <!-- The session bar again, for while the drawer covers the page: the
+         drawer is where an unsaved form is, and Tab stays inside it. -->
+    <div id="drawer-session-bar" class="session-bar hidden" role="status"></div>
     <div id="drawer-body" class="drawer-body"></div>
   </aside>
 
