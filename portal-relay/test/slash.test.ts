@@ -78,7 +78,7 @@ function makeHandler() {
     options,
   });
 
-  return { handler, permissions, invites, resyncs, inv, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { handler, identity, permissions, invites, resyncs, inv, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('authorization: Manage-Server, superadmin, or guild delegate pass; others are denied', () => {
@@ -436,3 +436,25 @@ test('/ban holds until an admin grants access again; /add or /add-role lifts it'
   }
 });
 
+
+test('a persona on the file default keeps it in other guilds after /add, /add-role, /remove and /remove-role here', () => {
+  const t = makeHandler();
+  try {
+    (t.permissions as any).fileDefault = ['VIEW_CHANNEL'];
+    const ids = ['nyx-1', 'quill-1', 'juniper-1', 'sol-1'];
+    for (const id of ids) t.identity.upsert({ id, displayName: id, avatar: '', token: `tok-${id}` });
+    const elsewhere = (pid: string) => [...t.permissions.resolve(pid, 'g2', 'chan-z')];
+    for (const id of ids) assert.deepEqual(elsewhere(id), ['VIEW_CHANNEL'], 'no entry: the file default everywhere');
+    t.handler.handle(t.inv('add', { persona: 'nyx-1', level: 'write' }));
+    assert.deepEqual(elsewhere('nyx-1'), ['VIEW_CHANNEL'], '/add');
+    t.handler.handle(t.inv('add-role', { persona: 'quill-1', role: 'chan-role' }));
+    assert.deepEqual(elsewhere('quill-1'), ['VIEW_CHANNEL'], '/add-role');
+    t.handler.handle(t.inv('remove', { persona: 'juniper-1' }));
+    assert.deepEqual(elsewhere('juniper-1'), ['VIEW_CHANNEL'], '/remove');
+    t.handler.handle(t.inv('add-role', { persona: 'sol-1', role: 'guild-role' }));
+    t.handler.handle(t.inv('remove-role', { persona: 'sol-1', role: 'guild-role' }));
+    assert.deepEqual(elsewhere('sol-1'), ['VIEW_CHANNEL'], '/remove-role');
+  } finally {
+    t.cleanup();
+  }
+});

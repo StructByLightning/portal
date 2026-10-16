@@ -335,7 +335,10 @@ writeFileSync(join(dir, 'identity.json'), JSON.stringify({
   }),
 }, null, 2));
 writeFileSync(join(dir, 'permissions.json'), JSON.stringify({ roles: ACCESS_ROLES, personas: PERMISSIONS }, null, 2));
-writeFileSync(join(dir, 'invites.json'), JSON.stringify({ invites: INVITES }, null, 2));
+// In the order they were made, as the relay's store keeps them (it appends each
+// new invite; the panel lists them newest first).
+const byCreated = (a: Record<string, unknown>, b: Record<string, unknown>) => String(a.createdAt).localeCompare(String(b.createdAt));
+writeFileSync(join(dir, 'invites.json'), JSON.stringify({ invites: [...INVITES].sort(byCreated) }, null, 2));
 const auditPath = join(dir, 'audit.jsonl');
 writeFileSync(auditPath, AUDIT.map((r) => JSON.stringify(r)).join('\n') + '\n');
 

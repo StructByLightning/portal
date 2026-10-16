@@ -49,6 +49,17 @@ function fromEntry(e: PersonaEntry): PersonaFileEntry {
   };
 }
 
+/** Drop what an edit left empty in one guild of a policy: an empty channel
+ *  map, then a guild entry holding nothing, then an empty guilds map. (An
+ *  empty entry resolves exactly like a missing one; it is only clutter.) */
+function pruneGuild(pol: PersonaPolicy, guildId: string): void {
+  const g = pol.guilds?.[guildId];
+  if (!g) return;
+  if (g.channels && !Object.keys(g.channels).length) delete g.channels;
+  if (g.default === undefined && !g.channels) delete pol.guilds![guildId];
+  if (pol.guilds && !Object.keys(pol.guilds).length) delete pol.guilds;
+}
+
 export type PermissionChange = {
   personaId: string;
   /** Granularity of what changed — drives how many channels the relay re-pushes. */
@@ -364,12 +375,29 @@ export class PermissionsStore {
   }
 
   clearChannel(personaId: string, guildId: string, channelId: string): void {
-    const g = this.personas.get(personaId)?.policy?.guilds?.[guildId];
+    const pol = this.personas.get(personaId)?.policy;
+    const g = pol?.guilds?.[guildId];
     if (g?.channels) {
       delete g.channels[channelId];
+      pruneGuild(pol!, guildId);
       this.persist();
       this.emit({ personaId, scope: 'channel', guildId, channelId });
     }
+  }
+
+  /** Remove a persona's guild-wide setting in `guildId` (neither a level nor
+   *  a deny): channels there without their own grant fall back to the
+   *  persona default. A guild entry left with nothing in it is deleted.
+   *  Returns whether there was a setting to remove. */
+  unsetGuildDefault(personaId: string, guildId: string): boolean {
+    const pol = this.personas.get(personaId)?.policy;
+    const g = pol?.guilds?.[guildId];
+    if (!g || g.default === undefined) return false;
+    delete g.default;
+    pruneGuild(pol!, guildId);
+    this.persist();
+    this.emit({ personaId, scope: 'guild', guildId });
+    return true;
   }
 
   /** Ban a persona from one guild (/ban): drops every channel grant, pins the
