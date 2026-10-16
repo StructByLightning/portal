@@ -4,7 +4,8 @@
 // global (window.PA.<module>), and no HTML parsing of data — and the
 // behaviour of ui.js's feedback helpers: busy() locks a button for exactly one
 // request, onSubmit() ignores a second submit while the first is pending,
-// errors toast stickily, and dirtyTracker() notices edits.
+// errors toast stickily (and their ✕ can be reached from the keyboard while
+// the drawer is open), and dirtyTracker() notices edits.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -16,7 +17,28 @@ const ADMIN = fileURLToPath(new URL('../../portal-admin/', import.meta.url));
 const SCRIPTS = ['ui.js', 'app.js'];
 const source = (f: string) => readFileSync(join(ADMIN, f), 'utf8');
 
-// ── A minimal DOM: enough for ui.js's helpers, and for loading app.js ──
+// ── A minimal DOM: enough for ui.js's helpers, and for booting app.js ──
+
+/** Selectors as the panel uses them: comma lists of compound selectors made
+ *  of tag, #id, .class, [attr], [attr="v"] and :not(…). No combinators. */
+function matchesSelector(el: FakeElement, sel: string): boolean {
+  return sel.split(/,(?![^(]*\))/).some((part) => matchesCompound(el, part.trim()));
+}
+function matchesCompound(el: FakeElement, sel: string): boolean {
+  const m = /^([a-zA-Z][\w-]*)?(.*)$/.exec(sel)!;
+  if (m[1] && el.tagName !== m[1].toUpperCase()) return false;
+  const tokens = m[2].match(/#[\w-]+|\.[\w-]+|\[[^\]]+\]|:not\([^)]*\)/g) ?? [];
+  if (tokens.join('') !== m[2]) throw new Error('fake DOM: unsupported selector ' + JSON.stringify(sel));
+  return tokens.every((t) => {
+    if (t.startsWith('#')) return el.id === t.slice(1);
+    if (t.startsWith('.')) return el.classList.contains(t.slice(1));
+    if (t.startsWith(':not(')) return !matchesCompound(el, t.slice(5, -1));
+    const a = /^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(t);
+    if (!a) throw new Error('fake DOM: unsupported selector ' + JSON.stringify(sel));
+    const v = a[1] === 'type' ? el.type || el.getAttribute('type') : el.getAttribute(a[1]);
+    return a[2] === undefined ? v !== null : v === a[2];
+  });
+}
 
 class FakeNode {
   childNodes: FakeNode[] = [];
@@ -60,7 +82,6 @@ class FakeElement extends FakeNode {
   attrs = new Map<string, string>();
   listeners = new Map<string, Array<(e: unknown) => void>>();
   style: Record<string, string> = {};
-  disabled = false;
   value = '';
   checked = false;
   type = '';
@@ -69,6 +90,55 @@ class FakeElement extends FakeNode {
   }
   get children() {
     return this.childNodes.filter((c): c is FakeElement => c instanceof FakeElement);
+  }
+  get lastChild() {
+    return this.childNodes.at(-1) ?? null;
+  }
+  get disabled() {
+    return this.attrs.has('disabled');
+  }
+  set disabled(v: boolean) {
+    if (v) this.attrs.set('disabled', '');
+    else this.attrs.delete('disabled');
+  }
+  get dataset(): Record<string, string | undefined> {
+    return new Proxy({}, {
+      get: (_t, k) => (typeof k === 'string' ? this.attrs.get('data-' + k.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase())) : undefined),
+    });
+  }
+  get options() {
+    return this.querySelectorAll('option');
+  }
+  matches(sel: string) {
+    return matchesSelector(this, sel);
+  }
+  closest(sel: string): FakeElement | null {
+    for (let n: FakeNode | null = this; n; n = n.parentNode) if (n instanceof FakeElement && n.matches(sel)) return n;
+    return null;
+  }
+  querySelectorAll(sel: string): FakeElement[] {
+    const out: FakeElement[] = [];
+    const walk = (n: FakeNode) => {
+      for (const c of n.childNodes) {
+        if (!(c instanceof FakeElement)) continue;
+        if (c.matches(sel)) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
+  }
+  querySelector(sel: string) {
+    return this.querySelectorAll(sel)[0] ?? null;
+  }
+  contains(n: FakeNode | null) {
+    for (; n; n = n.parentNode) if (n === this) return true;
+    return false;
+  }
+  /** display:none comes from the .hidden class here, as in styles.css. */
+  checkVisibility() {
+    for (let n: FakeNode | null = this; n instanceof FakeElement; n = n.parentNode) if (n.classList.contains('hidden')) return false;
+    return true;
   }
   get className() {
     return this.attrs.get('class') ?? '';
@@ -165,6 +235,19 @@ class FakeDocument {
   }
   addEventListener(type: string, fn: unknown) {
     this.listeners.push([type, fn]);
+  }
+  querySelector(sel: string) {
+    return this.body.querySelector(sel);
+  }
+  querySelectorAll(sel: string) {
+    return this.body.querySelectorAll(sel);
+  }
+  /** Dispatch a key to the document's keydown listeners (ui.js's runs first,
+   *  as it is registered first, in the capture phase). */
+  key(key: string, opts: { shiftKey?: boolean } = {}) {
+    const ev = { key, shiftKey: !!opts.shiftKey, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; }, stopPropagation() {} };
+    for (const [type, fn] of this.listeners) if (type === 'keydown') (fn as (e: unknown) => void)(ev);
+    return ev;
   }
 }
 
@@ -380,3 +463,89 @@ test('ui.dirtyTracker: edits make a form dirty; reset() and data-no-dirty do not
   instant.value = 'g1-readers';
   assert.equal(t.isDirty(), false);
 });
+
+// ── The drawer and the toast stack, from the keyboard ──
+
+/** index.html's drawer markup and toast stack. */
+function drawerDom(doc: FakeDocument, el: (...a: any[]) => FakeElement) {
+  const title = el('h2', { id: 'drawer-title', tabindex: '-1' });
+  const close = el('button', { id: 'drawer-close', 'aria-label': 'Close panel', text: '✕' });
+  const body = el('div', { id: 'drawer-body' });
+  const drawer = el('aside', { id: 'drawer', class: 'drawer hidden', role: 'dialog', tabindex: '-1' }, [el('header', {}, [title, close]), body]);
+  doc.body.appendChild(el('div', { id: 'drawer-scrim', class: 'drawer-scrim hidden' }));
+  doc.body.appendChild(drawer);
+  const toasts = el('div', { id: 'toasts' });
+  doc.body.appendChild(toasts);
+  return { title, close, drawer, toasts };
+}
+
+test('ui.drawer: Tab reaches a sticky toast’s ✕ from the drawer; ✕ and Esc dismiss it and leave the drawer open', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, drawer, statusLine } = ctx.PA.ui;
+  const dom = drawerDom(doc, el);
+  const label = el('input', { type: 'text' });
+  const submit = el('button', { type: 'submit', text: 'Mint invite' });
+  const form = el('form', {}, [label, submit]);
+  drawer.open({ title: 'Mint invite', body: form });
+  assert.equal(doc.activeElement, dom.title);
+
+  // No toast: the drawer's own cycle, as before.
+  submit.focus();
+  assert.equal(doc.key('Tab').defaultPrevented, true);
+  assert.equal(doc.activeElement, dom.close, 'Tab from the last control wraps to the first');
+  label.focus();
+  assert.equal(doc.key('Tab').defaultPrevented, false, 'within the drawer the browser moves focus');
+
+  const status = statusLine(form);
+  status.err('Not minted: pick at least one access role.');
+  const x = dom.toasts.querySelector('.toast-x')!;
+  assert.ok(x, 'the error toast has a ✕');
+  submit.focus();
+  doc.key('Tab');
+  assert.equal(doc.activeElement, x, 'Tab goes on from the drawer’s last control to the toast’s ✕');
+  doc.key('Tab');
+  assert.equal(doc.activeElement, dom.close, '…and from there round to the drawer');
+  doc.key('Tab', { shiftKey: true });
+  assert.equal(doc.activeElement, x, 'Shift+Tab from the first control reaches the ✕');
+  doc.key('Tab', { shiftKey: true });
+  assert.equal(doc.activeElement, submit, '…and Shift+Tab again is back in the drawer');
+  dom.title.focus();
+  doc.key('Tab', { shiftKey: true });
+  assert.equal(doc.activeElement, x, 'Shift+Tab from the drawer title reaches the ✕ too');
+
+  // The ✕: the message goes, focus goes back into the drawer, which stays open.
+  x.click();
+  assert.equal(dom.toasts.children.length, 0);
+  assert.equal(doc.activeElement, dom.title);
+  assert.equal(drawer.isOpen(), true);
+  assert.equal(status.node.textContent, 'Not minted: pick at least one access role.', 'the status line keeps the error');
+
+  // Esc on a ✕ dismisses that message only; focus moves to the next one.
+  status.err('First.');
+  status.err('Second.');
+  const [x1, x2] = dom.toasts.querySelectorAll('.toast-x');
+  x1.focus();
+  assert.equal(doc.key('Escape').defaultPrevented, true);
+  assert.deepEqual(dom.toasts.children.map((n) => n.textContent), ['Second.✕']);
+  assert.equal(doc.activeElement, x2);
+  assert.equal(drawer.isOpen(), true, 'Esc on a toast does not close the drawer');
+  doc.key('Escape');
+  assert.equal(dom.toasts.children.length, 0);
+  assert.equal(doc.activeElement, dom.title);
+  assert.equal(drawer.isOpen(), true);
+  doc.key('Escape');
+  assert.equal(drawer.isOpen(), false, 'Esc anywhere else in the drawer still closes it');
+});
+
+test('ui.toast: the ✕ is described by its message', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, toast } = ctx.PA.ui;
+  doc.body.appendChild(el('div', { id: 'toasts' }));
+  const t = toast('Not saved: channel is not in this guild.', { kind: 'err' });
+  const x = t.node.querySelector('.toast-x')!;
+  const msg = doc.getElementById(x.getAttribute('aria-describedby')!)!;
+  assert.equal(msg.textContent, 'Not saved: channel is not in this guild.');
+});
+

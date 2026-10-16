@@ -132,6 +132,12 @@ label { display: block; }
 .toast-err { border-left: 4px solid var(--danger); color: var(--danger); }
 .toast-x { font: inherit; background: none; border: 1px solid transparent; border-radius: 5px; color: var(--muted); cursor: pointer; padding: 0 6px; line-height: 1.4; }
 .toast-x:hover { border-color: var(--line); color: var(--fg); }
+/* With the drawer open on a wide screen the stack moves to its left, over the
+   scrim, so a sticky error never covers the form it is about. Narrower than
+   this it stays on top of the drawer (Tab and Esc still reach its ✕). */
+@media (min-width: 820px) {
+  body:has(#drawer:not(.hidden)) .toasts { right: 532px; max-width: calc(100vw - 556px); }
+}
 
 /* ── Toolbar / pager ── */
 .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }

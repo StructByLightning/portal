@@ -98,11 +98,21 @@
 
   const TOAST_MS = 6000;
   const MAX_TOASTS = 5;
+  const dismissers = new WeakMap(); // toast node → its dismiss()
+
+  /** The toast in #toasts that holds `n`, if any. */
+  function toastOf(n) {
+    const host = document.getElementById('toasts');
+    while (n && n.parentNode && n.parentNode !== host) n = n.parentNode;
+    return n && host && n.parentNode === host ? n : null;
+  }
 
   /**
    * Show a toast in #toasts. kind: 'ok' (default) | 'err' | 'info'. Errors are
    * role=alert and sticky with a ✕; the rest hide after about 6 s unless
-   * sticky is set. Returns { node, dismiss }.
+   * sticky is set. While the drawer is open, Tab reaches the ✕ after the
+   * drawer's last control, and Esc on a toast dismisses it. Returns
+   * { node, dismiss }.
    */
   function toast(msg, opts) {
     const o = opts || {};
@@ -110,16 +120,32 @@
     const sticky = o.sticky != null ? o.sticky : kind === 'err';
     const host = document.getElementById('toasts');
     if (!host) return { node: null, dismiss() {} };
+    const msgId = uid('toast');
     const node = el('div', { class: 'toast toast-' + kind, role: kind === 'err' ? 'alert' : 'status' }, [
-      el('span', { class: 'toast-msg' }, [toText(msg)]),
+      el('span', { class: 'toast-msg', id: msgId }, [toText(msg)]),
     ]);
     let timer = null;
     const dismiss = () => {
       clearTimeout(timer);
-      if (node.parentNode) node.parentNode.removeChild(node);
+      if (!node.parentNode) return;
+      // Dismissed from the keyboard: focus moves to the nearest other ✕ (the
+      // next message first), else back into the open drawer.
+      const hadFocus = toastOf(document.activeElement) === node;
+      const sibs = Array.from(node.parentNode.children);
+      const i = sibs.indexOf(node);
+      node.parentNode.removeChild(node);
+      if (!hadFocus) return;
+      const x = sibs.slice(i + 1).concat(sibs.slice(0, i).reverse())
+        .map((n) => n.querySelector('.toast-x'))
+        .find(Boolean);
+      if (x) x.focus();
+      else if (current) drawerEls().title.focus();
     };
+    dismissers.set(node, dismiss);
     if (sticky) {
-      node.appendChild(el('button', { class: 'toast-x', 'aria-label': 'Dismiss this message', title: 'Dismiss', text: '✕', onclick: dismiss }));
+      node.appendChild(el('button', {
+        class: 'toast-x', 'aria-label': 'Dismiss this message', 'aria-describedby': msgId, title: 'Dismiss', text: '✕', onclick: dismiss,
+      }));
     } else {
       timer = setTimeout(dismiss, o.ms || TOAST_MS);
     }
@@ -127,7 +153,9 @@
     // Keep the stack short: drop the oldest passing messages first.
     while (host.children.length > MAX_TOASTS) {
       const old = Array.from(host.children).find((n) => !n.classList.contains('toast-err')) || host.firstChild;
-      host.removeChild(old);
+      const drop = dismissers.get(old);
+      if (drop) drop();
+      else host.removeChild(old);
     }
     return { node, dismiss };
   }
@@ -246,27 +274,31 @@
     return Array.from(root.querySelectorAll(FOCUSABLE)).filter(shown);
   }
 
-  /** Keep Tab inside `root`. */
-  function trapTab(e, root) {
-    const f = focusables(root);
-    if (!f.length) {
-      e.preventDefault();
-      root.focus();
-      return;
-    }
-    const first = f[0];
-    const last = f[f.length - 1];
+  /**
+   * Keep Tab inside `roots`: a dialog, then any layer that joins its cycle
+   * (the toast stack). Within a root the browser moves focus as usual; past a
+   * root's last control (or before its first) focus goes on to the next root,
+   * wrapping round.
+   */
+  function trapTab(e, roots) {
+    const rs = [].concat(roots).filter(Boolean);
+    const groups = rs.map(focusables);
+    const f = [].concat(...groups);
     const a = document.activeElement;
-    if (!root.contains(a)) {
-      e.preventDefault();
-      (e.shiftKey ? last : first).focus();
-    } else if (e.shiftKey && (a === first || !f.includes(a))) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && a === last) {
-      e.preventDefault();
-      first.focus();
+    const k = rs.findIndex((r) => r.contains(a));
+    let to = null;
+    if (!f.length) to = rs[0];
+    else if (k < 0) to = e.shiftKey ? f[f.length - 1] : f[0];
+    else {
+      const g = groups[k];
+      const i = f.indexOf(a);
+      if (e.shiftKey && i < 0) to = [].concat(...groups.slice(0, k)).pop() || f[f.length - 1];
+      else if (e.shiftKey && a === g[0]) to = f[(i - 1 + f.length) % f.length];
+      else if (!e.shiftKey && i >= 0 && a === g[g.length - 1]) to = f[(i + 1) % f.length];
     }
+    if (!to) return;
+    e.preventDefault();
+    to.focus();
   }
 
   const modals = [];
@@ -487,9 +519,19 @@
         } else trapTab(e, top.box);
         return;
       }
+      // Esc on a toast's ✕ dismisses that message, and only that.
+      const t = e.key === 'Escape' ? toastOf(document.activeElement) : null;
+      if (t && dismissers.has(t)) {
+        e.preventDefault();
+        e.stopPropagation();
+        dismissers.get(t)();
+        return;
+      }
       if (!current) return;
       const d = drawerEls();
-      if (e.key === 'Tab') return trapTab(e, d.drawer);
+      // The toasts sit outside the drawer (above it), but their ✕s join its Tab
+      // cycle: a sticky error can be dismissed without closing the drawer.
+      if (e.key === 'Tab') return trapTab(e, [d.drawer, document.getElementById('toasts')]);
       // Esc: unsaved changes → ask; a focused field → just leave the field;
       // otherwise close.
       e.preventDefault();
