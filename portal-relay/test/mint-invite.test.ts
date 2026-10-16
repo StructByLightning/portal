@@ -517,3 +517,22 @@ test('mark_read passes count, since and keepPings through to the read-state stor
     t.cleanup();
   }
 });
+
+test('an invite granting scope:{all} covers every channel of ITS guild only — never every guild', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_all', label: 'all', grant: { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { all: true } }, guildId: GUILD });
+    const res = await t.relay.enroll({ invite: 'inv_all', desiredName: 'whole-guild' });
+    assert.ok(!('error' in res), JSON.stringify(res));
+    const policy = t.relay.permissions.getPolicy(res.personaId);
+    assert.deepEqual(policy.default, [], 'no persona-wide default');
+    assert.deepEqual(policy.guilds?.[GUILD]?.default, ['VIEW_CHANNEL', 'READ_HISTORY']);
+    assert.deepEqual(t.relay.capsFor(res.personaId, FOREIGN_CHAN, OTHER_GUILD), [], 'nothing in another guild');
+    // No guild on the invite: nothing at all.
+    t.relay.invites.mint({ code: 'inv_all_noguild', label: 'x', grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } });
+    const bare = await t.relay.enroll({ invite: 'inv_all_noguild', desiredName: 'nowhere' });
+    assert.deepEqual(t.relay.permissions.getPolicy(bare.personaId), { default: [] });
+  } finally {
+    t.cleanup();
+  }
+});

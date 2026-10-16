@@ -721,7 +721,7 @@ export class Relay implements GatewayHooks {
     if (!grant && inv.caps?.length) {
       console.error(
         `[portal-relay] invite "${inv.label ?? inv.code}" uses deprecated blanket caps; ` +
-          `honouring as scope:{all}. Re-mint scoped (RFC-004).`,
+          `honouring as scope:{all} of its guild. Re-mint scoped (RFC-004).`,
       );
       grant = { caps: inv.caps, scope: { all: true } };
     }
@@ -781,7 +781,17 @@ export class Relay implements GatewayHooks {
    *  Static scopes only — mirror shapes go through materializeMirrorGrant so
    *  they resolve live; reaching here with one is a caller bug (deny). */
   private scopeToPolicy(guildId: string | undefined, scope: Scope, caps: Capability[]): PersonaPolicy {
-    if ('all' in scope) return { default: caps };
+    // `all` = every channel of the INVITE'S guild — a guild default — never a
+    // persona-wide default (which would apply in every guild the relay
+    // serves). Same rule as access roles (scope:{all} is guild-bound). No
+    // guild, no grant.
+    if ('all' in scope) {
+      if (!guildId) {
+        console.error('[portal-relay] scope:{all} grant without guildId — denying');
+        return { default: [] };
+      }
+      return { default: [], guilds: { [guildId]: { default: caps } } };
+    }
     if (!guildId || !('channels' in scope)) {
       console.error('[portal-relay] scoped grant without guildId or with a mirror shape — denying');
       return { default: [] };

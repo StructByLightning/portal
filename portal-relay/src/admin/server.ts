@@ -12,7 +12,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import type { AdminConfig } from '../config.js';
+import type { AdminConfig, Scope } from '../config.js';
+import type { Capability } from '@animalabs/portal-protocol';
+import { ALL_CAPS } from '../permissions.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
@@ -165,7 +167,7 @@ export class AdminServer {
     if (gm) {
       const guildId = decodeURIComponent(gm[1]);
       const sub = gm[2] ?? '';
-      if (!canManageGuild(session, guildId)) {
+      if (!canManageGuild(session, guildId, (g) => this.isServed(g))) {
         this.audit.append({
           actor: { id: session.userId, name: session.userName, kind: 'admin' },
           action: 'authz.denied',
@@ -311,15 +313,28 @@ export class AdminServer {
     // that explicitly list this user, even when their live Discord perms don't
     // qualify (e.g. a role with most perms but not Manage Server). Scoped to the
     // named guilds only — strictly narrower than super-admin.
-    const adminGuilds = new Set(result.adminGuilds);
+    const claimed = new Set(result.adminGuilds);
     const guildNames: Record<string, string> = { ...result.guildNames };
     for (const [gid, uids] of Object.entries(this.deps.config.guildAdmins ?? {})) {
       if (!uids.includes(result.user.id)) continue;
-      adminGuilds.add(gid);
+      claimed.add(gid);
       if (!guildNames[gid]) {
         const g = this.deps.listGuilds().find((x) => x.id === gid);
         if (g) guildNames[gid] = g.name;
       }
+    }
+    // Only guilds this relay SERVES count: Discord reports admin rights for
+    // every server the user owns or runs, and none of those is administered
+    // here. Someone who administers no served guild gets no session at all.
+    const adminGuilds = new Set([...claimed].filter((gid) => this.isServed(gid)));
+    if (!isSuper && adminGuilds.size === 0) {
+      this.audit.append({
+        actor: { id: result.user.id, name: result.user.global_name || result.user.username, kind: 'admin' },
+        action: 'login.denied',
+        ok: false,
+        detail: { reason: 'administers no guild this relay serves' },
+      });
+      return sendJson(res, 403, err('FORBIDDEN', 'you are not an admin of any guild portal serves'));
     }
     const session = this.sessions.create({
       userId: result.user.id,
@@ -468,20 +483,21 @@ export class AdminServer {
   private mintInvite(res: ServerResponse, session: AdminSession, guildId: string, body: any): void {
     if (!this.deps.invites) return sendJson(res, 400, err('DISABLED', 'invites not enabled'));
     const roles: string[] = Array.isArray(body?.roles) ? body.roles : [];
-    const grant = body?.grant;
+    // The grant is REBUILT from validated fields, never stored as sent: what an
+    // invite confers is applied at enroll/claim time, so anything a caller
+    // could smuggle into it here would be granted later.
+    let grant: { caps: Capability[]; scope: Scope } | undefined;
+    if (!roles.length && body?.grant !== undefined) {
+      const checked = this.checkInviteGrant(session, guildId, body.grant);
+      if (typeof checked === 'string') return sendJson(res, checked.startsWith('FORBIDDEN:') ? 403 : 400, err(checked.startsWith('FORBIDDEN:') ? 'FORBIDDEN' : 'INVALID', checked.replace(/^(FORBIDDEN|INVALID): /, '')));
+      grant = checked;
+    }
     if (!roles.length && !grant) return sendJson(res, 400, err('INVALID', 'invite needs roles or a grant'));
 
     // Guild-admins may only grant access bound to their own guild (§5.3).
     for (const r of roles) {
       const e = this.roleAssignError(session, guildId, r);
       if (e) return sendJson(res, 403, err('FORBIDDEN', e));
-    }
-    if (grant?.scope?.channels) {
-      for (const cid of grant.scope.channels as string[]) {
-        if (!this.deps.channelInGuild(guildId, cid)) {
-          return sendJson(res, 403, err('FORBIDDEN', `channel ${cid} is not in this guild`));
-        }
-      }
     }
     const mode = ['mint', 'augment', 'both'].includes(body?.mode) ? body.mode : undefined;
     const expiresAt =
@@ -493,7 +509,7 @@ export class AdminServer {
       label: typeof body?.label === 'string' ? body.label : 'invite',
       guildId,
       uses: 0,
-      ...(roles.length ? { roles } : { grant }),
+      ...(roles.length ? { roles } : { grant: grant! }),
       ...(mode ? { mode } : {}),
       ...(typeof body?.maxUses === 'number' ? { maxUses: body.maxUses } : {}),
       ...(expiresAt ? { expiresAt } : {}),
@@ -944,6 +960,54 @@ export class AdminServer {
       channels: clipToGuild(await this.channelLabels(channels), guildId),
       guilds: this.guildNames(records.map((r) => r.target), guildId),
     };
+  }
+
+  /** A guild this relay serves: the bot has joined it and the allow-list admits it. */
+  private isServed(guildId: string): boolean {
+    return this.deps.listGuilds().some((g) => g.id === guildId);
+  }
+
+  /**
+   * Validate an invite grant for guild G and return a clean copy, or an error
+   * string ("FORBIDDEN: …" / "INVALID: …"). Caps must be known capability
+   * names; the scope must be exactly one of: channels of G, a Discord role of
+   * G to mirror, several roles of G to mirror — or, for super-admins only,
+   * `all` (every channel of G; see Relay.scopeToPolicy).
+   */
+  private checkInviteGrant(session: AdminSession, guildId: string, raw: unknown): { caps: Capability[]; scope: Scope } | string {
+    if (!raw || typeof raw !== 'object') return 'INVALID: grant must be an object';
+    const g = raw as { caps?: unknown; scope?: unknown };
+    if (!Array.isArray(g.caps) || g.caps.length === 0) return 'INVALID: grant.caps must list at least one capability';
+    const known = new Set<string>(ALL_CAPS);
+    const caps = [...new Set(g.caps)];
+    for (const c of caps) if (typeof c !== 'string' || !known.has(c)) return `INVALID: unknown capability ${String(c)}`;
+    const scope = (g.scope ?? {}) as Record<string, unknown>;
+    const keys = Object.keys(scope);
+    if (keys.length !== 1) return 'INVALID: grant.scope must have exactly one of channels, mirrorRole, mirrorRoles, all';
+    const guildRoles = new Set(this.deps.listRoles(guildId).map((r) => r.id));
+    if (Array.isArray(scope.channels)) {
+      const channels = [...new Set(scope.channels)];
+      if (!channels.length) return 'INVALID: grant.scope.channels is empty';
+      for (const cid of channels) {
+        if (typeof cid !== 'string' || !this.deps.channelInGuild(guildId, cid)) return `FORBIDDEN: channel ${String(cid)} is not in this guild`;
+      }
+      return { caps: caps as Capability[], scope: { channels: channels as string[] } };
+    }
+    if (typeof scope.mirrorRole === 'string') {
+      if (!guildRoles.has(scope.mirrorRole)) return `FORBIDDEN: role ${scope.mirrorRole} is not a role of this guild`;
+      return { caps: caps as Capability[], scope: { mirrorRole: scope.mirrorRole } };
+    }
+    if (Array.isArray(scope.mirrorRoles)) {
+      const ids = [...new Set(scope.mirrorRoles)];
+      if (!ids.length) return 'INVALID: grant.scope.mirrorRoles is empty';
+      for (const id of ids) if (typeof id !== 'string' || !guildRoles.has(id)) return `FORBIDDEN: role ${String(id)} is not a role of this guild`;
+      return { caps: caps as Capability[], scope: { mirrorRoles: ids as string[] } };
+    }
+    if (scope.all === true) {
+      if (!session.isSuper) return 'FORBIDDEN: only a super-admin may grant every channel of a guild';
+      return { caps: caps as Capability[], scope: { all: true } };
+    }
+    return 'INVALID: grant.scope must have exactly one of channels, mirrorRole, mirrorRoles, all';
   }
 
   /** Guild ids a persona can possibly act in (across the bot's known guilds). */
