@@ -24,6 +24,10 @@ portal-admin.example.com {
 	handle {
 		root * /srv/portal-admin
 		try_files {path} /index.html
+		# The page names its scripts with a ?v= release query, so it must
+		# never be served stale: browsers revalidate it on every load.
+		@page path / /index.html
+		header @page Cache-Control "no-cache"
 		file_server
 	}
 

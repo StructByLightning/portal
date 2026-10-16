@@ -6,12 +6,25 @@ relay's admin HTTP API — **all** authorization is enforced server-side.
 
 ```
 portal-admin/
-├── index.html        app shell + login + right-side detail drawer + token modal
+├── index.html        app shell + login + right-side detail drawer + toast stack
+├── ui.js             DOM helpers and widgets (window.PA.ui): toasts, status
+│                     lines, busy buttons, confirm dialogs, the drawer
 ├── app.js            API client, resource tabs, dense tables, all mutations
+│                     (window.PA.app)
 ├── styles.css        self-contained styling (dense, dark/light, CSP-clean)
 ├── Caddyfile.example reverse-proxy + static-serve vhost
 └── README.md
 ```
+
+Each script is a classic `defer` script wrapped in one IIFE that assigns a
+single global, `window.PA.<module>`; `index.html` loads them in order with a
+`?v=` release query, which you bump when a release changes them. Nothing sets
+`innerHTML`. `portal-relay/test/admin-spa.test.ts` checks these rules and
+`ui.js`'s helpers in `node:vm`.
+
+To try the panel locally without Discord, run the preview harness:
+`node --import tsx scripts/admin-preview.mts` in `portal-relay/` (see its
+README, "Preview the admin panel").
 
 ## Information architecture
 
@@ -120,4 +133,13 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
 - Rotated tokens are shown exactly once — copy and deliver out-of-band.
 - No client-side authz: a guild-admin hitting another guild gets a `403`, surfaced
   inline. Token endpoints return `403` for non-super-admins.
-- Keyboard: `/` focuses the active search box, `Esc` closes the drawer.
+- Feedback: every result or error appears in the status line of the section it
+  came from and stays there; a toast mirrors it. Error toasts stay until
+  dismissed (✕); the rest fade after about 6 seconds. A button that sends a
+  request is disabled until the answer arrives, so a double click sends one.
+- Keyboard: `/` focuses the active search box. In the drawer, `Esc` (or a click
+  on the dimmed page) asks "Discard changes?" when a form has unsaved edits,
+  otherwise leaves a focused field, otherwise closes the drawer. `Tab` stays
+  inside the drawer and dialogs; `Enter` submits the section's form.
+- Below 640px wide the top bar wraps, tables scroll sideways inside their box,
+  and the drawer takes the whole screen.
