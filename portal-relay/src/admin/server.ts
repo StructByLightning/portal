@@ -66,7 +66,7 @@ export interface AdminDeps {
   closePersona(personaId: string): void;
   /** Admin-initiated augment: apply an invite's grant to an existing persona.
    *  Mirrors the `claim_invite` op but actor = the admin. Returns role list. */
-  applyClaim(personaId: string, code: string): { roles: string[] };
+  applyClaim(personaId: string, code: string): { roles: string[]; liftedBans?: string[] };
   /** Force-rotate a persona's token; returns the new plaintext (show once). */
   rotatePersonaToken(personaId: string): string;
   /** Force-revoke a persona's token + drop its sessions. */
@@ -619,7 +619,7 @@ export class AdminServer {
     } catch (e) {
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles } });
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper) });
   }
 

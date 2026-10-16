@@ -1056,7 +1056,7 @@ export class Relay implements GatewayHooks {
    * grant, consumes a use, and returns the resulting role set. Throws rpcError on
    * any rejection. Auditing is the caller's responsibility (actor differs).
    */
-  private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[] } {
+  private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[]; liftedBans?: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
     if (!this.identity.get(personaId)) throw rpcError('NOT_FOUND', 'no such persona');
     const checked = this.invites.check(code, Date.now());
@@ -1080,13 +1080,18 @@ export class Relay implements GatewayHooks {
     const grantProblem = this.inviteGrantProblem(checked);
     if (grantProblem) throw rpcError('INVALID_PARAMS', grantProblem);
     // A persona banned from a guild (/ban) can't give itself access there
-    // again by claiming an invite — only an admin can (an admin-initiated
-    // claim is that admin's decision, and lifts the ban).
+    // again by claiming an invite — only an admin can. An admin-initiated
+    // claim is that admin's decision, and lifts the ban in each guild where
+    // the invite actually grants something (a role with no capabilities
+    // grants nothing, so it doesn't).
     const touched = new Set<string>();
-    if (grant && checked.guildId) touched.add(checked.guildId);
+    const grantsIn = new Set<string>();
+    if (grant && checked.guildId) touched.add(checked.guildId), grantsIn.add(checked.guildId);
     for (const r of checked.roles ?? []) {
-      const g = this.permissions.getRole(r)?.guildId;
-      if (g) touched.add(g);
+      const role = this.permissions.getRole(r);
+      if (!role?.guildId) continue;
+      touched.add(role.guildId);
+      if (role.caps.length) grantsIn.add(role.guildId);
     }
     const banned = [...touched].filter((g) => this.permissions.isBanned(personaId, g));
     if (banned.length && !opts.byAdmin) {
@@ -1100,7 +1105,7 @@ export class Relay implements GatewayHooks {
       mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
       if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
     }
-    for (const g of banned) this.permissions.liftBan(personaId, g);
+    const liftedBans = banned.filter((g) => grantsIn.has(g) && this.permissions.liftBan(personaId, g));
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
     }
@@ -1111,7 +1116,7 @@ export class Relay implements GatewayHooks {
       this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
     }
     this.invites.consume(code);
-    return { roles: this.permissions.getRoleNames(personaId) };
+    return { roles: this.permissions.getRoleNames(personaId), ...(liftedBans.length ? { liftedBans } : {}) };
   }
 
   /**

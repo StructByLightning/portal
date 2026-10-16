@@ -377,3 +377,23 @@ test('an invite naming an access role that no longer exists is refused, so the n
   }
 });
 
+test('an admin claim lifts a ban only where the invite grants something', () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('g1-marker', { caps: [], scope: { all: true }, guildId: GUILD });
+    t.relay.permissions.setRole('g1-staff', { caps: [...RW], scope: { all: true }, guildId: GUILD });
+    t.relay.invites.mint({ code: 'marker', mode: 'augment', maxUses: 5, roles: ['g1-marker'] } as any);
+    t.relay.invites.mint({ code: 'staff', mode: 'augment', maxUses: 5, roles: ['g1-staff'] } as any);
+    t.relay.permissions.clearGuild(EXISTING, GUILD);
+    const r = t.relay.applyInviteAugment(EXISTING, 'marker', { byAdmin: true });
+    assert.equal(r.liftedBans, undefined);
+    assert.equal(t.relay.permissions.isBanned(EXISTING, GUILD), true, 'a claim that grants nothing leaves the ban');
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'staff'), /banned/);
+    const r2 = t.relay.applyInviteAugment(EXISTING, 'staff', { byAdmin: true });
+    assert.deepEqual(r2.liftedBans, [GUILD]);
+    assert.deepEqual(t.caps(EXISTING, CHAN_A), [...RW]);
+  } finally {
+    t.cleanup();
+  }
+});
+
