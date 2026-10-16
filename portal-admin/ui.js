@@ -16,7 +16,11 @@
  *   copyText           clipboard, falling back to selecting the text
  *   modal              the shared modal layer (focus trap, Esc)
  *   dirtyTracker       has this form changed since it was drawn or saved?
- *   drawer             the right-side drawer: focus, Esc, scrim, "Discard changes?"
+ *   drawer             the right-side drawer: focus, Esc, scrim, "Discard changes?",
+ *                      and the form it holds (registerForm: kept across a sign-in)
+ *   sessionEnded       "Your session ended" over the page, which stays as it was
+ *   expiryBar          the "Your session ends at 14:05" bar
+ *   notAdminView       a guild this admin can't manage (never named)
  */
 (function () {
   'use strict';
@@ -346,15 +350,18 @@
    */
   function modal(opts) {
     const titleId = uid('modal-title');
+    const title = el('h2', { id: titleId, text: opts.title });
     const box = el('div', { class: 'modal', role: opts.role || 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId, tabindex: '-1' }, [
-      el('h2', { id: titleId, text: opts.title }),
+      title,
       ...[].concat(opts.body || []),
       el('div', { class: 'modal-actions' }, opts.actions || []),
     ]);
     const backdrop = el('div', { class: 'modal-backdrop' }, [box]);
     const opener = document.activeElement;
     const entry = { box, onEscape: opts.onEscape };
-    document.body.appendChild(backdrop);
+    // index.html's #modals keeps the layer in one place; any page without it
+    // still gets one.
+    (document.getElementById('modals') || document.body).appendChild(backdrop);
     modals.push(entry);
     (opts.initialFocus || box).focus();
     let closed = false;
@@ -367,7 +374,14 @@
       const back = [opts.returnFocus, opener].find((n) => n && n !== document.body && n.isConnected && typeof n.focus === 'function');
       if (back) back.focus();
     }
-    return { box, close };
+    return {
+      box,
+      close,
+      isOpen: () => !closed,
+      setTitle(text) {
+        title.textContent = text;
+      },
+    };
   }
 
   function modalOpen() {
@@ -634,7 +648,7 @@
   // #drawer-close and #drawer-body, behind #drawer-scrim.
 
   let drawerSeq = 0;
-  let current = null; // { token, trackers, onClose, returnFocus }
+  let current = null; // { token, trackers, form, onClose, returnFocus }
   let drawerBound = false;
 
   function drawerEls() {
@@ -671,7 +685,7 @@
       bindDrawer();
       const d = drawerEls();
       const returnFocus = current ? current.returnFocus : document.activeElement;
-      current = { token: ++drawerSeq, trackers: [], onClose: opts.onClose || null, returnFocus };
+      current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus };
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
@@ -692,6 +706,15 @@
           if (handle.isCurrent()) current.trackers.push(t);
           return t;
         },
+        /**
+         * The form whose unsaved state "Sign in again" keeps: key names its
+         * draft schema (PA.lib.DRAFT_FORMS); serialize() → its fields;
+         * restore(fields) puts them back; isDirty() (optional) says whether
+         * there is anything to keep. The last form registered is the one kept.
+         */
+        registerForm(key, hooks) {
+          if (handle.isCurrent()) current.form = Object.assign({ key }, hooks);
+        },
       };
       handle.setTitle(opts.title || '', opts.subtitle);
       handle.setBody(opts.body || el('p', { class: 'muted loading', role: 'status', text: 'Loading…' }));
@@ -706,8 +729,13 @@
 
     isDirty: () => !!current && current.trackers.some((t) => t.isDirty()),
 
-    /** Close now, without asking. */
-    close() {
+    /** The registered form of the open drawer ({ key, serialize, restore,
+     *  isDirty }), or null. */
+    activeForm: () => (current && current.form) || null,
+
+    /** Close now, without asking. `reason` reaches onClose (the app tells a
+     *  close it asked for from one the admin did: ✕, Esc, the scrim). */
+    close(reason) {
       if (!current) return;
       const c = current;
       current = null;
@@ -717,27 +745,138 @@
       d.scrim.classList.add('hidden');
       clear(d.body);
       if (c.returnFocus && c.returnFocus.isConnected && typeof c.returnFocus.focus === 'function') c.returnFocus.focus();
-      if (c.onClose) c.onClose();
+      if (c.onClose) c.onClose(reason);
+    },
+
+    /** 'Discard changes?' — resolves true to discard. */
+    confirmDiscard() {
+      return confirmDialog({
+        title: 'Discard changes?',
+        body: 'Something in this panel was changed and not saved.',
+        confirmLabel: 'Discard changes',
+        cancelLabel: 'Cancel',
+        danger: true,
+      });
     },
 
     /** Close, asking 'Discard changes?' first when a tracked form is dirty.
      *  Resolves true if the drawer closed. */
     async requestClose() {
       if (!current) return true;
-      if (drawer.isDirty()) {
-        const discard = await confirmDialog({
-          title: 'Discard changes?',
-          body: 'Something in this panel was changed and not saved.',
-          confirmLabel: 'Discard changes',
-          cancelLabel: 'Cancel',
-          danger: true,
-        });
-        if (!discard) return false;
-      }
+      if (drawer.isDirty() && !(await drawer.confirmDiscard())) return false;
       drawer.close();
       return true;
     },
   };
+
+  // ── Session ───────────────────────────────────────────────────────────────
+
+  let sessionBox = null; // the open "Your session ended" modal
+
+  const SESSION_TITLES = {
+    read: 'Your session ended.',
+    mutation: 'Your session ended — this change was NOT saved.',
+    elsewhere: 'You signed out in another tab.',
+  };
+
+  /**
+   * "Your session ended", over the page, which stays exactly as it was (the
+   * open drawer and its form included). { kind: 'read' | 'mutation' |
+   * 'elsewhere', onSignIn }. One at a time: a later call only sharpens the
+   * title (a change that was not saved outranks a read). Returns { close }.
+   */
+  function sessionEnded(opts) {
+    const o = opts || {};
+    const kind = SESSION_TITLES[o.kind] ? o.kind : 'read';
+    const rank = { read: 0, elsewhere: 1, mutation: 2 };
+    if (sessionBox && sessionBox.m.isOpen()) {
+      if (rank[kind] > rank[sessionBox.kind]) {
+        sessionBox.kind = kind;
+        sessionBox.m.setTitle(SESSION_TITLES[kind]);
+      }
+      return sessionBox;
+    }
+    const signIn = el('button', { class: 'btn btn-primary', text: 'Sign in again' });
+    const close = el('button', { class: 'btn', text: 'Close' });
+    const m = modal({
+      title: SESSION_TITLES[kind],
+      body: [el('p', { text: 'Sign in again to continue. Your place and unsaved form will be kept.' })],
+      actions: [close, signIn],
+      role: 'alertdialog',
+      initialFocus: signIn,
+      onEscape: () => m.close(),
+    });
+    m.box.classList.add('modal-session');
+    close.addEventListener('click', () => m.close());
+    signIn.addEventListener('click', () => {
+      signIn.disabled = true;
+      signIn.textContent = 'Signing in…';
+      if (o.onSignIn) o.onSignIn();
+    });
+    sessionBox = { kind, m, close: () => m.close() };
+    return sessionBox;
+  }
+
+  /** Close the "Your session ended" modal, if it is up (signed in again).
+   *  Returns whether it was. */
+  function sessionResumed() {
+    const was = !!sessionBox && sessionBox.m.isOpen();
+    if (was) sessionBox.m.close();
+    sessionBox = null;
+    return was;
+  }
+
+  /**
+   * The bar under the top bar that says when the session ends, with one
+   * action. `host` is index.html's #session-bar. Returns { show(text,
+   * actionLabel, onAction), hide() }.
+   */
+  function expiryBar(host) {
+    return {
+      show(text, actionLabel, onAction) {
+        if (!host) return;
+        clear(host);
+        host.appendChild(el('span', { class: 'session-bar-text', text }));
+        if (actionLabel) host.appendChild(el('button', { class: 'btn btn-sm', text: actionLabel, onclick: onAction }));
+        host.classList.remove('hidden');
+      },
+      hide() {
+        if (!host) return;
+        host.classList.add('hidden');
+        clear(host);
+      },
+    };
+  }
+
+  /**
+   * In place of a guild's view when this admin can't manage it: the reason
+   * (the same words whether they aren't an admin or it couldn't be checked),
+   * a switcher of the guilds they do manage, and Try again. It never names the
+   * guild. With no guild at all ({ none: true }): say so, with Sign out.
+   *   { guilds: [{id, name}], none, onPick(gid), onRetry(), onSignOut() }
+   */
+  function notAdminView(o) {
+    const headId = uid('not-admin');
+    if (o.none) {
+      return el('section', { class: 'not-admin', 'aria-labelledby': headId }, [
+        el('h2', { id: headId, tabindex: '-1', text: 'You don’t manage any guild this relay serves right now.' }),
+        el('p', { class: 'muted', text: 'Ask the server owner for Manage Server, or ask the relay operator to add you.' }),
+        el('div', { class: 'inline' }, [el('button', { class: 'btn', text: 'Sign out', onclick: o.onSignOut })]),
+      ]);
+    }
+    const pick = el('select', {}, [el('option', { value: '', text: 'Pick a guild…' })]
+      .concat((o.guilds || []).map((g) => el('option', { value: g.id, text: g.name || g.id }))));
+    pick.addEventListener('change', () => {
+      if (pick.value) o.onPick(pick.value);
+    });
+    const retry = el('button', { class: 'btn', text: 'Try again' });
+    retry.addEventListener('click', () => busy(retry, () => o.onRetry(), 'Checking…'));
+    return el('section', { class: 'not-admin', 'aria-labelledby': headId }, [
+      el('h2', { id: headId, tabindex: '-1', text: PA.lib.NOT_GUILD_ADMIN }),
+      (o.guilds || []).length ? field({ label: 'Go to a guild you manage', control: pick }) : null,
+      el('div', { class: 'inline' }, [retry]),
+    ]);
+  }
 
   // Keyboard for the modal layer and the drawer. Capture phase, so it runs
   // before anything else on the page sees the key.
@@ -804,5 +943,9 @@
     copyText,
     dirtyTracker,
     drawer,
+    sessionEnded,
+    sessionResumed,
+    expiryBar,
+    notAdminView,
   };
 })();

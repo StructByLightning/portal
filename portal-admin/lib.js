@@ -16,6 +16,10 @@
  *   grantSummary, inviteSummary        what an invite confers, in one line
  *   inviteStatusText                   'Active' · 'Used up' · 'Expired'
  *   errorText                          a refusal from the relay, in words
+ *   parseRoute, formatRoute            the panel's #/… addresses (round-trip)
+ *   isSafeReturnTo                     a place to come back to after sign-in
+ *   makeDraft, readDraft, draftFields  an unsaved form kept across a sign-in
+ *   loginErrorText                     why a sign-in came back (?login_error=)
  */
 (function (root) {
   'use strict';
@@ -402,10 +406,316 @@
       case 'INVALID_NAME': return p + ': an access role name uses lower-case letters, digits, dots, dashes and underscores (up to 64), starting with a letter or digit.';
       default: break;
     }
-    if (e && e.status === 401) return p + ': your session ended. Sign in again.';
+    if (e && e.status === 401) return p + ': your session ended. Sign in again, then save it.';
     if (code === 'FORBIDDEN' && e.reason === 'NOT_GUILD_ADMIN') return NOT_GUILD_ADMIN;
     const why = String((e && e.message) || 'something went wrong').trim().replace(/[.\s]+$/, '');
     return p + ': ' + why + '.';
+  }
+
+  // ── Routes ────────────────────────────────────────────────────────────────
+  // Every place in the panel has an address after '#' (Caddy serves one page,
+  // so the path can't carry it):
+  //
+  //   #/                                   home: the last guild and tab
+  //   #/g/{gid}/channels[?q&show&cat]      #/g/{gid}/channels/c/{cid}
+  //   #/g/{gid}/personas[?q]               #/g/{gid}/personas/p/{pid} · …/personas/add
+  //   #/g/{gid}/give[?p&c&lvl]
+  //   #/g/{gid}/invites[?status&q]         #/g/{gid}/invites/new[?c&lvl&r] · …/invites/i/{inviteId}
+  //   #/g/{gid}/roles[?q]                  #/g/{gid}/roles/r/{name} · …/roles/new
+  //   #/g/{gid}/audit[?q&actor&persona&channel&action&reads]
+  //   #/all/personas[?q]                   #/all/personas/p/{pid}
+  //   #/all/audit[?guild&q&actor&…]        #/guilds
+  //
+  // A route is { area: 'home' | 'g' | 'all' | 'guilds', gid, view, drawer,
+  // query }: `drawer` is null or { kind, id? } (the panel open over the list),
+  // `query` the leaf's parameters (the list's, or the drawer's when one is
+  // open). Ids are checked here, so a link can't carry anything else; an
+  // invite appears only as the hash of its code, never as the code. Unknown
+  // query keys are dropped; a bad value makes the whole route invalid (null).
+  // The lists' search boxes keep ?q= on every list, not only the ones above
+  // that list it.
+
+  const SNOWFLAKE = /^\d{5,25}$/;
+  const PERSONA_ID = /^[A-Za-z0-9._:-]{1,100}$/;
+  const INVITE_ID = /^[0-9a-f]{24}$/;
+  const MAX_IDS = 20;
+  const MAX_TEXT = 200;
+
+  const isSnowflake = (s) => typeof s === 'string' && SNOWFLAKE.test(s);
+  const isPersonaId = (s) => typeof s === 'string' && PERSONA_ID.test(s) && s !== '.' && s !== '..';
+  const isRoleName = (s) => typeof s === 'string' && s.length >= 1 && s.length <= 64 && s.indexOf('/') < 0 && s !== '.' && s !== '..';
+
+  /** Query value kinds: one id, a list of ids, free text, or one of a set. */
+  const ONE = { gid: isSnowflake, cid: isSnowflake, uid: isSnowflake, pid: isPersonaId, role: isRoleName };
+  const AUDIT_ACTIONS = ['access', 'roles', 'invites', 'sessions', 'identity'];
+  const AUDIT_QUERY = { q: 'text', actor: 'uid', persona: 'pid', channel: 'cid', action: AUDIT_ACTIONS, reads: ['1'] };
+
+  /** The grammar: area → view → { query, drawers: segment → { kind, id?, query? } }.
+   *  Query keys are listed in the order formatRoute writes them. */
+  const GRAMMAR = {
+    g: {
+      channels: { query: { q: 'text', show: ['all', 'agents', 'empty'], cat: 'cid' }, drawers: { c: { kind: 'channel', id: 'cid' } } },
+      personas: { query: { q: 'text' }, drawers: { p: { kind: 'persona', id: 'pid' }, add: { kind: 'add' } } },
+      give: { query: { p: 'pid[]', c: 'cid[]', lvl: LEVELS } },
+      invites: {
+        query: { status: ['active', 'spent', 'all'], q: 'text' },
+        drawers: { new: { kind: 'mint', query: { c: 'cid', lvl: LEVELS, r: 'role[]' } }, i: { kind: 'invite', id: 'invite' } },
+      },
+      roles: { query: { q: 'text' }, drawers: { r: { kind: 'role', id: 'role' }, new: { kind: 'newRole' } } },
+      audit: { query: AUDIT_QUERY },
+    },
+    all: {
+      personas: { query: { q: 'text' }, drawers: { p: { kind: 'persona', id: 'pid' } } },
+      audit: { query: Object.assign({ guild: 'gid' }, AUDIT_QUERY) },
+    },
+  };
+  const ID_CHECK = { cid: isSnowflake, pid: isPersonaId, role: isRoleName, invite: (s) => typeof s === 'string' && INVITE_ID.test(s) };
+
+  /** encodeURIComponent, plus the five characters it leaves alone, so every
+   *  address fits isSafeReturnTo's character set; ':' (in persona ids) stays
+   *  readable. */
+  function enc(s) {
+    return encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase()).replace(/%3A/g, ':');
+  }
+  /** A path segment, decoded (null when it doesn't decode). */
+  function dec(s) {
+    try {
+      return decodeURIComponent(s);
+    } catch {
+      return null;
+    }
+  }
+  /** A query key or value: '+' is a space there, as in any query string. */
+  const decQ = (s) => dec(s.replace(/\+/g, ' '));
+
+  /** One query value, checked: the value to keep, or undefined when it is bad.
+   *  `raw` is still encoded, so a list splits on real commas only. */
+  function queryValue(kind, raw) {
+    if (Array.isArray(kind)) {
+      const v = decQ(raw);
+      return kind.indexOf(v) >= 0 ? v : undefined;
+    }
+    if (kind === 'text') {
+      const v = decQ(raw);
+      if (v == null || v.length > MAX_TEXT) return undefined;
+      return v.trim();
+    }
+    if (kind.slice(-2) === '[]') {
+      const check = ONE[kind.slice(0, -2)];
+      const items = raw.split(',').map(decQ);
+      if (items.length > MAX_IDS || items.some((x) => x == null || !check(x))) return undefined;
+      return items.filter((x, i) => items.indexOf(x) === i);
+    }
+    const v = decQ(raw);
+    return v != null && ONE[kind](v) ? v : undefined;
+  }
+
+  /** The query string after '?', against `spec`: { ok, query }. */
+  function parseQuery(text, spec) {
+    const query = {};
+    if (!text) return { ok: true, query };
+    for (const part of text.split('&')) {
+      if (!part) continue;
+      const eq = part.indexOf('=');
+      const key = decQ(eq < 0 ? part : part.slice(0, eq));
+      const raw = eq < 0 ? '' : part.slice(eq + 1);
+      if (key == null) return { ok: false };
+      if (!spec || !Object.prototype.hasOwnProperty.call(spec, key)) continue; // unknown: dropped
+      if (Object.prototype.hasOwnProperty.call(query, key)) continue; // the first one counts
+      if (raw === '') continue; // empty: as if absent
+      const v = queryValue(spec[key], raw);
+      if (v === undefined) return { ok: false };
+      if (v === '' || (Array.isArray(v) && !v.length)) continue;
+      query[key] = v;
+    }
+    return { ok: true, query };
+  }
+
+  /** '#/g/…' → a route, area 'home' for '#/' (or nothing), or null when
+   *  it isn't one of the panel's addresses. */
+  function parseRoute(hash) {
+    if (typeof hash !== 'string') return null;
+    if (hash === '' || hash === '#' || hash === '#/') return { area: 'home', gid: null, view: null, drawer: null, query: {} };
+    if (hash.length > 2048 || hash.slice(0, 2) !== '#/') return null;
+    const qi = hash.indexOf('?');
+    const path = qi < 0 ? hash.slice(2) : hash.slice(2, qi);
+    const qtext = qi < 0 ? '' : hash.slice(qi + 1);
+    const raw = path.split('/');
+    if (raw.length > 1 && raw[raw.length - 1] === '') raw.pop(); // one trailing '/' is fine
+    const segs = [];
+    for (const s of raw) {
+      const d = dec(s);
+      if (d == null || d === '' || d === '.' || d === '..') return null;
+      segs.push(d);
+    }
+    let area = segs[0];
+    let gid = null;
+    let rest;
+    if (area === 'guilds') {
+      if (segs.length !== 1) return null;
+      return { area: 'guilds', gid: null, view: 'guilds', drawer: null, query: {} };
+    }
+    if (area === 'g') {
+      gid = segs[1];
+      if (!isSnowflake(gid)) return null;
+      rest = segs.slice(2);
+    } else if (area === 'all') {
+      rest = segs.slice(1);
+    } else return null;
+    const views = GRAMMAR[area];
+    const view = rest[0];
+    if (!view || !Object.prototype.hasOwnProperty.call(views, view)) return null;
+    const v = views[view];
+    let drawer = null;
+    let spec = v.query;
+    if (rest.length > 1) {
+      const d = v.drawers && Object.prototype.hasOwnProperty.call(v.drawers, rest[1]) ? v.drawers[rest[1]] : null;
+      if (!d) return null;
+      if (d.id) {
+        if (rest.length !== 3 || !ID_CHECK[d.id](rest[2])) return null;
+        drawer = { kind: d.kind, id: rest[2] };
+      } else {
+        if (rest.length !== 2) return null;
+        drawer = { kind: d.kind };
+      }
+      spec = d.query || null;
+    }
+    const q = parseQuery(qtext, spec);
+    if (!q.ok) return null;
+    return { area, gid, view, drawer, query: q.query };
+  }
+
+  /** A route → its address, canonical: parseRoute(formatRoute(r)) is r, and
+   *  formatRoute(parseRoute(h)) is h for any canonical h. Null for a route
+   *  this grammar can't write. */
+  function formatRoute(r) {
+    if (!r || typeof r !== 'object') return null;
+    if (r.area === 'home') return '#/';
+    if (r.area === 'guilds') return '#/guilds';
+    const views = GRAMMAR[r.area];
+    if (!views || !Object.prototype.hasOwnProperty.call(views, r.view)) return null;
+    if (r.area === 'g' && !isSnowflake(r.gid)) return null;
+    const v = views[r.view];
+    let path = r.area === 'g' ? '#/g/' + r.gid + '/' + r.view : '#/all/' + r.view;
+    let spec = v.query;
+    if (r.drawer) {
+      const seg = Object.keys(v.drawers || {}).find((k) => v.drawers[k].kind === r.drawer.kind);
+      if (!seg) return null;
+      const d = v.drawers[seg];
+      path += '/' + seg;
+      if (d.id) {
+        if (!ID_CHECK[d.id](r.drawer.id)) return null;
+        path += '/' + enc(r.drawer.id);
+      }
+      spec = d.query || null;
+    }
+    const parts = [];
+    const query = r.query || {};
+    for (const k of Object.keys(spec || {})) {
+      const val = query[k];
+      if (val == null || val === '' || (Array.isArray(val) && !val.length)) continue;
+      parts.push(k + '=' + (Array.isArray(val) ? val.map(enc).join(',') : enc(val)));
+    }
+    return parts.length ? path + '?' + parts.join('&') : path;
+  }
+
+  /** May `s` (from sessionStorage) be a place to return to after sign-in? Only
+   *  a panel address in a narrow character set; it is only ever parsed into a
+   *  route, never assigned to location. */
+  function isSafeReturnTo(s) {
+    return typeof s === 'string' && /^#\/[A-Za-z0-9/%._~?=&,:-]{0,512}$/.test(s) && parseRoute(s) !== null;
+  }
+
+  // ── Drafts ────────────────────────────────────────────────────────────────
+  // A form's unsaved state, kept in sessionStorage across "Sign in again" and
+  // put back when the same admin returns to the same place within 30 minutes.
+  // Only the fields listed here are kept: never an invite code, a token, a
+  // picture or anything a reveal showed.
+
+  const CAP_NAME = /^[A-Z][A-Z0-9_]{0,40}$/;
+  const FIELD = {
+    text: (v) => typeof v === 'string' && v.length <= 500,
+    snowflake: isSnowflake,
+    snowflakes: (v) => Array.isArray(v) && v.length <= 500 && v.every(isSnowflake),
+    roles: (v) => Array.isArray(v) && v.length <= 500 && v.every(isRoleName),
+    caps: (v) => Array.isArray(v) && v.length <= 64 && v.every((c) => typeof c === 'string' && CAP_NAME.test(c)),
+    digits: (v) => typeof v === 'string' && /^\d{0,9}$/.test(v),
+    target: (v) => v === '__guild__' || isSnowflake(v),
+  };
+  const oneOf = (xs) => (v) => xs.indexOf(v) >= 0;
+
+  /** Per form: field → check. */
+  const DRAFT_FORMS = {
+    // The mint drawer (never the minted code).
+    mint: {
+      label: FIELD.text, kind: oneOf(['roles', 'channels', 'mirror']), roles: FIELD.roles, channels: FIELD.snowflakes,
+      mirrorRole: FIELD.snowflake, caps: FIELD.caps, uses: oneOf(['1', '5', '25', 'unlimited', 'other']), usesOther: FIELD.digits,
+      expires: oneOf(['1', '7', '30', 'never']), mode: oneOf(['mint', 'augment', 'both']),
+    },
+    // A direct grant in the persona drawer.
+    grant: { target: FIELD.target, caps: FIELD.caps },
+    // Defining an access role.
+    role: {
+      name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,
+      mirrorRole: FIELD.snowflake, mirrorRoles: FIELD.snowflakes, caps: FIELD.caps,
+    },
+  };
+  const DRAFT_MAX_AGE = 30 * 60_000;
+
+  /** The fields of `form` a draft may keep: the listed ones, when well-formed. */
+  function draftFields(form, fields) {
+    const schema = Object.prototype.hasOwnProperty.call(DRAFT_FORMS, form) ? DRAFT_FORMS[form] : null;
+    const out = {};
+    if (!schema || !fields || typeof fields !== 'object') return out;
+    for (const k of Object.keys(schema)) {
+      if (Object.prototype.hasOwnProperty.call(fields, k) && schema[k](fields[k])) out[k] = Array.isArray(fields[k]) ? fields[k].slice() : fields[k];
+    }
+    return out;
+  }
+
+  /** { v: 1, userId, route, form, fields, at }, or null when it can't be one. */
+  function makeDraft(o) {
+    if (!o || typeof o.userId !== 'string' || !o.userId || !isSafeReturnTo(o.route)) return null;
+    if (!Object.prototype.hasOwnProperty.call(DRAFT_FORMS, o.form) || typeof o.at !== 'number') return null;
+    return { v: 1, userId: o.userId, route: o.route, form: o.form, fields: draftFields(o.form, o.fields), at: o.at };
+  }
+
+  /** A stored draft (an object or its JSON) if it is this admin's and younger
+   *  than 30 minutes; otherwise null. */
+  function readDraft(stored, o) {
+    let d = stored;
+    if (typeof d === 'string') {
+      try {
+        d = JSON.parse(d);
+      } catch {
+        return null;
+      }
+    }
+    if (!d || typeof d !== 'object' || d.v !== 1 || !o || typeof o.userId !== 'string' || d.userId !== o.userId) return null;
+    if (typeof d.at !== 'number' || !(o.now - d.at >= 0) || o.now - d.at > DRAFT_MAX_AGE) return null;
+    return makeDraft(d);
+  }
+
+  // ── Sign-in errors ────────────────────────────────────────────────────────
+
+  /** ?login_error=<code> → what the sign-in card says. Only these words are
+   *  ever shown: nothing from the URL reaches the page. */
+  const LOGIN_ERRORS = {
+    cancelled: 'Sign-in was cancelled in Discord.',
+    expired: 'That sign-in took too long or the relay restarted. Try again.',
+    mismatch: 'Sign-in was started in another tab. Try again here.',
+    discord_error: 'Discord didn’t respond. Try again in a minute.',
+    rate_limited: 'Too many sign-in attempts. Wait a minute and try again.',
+    not_admin: 'You don’t manage any guild this relay serves. Ask the server owner for Manage Server, or ask the relay operator to add you.',
+    // What a relay without the codes above sends.
+    failed: 'Sign-in didn’t finish: it was cancelled, took too long, or was started in another tab. Try again.',
+    discord: 'Discord didn’t respond. Try again in a minute.',
+  };
+
+  /** null when there is no code; a generic line for a code not in the table. */
+  function loginErrorText(code) {
+    if (code == null) return null;
+    return Object.prototype.hasOwnProperty.call(LOGIN_ERRORS, code) ? LOGIN_ERRORS[code] : 'Sign-in didn’t finish. Try again.';
   }
 
   PA.lib = {
@@ -414,5 +724,7 @@
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,
+    isSnowflake, isPersonaId, isRoleName, parseRoute, formatRoute, isSafeReturnTo,
+    DRAFT_FORMS, draftFields, makeDraft, readDraft, loginErrorText,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

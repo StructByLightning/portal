@@ -56,15 +56,20 @@ a { color: var(--accent); }
 .btn-ghost:hover { border-color: var(--line); }
 .btn-danger-solid { background: var(--danger); color: #fff; border-color: var(--danger); }
 .btn[aria-busy="true"] { cursor: progress; }
-/* A button that reads as a link (persona names in tables). */
-.link { font: inherit; color: var(--accent); background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+/* A link that looks like a button (+ Mint invite), and a name that is a link
+   (persona names in tables: <a href="#/…">, or a button when it can't be). */
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+.link { font: inherit; color: var(--accent); background: none; border: none; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
 .link:hover { text-decoration: underline; }
 
 /* ── Login ── */
 .login { display: grid; place-items: center; height: 100vh; }
 .login-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 32px 36px; max-width: 360px; text-align: center; }
 .login-card .btn { display: inline-block; margin-top: 12px; text-decoration: none; }
+.login-error { margin-top: 14px; }
+.login-error p { margin: 0; }
 .error { color: var(--danger); }
+.field-error { color: var(--danger); font-size: 12px; }
 
 /* ── Shell ── */
 .app { display: flex; flex-direction: column; min-height: 100vh; }
@@ -79,7 +84,7 @@ a { color: var(--accent); }
 .tabs { display: flex; gap: 2px; }
 .tab {
   border: none; background: transparent; color: var(--muted); cursor: pointer;
-  font: inherit; padding: 6px 11px; border-radius: 6px;
+  font: inherit; padding: 6px 11px; border-radius: 6px; text-decoration: none; white-space: nowrap;
 }
 .tab:hover { color: var(--fg); background: var(--row-hover); }
 .tab.active { color: var(--fg); background: var(--row-hover); box-shadow: inset 0 -2px 0 var(--accent); }
@@ -88,6 +93,16 @@ a { color: var(--accent); }
 .scope-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
 .scope-select, .scope-static { max-width: 230px; }
 .scope-static { font-weight: 600; }
+/* Super-admins: go to a guild by id (in place of the old prompt()). It takes
+   the select's place while open; its error hangs below it, over the page, so
+   the top bar keeps its height. */
+.guild-go { position: relative; display: flex; align-items: center; gap: 6px; }
+.guild-go input { width: 190px; }
+.guild-go .field-error {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 25; white-space: nowrap;
+  background: var(--panel); border: 1px solid var(--danger); border-radius: 5px; padding: 2px 7px;
+}
+.guild-go .field-error:empty { display: none; }
 
 .user { display: flex; align-items: center; gap: 8px; }
 .user-name { color: var(--muted); }
@@ -110,6 +125,17 @@ label { display: block; }
 .loading { padding: 8px 2px; }
 .banner { margin: 0 0 10px; padding: 7px 11px; border-radius: 6px; border: 1px solid var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
 .banner.err { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+/* When the session ends: under the top bar, never over the page. */
+.session-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 14px 0; padding: 7px 11px;
+  border: 1px solid var(--warn); border-radius: 6px; background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.session-bar-text { overflow-wrap: anywhere; }
+/* A guild this admin can't manage: why, the guilds they do, Try again. */
+.not-admin { max-width: 560px; margin: 32px auto; padding: 18px 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.not-admin h2 { font-size: 16px; }
+.not-admin h2:focus-visible { outline: none; }
+.not-admin .field select { width: 100%; }
 /* Notices about the panel itself, between the top bar and the view. */
 .notices:empty { display: none; }
 .notices { padding: 10px 14px 0; }
@@ -124,7 +150,8 @@ label { display: block; }
 .status-line { margin: 8px 0 0; padding: 6px 10px; border-radius: 6px; border: 1px solid transparent; overflow-wrap: anywhere; }
 .status-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
 .status-err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 8%, transparent); }
-.status-info { color: var(--muted); }
+/* A note about the form itself (a restored draft): neither a result nor an error. */
+.status-info { color: var(--fg); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .view > .status-line { margin: 0 0 8px; }
 .code-result { font-size: 13px; user-select: all; }
 
@@ -310,6 +337,12 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
   .drawer { width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh; border-left: none; }
   .drawer-body { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
   .field-row { flex-direction: column; gap: 0; }
+  .guild-go { flex: 1 1 100%; }
+  .guild-go input { flex: 1 1 120px; width: auto; min-width: 0; }
+  .session-bar { margin: 8px 12px 0; }
+  .not-admin { margin: 16px 0; padding: 14px; }
+  .modal { padding: 16px; }
+  .modal-actions { flex-wrap: wrap; }
   /* Full width, at the bottom like the wide-screen stack: at the top it hid
      the tabs and the guild switcher (the topbar is not sticky here). */
   .toasts { bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none; }

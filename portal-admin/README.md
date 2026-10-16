@@ -9,10 +9,12 @@ portal-admin/
 ├── index.html        app shell + login + right-side detail drawer + toast stack
 ├── lib.js            pure helpers (window.PA.lib): the Read/Write/Full levels
 │                     and capabilities (a mirror of the relay's, parity-tested),
-│                     channel/role names, one-line summaries of roles and invites
+│                     channel/role names, one-line summaries of roles and invites,
+│                     the #/… address grammar, drafts, sign-in error words
 ├── ui.js             DOM helpers and widgets (window.PA.ui): toasts, status
 │                     lines, busy buttons, confirm dialogs, the level control,
-│                     checkbox lists, the drawer
+│                     checkbox lists, the drawer, "Your session ended", the
+│                     expiry bar, the Not-an-admin view
 ├── app.js            API client, resource tabs, dense tables, all mutations
 │                     (window.PA.app)
 ├── styles.css        self-contained styling (dense, dark/light, CSP-clean)
@@ -71,8 +73,63 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
 - **Audit** *(guild-scoped)* — every mutation, newest first.
 
 **Scope control:** if you administer exactly one guild it's shown as a fixed
-label; otherwise it's a selector. Super-admins also get an "other guild id…"
-entry (they may act in any guild).
+label; otherwise it's a selector. Super-admins also get a "Go to guild id…"
+entry, which opens a field for the id in the top bar (they may act in any
+guild).
+
+## Addresses
+
+Every place has an address after `#` (Caddy serves one page, so the path
+can't carry it), so reload, Back, a shared link and a sign-in keep it:
+
+```
+#/                                  the last guild and tab you used here
+#/g/<guild>/personas[?q=]           #/g/<guild>/personas/p/<persona>
+#/g/<guild>/invites[?q=]            #/g/<guild>/invites/new[?r=<role>,…|c=<channel>&lvl=read|write|full]
+#/g/<guild>/roles[?q=]              #/g/<guild>/roles/new
+#/g/<guild>/audit[?q=]
+#/all/personas[?q=]                 #/all/personas/p/<persona>          (super-admins)
+#/guilds                                                                 (super-admins)
+```
+
+`lib.parseRoute` also knows the addresses later versions add (channels, give
+access, invite detail, role detail, the global audit); this version says
+"That page isn't available yet" and shows the nearest page there is. Ids are
+checked (guilds and channels are 5–25 digits; an invite is only ever the hash
+of its code, never the code); anything else is "That link wasn't valid" and
+home. A link into a guild you can't manage shows why — never that guild's data
+or name — with the guilds you do manage and Try again.
+
+Changing guild, tab or drawer adds a history entry; a search changes `?q=`
+in place, so Back never steps through keystrokes. A drawer opened from its
+list closes with Back; one reached by a link or a reload is replaced by its
+list. Leaving a drawer with unsaved changes (Back, a link, closing the page)
+asks first.
+
+## When the session ends
+
+Sessions last 30 minutes (`PORTAL_ADMIN_SESSION_TTL_MS`). Two minutes before
+the end a bar under the top bar says when, with **Sign in again**. A request
+the relay refuses with 401 never throws the page away: "Your session ended"
+comes up over it — "this change was NOT saved" after a change — and the page
+and any open form stay as they were. **Sign in again** keeps this address and
+the open form's unsaved fields (only the fields listed in `PA.lib.DRAFT_FORMS`:
+never an invite code, a token or a picture) in `sessionStorage`, and goes
+through Discord; back in the panel, the same admin within 30 minutes gets the
+same place and the form filled in again, with "Restored your unsaved change —
+review and save. Nothing was submitted." Nothing is ever sent again by itself.
+
+Coming back to the tab checks the session (`GET /admin/me`). Tabs tell each
+other (`BroadcastChannel`) when someone signs in or out; a tab whose CSRF
+token went stale because another tab signed in again fetches the new one and
+sends its change once more (the relay refuses a bad token before doing
+anything). If the browser is now signed in as another admin, the tab reloads.
+Sign-in errors (`?login_error=`) are shown from a fixed table and removed
+from the address.
+
+Browser storage is a convenience only (the panel works without it):
+`localStorage` keeps `pa.lastGuild:<user>` and `pa.lastTab:<user>` (cleared on
+Sign out), `sessionStorage` keeps `pa.returnTo` and `pa.draft` for one sign-in.
 
 ## How it fits together
 
@@ -168,8 +225,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
 ## Notes
 
 - Rotated tokens are shown exactly once — copy and deliver out-of-band.
-- No client-side authz: a guild-admin hitting another guild gets a `403`, surfaced
-  inline. Token endpoints return `403` for non-super-admins.
+- No client-side authz: the relay decides on every request. A guild-admin
+  following a link into another guild gets the Not-an-admin view (the panel
+  asks nothing of a guild that isn't in their list, and shows the same view
+  when the relay answers `403`). Token endpoints return `403` for
+  non-super-admins.
 - Feedback: every result or error appears in the status line of the section it
   came from and stays there; a toast mirrors it. Error toasts stay until
   dismissed (✕) or until the same section reports a newer result; the rest
@@ -177,9 +237,10 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   of an open drawer on a wide screen), and the page keeps that much room at
   its end, so nothing stays hidden under them. A button that sends a
   request is disabled until the answer arrives, so a double click sends one.
-- Keyboard: `/` focuses the active search box. In the drawer, `Esc` (or a click
-  on the dimmed page) asks "Discard changes?" when a form has unsaved edits,
-  otherwise leaves a focused field, otherwise closes the drawer. `Tab` stays
-  inside the drawer and dialogs; `Enter` submits the section's form.
+- Keyboard: `/` focuses the active search box. Tabs and persona names are
+  links. In the drawer, `Esc` (or a click on the dimmed page) asks "Discard
+  changes?" when a form has unsaved edits, otherwise leaves a focused field,
+  otherwise closes the drawer and puts focus back on the link that opened it.
+  `Tab` stays inside the drawer and dialogs; `Enter` submits the section's form.
 - Below 640px wide the top bar wraps, tables scroll sideways inside their box,
   and the drawer takes the whole screen.

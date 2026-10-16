@@ -4,22 +4,24 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="same-origin" />
-  <title>Portal Admin</title>
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <title>Portal admin</title>
+  <link rel="stylesheet" href="styles.css?v=5" />
   <!-- Classic deferred scripts, run in order; each assigns only window.PA.<module>.
        Bump ?v= on a release so browsers don't mix old and new files. -->
-  <script src="lib.js?v=4" defer></script>
-  <script src="ui.js?v=4" defer></script>
-  <script src="app.js?v=4" defer></script>
+  <script src="lib.js?v=5" defer></script>
+  <script src="ui.js?v=5" defer></script>
+  <script src="app.js?v=5" defer></script>
 </head>
 <body>
-  <!-- Login screen (shown when /admin/me returns 401) -->
+  <!-- Sign-in card: only at boot, when /admin/me returns 401. (A session that
+       ends mid-task is "Your session ended" over the page instead.) -->
   <section id="login" class="login hidden">
     <div class="login-card">
-      <h1>Portal Admin</h1>
-      <p>Sign in with Discord to manage personas, invites and access.</p>
-      <a class="btn btn-primary" href="/admin/login">Sign in with Discord</a>
-      <p id="login-error" class="error hidden" role="alert"></p>
+      <h1>Portal admin</h1>
+      <p>Sign in with Discord to manage personas, channels and invites.</p>
+      <a id="login-btn" class="btn btn-primary" href="/admin/login">Sign in with Discord</a>
+      <!-- Why the last sign-in came back (?login_error=…), with Try again. -->
+      <div id="login-error" class="login-error hidden" role="alert"></div>
     </div>
   </section>
 
@@ -28,12 +30,13 @@
     <header class="topbar">
       <div class="brand">portal<span class="brand-dim">/admin</span></div>
 
+      <!-- Tabs are links: each has an address (#/g/<guild>/<tab>). -->
       <nav class="tabs" id="tabs" aria-label="Sections">
-        <button type="button" class="tab" data-tab="personas">Personas</button>
-        <button type="button" class="tab" data-tab="invites">Invites</button>
-        <button type="button" class="tab" data-tab="roles">Access roles</button>
-        <button type="button" class="tab" data-tab="audit">Audit</button>
-        <button type="button" class="tab tab-super" data-tab="guilds">Guilds</button>
+        <a class="tab" data-tab="personas" href="#/">Personas</a>
+        <a class="tab" data-tab="invites" href="#/">Invites</a>
+        <a class="tab" data-tab="roles" href="#/">Access roles</a>
+        <a class="tab" data-tab="audit" href="#/">Audit</a>
+        <a class="tab tab-super hidden" data-tab="guilds" href="#/guilds">Guilds</a>
       </nav>
 
       <div class="spacer"></div>
@@ -51,6 +54,9 @@
       </div>
     </header>
 
+    <!-- When the session ends (from two minutes before), with Sign in again. -->
+    <div id="session-bar" class="session-bar hidden" role="status"></div>
+
     <!-- Notices about the panel itself (a newer relay asks for a reload). -->
     <div id="notices" class="notices"></div>
 
@@ -66,6 +72,9 @@
     </header>
     <div id="drawer-body" class="drawer-body"></div>
   </aside>
+
+  <!-- The modal layer: confirms, "Your session ended", a token shown once. -->
+  <div id="modals"></div>
 
   <!-- Results and errors: errors stay until dismissed; the rest fade. -->
   <div id="toasts" class="toasts" aria-live="polite"></div>

@@ -194,8 +194,22 @@ class FakeElement extends FakeNode {
     for (const fn of this.listeners.get(type) ?? []) fn(ev);
     return ev;
   }
+  /** A click; on a link to '#…' that nothing prevented, the browser goes
+   *  there (a new history entry, then popstate and hashchange). */
   click() {
-    if (!this.disabled) this.fire('click');
+    if (this.disabled) return;
+    const ev = this.fire('click');
+    const href = this.tagName === 'A' ? this.getAttribute('href') : null;
+    if (href && href.startsWith('#') && !ev.defaultPrevented) this.doc.nav?.go(href);
+  }
+  /** A form's controls, in document order (dirtyTracker snapshots these);
+   *  a test may set its own list. */
+  private ownElements?: FakeElement[];
+  get elements(): FakeElement[] | undefined {
+    return this.ownElements ?? (this.tagName === 'FORM' ? this.querySelectorAll('input, select, textarea, button') : undefined);
+  }
+  set elements(v: FakeElement[] | undefined) {
+    this.ownElements = v;
   }
   focus() {
     this.doc.activeElement = this;
@@ -217,6 +231,9 @@ class FakeDocument {
   body: FakeElement;
   activeElement: FakeElement;
   listeners: Array<[string, unknown]> = [];
+  nav: FakeNav | null = null;
+  visibilityState = 'visible';
+  title = '';
   constructor() {
     this.body = new FakeElement('BODY', this);
     this.activeElement = this.body;
@@ -254,6 +271,124 @@ class FakeDocument {
     for (const [type, fn] of this.listeners) if (type === 'keydown') (fn as (e: unknown) => void)(ev);
     return ev;
   }
+}
+
+/**
+ * The address bar and the history: entries of path+search+hash, Back and
+ * Forward, and the window events they fire (popstate, then hashchange, after
+ * the current task — as a browser does). pushState/replaceState fire nothing.
+ */
+class FakeNav {
+  entries: string[];
+  i = 0;
+  listeners = new Map<string, Array<(e: unknown) => void>>();
+  assigned: string[] = [];
+  reloads = 0;
+  constructor(start = '/') {
+    this.entries = [start];
+  }
+  private url() {
+    return new URL(this.entries[this.i], 'http://panel.invalid');
+  }
+  private resolve(u: string) {
+    const r = new URL(u, this.url());
+    return r.pathname + r.search + r.hash;
+  }
+  private fireNav() {
+    setImmediate(() => {
+      for (const t of ['popstate', 'hashchange']) for (const fn of this.listeners.get(t) ?? []) fn({ type: t });
+    });
+  }
+  get current() {
+    return this.entries[this.i];
+  }
+  /** The window's own addEventListener (popstate, hashchange, beforeunload). */
+  addEventListener = (type: string, fn: (e: unknown) => void) => {
+    const l = this.listeners.get(type) ?? [];
+    l.push(fn);
+    this.listeners.set(type, l);
+  };
+  dispatch(type: string, e: Record<string, unknown> = {}) {
+    const ev = { type, defaultPrevented: false, returnValue: undefined as unknown, preventDefault() { ev.defaultPrevented = true; }, ...e };
+    for (const fn of this.listeners.get(type) ?? []) fn(ev);
+    return ev;
+  }
+  location = (() => {
+    const nav = this;
+    return {
+      get hash() {
+        const h = nav.url().hash;
+        return h === '#' ? '' : h;
+      },
+      get pathname() {
+        return nav.url().pathname;
+      },
+      get search() {
+        return nav.url().search;
+      },
+      assign(u: string) {
+        nav.assigned.push(u);
+      },
+      reload() {
+        nav.reloads++;
+      },
+    };
+  })();
+  history = (() => {
+    const nav = this;
+    return {
+      get length() {
+        return nav.entries.length;
+      },
+      pushState(_s: unknown, _t: string, u: string) {
+        nav.entries.splice(nav.i + 1);
+        nav.entries.push(nav.resolve(u));
+        nav.i++;
+      },
+      replaceState(_s: unknown, _t: string, u: string) {
+        nav.entries[nav.i] = nav.resolve(u);
+      },
+      back() {
+        if (nav.i > 0) {
+          nav.i--;
+          nav.fireNav();
+        }
+      },
+      forward() {
+        if (nav.i < nav.entries.length - 1) {
+          nav.i++;
+          nav.fireNav();
+        }
+      },
+    };
+  })();
+  /** A link click, or an address typed into the bar: a new entry and the events. */
+  go(href: string) {
+    const to = this.resolve(href);
+    if (to === this.entries[this.i]) return;
+    this.entries.splice(this.i + 1);
+    this.entries.push(to);
+    this.i++;
+    this.fireNav();
+  }
+  back() {
+    this.history.back();
+  }
+}
+
+/** sessionStorage / localStorage, as a Map. */
+function fakeStorage(seed: Record<string, string> = {}) {
+  const m = new Map(Object.entries(seed));
+  return {
+    map: m,
+    get length() {
+      return m.size;
+    },
+    key: (i: number) => [...m.keys()][i] ?? null,
+    getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+    setItem: (k: string, v: string) => void m.set(k, String(v)),
+    removeItem: (k: string) => void m.delete(k),
+  };
 }
 
 /** A sandbox with a fake document and a manual clock. */
@@ -634,7 +769,7 @@ test('ui.toast: the ✕ is described by its message', () => {
 const G1 = '100000000000000001'; // the preview harness's invented Guild One
 
 /** Answers a mutation (or overrides a read): a body, a refuse(), or undefined for the default. */
-type FakeHandler = (method: string, pathAndQuery: string, body: any) => unknown;
+type FakeHandler = (method: string, pathAndQuery: string, body: any, headers: Record<string, string>) => unknown;
 
 class Refusal {
   constructor(public status: number, public error: Record<string, unknown>) {}
@@ -645,16 +780,23 @@ const refuse = (status: number, code: string, message = code, extra: Record<stri
 /** A sandbox with index.html's shell, signed in as a one-guild admin. Every
  *  request lands in `calls` as 'METHOD /path?query', and every JSON body sent
  *  in `bodies`. `routes` adds or replaces GET answers by path. */
-function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandler } = {}) {
+function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandler; url?: string; session?: Record<string, string>; local?: Record<string, string> } = {}) {
   const box = sandbox();
   const { ctx, doc } = box;
   const calls: string[] = [];
   const bodies: any[] = [];
+  const nav = new FakeNav(opts.url ?? '/');
+  doc.nav = nav;
+  const sessionStore = fakeStorage(opts.session);
+  const localStore = fakeStorage(opts.local);
   Object.assign(ctx, {
     URLSearchParams,
-    location: { search: '', pathname: '/', hash: '' },
-    history: { replaceState() {} },
-    fetch: async (path: string, req: { method: string; body?: string }) => {
+    location: nav.location,
+    history: nav.history,
+    addEventListener: nav.addEventListener,
+    sessionStorage: sessionStore,
+    localStorage: localStore,
+    fetch: async (path: string, req: { method: string; body?: string; headers?: Record<string, string> }) => {
       calls.push(req.method + ' ' + path);
       const url = new URL(path, 'http://panel.invalid');
       const route = url.pathname;
@@ -670,7 +812,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       };
       const sent = req.body ? JSON.parse(req.body) : undefined;
       if (sent !== undefined) bodies.push(sent);
-      let body = opts.handle?.(req.method, route + url.search, sent);
+      let body = opts.handle?.(req.method, route + url.search, sent, req.headers ?? {});
       if (body === undefined) body = req.method === 'DELETE' ? {} : req.method === 'GET' ? routes[route] : undefined;
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
       // refuse(status, code, message, extra) answers as the relay refuses.
@@ -680,19 +822,31 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
   });
   load(ctx);
   const { el } = ctx.PA.ui;
-  const tab = (name: string, cls = 'tab') => el('button', { class: cls, 'data-tab': name, text: name });
+  // As index.html has them: links, whose addresses the app keeps up to date.
+  const tab = (name: string, cls = 'tab') => el('a', { class: cls, 'data-tab': name, href: '#/', text: name });
   const tabs = { personas: tab('personas'), invites: tab('invites'), roles: tab('roles'), audit: tab('audit'), guilds: tab('guilds', 'tab tab-super hidden') };
-  doc.body.appendChild(el('div', { id: 'login', class: 'hidden' }, [el('p', { id: 'login-error', class: 'hidden' })]));
+  doc.body.appendChild(el('div', { id: 'login', class: 'hidden' }, [
+    el('a', { id: 'login-btn', href: '/admin/login', text: 'Sign in with Discord' }), el('div', { id: 'login-error', class: 'hidden' }),
+  ]));
   doc.body.appendChild(el('div', { id: 'app', class: 'hidden' }, [
     el('header', {}, [
       el('span', { id: 'user-name' }), el('span', { id: 'super-badge', class: 'hidden' }),
-      el('select', { id: 'guild-select' }), el('span', { id: 'guild-static', class: 'hidden' }),
+      el('div', { id: 'scope' }, [el('select', { id: 'guild-select' }), el('span', { id: 'guild-static', class: 'hidden' })]),
       el('nav', {}, Object.values(tabs)), el('button', { id: 'logout-btn', text: 'Sign out' }),
     ]),
+    el('div', { id: 'session-bar', class: 'hidden' }),
     el('main', { id: 'view' }),
   ]));
   drawerDom(doc, el);
-  return { ...box, calls, bodies, tabs };
+  doc.body.appendChild(el('div', { id: 'modals' }));
+  return { ...box, calls, bodies, tabs, nav, sessionStore, localStore };
+}
+
+/** The link or button that reads `text`. */
+function clickable(doc: FakeDocument, text: string, root: FakeElement = doc.body) {
+  const hit = root.querySelectorAll('a, button').find((b) => b.textContent === text);
+  if (!hit) throw new Error('nothing to click reads ' + JSON.stringify(text));
+  return hit;
 }
 
 async function settle() {
@@ -1004,7 +1158,7 @@ async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>;
   });
   await box.ctx.PA.app.boot();
   await settle();
-  box.doc.querySelectorAll('button').find((b) => b.textContent === 'Aria')!.click();
+  clickable(box.doc, 'Aria').click();
   await settle();
   const drawer = box.doc.getElementById('drawer-body')!;
   const form = drawer.querySelector('form.grant-form')!;
@@ -1118,10 +1272,11 @@ async function rolesTab() {
   await settle();
   box.tabs.roles.click();
   await settle();
-  const button = (text: string) => box.doc.querySelectorAll('button').find((b) => b.textContent === text);
+  const button = (text: string) => box.doc.querySelectorAll('a, button').find((b) => b.textContent === text);
   const confirm = () => box.doc.querySelector('.modal');
-  /** '+ Define access role', a name, a level, then Create. */
-  async function define(name: string, level: string) {
+  /** '+ Define access role', a name, a level, then Create (`beforeCreate`
+   *  runs just before Create is pressed). */
+  async function define(name: string, level: string, beforeCreate?: () => void) {
     button('+ Define access role')!.click();
     await settle();
     const form = box.doc.getElementById('drawer-body')!.querySelector('form')!;
@@ -1135,6 +1290,7 @@ async function rolesTab() {
     radio.checked = true;
     radio.fire('change');
     assert.equal(form.querySelector('button[type="submit"]')!.disabled, false);
+    beforeCreate?.();
     form.fire('submit');
     await settle();
   }
@@ -1199,9 +1355,10 @@ test('role drawer: a role deleted (or made elsewhere) since the tab was drawn is
   assert.ok(catalog.constructor && Object.hasOwn(catalog, 'constructor'));
 
   // When the relay can't be asked, nothing is created and the drawer says so.
+  // (The drawer loads this guild's channels as it opens; the relay goes away
+  // after that, just before Create.)
   const posts = bodies.length;
-  net.down = true;
-  await define('g1-offline', 'read');
+  await define('g1-offline', 'read', () => (net.down = true));
   assert.equal(bodies.length, posts);
   assert.equal(catalog['g1-offline'], undefined);
   const form = doc.getElementById('drawer-body')!.querySelector('form')!;
@@ -1475,7 +1632,7 @@ test('invites list: each invite’s status; a spent one is deleted, an active on
   });
   await ctx.PA.app.boot();
   await settle();
-  doc.querySelectorAll('button').find((b) => b.textContent === 'invites')!.click();
+  clickable(doc, 'invites').click();
   await settle();
   const rows = doc.getElementById('view')!.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
   assert.deepEqual(rows[0].slice(0, 3), ['Code', 'Label', 'Status']);
@@ -1500,7 +1657,7 @@ test('persona drawer: Upload is offered only when the relay keeps uploaded pictu
     });
     await ctx.PA.app.boot();
     await settle();
-    doc.querySelectorAll('button').find((b) => b.textContent === 'Aria')!.click();
+    clickable(doc, 'Aria').click();
     await settle();
     const drawer = doc.getElementById('drawer-body')!;
     assert.ok(drawer.querySelectorAll('button').some((b) => b.textContent === 'Save'), 'the URL form is there');
@@ -1538,4 +1695,564 @@ test('role drawer: a new name must be one the relay accepts', async () => {
   const submit = form.querySelector('button[type="submit"]')!;
   assert.equal(submit.disabled, true);
   assert.match(form.textContent, /Use lower-case letters, digits, dots, dashes or underscores in the name \(up to 64\) to create it\./);
+});
+
+// ── Addresses: the router grammar (lib.js) ──
+
+const GA = '100000000000000001'; // Guild One
+const GB = '100000000000000002'; // Guild Two
+
+test('lib.parseRoute / formatRoute: every address round-trips', () => {
+  const { lib } = libOnly();
+  const g = '#/g/' + GA;
+  const table = [
+    '#/',
+    '#/guilds',
+    g + '/channels',
+    g + '/channels?q=res&show=agents&cat=' + CH.catResearch,
+    g + '/channels/c/' + CH.research,
+    g + '/personas',
+    g + '/personas?q=ar%20ia',
+    g + '/personas/p/aria',
+    g + '/personas/p/aria-1a2b3c',
+    g + '/personas/p/sol.6d7e8f:x_y',
+    g + '/personas/add',
+    g + '/give',
+    g + '/give?p=aria,sol&c=' + CH.general + ',' + CH.research + '&lvl=write',
+    g + '/invites',
+    g + '/invites?status=spent&q=guests',
+    g + '/invites/new',
+    g + '/invites/new?c=' + CH.general + '&lvl=read&r=g1-readers,g1-chatters',
+    g + '/invites/i/0123456789abcdef01234567',
+    g + '/roles',
+    g + '/roles?q=g1',
+    g + '/roles/r/g1-readers',
+    g + '/roles/r/Old%20Name%2C%20kept',
+    g + '/roles/new',
+    g + '/audit',
+    g + '/audit?q=mint&actor=200000000000000002&persona=aria&channel=' + CH.general + '&action=invites&reads=1',
+    '#/all/personas',
+    '#/all/personas?q=sol',
+    '#/all/personas/p/sol',
+    '#/all/audit',
+    '#/all/audit?guild=' + GB + '&action=roles',
+  ];
+  for (const h of table) {
+    const r = lib.parseRoute(h);
+    assert.ok(r, 'parses: ' + h);
+    assert.equal(lib.formatRoute(r), h, 'formats back: ' + h);
+    assert.deepEqual(plain(lib.parseRoute(lib.formatRoute(r))), plain(r), 'and parses the same: ' + h);
+    assert.equal(lib.isSafeReturnTo(h), true, 'a place to return to: ' + h);
+  }
+  // What a route holds.
+  assert.deepEqual(plain(lib.parseRoute(g + '/personas/p/aria')), { area: 'g', gid: GA, view: 'personas', drawer: { kind: 'persona', id: 'aria' }, query: {} });
+  assert.deepEqual(plain(lib.parseRoute(g + '/invites/new?c=' + CH.general + '&lvl=read&r=g1-readers,a%2Cb')!.query), { c: CH.general, lvl: 'read', r: ['g1-readers', 'a,b'] });
+  assert.equal(lib.parseRoute('')!.area, 'home');
+  // Anything else is written back the one way: unknown keys and empty values go.
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/personas?zz=1&q=')), g + '/personas');
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/personas?q=a&q=b')), g + '/personas?q=a', 'the first one counts');
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/personas?utm=x&q=a+b')), g + '/personas?q=a%20b');
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/personas/')), g + '/personas');
+  // Characters encodeURIComponent leaves alone are escaped too.
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'personas', drawer: null, query: { q: "it's (x)!" } }), g + '/personas?q=it%27s%20%28x%29%21');
+});
+
+test('lib.parseRoute: a bad id, value or shape is no route at all', () => {
+  const { lib } = libOnly();
+  const g = '#/g/' + GA;
+  const bad = [
+    '#/g/abc/zzz', '#/g/1234/personas', '#/g/' + '1'.repeat(26) + '/personas', '#/g//personas', '#/g/' + GA,
+    g + '/zzz', g + '/personas/p', g + '/personas/p/a/b', g + '/personas/p/' + encodeURIComponent('a/b'),
+    g + '/personas/p/..', g + '/personas/p/' + 'x'.repeat(101), g + '/personas/p/a%20b', g + '/personas/x/aria',
+    g + '/channels/c/general', g + '/channels?show=some', g + '/channels?cat=12',
+    g + '/invites/i/0123456789ABCDEF01234567', g + '/invites/i/0123', g + '/invites?status=used',
+    g + '/invites/new?lvl=admin', g + '/invites/new?r=a%2Fb',
+    g + '/roles/r/' + 'r'.repeat(65), g + '/roles/r/a%2Fb', g + '/roles/r/%E0%A4%A',
+    g + '/give?p=' + Array.from({ length: 21 }, (_, i) => 'p' + i).join(','), g + '/give?c=' + CH.general + ',x', g + '/give?lvl=Write',
+    g + '/audit?actor=gwen', g + '/audit?action=everything', g + '/audit?reads=yes',
+    '#/all', '#/all/roles', '#/all/personas/p/a/b', '#/guilds/x', '#/x', '#g/' + GA + '/personas', 'javascript:alert(1)', '/#/guilds',
+    g + '/../' + GB + '/personas', '#/g/1/../x',
+  ];
+  for (const h of bad) assert.equal(lib.parseRoute(h), null, h);
+  // And nothing it can't write is written.
+  assert.equal(lib.formatRoute({ area: 'g', gid: 'abc', view: 'personas', drawer: null, query: {} }), null);
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'personas', drawer: { kind: 'persona', id: 'a/b' }, query: {} }), null);
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'zzz', drawer: null, query: {} }), null);
+});
+
+test('lib.isSafeReturnTo: only a panel address, in a narrow character set', () => {
+  const { lib } = libOnly();
+  for (const s of [
+    'javascript:alert(1)', 'javascript://%0aalert(1)', '#/g/1/../x', '#/g/' + GA + '/../x', 'https://example.invalid/#/g/' + GA + '/personas',
+    '//example.invalid', '/admin/login', '#/g/' + GA + '/personas?q=' + 'a'.repeat(600), '#/' + 'g'.repeat(600),
+    '#/g/' + GA + '/zzz', '#/g/' + GA + '/channels/x', '#/nowhere', '#/g/' + GA + '/personas?q=<b>', '#/g/' + GA + '/personas?q=a b',
+    '', null, undefined, 42, { toString: () => '#/guilds' },
+  ]) assert.equal(lib.isSafeReturnTo(s as any), false, String(s));
+  for (const s of ['#/', '#/guilds', '#/g/' + GA + '/invites/new', '#/g/' + GA + '/personas?q=ar%20ia']) assert.equal(lib.isSafeReturnTo(s), true, s);
+});
+
+test('lib drafts: only whitelisted fields are kept, only for the same admin, for 30 minutes', () => {
+  const { lib } = libOnly();
+  const route = '#/g/' + GA + '/invites/new';
+  const fields = {
+    label: 'x', kind: 'roles', roles: ['g1-readers'], caps: ['VIEW_CHANNEL'], uses: '5', expires: '7', mode: 'mint',
+    // Never kept: a code, a token, a picture, a reveal, anything unlisted or malformed.
+    code: 'inv_secret', token: 'tok', avatar: 'data:image/png;base64,AAAA', reveal: 'inv_x', password: 'p',
+    channels: ['not-an-id'], usesOther: '1e9',
+  };
+  const d = lib.makeDraft({ userId: '200000000000000001', route, form: 'mint', fields, at: 1000 })!;
+  assert.deepEqual(plain(d), {
+    v: 1, userId: '200000000000000001', route, form: 'mint', at: 1000,
+    fields: { label: 'x', kind: 'roles', roles: ['g1-readers'], caps: ['VIEW_CHANNEL'], uses: '5', expires: '7', mode: 'mint' },
+  });
+  assert.deepEqual(plain(lib.draftFields('grant', { target: '__guild__', caps: ['VIEW_CHANNEL'], code: 'inv_x' })), { target: '__guild__', caps: ['VIEW_CHANNEL'] });
+  assert.deepEqual(plain(lib.draftFields('role', { name: 'g1-x', where: 'all', token: 't' })), { name: 'g1-x', where: 'all' });
+  // Forms without a schema (the invite claim takes a code) keep nothing.
+  assert.equal(lib.makeDraft({ userId: 'u', route, form: 'claim', fields: { code: 'inv_x' }, at: 1 }), null);
+  assert.equal(lib.makeDraft({ userId: 'u', route: 'javascript:x', form: 'mint', fields: {}, at: 1 }), null);
+  assert.equal(lib.makeDraft({ userId: '', route, form: 'mint', fields: {}, at: 1 }), null);
+
+  const json = JSON.stringify(d);
+  assert.deepEqual(plain(lib.readDraft(json, { userId: '200000000000000001', now: 1000 + 29 * 60_000 })), plain(d));
+  assert.equal(lib.readDraft(json, { userId: '200000000000000002', now: 2000 }), null, 'another admin');
+  assert.equal(lib.readDraft(json, { userId: '200000000000000001', now: 1000 + 31 * 60_000 }), null, 'too old');
+  assert.equal(lib.readDraft(json, { userId: '200000000000000001', now: 500 }), null, 'from the future');
+  assert.equal(lib.readDraft(JSON.stringify({ ...d, v: 2 }), { userId: '200000000000000001', now: 1000 }), null);
+  assert.equal(lib.readDraft('{nope', { userId: '200000000000000001', now: 1000 }), null);
+  assert.equal(lib.readDraft(null, { userId: '200000000000000001', now: 1000 }), null);
+  // A stored draft is checked again on the way back in.
+  const tampered = JSON.stringify({ ...d, fields: { ...d.fields, code: 'inv_secret' } });
+  assert.equal('code' in lib.readDraft(tampered, { userId: '200000000000000001', now: 1000 })!.fields, false);
+});
+
+test('lib.loginErrorText: the fixed table; anything else is a generic line', () => {
+  const { lib } = libOnly();
+  assert.equal(lib.loginErrorText('cancelled'), 'Sign-in was cancelled in Discord.');
+  assert.equal(lib.loginErrorText('expired'), 'That sign-in took too long or the relay restarted. Try again.');
+  assert.equal(lib.loginErrorText('mismatch'), 'Sign-in was started in another tab. Try again here.');
+  assert.equal(lib.loginErrorText('discord_error'), 'Discord didn’t respond. Try again in a minute.');
+  assert.equal(lib.loginErrorText('rate_limited'), 'Too many sign-in attempts. Wait a minute and try again.');
+  assert.match(lib.loginErrorText('not_admin'), /^You don’t manage any guild this relay serves\./);
+  assert.equal(lib.loginErrorText('<script>'), 'Sign-in didn’t finish. Try again.');
+  assert.equal(lib.loginErrorText(null), null);
+});
+
+// ── Addresses in the app: reload, Back, links ──
+
+const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1' };
+const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1' };
+
+/** The panel signed in as `me`, at `url`, over Guild One's fixture. */
+async function panelAt(url: string, opts: { me?: unknown; guilds?: unknown[]; handle?: FakeHandler; routes?: Record<string, unknown>; session?: Record<string, string>; local?: Record<string, string> } = {}) {
+  const g = '/admin/g/' + GA;
+  const box = appSandbox({
+    url,
+    session: opts.session,
+    local: opts.local,
+    routes: {
+      '/admin/me': opts.me ?? ME_GWEN,
+      '/admin/guilds': { guilds: opts.guilds ?? [{ id: GA, name: 'Guild One' }] },
+      [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
+      [g + '/channels']: { channels: G1_CHANNELS },
+      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters'], guildPolicy: { channels: {} }, names: { channels: {} } },
+      [g + '/audit']: { records: [] },
+      ...opts.routes,
+    },
+    handle: opts.handle,
+  });
+  await box.ctx.PA.app.boot();
+  await settle();
+  const here = () => box.nav.location.hash;
+  const drawerOpen = () => !box.doc.getElementById('drawer')!.classList.contains('hidden');
+  return { ...box, here, drawerOpen };
+}
+
+test('app routes: reload keeps the guild and tab; a persona is an address; Back closes it, then goes back a tab', async () => {
+  const g = '#/g/' + GA;
+  const { nav, here, calls, tabs, drawerOpen, doc } = await panelAt('/' + g + '/invites');
+  assert.equal(here(), g + '/invites');
+  assert.ok(calls.includes(`GET /admin/g/${GA}/invites?limit=50&offset=0`), 'Invites is drawn');
+  assert.equal(tabs.invites.getAttribute('aria-current'), 'page');
+  assert.equal(tabs.personas.getAttribute('href'), g + '/personas', 'tabs are links');
+  assert.equal(doc.title, 'Portal admin — Invites — Guild One');
+
+  tabs.personas.click();
+  await settle();
+  assert.equal(here(), g + '/personas');
+  const aria = clickable(doc, 'Aria');
+  assert.equal(aria.tagName, 'A');
+  assert.equal(aria.getAttribute('href'), g + '/personas/p/aria');
+  aria.click();
+  await settle();
+  assert.equal(here(), g + '/personas/p/aria');
+  assert.ok(drawerOpen());
+
+  nav.back();
+  await settle();
+  assert.equal(here(), g + '/personas');
+  assert.equal(drawerOpen(), false, 'Back closes the drawer');
+  nav.back();
+  await settle();
+  assert.equal(here(), g + '/invites', 'and Back again is Invites');
+  assert.equal(tabs.invites.getAttribute('aria-current'), 'page');
+});
+
+test('app routes: a deep link opens its drawer; closing it puts its list in its place', async () => {
+  const g = '#/g/' + GA;
+  const { nav, here, drawerOpen, doc } = await panelAt('/' + g + '/personas/p/aria');
+  assert.ok(drawerOpen());
+  assert.equal(doc.getElementById('drawer-title')!.textContent, 'Aria aria');
+  const before = nav.entries.length;
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(here(), g + '/personas');
+  assert.equal(nav.entries.length, before, 'replaced, not a new entry');
+  assert.equal(drawerOpen(), false);
+});
+
+test('app routes: Esc closes the drawer and gives focus back to the link that opened it', async () => {
+  const g = '#/g/' + GA;
+  const { here, doc, drawerOpen } = await panelAt('/' + g + '/personas');
+  const aria = clickable(doc, 'Aria');
+  aria.focus();
+  aria.click();
+  await settle();
+  assert.ok(drawerOpen());
+  assert.equal(doc.activeElement, doc.getElementById('drawer-title'), 'focus moves to the title');
+  doc.key('Escape');
+  await settle();
+  assert.equal(drawerOpen(), false);
+  assert.equal(doc.activeElement, aria);
+  assert.equal(here(), g + '/personas');
+});
+
+test('app routes: a link that isn’t valid goes to the last guild and tab, and says so', async () => {
+  const local = { ['pa.lastGuild:' + ME_GWEN.user.id]: GA, ['pa.lastTab:' + ME_GWEN.user.id]: 'roles' };
+  const { here, doc, nav } = await panelAt('/#/g/abc/zzz', { local });
+  assert.equal(here(), '#/g/' + GA + '/roles');
+  assert.equal(nav.entries.length, 1, 'in place (replaceState)');
+  assert.ok(doc.getElementById('toasts')!.textContent.includes('That link wasn’t valid.'));
+});
+
+test('app routes: home is the last guild and tab; the place is remembered as you go', async () => {
+  const { here, localStore, tabs } = await panelAt('/');
+  assert.equal(here(), '#/g/' + GA + '/personas', 'a first visit lands on Personas');
+  tabs.audit.click();
+  await settle();
+  assert.equal(localStore.getItem('pa.lastTab:' + ME_GWEN.user.id), 'audit');
+  assert.equal(localStore.getItem('pa.lastGuild:' + ME_GWEN.user.id), GA);
+});
+
+test('app routes: a page a later version adds says so and shows the nearest one', async () => {
+  const { here, doc } = await panelAt('/#/g/' + GA + '/channels/c/' + CH.research);
+  assert.equal(here(), '#/g/' + GA + '/personas');
+  assert.ok(doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Personas instead.'));
+});
+
+test('app routes: the search box keeps ?q= in place — Back never steps through keystrokes', async () => {
+  const g = '#/g/' + GA;
+  const { here, nav, doc, advance, calls } = await panelAt('/' + g + '/personas');
+  const before = nav.entries.length;
+  const search = doc.getElementById('list-search')!;
+  for (const v of ['a', 'ar', 'ari']) {
+    search.value = v;
+    search.fire('input');
+    advance(300);
+    await settle();
+  }
+  assert.equal(here(), g + '/personas?q=ari');
+  assert.equal(nav.entries.length, before);
+  assert.equal(calls.at(-1), `GET /admin/g/${GA}/personas?q=ari&limit=50&offset=0`);
+  // A reload of that address comes back with the search in the box.
+  const again = await panelAt('/' + g + '/personas?q=ari');
+  assert.equal(again.doc.getElementById('list-search')!.value, 'ari');
+  assert.ok(again.calls.includes(`GET /admin/g/${GA}/personas?q=ari&limit=50&offset=0`));
+});
+
+test('app routes: a link into a guild this admin can’t manage shows why, never that guild’s data or name', async () => {
+  const { here, doc, calls } = await panelAt('/#/g/' + GB + '/personas', {
+    routes: { ['/admin/g/' + GB + '/personas']: { personas: [{ id: 'sol', displayName: 'Sol' }], total: 1, limit: 50, offset: 0 } },
+  });
+  assert.equal(here(), '#/g/' + GB + '/personas', 'the address stays');
+  const view = doc.getElementById('view')!;
+  assert.equal(view.querySelector('h2')!.textContent, 'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
+  assert.ok(!calls.some((c) => c.includes('/admin/g/' + GB)), 'nothing is asked of that guild');
+  assert.doesNotMatch(doc.body.textContent, /Guild Two|Sol/);
+  assert.equal(doc.title, 'Portal admin');
+  // The guild switcher, inline: picking a guild goes there.
+  const pick = view.querySelector('select')!;
+  pick.value = GA;
+  pick.fire('change');
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/personas');
+  assert.ok(doc.getElementById('view')!.textContent.includes('Aria'));
+});
+
+test('app routes: the relay’s own “not an admin of this guild” shows the same view, and Try again asks again', async () => {
+  let allowed = false;
+  const { doc, calls } = await panelAt('/#/g/' + GA + '/invites', {
+    handle: (method, path) => (!allowed && path.startsWith('/admin/g/') ? refuse(403, 'FORBIDDEN', 'not an admin of this guild', { reason: 'NOT_GUILD_ADMIN' }) : undefined),
+  });
+  const view = doc.getElementById('view')!;
+  assert.equal(view.querySelector('h2')!.textContent, 'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
+  allowed = true;
+  clickable(doc, 'Try again', view).click();
+  await settle();
+  assert.ok(calls.filter((c) => c === 'GET /admin/guilds').length >= 2, 'the guild list is asked for again');
+  assert.ok(doc.getElementById('view')!.textContent.includes('inv_fixtureinvite0000000a'), 'and the page is shown');
+});
+
+test('app routes: a super-admin’s page, for anyone else, goes home', async () => {
+  const { here } = await panelAt('/#/guilds');
+  assert.equal(here(), '#/g/' + GA + '/personas');
+});
+
+// ── A session that ends mid-task ──
+
+/** Mint drawer: label and access role picked, as an admin would. */
+function fillMint(doc: FakeDocument, label: string, role: string) {
+  const drawer = doc.getElementById('drawer-body')!;
+  const input = drawer.querySelector('input[name="label"]')!;
+  input.value = label;
+  input.fire('input');
+  const box = drawer.querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === role)!;
+  box.checked = true;
+  box.fire('change');
+  return drawer.querySelector('form')!;
+}
+
+test('session: a change refused with 401 says it was NOT saved, over the page; Sign in again keeps the place and the form', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method, path) => (down ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
+  });
+  const { doc, nav, sessionStore, drawerOpen } = box;
+  const form = fillMint(doc, 'x', 'g1-readers');
+  down = true;
+  form.fire('submit');
+  await settle();
+  const modal = doc.querySelector('.modal')!;
+  assert.equal(modal.getAttribute('role'), 'alertdialog');
+  assert.equal(modal.querySelector('h2')!.textContent, 'Your session ended — this change was NOT saved.');
+  assert.ok(drawerOpen(), 'the drawer stays');
+  assert.equal(doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, 'x', 'and so does the form');
+  assert.ok(doc.getElementById('login')!.classList.contains('hidden'), 'not the sign-in card');
+  assert.ok(!doc.getElementById('app')!.classList.contains('hidden'));
+
+  clickable(doc, 'Sign in again', modal).click();
+  assert.deepEqual(nav.assigned, ['/admin/login']);
+  assert.equal(sessionStore.getItem('pa.returnTo'), g + '/invites/new');
+  const draft = JSON.parse(sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.v, 1);
+  assert.equal(draft.userId, ME_OP.user.id);
+  assert.equal(draft.route, g + '/invites/new');
+  assert.equal(draft.form, 'mint');
+  assert.equal(draft.fields.label, 'x');
+  assert.deepEqual(draft.fields.roles, ['g1-readers']);
+  assert.equal(JSON.stringify(draft).includes('inv_'), false);
+  // Going to sign in asks no "Leave site?" question.
+  assert.equal(nav.dispatch('beforeunload').defaultPrevented, false);
+
+  // Back from Discord: the relay lands on '/', the panel on the kept place,
+  // the form filled in again. Nothing is sent.
+  const back = await panelAt('/', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    session: { 'pa.returnTo': sessionStore.getItem('pa.returnTo')!, 'pa.draft': sessionStore.getItem('pa.draft')! },
+  });
+  assert.equal(back.here(), g + '/invites/new');
+  const body = back.doc.getElementById('drawer-body')!;
+  assert.equal(body.querySelector('input[name="label"]')!.value, 'x');
+  assert.equal(body.querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === 'g1-readers')!.checked, true);
+  assert.ok(body.textContent.includes('Restored your unsaved change — review and save. Nothing was submitted.'));
+  assert.ok(!back.calls.some((c) => c.startsWith('POST')), 'nothing was submitted');
+  assert.equal(back.sessionStore.getItem('pa.draft'), null, 'the draft is used once');
+  assert.equal(back.sessionStore.getItem('pa.returnTo'), null);
+});
+
+test('session: a draft is put back only for the same admin, at the same place', async () => {
+  const g = '#/g/' + GA;
+  const draft = (userId: string, route: string) => JSON.stringify({ v: 1, userId, route, form: 'mint', fields: { label: 'kept' }, at: Date.now() });
+  for (const [d, want] of [
+    [draft(ME_OP.user.id, g + '/invites/new'), 'kept'],
+    [draft('200000000000000009', g + '/invites/new'), ''],
+    [draft(ME_OP.user.id, g + '/invites'), ''],
+  ] as const) {
+    const box = await panelAt('/' + g + '/invites/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], session: { 'pa.draft': d } });
+    assert.equal(box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, want);
+  }
+});
+
+test('session: a read that finds the session over says so over the page; the sign-in card is for boot only', async () => {
+  let down = false;
+  const { doc, tabs } = await panelAt('/#/g/' + GA + '/personas', {
+    handle: (method) => (down && method === 'GET' ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
+  });
+  down = true;
+  tabs.invites.click();
+  await settle();
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Your session ended.');
+  assert.ok(doc.getElementById('login')!.classList.contains('hidden'));
+  assert.equal(doc.querySelectorAll('.modal').length, 1, 'one at a time');
+});
+
+test('session: a stale CSRF token (another tab signed in again) is fetched anew and the change sent once more', async () => {
+  let token = 'csrf-new';
+  const sent: string[] = [];
+  const me = () => ({ ...ME_GWEN, csrf: token });
+  const box = await panelAt('/#/g/' + GA + '/personas/p/aria', {
+    handle: (method, path, body, headers) => {
+      if (path === '/admin/me') return me();
+      if (method === 'PUT') {
+        sent.push(headers['X-CSRF-Token']);
+        return headers['X-CSRF-Token'] === token ? { guildPolicy: { channels: { [CH.general]: [...LEVEL_CAPS.write] } } } : refuse(403, 'CSRF', 'missing or invalid CSRF token');
+      }
+      return undefined;
+    },
+  });
+  token = 'csrf-newer'; // tab B signed in again
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.general;
+  target.fire('change');
+  const write = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'write')!;
+  write.checked = true;
+  write.fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(sent, ['csrf-new', 'csrf-newer'], 'refused once, then sent with the new token');
+  assert.match(form.textContent, /Aria → Write in #general\./);
+  assert.equal(box.doc.querySelector('.modal'), null);
+});
+
+test('session: a stale CSRF token that now belongs to another admin reloads the tab', async () => {
+  let who = ME_GWEN;
+  const box = await panelAt('/#/g/' + GA + '/personas/p/aria', {
+    handle: (method, path) => {
+      if (path === '/admin/me') return who;
+      if (method === 'DELETE') return refuse(403, 'CSRF', 'missing or invalid CSRF token');
+      return undefined;
+    },
+  });
+  who = { ...ME_GWEN, user: { id: '200000000000000003', name: 'Dee' } };
+  clickable(box.doc, 'Deny guild-wide').click();
+  await settle();
+  box.doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(box.nav.reloads, 1);
+  assert.equal(box.sessionStore.getItem('pa.notice'), 'other-user');
+  assert.equal(box.calls.filter((c) => c.startsWith('DELETE')).length, 1, 'not sent again as someone else');
+});
+
+test('session: the sign-in card says why the last sign-in came back, and the code leaves the address', async () => {
+  const box = appSandbox({ url: '/?login_error=expired#/g/' + GA + '/invites', handle: (_m, path) => (path === '/admin/me' ? refuse(401, 'UNAUTHENTICATED') : undefined) });
+  await box.ctx.PA.app.boot();
+  await settle();
+  const err = box.doc.getElementById('login-error')!;
+  assert.ok(!box.doc.getElementById('login')!.classList.contains('hidden'));
+  assert.equal(err.querySelector('p')!.textContent, 'That sign-in took too long or the relay restarted. Try again.');
+  assert.equal(clickable(box.doc, 'Try again', err).getAttribute('href'), '/admin/login');
+  assert.equal(box.nav.current, '/#/g/' + GA + '/invites', 'the code is gone; the place stays');
+  // Signing in from here comes back here.
+  box.doc.getElementById('login-btn')!.click();
+  assert.equal(box.sessionStore.getItem('pa.returnTo'), '#/g/' + GA + '/invites');
+});
+
+test('session: unsaved changes ask before the page is left', async () => {
+  const box = await panelAt('/#/g/' + GA + '/invites/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }] });
+  assert.equal(box.nav.dispatch('beforeunload').defaultPrevented, false, 'nothing typed yet');
+  fillMint(box.doc, 'x', 'g1-readers');
+  assert.equal(box.nav.dispatch('beforeunload').defaultPrevented, true);
+});
+
+test('session: Back out of a drawer with unsaved changes asks first; Cancel stays', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/invites', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }] });
+  clickable(box.doc, '+ Mint invite').click();
+  await settle();
+  assert.equal(box.here(), g + '/invites/new');
+  fillMint(box.doc, 'x', 'g1-readers');
+  box.nav.back();
+  await settle();
+  const ask = box.doc.querySelector('.modal')!;
+  assert.equal(ask.querySelector('h2')!.textContent, 'Discard changes?');
+  assert.equal(box.here(), g + '/invites/new', 'the address is put back while it asks');
+  clickable(box.doc, 'Cancel', ask).click();
+  await settle();
+  assert.ok(box.drawerOpen());
+  assert.equal(box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, 'x');
+  box.nav.back();
+  await settle();
+  clickable(box.doc, 'Discard changes', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal(box.drawerOpen(), false);
+  assert.equal(box.here(), g + '/invites');
+  assert.equal(box.nav.i, 0, 'Back to the entry it was going to, not a copy of it');
+});
+
+test('session: tabs tell each other about sign-in and sign-out; coming back to the tab checks the session', async () => {
+  const channels: Array<{ name: string; posted: unknown[]; onmessage: ((e: { data: unknown }) => void) | null }> = [];
+  class FakeChannel {
+    posted: unknown[] = [];
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    constructor(public name: string) {
+      channels.push(this);
+    }
+    postMessage(m: unknown) {
+      this.posted.push(m);
+    }
+  }
+  let token = 'csrf-1';
+  const sentWith: string[] = [];
+  const box = appSandbox({
+    url: '/#/g/' + GA + '/personas',
+    routes: { '/admin/guilds': { guilds: [{ id: GA, name: 'Guild One' }] } },
+    handle: (method, path, _b, headers) => {
+      if (path === '/admin/me') return { ...ME_GWEN, csrf: token, session: { expiresAt: Date.now() + 60_000 } };
+      if (method === 'POST' && path === '/admin/logout') {
+        sentWith.push(headers['X-CSRF-Token']);
+        return { ok: true };
+      }
+      return undefined;
+    },
+  });
+  box.ctx.BroadcastChannel = FakeChannel;
+  await box.ctx.PA.app.boot();
+  await settle();
+  const ch = channels[0];
+  assert.equal(ch.name, 'portal-admin');
+  assert.deepEqual(plain(ch.posted), [{ type: 'signed-in' }], 'this tab signed in: the others hear of it');
+  // Within two minutes of the end: the bar says when, with Sign in again.
+  const bar = box.doc.getElementById('session-bar')!;
+  assert.ok(!bar.classList.contains('hidden'));
+  assert.match(bar.textContent, /^Your session ends at .+\.Sign in again$/);
+
+  // Another tab signed in again: this one takes the new token.
+  token = 'csrf-2';
+  const before = box.calls.length;
+  ch.onmessage!({ data: { type: 'signed-in' } });
+  await settle();
+  assert.deepEqual(box.calls.slice(before), ['GET /admin/me']);
+
+  // Back to this tab: is the session still good?
+  for (const [type, fn] of box.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
+  await settle();
+  assert.equal(box.calls.at(-1), 'GET /admin/me');
+
+  // Another tab signed out.
+  ch.onmessage!({ data: { type: 'signed-out' } });
+  await settle();
+  assert.equal(box.doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'You signed out in another tab.');
+  assert.match(bar.textContent, /^You signed out in another tab\./);
+
+  // Sign out here: with the token taken from the other tab's sign-in; the
+  // others hear of it, and this admin's conveniences are forgotten.
+  box.localStore.setItem('pa.lastTab:' + ME_GWEN.user.id, 'audit');
+  box.doc.getElementById('logout-btn')!.click();
+  await settle();
+  assert.deepEqual(sentWith, ['csrf-2']);
+  assert.deepEqual(plain(ch.posted.at(-1)), { type: 'signed-out' });
+  assert.equal(box.localStore.getItem('pa.lastTab:' + ME_GWEN.user.id), null);
+  assert.ok(!box.doc.getElementById('login')!.classList.contains('hidden'));
 });

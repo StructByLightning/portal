@@ -4,8 +4,14 @@
  * plus Guilds for super-admins) with a persistent guild scope in the header.
  * Dense tables + a right-side detail drawer for editing one row at a time.
  *
+ * Every place has an address after '#' (PA.lib.parseRoute): reload, Back, a
+ * shared link and a sign-in all come back to it. One applyRoute() makes the
+ * page match the address, whatever changed it — a link, Back, a search.
+ *
  * Pure API client: every authorization decision is server-side. The CSRF token
- * from /admin/me is echoed in X-CSRF-Token on all mutating requests.
+ * from /admin/me is echoed in X-CSRF-Token on all mutating requests. A session
+ * that ends mid-task never throws the page away: "Your session ended" comes up
+ * over it, and "Sign in again" keeps the place and the unsaved form.
  *
  * Feedback: every result lands in the inline status line of the section it
  * came from (and stays there), mirrored by a toast. DOM helpers and widgets
@@ -27,6 +33,7 @@ const CLIENT_API = 2;
 
 const state = {
   me: null,        // /admin/me: { user, isSuper, guilds, csrf, apiVersion, levels, caps, features, session }
+  guilds: [],      // the guilds this admin may manage (and the relay serves), named
   guildId: null,   // selected guild id (null when no guild is selectable)
   tab: 'personas',
   personaScope: 'guild', // super-admins: 'guild' (access here) or 'all' personas
@@ -35,11 +42,50 @@ const state = {
   cache: {},       // per-guild { roles, channels } caches
   list: null,      // the active list view: { refresh, search, status }
   listStale: false, // a drawer changed something the list shows: refresh on close
-  drawerKey: null, // data-key of the list row the open drawer belongs to
+  rowKey: null,    // data-key of the list row the open drawer belongs to
   renderSeq: 0,    // bumped by every render(); a slower, older one stops drawing
+  route: null,     // the route the page shows (PA.lib.parseRoute)
+  viewKey: null,   // which list is drawn (guild + tab); a change redraws it
+  drawerRoute: null, // the address of the open drawer, if a route opened one
+  drawerPushed: false, // that drawer was opened from its list: closing it goes Back
+  draft: null,     // an unsaved form brought back across a sign-in, until used
+  leaving: false,  // on the way to sign in: no "Leave site?" question
+  expiryTimer: null,
+  clockSkew: 0,    // the relay's clock minus this one (from the Date header)
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
+
+// ── Browser storage: conveniences only ─────────────────────────────────────────
+// Every access can throw (a private window, blocked site data); the panel works
+// without any of it.
+
+function storage(kind) {
+  const s = () => window[kind];
+  return {
+    get(k) { try { return s().getItem(k); } catch { return null; } },
+    set(k, v) { try { s().setItem(k, v); } catch { /* not kept */ } },
+    del(k) { try { s().removeItem(k); } catch { /* nothing to remove */ } },
+    keys() {
+      try {
+        const out = [];
+        for (let i = 0; i < s().length; i++) out.push(s().key(i));
+        return out;
+      } catch { return []; }
+    },
+  };
+}
+const local = storage('localStorage');   // pa.lastGuild:<user>, pa.lastTab:<user>
+const session = storage('sessionStorage'); // pa.returnTo, pa.draft, pa.notice
+/** Read a sessionStorage key once: it is deleted as it is read. */
+function takeSession(k) {
+  const v = session.get(k);
+  session.del(k);
+  return v;
+}
+
+const userId = () => (state.me && state.me.user && state.me.user.id) || '';
+const isSuper = () => !!(state.me && state.me.isSuper);
 
 // ── API layer ──────────────────────────────────────────────────────────────────
 
@@ -53,8 +99,17 @@ class ApiError extends Error {
   }
 }
 
-/** JSON request to the admin API. opts.raw sends `body` as-is with
- *  opts.contentType (avatar upload). */
+/**
+ * JSON request to the admin API. opts.raw sends `body` as-is with
+ * opts.contentType (avatar upload).
+ *   401 → "Your session ended" over the page (not at boot, or with opts.quiet),
+ *         and a rejection: nothing is redrawn, so the form stays as it was.
+ *   403 CSRF → this tab's token is stale (another tab signed in again): fetch
+ *         /admin/me and send once more with the new one — the relay refuses a
+ *         bad token before doing anything, so the retry can't double up. A
+ *         different admin in the cookie now → reload.
+ *   403 FORBIDDEN on a guild route → the Not-an-admin view for that guild.
+ */
 async function api(method, path, body, opts = {}) {
   const req = { method, credentials: 'same-origin', headers: {} };
   if (opts.raw) {
@@ -68,12 +123,37 @@ async function api(method, path, body, opts = {}) {
   let res;
   try { res = await fetch(path, req); }
   catch { throw new ApiError(0, 'NETWORK', 'network error'); }
-  if (res.status === 401) { showLogin(); throw new ApiError(401, 'UNAUTHENTICATED', 'login required'); }
+  noteClock(res);
+  if (res.status === 401) {
+    if (!opts.boot && !opts.quiet && state.me) sessionEnded(method === 'GET' ? 'read' : 'mutation');
+    throw new ApiError(401, 'UNAUTHENTICATED', 'login required');
+  }
   let data = null;
   const text = await res.text();
   if (text) { try { data = JSON.parse(text); } catch { /* non-JSON */ } }
-  if (!res.ok) { const e = (data && data.error) || {}; throw new ApiError(res.status, e.code, e.message, e); }
+  if (!res.ok) {
+    const b = (data && data.error) || {};
+    const e = new ApiError(res.status, b.code, b.message, b);
+    if (res.status === 403 && b.code === 'CSRF' && method !== 'GET' && !opts.retried && state.me) {
+      const fresh = await refreshMe();
+      if (fresh) return api(method, path, body, Object.assign({}, opts, { retried: true }));
+    }
+    const gm = /^\/admin\/g\/([^/?]+)/.exec(path);
+    if (res.status === 403 && b.code === 'FORBIDDEN' && b.reason === 'NOT_GUILD_ADMIN' && gm) {
+      e.handled = true;
+      notGuildAdmin(decodeURIComponent(gm[1]));
+    }
+    throw e;
+  }
   return data || {};
+}
+
+/** The relay's clock, from a response's Date header: the session's end is in
+ *  its time, and the expiry bar must count in this one. */
+function noteClock(res) {
+  const h = res && res.headers && typeof res.headers.get === 'function' ? res.headers.get('date') : null;
+  const at = h ? Date.parse(h) : NaN;
+  if (!isNaN(at)) state.clockSkew = at - Date.now();
 }
 
 const G = () => '/admin/g/' + encodeURIComponent(state.guildId);
@@ -112,15 +192,17 @@ function loadError(text, retry) {
   ]);
 }
 
-// Per-guild role catalog + channels, cached (used by editors/pickers).
-async function guildMeta() {
+// Per-guild role catalog + channels, cached (used by editors/pickers). The
+// promise is cached, so a list and a drawer opened together ask once.
+function guildMeta() {
   const key = state.guildId;
   if (!state.cache[key]) {
-    const [roles, chans] = await Promise.all([api('GET', G() + '/roles'), api('GET', G() + '/channels')]);
-    state.cache[key] = {
+    const p = Promise.all([api('GET', G() + '/roles'), api('GET', G() + '/channels')]).then(([roles, chans]) => ({
       catalog: roles.catalog || {}, discordRoles: roles.discordRoles || [],
       canAuthor: !!roles.canAuthor, channels: chans.channels || [],
-    };
+    }));
+    state.cache[key] = p;
+    p.catch(() => { if (state.cache[key] === p) delete state.cache[key]; });
   }
   return state.cache[key];
 }
@@ -143,35 +225,76 @@ function guildRoleNames(meta) {
 
 // ── Boot / auth ──────────────────────────────────────────────────────────────
 
+/** The sign-in card: at boot, when there is no session. Mid-session an ended
+ *  session is "Your session ended" over the page instead, never this. */
 function showLogin(errMsg) {
   $('#app').classList.add('hidden');
-  ui.drawer.close();
+  closeDrawerFor('route');
+  document.title = 'Portal admin';
   $('#login').classList.remove('hidden');
-  const e = $('#login-error');
-  if (errMsg) { e.textContent = errMsg; e.classList.remove('hidden'); } else e.classList.add('hidden');
+  const box = $('#login-error');
+  clear(box);
+  box.classList.toggle('hidden', !errMsg);
+  if (errMsg) {
+    box.appendChild(el('p', { class: 'error', text: errMsg }));
+    box.appendChild(el('a', { class: 'btn', href: '/admin/login', text: 'Try again', onclick: keepReturnTo }));
+  }
 }
 
-// Why a sign-in ended back here (the server redirects with a fixed code; the
-// message comes from this table — nothing from the URL is shown).
-const LOGIN_ERRORS = {
-  not_admin: 'This Discord account doesn’t administer any server portal serves. If it should, ask a portal operator to add the server.',
-  failed: 'Sign-in didn’t complete — it may have expired, or been opened twice. Please try again.',
-  discord: 'Discord sign-in failed. Please try again.',
-};
+/** Before going to sign in: keep this address to come back to (unless it is
+ *  only home, and an earlier one is waiting). */
+function keepReturnTo() {
+  const r = lib.parseRoute(location.hash);
+  const h = r && r.area !== 'home' ? lib.formatRoute(r) : null;
+  if (h && lib.isSafeReturnTo(h)) session.set('pa.returnTo', h);
+}
+
+/** The open drawer's unsaved form, as a draft for after the sign-in: only
+ *  its whitelisted fields (PA.lib.DRAFT_FORMS), only when it has changes. */
+function saveDraft() {
+  session.del('pa.draft');
+  const f = ui.drawer.isOpen() ? ui.drawer.activeForm() : null;
+  if (!f || (f.isDirty && !f.isDirty())) return;
+  let fields;
+  try { fields = f.serialize(); } catch { return; }
+  const d = lib.makeDraft({ userId: userId(), route: location.hash, form: f.key, fields, at: Date.now() });
+  if (d) session.set('pa.draft', JSON.stringify(d));
+}
+
+/** "Sign in again": keep the place and the unsaved form, then go through
+ *  Discord. Nothing is sent again afterwards — the form comes back filled
+ *  in, and the admin saves it. */
+function signInAgain() {
+  keepReturnTo();
+  saveDraft();
+  state.leaving = true;
+  location.assign('/admin/login');
+}
+
+/** The session is over (a 401, or a sign-out in another tab): say so over the
+ *  page, which stays as it is — and, once that is closed, in the bar. */
+function sessionEnded(kind) {
+  clearTimeout(state.expiryTimer);
+  ui.expiryBar($('#session-bar')).show(kind === 'elsewhere' ? 'You signed out in another tab.' : 'Your session ended.', 'Sign in again', signInAgain);
+  ui.sessionEnded({ kind, onSignIn: signInAgain });
+}
 
 async function boot() {
+  const btn = $('#login-btn');
+  if (btn && !boot.bound) { boot.bound = true; btn.addEventListener('click', keepReturnTo); }
   const params = new URLSearchParams(location.search);
-  const code = params.get('login_error');
-  const loginError = code && Object.prototype.hasOwnProperty.call(LOGIN_ERRORS, code) ? LOGIN_ERRORS[code] : null;
+  // Why a sign-in came back here: a fixed code, put in words by a fixed
+  // table (nothing from the URL is shown), and taken out of the address.
+  const loginError = lib.loginErrorText(params.has('login_error') ? params.get('login_error') : null);
   if (params.has('login_error')) {
     params.delete('login_error');
     const rest = params.toString();
     history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
   }
   let me;
-  try { me = await api('GET', '/admin/me'); }
+  try { me = await api('GET', '/admin/me', undefined, { boot: true }); }
   catch (e) {
-    if (e.status === 401) { if (loginError) showLogin(loginError); return; }
+    if (e.status === 401) return showLogin(loginError);
     return showLogin('Couldn’t reach the admin API: ' + e.message + '. Reload to try again.');
   }
   state.me = me;
@@ -186,15 +309,45 @@ async function boot() {
   // Super-admin-only tabs (Guilds).
   for (const t of document.querySelectorAll('.tab-super')) t.classList.toggle('hidden', !me.isSuper);
 
-  // Scope the switcher to guilds the bot is actually in (named) — not every
-  // guild the admin owns on Discord — so it lands where data exists.
-  let guilds = [];
-  try { guilds = (await api('GET', '/admin/guilds')).guilds || []; }
-  catch { guilds = me.guilds || []; }
-  setupScope(me, guilds);
+  await loadGuilds();
 
-  for (const t of document.querySelectorAll('.tab')) t.addEventListener('click', () => selectTab(t.dataset.tab));
+  // A sign-in that came back with an error while this browser still had a
+  // good session: the panel opens, and says what happened.
+  if (loginError) ui.toast(loginError, { kind: 'info' });
+  if (takeSession('pa.notice') === 'other-user') {
+    ui.toast('Another admin signed in in another tab, so this tab now shows ' + ((me.user && me.user.name) || 'their account') + '.', { kind: 'info' });
+  }
+
+  // Where to start: this address; else the place kept before signing in;
+  // else home. Both are read once, after the sign-in worked.
+  const returnTo = takeSession('pa.returnTo');
+  state.draft = lib.readDraft(takeSession('pa.draft'), { userId: userId(), now: Date.now() });
+  const here = lib.parseRoute(location.hash);
+  if (here && here.area === 'home' && lib.isSafeReturnTo(returnTo)) history.replaceState(null, '', returnTo);
+
+  bindApp();
+  scheduleExpiry();
+  broadcast('signed-in');
+  await applyRoute();
+}
+
+function bindApp() {
+  if (bindApp.done) return;
+  bindApp.done = true;
   $('#logout-btn').addEventListener('click', logout);
+  // Back, Forward, a link, an edited address: one place makes the page match.
+  window.addEventListener('popstate', () => applyRoute());
+  window.addEventListener('hashchange', () => applyRoute());
+  window.addEventListener('beforeunload', (e) => {
+    if (state.leaving || !ui.drawer.isDirty()) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+  // Back to this tab: is the session still good? Better asked now than after
+  // typing into a form.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && state.me) refreshMe();
+  });
   // Esc, Tab and the scrim inside the drawer and dialogs are ui.js's.
   document.addEventListener('keydown', (e) => {
     if (e.key !== '/' || ui.drawer.isOpen() || ui.modalOpen()) return;
@@ -203,8 +356,7 @@ async function boot() {
     const s = $('#list-search');
     if (s) { e.preventDefault(); s.focus(); }
   });
-
-  selectTab('personas');
+  openChannel();
 }
 
 /** The relay speaks a newer admin API than this copy of the panel: say so,
@@ -225,78 +377,497 @@ function feature(name) {
   return !f || f[name] !== false;
 }
 
-function setupScope(me, guilds) {
-  guilds = guilds || me.guilds || [];
+let meInFlight = null;
+/**
+ * Who is this tab signed in as, now? (Another tab may have signed in again,
+ * or out.) The same admin: take the new CSRF token and session end, and put
+ * away "Your session ended" if it was up. Another admin: reload. Resolves
+ * the new /admin/me, or null (a 401 has already said the session ended).
+ */
+function refreshMe() {
+  if (!meInFlight) {
+    meInFlight = (async () => {
+      try {
+        const me = await api('GET', '/admin/me');
+        if (!state.me) return null;
+        if (((me.user && me.user.id) || '') !== userId()) { otherAdmin(); return null; }
+        state.me.csrf = me.csrf;
+        state.me.session = me.session;
+        if (ui.sessionResumed()) ui.toast('You’re signed in again. Carry on where you were.');
+        scheduleExpiry();
+        return me;
+      } catch { return null; }
+      finally { meInFlight = null; }
+    })();
+  }
+  return meInFlight;
+}
+
+/** The cookie now belongs to another admin (signed in in another tab): this
+ *  tab can't act for them with what it shows, so it reloads as them. */
+function otherAdmin() {
+  session.set('pa.notice', 'other-user');
+  state.leaving = true;
+  location.reload();
+}
+
+// Tabs tell each other when someone signs in or out (same browser, same panel).
+let channel = null;
+function openChannel() {
+  try {
+    if (typeof BroadcastChannel !== 'function') return;
+    channel = new BroadcastChannel('portal-admin');
+    channel.onmessage = (ev) => {
+      const m = ev && ev.data;
+      if (!m || !state.me) return;
+      if (m.type === 'signed-in') refreshMe();
+      else if (m.type === 'signed-out') sessionEnded('elsewhere');
+    };
+  } catch { channel = null; }
+}
+function broadcast(type) {
+  try { if (channel) channel.postMessage({ type }); } catch { /* other tabs find out on their next request */ }
+}
+
+/** The bar under the top bar: two minutes before the session ends it says
+ *  when, with Sign in again (which keeps the place and the form). */
+const EXPIRY_WARN_MS = 2 * 60_000;
+function scheduleExpiry() {
+  clearTimeout(state.expiryTimer);
+  const bar = ui.expiryBar($('#session-bar'));
+  const ends = state.me && state.me.session && typeof state.me.session.expiresAt === 'number'
+    ? state.me.session.expiresAt - state.clockSkew : null;
+  if (ends == null) return bar.hide();
+  const at = clockText(ends);
+  const tick = () => {
+    const now = Date.now();
+    if (now >= ends) return bar.show('Your session ended at ' + at + '.', 'Sign in again', signInAgain);
+    if (now >= ends - EXPIRY_WARN_MS) {
+      bar.show('Your session ends at ' + at + '.', 'Sign in again', signInAgain);
+      state.expiryTimer = setTimeout(tick, ends - now + 250);
+      return;
+    }
+    bar.hide();
+    state.expiryTimer = setTimeout(tick, Math.min(ends - EXPIRY_WARN_MS - now, 0x7fffffff));
+  };
+  tick();
+}
+function stopExpiry() {
+  clearTimeout(state.expiryTimer);
+  ui.expiryBar($('#session-bar')).hide();
+}
+/** '14:05' (or '2:05 PM'), in this browser's way of writing times. */
+function clockText(ms) {
+  try { return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  catch { return new Date(ms).toTimeString().slice(0, 5); }
+}
+
+/** The guilds this admin may manage and the relay serves (named), for the
+ *  switcher — not every guild they happen to own on Discord. */
+async function loadGuilds() {
+  let guilds;
+  try { guilds = (await api('GET', '/admin/guilds')).guilds || []; }
+  catch { guilds = (state.me && state.me.guilds) || []; }
+  state.guilds = guilds;
+  bindSwitcher();
+  syncSwitcher();
+}
+
+/** After allow-list edits: new guilds appear without a re-login. */
+async function refreshScope() {
+  await loadGuilds();
+  syncShell();
+}
+
+async function logout() {
+  try { await api('POST', '/admin/logout', undefined, { quiet: true }); } catch { /* signed out either way */ }
+  forgetUser(userId());
+  broadcast('signed-out');
+  stopExpiry();
+  ui.sessionResumed();
+  state.me = null;
+  showLogin();
+}
+
+/** Sign out forgets this admin's conveniences in this browser. */
+function forgetUser(uid) {
+  session.del('pa.draft');
+  session.del('pa.returnTo');
+  if (!uid) return;
+  local.del('pa.lastGuild:' + uid);
+  local.del('pa.lastTab:' + uid);
+  for (const k of local.keys()) if (k && k.indexOf('pa.collapsed:' + uid + ':') === 0) local.del(k);
+}
+
+// ── Routes ───────────────────────────────────────────────────────────────────
+
+const GUILD_VIEWS = new Set(['personas', 'invites', 'roles', 'audit']);
+const TAB_NAMES = { personas: 'Personas', invites: 'Invites', roles: 'Access roles', audit: 'Audit', guilds: 'Guilds' };
+
+function route(area, gid, view, drawer = null, query = {}) {
+  return { area, gid: gid || null, view, drawer, query };
+}
+
+/** Go to `r`: a new history entry (Back comes back here), or with
+ *  { replace: true } in place of this one (search, filters, fixes). */
+function navigate(r, opts = {}) {
+  const hash = lib.formatRoute(r);
+  if (!hash) return Promise.resolve();
+  if (hash !== location.hash) {
+    if (opts.replace) history.replaceState(null, '', hash);
+    else history.pushState(null, '', hash);
+  }
+  return applyRoute();
+}
+
+/** May this admin manage `gid`? The relay decides, on every request; this is
+ *  its rule (a guild it serves that this admin administers), so a link into
+ *  any other guild never asks for that guild's data. */
+function canManage(gid) {
+  return isSuper() || state.guilds.some((g) => g.id === gid);
+}
+
+/** Where '#/' lands: the last guild and tab this admin used here (while they
+ *  may still manage it), else their first guild's Personas. */
+function homeRoute() {
+  const uid = userId();
+  const lastGuild = local.get('pa.lastGuild:' + uid);
+  const lastTab = local.get('pa.lastTab:' + uid);
+  if (lastTab === 'guilds' && isSuper()) return route('guilds', null, 'guilds');
+  const gid = lib.isSnowflake(lastGuild) && canManage(lastGuild) ? lastGuild : state.guilds.length ? state.guilds[0].id : null;
+  const view = GUILD_VIEWS.has(lastTab) ? lastTab : 'personas';
+  if (gid) return route('g', gid, view);
+  return isSuper() ? route('all', null, 'personas') : null;
+}
+
+function goHome() {
+  const h = homeRoute();
+  if (h) return navigate(h, { replace: true });
+  // Nowhere to land: a guild-admin none of whose guilds is served now.
+  history.replaceState(null, '', '#/');
+  state.route = lib.parseRoute('#/');
+  showNotAdmin(null);
+}
+
+/** Remember the last guild and tab, for '#/' next time. */
+function remember(r) {
+  const uid = userId();
+  if (!uid) return;
+  if (r.area === 'g' && canManage(r.gid)) {
+    local.set('pa.lastGuild:' + uid, r.gid);
+    local.set('pa.lastTab:' + uid, r.view);
+  } else if (r.area === 'guilds' || r.area === 'all') local.set('pa.lastTab:' + uid, r.view);
+}
+
+/**
+ * The route as this version of the panel shows it ({ route, note }): a view
+ * that a later version adds says so (note) and falls back to the nearest one
+ * there is; query keys nothing here acts on yet are dropped.
+ */
+function supported(r) {
+  const instead = (to, name) => ({ route: to, note: 'That page isn’t available yet — showing ' + name + ' instead.' });
+  if (r.area === 'all' && r.view === 'audit') {
+    const gid = r.query.guild && canManage(r.query.guild) ? r.query.guild : state.guildId || (homeRoute() || {}).gid;
+    return gid ? instead(route('g', gid, 'audit'), 'the guild’s audit') : instead(route('all', null, 'personas'), 'All personas');
+  }
+  if (r.area !== 'g' && r.area !== 'all') return { route: r, note: null };
+  if (r.view === 'channels' || r.view === 'give') return instead(route('g', r.gid, 'personas'), 'Personas');
+  const k = r.drawer && r.drawer.kind;
+  if (k === 'add' || k === 'invite' || k === 'role') return instead(route(r.area, r.gid, r.view), TAB_NAMES[r.view]);
+  const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? [] : ['q'];
+  const query = {};
+  for (const key of keep) if (r.query[key] !== undefined) query[key] = r.query[key];
+  return { route: Object.assign({}, r, { query }), note: null };
+}
+
+/** Which list is drawn: the same key means the same toolbar and rows (a
+ *  super-admin's scope switch between this guild and all personas included). */
+function viewKeyOf(r) {
+  if (r.area === 'guilds') return 'guilds';
+  if (r.view === 'personas') return 'personas:' + (r.area === 'g' ? r.gid : state.guildId);
+  return r.area + ':' + r.view + ':' + (r.gid || '');
+}
+
+let discardAsked = false;
+
+/**
+ * Make the page match the address. popstate, hashchange and navigate() all
+ * come here, and it is idempotent: the list is redrawn only when the guild or
+ * the tab changed (or opts.force: Try again), a search only refreshes the
+ * rows, and the drawer opens or closes only when the address says otherwise.
+ */
+async function applyRoute(opts = {}) {
+  if (!state.me) return;
+  const hash = location.hash;
+  let r = lib.parseRoute(hash);
+  if (!r) {
+    ui.toast('That link wasn’t valid.', { kind: 'info' });
+    return goHome();
+  }
+  // Home, and a super-admin's pages for anyone else, resolve to a real place.
+  if (r.area === 'home' || ((r.area === 'all' || r.area === 'guilds') && !isSuper())) return goHome();
+  const sup = supported(r);
+  if (sup.note) {
+    ui.toast(sup.note, { kind: 'info' });
+    return navigate(sup.route, { replace: true });
+  }
+  r = sup.route;
+  const canonical = lib.formatRoute(r);
+  if (canonical !== hash) history.replaceState(null, '', canonical);
+
+  const prev = state.route;
+  // Leaving a drawer with unsaved changes (Back, a link): put the address
+  // back on top, and ask first. Discard goes Back to where the admin was
+  // going (the entry just under it), which then shows as usual.
+  if (prev && prev.area !== 'home' && ui.drawer.isOpen() && ui.drawer.isDirty() && lib.formatRoute(prev) !== canonical) {
+    const prevHash = lib.formatRoute(prev);
+    history.pushState(null, '', prevHash);
+    if (discardAsked) return;
+    discardAsked = true;
+    const discard = await ui.drawer.confirmDiscard();
+    discardAsked = false;
+    if (!discard || location.hash !== prevHash) return;
+    closeDrawerFor('route');
+    history.back();
+    return;
+  }
+  // A kept form is only for the place it was kept at.
+  if (state.draft && state.draft.route !== canonical) state.draft = null;
+  state.route = r;
+
+  if (r.area === 'g' && !canManage(r.gid)) return showNotAdmin(r);
+  remember(r);
+
+  const vk = viewKeyOf(r);
+  const scope = r.area === 'all' ? 'all' : 'guild';
+  const listQ = r.drawer ? null : r.query.q || '';
+  if (opts.force || vk !== state.viewKey) {
+    closeDrawerFor('route');
+    state.viewKey = vk;
+    if (r.gid) state.guildId = r.gid;
+    state.tab = r.view;
+    state.personaScope = scope;
+    state.q = listQ || '';
+    state.offset = 0;
+    syncShell();
+    render();
+  } else {
+    if (state.tab === 'personas' && scope !== state.personaScope) {
+      // A super-admin's scope switch: the same toolbar (and search), new rows.
+      state.personaScope = scope;
+      if (listQ !== null) state.q = listQ;
+      state.offset = 0;
+      if (state.list && state.list.onScope) state.list.onScope();
+    } else if (listQ !== null && listQ !== state.q) {
+      state.q = listQ;
+      state.offset = 0;
+      if (state.list) {
+        if (state.list.search) state.list.search.value = state.q;
+        state.list.refresh();
+      }
+    }
+    syncShell();
+  }
+
+  const dk = r.drawer ? canonical : null;
+  if (dk !== state.drawerRoute) {
+    closeDrawerFor('route');
+    if (r.drawer) {
+      // Opened from its own list (a link, a row): closing it goes Back there.
+      // Reached by a link from elsewhere or a reload: closing replaces it.
+      state.drawerPushed = !!prev && !prev.drawer && prev.area !== 'home' && viewKeyOf(prev) === vk;
+      state.drawerRoute = dk;
+      openRouteDrawer(r);
+    }
+  }
+}
+
+function openRouteDrawer(r) {
+  const k = r.drawer.kind;
+  if (k === 'persona') return openPersonaDrawer(r.drawer.id);
+  if (k === 'mint') return openMintDrawer(r.query);
+  if (k === 'newRole') return openRoleDrawer();
+}
+
+/** The list's search changed: the address follows, in place (Back never
+ *  steps through keystrokes). */
+function syncQuery() {
+  const r = state.route;
+  if (!r || r.drawer || !r.view || r.area === 'guilds') return;
+  const next = route(r.area, r.gid, r.view, null, state.q ? { q: state.q } : {});
+  const hash = lib.formatRoute(next);
+  if (!hash) return;
+  state.route = next;
+  if (hash !== location.hash) history.replaceState(null, '', hash);
+}
+
+/** Where a persona's drawer is, from the list being shown. */
+function personaRoute(id) {
+  return state.personaScope === 'all' || !state.guildId
+    ? route('all', null, 'personas', { kind: 'persona', id })
+    : route('g', state.guildId, 'personas', { kind: 'persona', id });
+}
+
+/** Tabs are links; their addresses follow the guild. */
+function tabHref(tab) {
+  if (tab === 'guilds') return '#/guilds';
+  if (state.guildId) return lib.formatRoute(route('g', state.guildId, tab)) || '#/';
+  return tab === 'personas' && isSuper() ? '#/all/personas' : '#/';
+}
+
+/** The tabs, the switcher and the window title, for the route shown. */
+function syncShell() {
+  const notAdmin = String(state.viewKey || '').startsWith('not-admin');
+  for (const t of document.querySelectorAll('.tab')) {
+    const tab = t.dataset.tab;
+    t.setAttribute('href', tabHref(tab));
+    const on = !notAdmin && tab === state.tab;
+    t.classList.toggle('active', on);
+    if (on) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+  }
+  syncSwitcher();
+  const all = state.tab === 'personas' && state.personaScope === 'all';
+  const tabName = notAdmin ? null : all ? 'All personas' : TAB_NAMES[state.tab];
+  const guild = !notAdmin && !all && state.tab !== 'guilds' && state.guildId && canManage(state.guildId) ? currentGuildName() : null;
+  document.title = ['Portal admin', tabName, guild].filter(Boolean).join(' — ');
+}
+
+/**
+ * The guild switcher: a fixed label for an admin of one guild, otherwise a
+ * select of the guilds they manage. While the page is about a guild that is
+ * not one of these (a link into someone else's), nothing is selected and
+ * nothing names it. Super-admins also get 'Go to guild id…'.
+ */
+function syncSwitcher() {
   const sel = $('#guild-select');
   const stat = $('#guild-static');
-  clear(sel);
-
-  if (guilds.length === 1 && !me.isSuper) {
-    // Single-guild delegate: scope is fixed; show it as a static label.
-    state.guildId = guilds[0].id;
-    stat.textContent = guilds[0].name || guilds[0].id;
+  const gid = state.guildId;
+  const known = state.guilds.some((g) => g.id === gid);
+  if (!isSuper() && state.guilds.length === 1 && (known || !gid)) {
+    stat.textContent = state.guilds[0].name || state.guilds[0].id;
     stat.classList.remove('hidden');
     sel.classList.add('hidden');
     return;
   }
   stat.classList.add('hidden');
-  sel.classList.remove('hidden');
-  if (!guilds.length && !me.isSuper) sel.appendChild(el('option', { value: '', text: 'no manageable guilds' }));
-  for (const g of guilds) sel.appendChild(el('option', { value: g.id, text: g.name || g.id }));
-  if (me.isSuper) sel.appendChild(el('option', { value: '__custom__', text: 'other guild id…' }));
-  // Preserve the current selection across repopulation (e.g. allow-list edits).
-  state.guildId = guilds.some((g) => g.id === state.guildId)
-    ? state.guildId
-    : guilds.length ? guilds[0].id : null;
-  sel.value = state.guildId || (me.isSuper ? '__custom__' : '');
-  if (!setupScope._bound) {
-    setupScope._bound = true;
-    sel.addEventListener('change', (e) => {
-      let v = e.target.value;
-      if (v === '__custom__') {
-        v = (prompt('Enter the Discord guild id to manage:') || '').trim();
-        if (!v) { e.target.value = state.guildId || ''; return; }
-        // Keep a synthetic option so the chosen id stays selected.
-        if (!Array.from(sel.options).some((o) => o.value === v)) {
-          sel.insertBefore(el('option', { value: v, text: v }), sel.lastChild);
-        }
-        sel.value = v;
-      }
-      state.guildId = v;
-      state.offset = 0; // the search query carries over to the new guild
-      // Drawers were built for the previous guild (its pickers, its ids) and
-      // submit against the current one — close them rather than let a form
-      // opened in one guild write into another.
-      ui.drawer.close();
-      render();
+  // The 'Go to guild id…' field takes the select's place while it is open.
+  const go = $('#guild-go');
+  sel.classList.toggle('hidden', !!go && !go.classList.contains('hidden'));
+  const shown = known || (isSuper() && lib.isSnowflake(gid));
+  clear(sel);
+  if (!shown) sel.appendChild(el('option', { value: '', text: state.guilds.length ? 'Pick a guild…' : 'No guild to manage' }));
+  for (const g of state.guilds) sel.appendChild(el('option', { value: g.id, text: g.name || g.id }));
+  // A guild a super-admin went to by id: shown by its id.
+  if (shown && !known) sel.appendChild(el('option', { value: gid, text: gid }));
+  if (isSuper()) sel.appendChild(el('option', { value: '__custom__', text: 'Go to guild id…' }));
+  sel.value = shown ? gid : '';
+}
+
+function bindSwitcher() {
+  if (bindSwitcher.done) return;
+  bindSwitcher.done = true;
+  const sel = $('#guild-select');
+  sel.addEventListener('change', () => {
+    const v = sel.value;
+    if (v === '__custom__') {
+      syncSwitcher();
+      openGuildGo();
+      return;
+    }
+    if (v) switchGuild(v);
+  });
+}
+
+/** A guild switch keeps the tab (and the search) and closes any drawer. */
+function switchGuild(gid) {
+  const tab = GUILD_VIEWS.has(state.tab) ? state.tab : 'personas';
+  const q = state.route && !state.route.drawer && state.route.query && state.route.query.q;
+  navigate(route('g', gid, tab, null, q ? { q } : {}));
+}
+
+/** Super-admins: go to a guild by its id, from a field in the top bar. */
+function openGuildGo() {
+  let form = $('#guild-go');
+  if (!form) {
+    const input = el('input', {
+      id: 'guild-go-id', type: 'text', inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false',
+      placeholder: 'Go to guild id…', 'aria-label': 'Guild id to go to', 'aria-describedby': 'guild-go-err',
     });
+    const err = el('span', { id: 'guild-go-err', class: 'field-error', role: 'status' });
+    const close = () => {
+      form.classList.add('hidden');
+      err.textContent = '';
+      input.value = '';
+      syncSwitcher();
+    };
+    form = el('form', { id: 'guild-go', class: 'guild-go', novalidate: true }, [
+      input,
+      el('button', { type: 'submit', class: 'btn btn-sm', text: 'Go' }),
+      el('button', { class: 'btn btn-sm btn-ghost', text: '✕', 'aria-label': 'Close the guild id field', onclick: () => { close(); $('#guild-select').focus(); } }),
+      err,
+    ]);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const v = input.value.trim();
+      if (!lib.isSnowflake(v)) {
+        err.textContent = 'That isn’t a guild id (5–25 digits).';
+        input.focus();
+        return;
+      }
+      close();
+      switchGuild(v);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      close();
+      $('#guild-select').focus();
+    });
+    $('#scope').appendChild(form);
   }
+  form.classList.remove('hidden');
+  $('#guild-select').classList.add('hidden');
+  $('#guild-go-id').focus();
 }
 
-/** Re-fetch the manageable-guild list and rebuild the scope switcher (used
- *  after allow-list edits so new guilds appear without a re-login). */
-async function refreshScope() {
-  let guilds = [];
-  try { guilds = (await api('GET', '/admin/guilds')).guilds || []; }
-  catch { guilds = (state.me && state.me.guilds) || []; }
-  setupScope(state.me, guilds);
-}
-
-async function logout() {
-  try { await api('POST', '/admin/logout'); } catch { /* ignore */ }
-  state.me = null;
-  showLogin();
-}
-
-function selectTab(tab) {
-  state.tab = tab;
-  state.q = ''; state.offset = 0;
-  for (const t of document.querySelectorAll('.tab')) {
-    t.classList.toggle('active', t.dataset.tab === tab);
-    if (t.dataset.tab === tab) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+/**
+ * In place of a guild's view when this admin can't manage it — from a link,
+ * or because the relay said so: why (never the guild's name), the guilds
+ * they do manage, and Try again. `r` null: they manage none at all.
+ */
+function showNotAdmin(r) {
+  closeDrawerFor('route');
+  state.viewKey = 'not-admin:' + (r ? r.gid : '');
+  if (r) {
+    state.guildId = r.gid;
+    state.tab = GUILD_VIEWS.has(r.view) ? r.view : 'personas';
   }
-  ui.drawer.close();
-  render();
+  state.list = null;
+  state.renderSeq++; // a list still loading must not draw over this
+  syncShell();
+  const view = $('#view');
+  clear(view);
+  view.appendChild(ui.notAdminView({
+    guilds: state.guilds.filter((g) => !r || g.id !== r.gid),
+    none: !r || (!state.guilds.length && !isSuper()),
+    onPick: (gid) => navigate(route('g', gid, state.tab)),
+    onRetry: retryRoute,
+    onSignOut: logout,
+  }));
+}
+
+/** The relay refused a guild route: this admin can't manage that guild (any
+ *  more), or it couldn't check right now. Its page says so, with Try again
+ *  (which asks the relay for the guild list again). */
+function notGuildAdmin(gid) {
+  if (state.route && state.route.area === 'g' && state.route.gid === gid) showNotAdmin(state.route);
+}
+
+/** Try again: ask the relay which guilds this admin manages, and show the
+ *  address again. */
+async function retryRoute() {
+  await loadGuilds();
+  await applyRoute({ force: true });
 }
 
 // ── Drawer glue ───────────────────────────────────────────────────────────────
@@ -304,24 +875,73 @@ function selectTab(tab) {
 /** Open the drawer (ui.drawer) for a list row: `key` is the row's data-key,
  *  so focus can find the row again if the list is redrawn on close. */
 function openDrawer(opts) {
-  state.drawerKey = opts.key || null;
+  state.rowKey = opts.key || null;
   return ui.drawer.open(Object.assign({}, opts, { onClose: onDrawerClosed }));
+}
+
+/** Close the drawer because the address changed (nothing more to do with the
+ *  address). */
+function closeDrawerFor(reason) {
+  state.drawerRoute = null;
+  if (ui.drawer.isOpen()) ui.drawer.close(reason);
 }
 
 /** A drawer changed something its list shows. */
 function markStale() { state.listStale = true; }
 
-function onDrawerClosed() {
-  const key = state.drawerKey;
-  state.drawerKey = null;
-  if (!state.listStale || !state.list) return;
-  state.listStale = false;
-  state.list.refresh().then(() => {
+function onDrawerClosed(reason) {
+  const key = state.rowKey;
+  state.rowKey = null;
+  // Closed by the admin (✕, Esc, the scrim, Done): the address follows. Back
+  // to the list it was opened from; or, for one reached by a link or a
+  // reload, its list in place of it.
+  if (reason !== 'route') {
+    state.drawerRoute = null;
+    const r = state.route;
+    if (r && r.drawer) {
+      const list = route(r.area, r.gid, r.view, null, state.q ? { q: state.q } : {});
+      state.route = list;
+      if (state.drawerPushed) history.back();
+      else history.replaceState(null, '', lib.formatRoute(list));
+    }
+  }
+  state.drawerPushed = false;
+  // Focus goes back to the link that opened it (ui.drawer does that); when
+  // there was none (a row click, a link from elsewhere) or the list was
+  // redrawn, to the row's link.
+  const focusRow = () => {
     const a = document.activeElement;
     if (!key || (a && a !== document.body && a.isConnected)) return;
     const row = Array.from(document.querySelectorAll('[data-key]')).find((n) => n.dataset.key === key);
     if (row) row.focus();
-  });
+  };
+  if (!state.listStale || !state.list) return focusRow();
+  state.listStale = false;
+  state.list.refresh().then(focusRow);
+}
+
+/**
+ * Register the drawer's form for "Sign in again" (ui.drawer.registerForm) and,
+ * when a draft of it was brought back for this very place, put it back:
+ * nothing is sent — the line says so, and the admin saves it. Resolves true
+ * when it was restored.
+ */
+function keepForm(d, key, hooks, status) {
+  d.registerForm(key, hooks);
+  const dr = state.draft;
+  if (!dr || dr.form !== key || !state.route || dr.route !== lib.formatRoute(state.route)) return false;
+  state.draft = null;
+  try { hooks.restore(dr.fields); } catch (e) { console.error('[portal-admin] restore', e); return false; }
+  status.info('Restored your unsaved change — review and save. Nothing was submitted.');
+  return true;
+}
+
+/** A read that found the session over: say so where the content would be. */
+function sessionEndedNote() {
+  return el('div', { class: 'load-error', role: 'alert' }, [
+    el('p', { text: 'Your session ended. Sign in again to see this.' }),
+    el('button', { class: 'btn btn-sm', text: 'Sign in again', onclick: signInAgain }),
+  ]);
 }
 
 // ── Render dispatch ──────────────────────────────────────────────────────────
@@ -333,12 +953,12 @@ async function render() {
   state.list = null;
   // Super-admins reach the global persona list (profile, token) without a
   // guild — e.g. before the relay has joined any.
-  const globalPersonas = state.tab === 'personas' && state.me && state.me.isSuper;
+  const globalPersonas = state.tab === 'personas' && isSuper() && (state.personaScope === 'all' || !state.guildId);
   if (GUILD_TABS.has(state.tab) && !state.guildId && !globalPersonas) {
     clear(view);
     view.appendChild(el('div', { class: 'empty' }, [
       el('p', { text: 'Select a guild to manage.' }),
-      state.me.isSuper ? el('p', { class: 'muted', text: 'As a super-admin you can pick “other guild id…”.' }) : null,
+      isSuper() ? el('p', { class: 'muted', text: 'As a super-admin you can pick “Go to guild id…”.' }) : null,
     ]));
     return;
   }
@@ -354,10 +974,10 @@ async function render() {
     else if (tab === 'audit') await renderAudit(view, stale);
     else if (tab === 'guilds') await renderGuilds(view);
   } catch (e) {
-    if (e.status === 401 || stale()) return;
+    if (stale() || e.handled) return;
     clear(view);
-    const text = e.status === 403 ? NOT_GUILD_ADMIN : couldntLoad('this tab', e);
-    view.appendChild(loadError(text, () => render()));
+    if (e.status === 401) return view.appendChild(sessionEndedNote());
+    view.appendChild(loadError(couldntLoad('this tab', e), () => render()));
   }
 }
 
@@ -391,6 +1011,7 @@ function listView(view, opts) {
         // new list's box shows state.q, so this box's text must not land there.
         if (state.list !== list) return;
         state.q = search.value.trim(); state.offset = 0; list.refresh();
+        syncQuery(); // ?q= in place: Back doesn't step through keystrokes
       }, 250);
     });
     bar.push(search);
@@ -415,9 +1036,9 @@ function listView(view, opts) {
         clear(results);
         results.appendChild(node);
       } catch (e) {
-        if (mine !== seq || e.status === 401) return;
+        if (mine !== seq || e.handled) return;
         clear(results);
-        results.appendChild(loadError(couldntLoad('this list', e), () => list.refresh()));
+        results.appendChild(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this list', e), () => list.refresh()));
       } finally {
         if (mine === seq) results.removeAttribute('aria-busy');
       }
@@ -491,7 +1112,12 @@ async function renderPersonas(view, stale) {
   const grantById = el('button', { class: 'btn btn-sm btn-primary', text: '+ Grant access by id' });
   grantById.addEventListener('click', () => {
     const id = (prompt('Persona id to grant access to (must already exist):') || '').trim();
-    if (id) openPersonaDrawer(id, meta);
+    if (!id) return;
+    if (!lib.isPersonaId(id)) {
+      list.status.err('Not opened: “' + id + '” isn’t a persona id (letters, digits, dots, colons, dashes and underscores).', { toast: false });
+      return;
+    }
+    navigate(personaRoute(id));
   });
   actions.push(grantById);
   const hint = el('p', { class: 'hint muted' });
@@ -519,8 +1145,10 @@ async function renderPersonas(view, stale) {
   });
   view.appendChild(hint);
 
-  // The scope switch keeps the toolbar (and the query); only the results change.
+  // The scope switch (an address: #/all/personas or this guild's) keeps the
+  // toolbar and the query; only the results change.
   function syncScope() {
+    if (scope) scope.value = isAll() ? 'all' : 'guild';
     const all = isAll();
     const ph = all ? 'Search all personas…' : 'Search personas with access here…';
     list.search.placeholder = ph;
@@ -532,19 +1160,25 @@ async function renderPersonas(view, stale) {
         (isSuper ? ', switch to All personas,' : '') + ' or mint an invite for an agent to claim.';
   }
   syncScope();
+  list.onScope = () => {
+    syncScope();
+    list.search.value = state.q;
+    list.refresh();
+  };
   if (scope) {
     scope.addEventListener('change', () => {
-      state.personaScope = scope.value;
-      state.offset = 0;
-      syncScope();
-      list.refresh();
+      const q = state.q ? { q: state.q } : {};
+      navigate(scope.value === 'all' ? route('all', null, 'personas', null, q) : route('g', state.guildId, 'personas', null, q));
     });
   }
 }
 
 function personaRow(p, meta, all) {
   const name = p.displayName || p.id;
-  const open = () => openPersonaDrawer(p.id, meta, { name });
+  // The name is a link to the persona's drawer (an address: reload, Back and
+  // sharing keep it); the rest of the row opens it too.
+  const href = lib.formatRoute(personaRoute(p.id));
+  const open = () => (href ? navigate(personaRoute(p.id)) : openPersonaDrawer(p.id, { name }));
   // In a guild's list, the guild's own access roles; others are only counted.
   let rolesText = (p.roles || []).join(', ') || '—';
   if (!all && meta) {
@@ -557,7 +1191,9 @@ function personaRow(p, meta, all) {
   }
   return openableRow(open, [
     el('td', { class: 'col-narrow' }, [avatarThumb(p.avatarUrl, '')]),
-    el('td', {}, [el('button', { class: 'link', 'data-key': 'persona:' + p.id, text: name, onclick: open })]),
+    el('td', {}, [href
+      ? el('a', { class: 'link', href, 'data-key': 'persona:' + p.id, text: name })
+      : el('button', { class: 'link', 'data-key': 'persona:' + p.id, text: name, onclick: open })]),
     el('td', {}, [el('code', { text: p.id })]),
     el('td', { class: 'cell-roles', text: rolesText }),
     all
@@ -577,22 +1213,28 @@ function directGrantsBadge(p) {
   return el('span', { class: 'muted', text: '—' });
 }
 
-async function openPersonaDrawer(id, meta, hint = {}) {
+async function openPersonaDrawer(id, hint = {}) {
   const isSuper = !!(state.me && state.me.isSuper);
+  // The name its list row shows, until the persona has loaded.
+  const row = Array.from(document.querySelectorAll('[data-key]')).find((n) => n.dataset.key === 'persona:' + id);
+  const name = hint.name || (row && row.textContent) || id;
   // Open at once; the sections arrive when the persona has loaded.
-  const d = openDrawer({ title: hint.name || id, subtitle: id, key: 'persona:' + id });
+  const d = openDrawer({ title: name, subtitle: id, key: 'persona:' + id });
   const missing = (e) => { if (e.status === 404) return null; throw e; };
   let local = null;
   let global = null;
+  let meta = null;
   try {
-    [local, global] = await Promise.all([
+    [local, global, meta] = await Promise.all([
       // What an admin of this guild may see and change…
       state.guildId ? api('GET', G() + '/personas/' + encodeURIComponent(id)).catch(missing) : null,
       // …and, for super-admins, the persona everywhere.
       isSuper ? api('GET', '/admin/personas/' + encodeURIComponent(id)).catch(missing) : null,
+      state.guildId ? guildMeta() : null,
     ]);
   } catch (e) {
-    if (e.status !== 401) d.setBody(loadError(couldntLoad(hint.name || id, e), () => openPersonaDrawer(id, meta, hint)));
+    if (!d.isCurrent() || e.handled) return;
+    d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad(name, e), () => openPersonaDrawer(id, hint)));
     return;
   }
   if (!d.isCurrent()) return;
@@ -804,9 +1446,14 @@ function everywhereSection(d) {
   guilds.forEach((g) => { if (g.name && !names.guilds[g.id]) names.guilds[g.id] = g.name; });
 
   const kids = [];
+  // Each guild links to this persona's drawer there.
+  const there = (gid) => (d.id ? lib.formatRoute(route('g', gid, 'personas', { kind: 'persona', id: d.id })) : null);
   kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Guilds it can act in' }),
     guilds.length
-      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [g.name || g.id, el('span', { class: 'muted mono', text: ' ' + g.id })])))
+      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [
+          there(g.id) ? el('a', { href: there(g.id), text: g.name || g.id }) : g.name || g.id,
+          el('span', { class: 'muted mono', text: ' ' + g.id }),
+        ])))
       : el('p', { class: 'muted', text: 'None.' })]));
 
   const roles = d.roles || [];
@@ -1070,6 +1717,19 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
 
   draw(policy0);
   update();
+  // Kept across "Sign in again": where and what level, nothing else.
+  keepForm(ctx.drawer, 'grant', {
+    serialize: () => ({ target: target.value, caps: level.value() }),
+    restore(f) {
+      if (f.target && Array.from(target.options).some((o) => o.value === f.target)) {
+        target.value = f.target;
+        preload();
+      }
+      if (f.caps) level.set(f.caps);
+      update();
+    },
+    isDirty: () => tracker.isDirty(),
+  }, status);
   det.appendChild(tableBox);
   det.appendChild(form);
   return det;
@@ -1080,8 +1740,8 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
 async function renderInvites(view, stale) {
   const meta = await guildMeta();
   if (stale()) return;
-  const mintBtn = el('button', { class: 'btn btn-sm btn-primary', text: '+ Mint invite' });
-  mintBtn.addEventListener('click', () => openMintDrawer(meta));
+  // A link: the mint drawer has an address (#/g/{gid}/invites/new).
+  const mintBtn = el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'invites', { kind: 'mint' })), text: '+ Mint invite' });
   const list = listView(view, {
     placeholder: 'Search invites…',
     actions: [mintBtn],
@@ -1174,8 +1834,18 @@ function mirrorRoleList(discordRoles) {
   return { list, toggle: toggle.node };
 }
 
-function openMintDrawer(meta) {
+/**
+ * The mint drawer (#/g/{gid}/invites/new). `prefill` is the address's query:
+ * r (access roles), or c (a channel) with lvl — 'Invite a new agent here'.
+ */
+async function openMintDrawer(prefill = {}) {
   const d = openDrawer({ title: 'Mint invite' });
+  let meta;
+  try { meta = await guildMeta(); } catch (e) {
+    if (d.isCurrent() && !e.handled) d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this guild’s access roles and channels', e), () => openMintDrawer(prefill)));
+    return;
+  }
+  if (!d.isCurrent()) return;
   const isSuper = !!(state.me && state.me.isSuper);
   const guild = currentGuildName();
   const names = metaNames(meta);
@@ -1263,7 +1933,45 @@ function openMintDrawer(meta) {
     el('div', {}, [submit]),
     status.node,
   ]);
+
+  // From the address: what to start with (not a change: Discard won't ask).
+  const prefRoles = (prefill.r || []).filter((r) => mine.includes(r));
+  const prefChannel = prefill.c && channelOptions(meta.channels).some((o) => o.value === prefill.c) ? prefill.c : null;
+  if (prefRoles.length) {
+    kind.set('roles');
+    roleList.setValues(prefRoles);
+  } else if (prefChannel) {
+    kind.set('channels');
+    chanList.setValues([prefChannel]);
+  }
+  if (prefill.lvl && lib.LEVEL_CAPS[prefill.lvl]) level.set(lib.LEVEL_CAPS[prefill.lvl]);
+  syncKind();
+
   const tracker = d.track(form);
+  // Kept across "Sign in again": the form's choices — never a minted code.
+  keepForm(d, 'mint', {
+    serialize: () => ({
+      label: label.value, kind: kind.value(), roles: roleList.values(), channels: chanList.values(),
+      mirrorRole: mirror.value() || undefined, caps: level.value(), uses: uses.value, usesOther: usesOther.value,
+      expires: expires.value, mode: who.value(),
+    }),
+    restore(f) {
+      if (f.label != null) label.value = f.label;
+      if (f.kind) kind.set(f.kind);
+      if (f.roles) roleList.setValues(f.roles.filter((r) => mine.includes(r)));
+      if (f.channels) chanList.setValues(f.channels);
+      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
+      if (f.caps) level.set(f.caps);
+      if (f.uses) uses.value = f.uses;
+      if (f.usesOther != null) usesOther.value = f.usesOther;
+      usesOther.classList.toggle('hidden', uses.value !== 'other');
+      if (f.expires) expires.value = f.expires;
+      if (f.mode) who.set(f.mode);
+      if (f.mode && f.mode !== 'mint') advanced.setAttribute('open', '');
+      syncKind();
+    },
+    isDirty: () => tracker.isDirty(),
+  }, status);
 
   ui.onSubmit(form, async () => {
     const no = (why) => status.err('Not minted: ' + why);
@@ -1356,9 +2064,8 @@ async function renderRoles(view, stale) {
   let data = null; // fetched once per visit; the filter runs locally
   const actions = [];
   if (meta.canAuthor) {
-    const add = el('button', { class: 'btn btn-sm btn-primary', text: '+ Define access role' });
-    add.addEventListener('click', () => openRoleDrawer(meta));
-    actions.push(add);
+    // A link: defining a role has an address (#/g/{gid}/roles/new).
+    actions.push(el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'roles', { kind: 'newRole' })), text: '+ Define access role' }));
   }
   const list = listView(view, {
     placeholder: 'Filter access roles…',
@@ -1406,13 +2113,25 @@ async function renderRoles(view, stale) {
   list.invalidate = () => { data = null; };
 }
 
-function openRoleDrawer(meta) {
+async function openRoleDrawer() {
   // The guild this drawer was opened for — its pickers list this guild's
   // channels and roles, so the role must be saved to it whatever happens to
   // the scope switcher meanwhile.
   const gid = state.guildId;
-  const names = metaNames(meta);
   const d = openDrawer({ title: 'Define access role' });
+  let meta;
+  try { meta = await guildMeta(); } catch (e) {
+    if (d.isCurrent() && !e.handled) d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this guild’s channels', e), () => openRoleDrawer()));
+    return;
+  }
+  if (!d.isCurrent()) return;
+  if (!meta.canAuthor) {
+    // Only super-admins define access roles: a link here lands on the list.
+    ui.drawer.close();
+    ui.toast('Only super-admins can define access roles. Ask one to add the role you need.', { kind: 'info' });
+    return;
+  }
+  const names = metaNames(meta);
   const name = el('input', { type: 'text', name: 'name', autocomplete: 'off', spellcheck: 'false' });
   // A role belongs to the guild being viewed and is built from that guild's
   // channels and Discord roles; to define one for another guild, switch first.
@@ -1471,7 +2190,25 @@ function openRoleDrawer(meta) {
   syncKind();
   update();
 
-  d.track(form);
+  const tracker = d.track(form);
+  // Kept across "Sign in again": the definition so far.
+  keepForm(d, 'role', {
+    serialize: () => ({
+      name: name.value, where: kind.value, channels: chanList.values(), mirrorRole: mirror.value() || undefined,
+      mirrorRoles: mirrors.list.values(), caps: level.value(),
+    }),
+    restore(f) {
+      if (f.name != null) name.value = f.name;
+      if (f.where) kind.value = f.where;
+      syncKind();
+      if (f.channels) chanList.setValues(f.channels);
+      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
+      if (f.mirrorRoles) mirrors.list.setValues(f.mirrorRoles);
+      if (f.caps) level.set(f.caps);
+      update();
+    },
+    isDirty: () => tracker.isDirty(),
+  }, status);
   ui.onSubmit(form, async () => {
     if (missing()) return; // Create is off until the form is complete
     status.clear(); // a line about the last try is not about this one
@@ -1902,8 +2639,11 @@ function auditTarget(r, names) {
   const kids = [];
   const t = r.target;
   if (t) {
-    const nm = (names.personas && names.personas[t]) || (names.guilds && names.guilds[t]);
-    kids.push(nm ? el('span', { text: nm, title: t }) : el('span', { text: t }));
+    const persona = names.personas && names.personas[t];
+    const nm = persona || (names.guilds && names.guilds[t]);
+    // A persona's name links to its drawer in this guild.
+    const href = persona && state.guildId ? lib.formatRoute(route('g', state.guildId, 'personas', { kind: 'persona', id: t })) : null;
+    kids.push(href ? el('a', { href, text: nm, title: t }) : nm ? el('span', { text: nm, title: t }) : el('span', { text: t }));
   } else if (r.detail) {
     // No target (e.g. a denied slash command): the detail is what says what
     // happened — keep it, minus the channel, which is named below.
