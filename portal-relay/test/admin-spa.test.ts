@@ -1048,3 +1048,117 @@ test('persona drawer: access roles are this guild’s only, with what each means
   const note = drawer.querySelectorAll('.field-hint').find((n) => /other guilds/.test(n.textContent))!;
   assert.equal(note.textContent, '+1 role in other guilds');
 });
+
+// ── The access-role drawer, driven as a super-admin would ──
+
+/** The Access roles tab as a super-admin, against a role catalog the fake
+ *  relay keeps (POST /admin/roles replaces a name, as the relay does). */
+async function rolesTab() {
+  const g = '/admin/g/' + G1;
+  const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'] };
+  const net = { down: false };
+  const box = appSandbox({
+    routes: {
+      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+      [g + '/channels']: { channels: G1_CHANNELS },
+    },
+    handle: (method, path, body) => {
+      if (net.down) throw new Error('offline');
+      if (method === 'GET' && path.startsWith(g + '/roles')) return { catalog, discordRoles: [], canAuthor: true };
+      if (method === 'POST' && path === '/admin/roles') {
+        catalog[body.name] = body.role;
+        return { ok: true, catalog };
+      }
+      if (method === 'DELETE' && path.startsWith('/admin/roles/')) {
+        delete catalog[decodeURIComponent(path.slice('/admin/roles/'.length))];
+        return { ok: true };
+      }
+      return undefined;
+    },
+  });
+  await box.ctx.PA.app.boot();
+  await settle();
+  box.tabs.roles.click();
+  await settle();
+  const button = (text: string) => box.doc.querySelectorAll('button').find((b) => b.textContent === text);
+  const confirm = () => box.doc.querySelector('.modal');
+  /** '+ Define access role', a name, a level, then Create. */
+  async function define(name: string, level: string) {
+    button('+ Define access role')!.click();
+    await settle();
+    const form = box.doc.getElementById('drawer-body')!.querySelector('form')!;
+    const input = form.querySelector('input[name="name"]')!;
+    input.value = name;
+    input.fire('input');
+    const where = form.querySelector('select[name="where"]')!;
+    where.value = 'all'; // the fake <select> has no default option
+    where.fire('change');
+    const radio = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === level)!;
+    radio.checked = true;
+    radio.fire('change');
+    assert.equal(form.querySelector('button[type="submit"]')!.disabled, false);
+    form.fire('submit');
+    await settle();
+  }
+  const rows = () => box.doc.getElementById('view')!.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
+  return { ...box, catalog, net, button, confirm, define, rows };
+}
+
+test('role drawer: asks before replacing a role that exists now, not only one the tab was drawn with', async () => {
+  const { define, confirm, catalog, rows, bodies } = await rolesTab();
+
+  // A new name is created without asking.
+  await define('g1-test', 'read');
+  assert.equal(confirm(), null);
+  assert.deepEqual(catalog['g1-test'].caps, [...LEVEL_CAPS.read]);
+  assert.ok(rows().some((r) => r[0] === 'g1-test' && r[1] === 'Read'), JSON.stringify(rows()));
+
+  // The same name again, in the same visit: the relay would replace it, so ask.
+  const posts = bodies.length;
+  await define('g1-test', 'write');
+  const dialog = confirm()!;
+  assert.ok(dialog, 'a role made during this visit is asked about');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'Replace access role g1-test?');
+  assert.match(dialog.textContent, /already exists \(Read in every channel of Guild One\)/);
+  dialog.querySelectorAll('button').find((b) => b.textContent === 'Cancel')!.click();
+  await settle();
+  assert.equal(bodies.length, posts, 'Cancel sends nothing');
+  assert.deepEqual(catalog['g1-test'].caps, [...LEVEL_CAPS.read], 'and leaves the role as it was');
+});
+
+test('role drawer: a role deleted (or made elsewhere) since the tab was drawn is judged as it is now', async () => {
+  const { define, confirm, catalog, net, button, rows, doc, bodies } = await rolesTab();
+
+  // Deleted during this visit: creating the name again is a plain create.
+  button('Delete')!.click();
+  await settle();
+  confirm()!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(catalog['g1-readers'], undefined);
+  await define('g1-readers', 'write');
+  assert.equal(confirm(), null, 'nothing to replace');
+  assert.deepEqual(catalog['g1-readers'].caps, [...LEVEL_CAPS.write]);
+
+  // Made by someone else after the tab was drawn: still asked about.
+  catalog['g1-elsewhere'] = { caps: [...LEVEL_CAPS.full], scope: { all: true }, guildId: G1 };
+  assert.ok(!rows().some((r) => r[0] === 'g1-elsewhere'), 'the tab has not seen it');
+  await define('g1-elsewhere', 'read');
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Replace access role g1-elsewhere?');
+  confirm()!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(catalog['g1-elsewhere'].caps, [...LEVEL_CAPS.read], 'Replace replaces it');
+
+  // A name that only an object's prototype has is not an existing role.
+  await define('constructor', 'read');
+  assert.equal(confirm(), null);
+  assert.ok(catalog.constructor && Object.hasOwn(catalog, 'constructor'));
+
+  // When the relay can't be asked, nothing is created and the drawer says so.
+  const posts = bodies.length;
+  net.down = true;
+  await define('g1-offline', 'read');
+  assert.equal(bodies.length, posts);
+  assert.equal(catalog['g1-offline'], undefined);
+  const form = doc.getElementById('drawer-body')!.querySelector('form')!;
+  assert.match(form.textContent, /Couldn’t reach the relay\. Nothing was changed\. Try again\./);
+});

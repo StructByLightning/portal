@@ -1315,7 +1315,6 @@ function openRoleDrawer(meta) {
   // channels and roles, so the role must be saved to it whatever happens to
   // the scope switcher meanwhile.
   const gid = state.guildId;
-  const catalog = meta.catalog || {};
   const names = metaNames(meta);
   const d = openDrawer({ title: 'Define access role' });
   const name = el('input', { type: 'text', name: 'name', autocomplete: 'off', spellcheck: 'false' });
@@ -1386,10 +1385,18 @@ function openRoleDrawer(meta) {
     else scope = { channels: chanList.values() };
     const role = { caps: level.value(), scope, guildId: gid };
     // The relay replaces a role of the same name: say so before it happens.
-    if (catalog[roleName]) {
+    // Ask the relay what exists now, not what the tab showed when it was
+    // drawn, so a role made or deleted since (here or by another admin) counts.
+    let existing = null;
+    try {
+      const now = await api('GET', '/admin/g/' + encodeURIComponent(gid) + '/roles');
+      const catalog = (now && now.catalog) || {};
+      if (Object.prototype.hasOwnProperty.call(catalog, roleName)) existing = catalog[roleName];
+    } catch (e) { status.err(notDone(e, 'Not created')); return; }
+    if (existing) {
       const go = await ui.confirmDialog({
         title: 'Replace access role ' + roleName + '?',
-        body: 'An access role named ' + roleName + ' already exists (' + lib.roleMeaning(catalog[roleName], names) + '). Creating it again replaces it for every persona that holds it.',
+        body: 'An access role named ' + roleName + ' already exists (' + lib.roleMeaning(existing, names) + '). Creating it again replaces it for every persona that holds it.',
         confirmLabel: 'Replace access role',
         danger: true,
       });
