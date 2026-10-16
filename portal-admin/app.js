@@ -1125,7 +1125,8 @@ function openRoleDrawer(discordRoles, channels) {
       invalidateGuildMeta();
       if (state.list && state.list.invalidate) state.list.invalidate();
       markStale();
-      ui.toast('Created access role ' + roleName + '.');
+      // Through the form's line, so an earlier 'Not created' toast goes too.
+      status.ok('Created access role ' + roleName + '.');
       ui.drawer.close(); // the list redraws with the new role
     } catch (e) { status.err(notDone(e, 'Not created')); }
   }, { busyLabel: 'Creating…' });

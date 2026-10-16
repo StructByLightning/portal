@@ -418,7 +418,7 @@ test('ui.toast: errors are alerts that stay until dismissed; the rest fade after
   assert.equal(host.children.length, 0);
 });
 
-test('ui.statusLine: the line holds the result and mirrors it as a toast', () => {
+test('ui.statusLine: the line holds the result and mirrors it as a toast; a newer result replaces the toast', () => {
   const { ctx, doc } = sandbox();
   load(ctx, ['ui.js']);
   const { el, statusLine } = ctx.PA.ui;
@@ -426,19 +426,91 @@ test('ui.statusLine: the line holds the result and mirrors it as a toast', () =>
   doc.body.appendChild(host);
   const section = el('section');
   const s = statusLine(section);
+  const texts = () => host.children.map((n) => n.textContent);
   assert.ok(s.node.classList.contains('hidden'));
   s.err('Not minted: pick at least one access role.');
   assert.equal(s.node.textContent, 'Not minted: pick at least one access role.');
   assert.ok(s.node.classList.contains('status-err'));
   assert.equal(host.children.at(-1)!.getAttribute('role'), 'alert');
+  // The same form then succeeds: the error toast is out of date and goes.
   s.ok(['Minted ', el('code', { text: 'inv_x' }), '.'], { toastText: 'Invite minted.' });
   assert.equal(s.node.textContent, 'Minted inv_x.');
-  assert.equal(host.children.at(-1)!.textContent, 'Invite minted.');
+  assert.deepEqual(texts(), ['Invite minted.'], 'the earlier error toast is gone');
+  // A result shown without a toast still takes the old one down.
   s.ok('quiet', { toast: false });
-  assert.equal(host.children.length, 2);
+  assert.deepEqual(texts(), []);
+  s.err('Not minted: an invented failure.');
+  assert.equal(host.children.length, 1);
   s.clear();
   assert.ok(s.node.classList.contains('hidden'));
   assert.equal(s.node.textContent, '');
+  assert.deepEqual(texts(), [], 'clear() takes its toast down too');
+});
+
+test('ui.statusLine: a line takes down only its own toast', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, statusLine, toast } = ctx.PA.ui;
+  const host = el('div', { id: 'toasts' });
+  doc.body.appendChild(host);
+  const section = el('section');
+  const list = statusLine(section);
+  const form = statusLine(section);
+  const texts = () => host.children.map((n) => n.textContent);
+  list.err('Not revoked: an invented failure.');
+  form.err('Not minted: pick at least one access role.');
+  toast('Not saved: something else.', { kind: 'err' });
+  form.ok('Minted inv_x.', { toastText: 'Invite minted.' });
+  assert.deepEqual(texts(), ['Not revoked: an invented failure.✕', 'Not saved: something else.✕', 'Invite minted.']);
+  // Dismissed with its ✕ first: the newer result has nothing left to take down.
+  host.children[0].querySelector('.toast-x')!.click();
+  list.ok('Revoked invite guests.');
+  assert.deepEqual(texts(), ['Not saved: something else.✕', 'Invite minted.', 'Revoked invite guests.']);
+});
+
+test('ui.toast: the page keeps room for the stack (--toasts-h, its height from the bottom of the screen)', () => {
+  const { ctx, doc } = sandbox();
+  const props: Record<string, string> = {};
+  (doc as any).documentElement = { style: { setProperty: (k: string, v: string) => (props[k] = v) } };
+  const observers: Array<() => void> = [];
+  ctx.ResizeObserver = class {
+    constructor(private fn: () => void) {}
+    observe() {
+      observers.push(this.fn);
+    }
+  };
+  ctx.innerHeight = 900;
+  ctx.addEventListener = () => {};
+  load(ctx, ['ui.js']);
+  const { el, toast } = ctx.PA.ui;
+  const host = el('div', { id: 'toasts' });
+  let top = 900;
+  (host as any).getBoundingClientRect = () => ({ top });
+  doc.body.appendChild(host);
+  const t = toast('Not saved: an invented failure.', { kind: 'err' });
+  assert.equal(observers.length, 1, 'the stack is watched once it is first used');
+  top = 846; // 42px of toast above a 12px margin
+  observers[0]();
+  assert.equal(props['--toasts-h'], '54px');
+  toast('Second.', { kind: 'err' });
+  assert.equal(observers.length, 1);
+  t.dismiss();
+  host.children[0].querySelector('.toast-x')!.click();
+  top = 888;
+  observers[0]();
+  assert.equal(props['--toasts-h'], '0px', 'no room kept once the stack is empty');
+});
+
+test('styles.css: the toast stack sits at the bottom, and the page and a narrow drawer keep room for it', () => {
+  const css = source('styles.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({ sel: m[1].trim(), body: m[2] }));
+  const stack = rules.filter((r) => /(^|\s)\.toasts$/.test(r.sel));
+  assert.ok(stack.length >= 2, 'a wide and a phone rule');
+  for (const r of stack) assert.doesNotMatch(r.body, /(^|[\s;])top\s*:/, r.sel + ' must not anchor to the top (it covered the toolbar and tabs)');
+  assert.match(stack[0].body, /bottom\s*:/);
+  for (const sel of ['.view', '.drawer-body']) {
+    assert.ok(rules.some((r) => r.sel === sel && /padding(-bottom)?\s*:[^;]*var\(--toasts-h/.test(r.body)), sel + ' keeps room for the stack');
+  }
 });
 
 test('ui.dirtyTracker: edits make a form dirty; reset() and data-no-dirty do not count', () => {
@@ -523,8 +595,9 @@ test('ui.drawer: Tab reaches a sticky toast’s ✕ from the drawer; ✕ and Esc
   assert.equal(status.node.textContent, 'Not minted: pick at least one access role.', 'the status line keeps the error');
 
   // Esc on a ✕ dismisses that message only; focus moves to the next one.
+  // (Two lines: a line's newer result would take its own older toast down.)
   status.err('First.');
-  status.err('Second.');
+  statusLine(form).err('Second.');
   const [x1, x2] = dom.toasts.querySelectorAll('.toast-x');
   x1.focus();
   assert.equal(doc.key('Escape').defaultPrevented, true);

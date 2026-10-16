@@ -135,7 +135,10 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   inline. Token endpoints return `403` for non-super-admins.
 - Feedback: every result or error appears in the status line of the section it
   came from and stays there; a toast mirrors it. Error toasts stay until
-  dismissed (✕); the rest fade after about 6 seconds. A button that sends a
+  dismissed (✕) or until the same section reports a newer result; the rest
+  fade after about 6 seconds. Toasts stack at the bottom of the screen (left
+  of an open drawer on a wide screen), and the page keeps that much room at
+  its end, so nothing stays hidden under them. A button that sends a
   request is disabled until the answer arrives, so a double click sends one.
 - Keyboard: `/` focuses the active search box. In the drawer, `Esc` (or a click
   on the dimmed page) asks "Discard changes?" when a form has unsaved edits,

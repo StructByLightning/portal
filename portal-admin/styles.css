@@ -104,7 +104,8 @@ select[multiple] { padding: 2px; }
 label { display: block; }
 
 /* ── View / banner ── */
-.view { padding: 14px; flex: 1; }
+/* The bottom padding grows by the toast stack's height (--toasts-h). */
+.view { padding: 14px 14px calc(14px + var(--toasts-h, 0px)); flex: 1; }
 .empty { color: var(--muted); padding: 40px; text-align: center; }
 .loading { padding: 8px 2px; }
 .banner { margin: 0 0 10px; padding: 7px 11px; border-radius: 6px; border: 1px solid var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
@@ -122,9 +123,14 @@ label { display: block; }
 .view > .status-line { margin: 0 0 8px; }
 .code-result { font-size: 13px; user-select: all; }
 
-/* ── Toasts: top-right, above the drawer and dialogs. ── */
-/* Below the 46px top bar and the drawer's header, so neither's buttons get covered. */
-.toasts { position: fixed; top: 56px; right: 12px; z-index: 60; display: flex; flex-direction: column; gap: 8px; width: 360px; max-width: calc(100vw - 24px); pointer-events: none; }
+/* ── Toasts: bottom-right, above the drawer and dialogs, newest at the bottom. ── */
+/* Not at the top: there a sticky error sat over the toolbar's buttons (+ Mint
+   invite, + Grant access by id, the scope select) and, on a phone, the tabs
+   and the guild switcher. At the bottom it can only cover the end of the page
+   or of the drawer, and ui.js keeps --toasts-h (the stack's height from the
+   bottom of the screen) so that much room is added there: whatever it covers
+   can be scrolled out from under it. */
+.toasts { position: fixed; bottom: 12px; right: 12px; z-index: 60; display: flex; flex-direction: column; gap: 8px; width: 360px; max-width: calc(100vw - 24px); pointer-events: none; }
 .toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); box-shadow: 0 6px 20px rgba(0,0,0,.18); overflow-wrap: anywhere; }
 .toast-msg { flex: 1; }
 .toast-ok { border-left: 4px solid var(--ok); }
@@ -134,7 +140,8 @@ label { display: block; }
 .toast-x:hover { border-color: var(--line); color: var(--fg); }
 /* With the drawer open on a wide screen the stack moves to its left, over the
    scrim, so a sticky error never covers the form it is about. Narrower than
-   this it stays on top of the drawer (Tab and Esc still reach its ✕). */
+   this it stays on top of the drawer (Tab and Esc still reach its ✕), and the
+   drawer keeps room at its end as the page does (see .drawer-body). */
 @media (min-width: 820px) {
   body:has(#drawer:not(.hidden)) .toasts { right: 532px; max-width: calc(100vw - 556px); }
 }
@@ -190,6 +197,10 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .drawer-title { margin: 0; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .drawer-subtitle { font-weight: 400; }
 .drawer-body { padding: 14px; overflow-y: auto; }
+/* Narrower than 820px the toast stack sits over the drawer: keep room for it. */
+@media (max-width: 819.98px) {
+  .drawer-body { padding-bottom: calc(14px + var(--toasts-h, 0px)); }
+}
 .drawer-sections { display: flex; flex-direction: column; gap: 16px; }
 .drawer-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
 .subsection { margin-bottom: 12px; }
@@ -256,7 +267,7 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
   .tabs { order: 4; flex: 1 1 100%; overflow-x: auto; scrollbar-width: none; }
   .tab { flex: 0 0 auto; }
   .spacer { display: none; }
-  .view { padding: 12px; }
+  .view { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
   .toolbar .search { flex: 1 1 100%; max-width: none; }
   .toolbar-actions { margin-left: 0; flex-wrap: wrap; }
   .toolbar-form { max-width: none; }
@@ -265,8 +276,10 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
   table.grid thead th { position: static; }
   .cell-roles { max-width: 220px; }
   .drawer { width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh; border-left: none; }
-  .drawer-body { padding: 12px; }
+  .drawer-body { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
   .field-row { flex-direction: column; gap: 0; }
-  .toasts { top: 52px; left: 8px; right: 8px; width: auto; max-width: none; }
+  /* Full width, at the bottom like the wide-screen stack: at the top it hid
+     the tabs and the guild switcher (the topbar is not sticky here). */
+  .toasts { bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none; }
   .cropper-wrap { flex-direction: column; }
 }

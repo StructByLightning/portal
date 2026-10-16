@@ -108,6 +108,27 @@
   }
 
   /**
+   * The stack sits at the bottom of the screen, over the page. While it holds
+   * messages, --toasts-h on <html> is the height it takes from the bottom of
+   * the viewport (0px when empty); styles.css adds that much room at the end
+   * of the page and of a narrow drawer, so anything a sticky message covers
+   * can be scrolled out from under it.
+   */
+  let roomKept = false;
+  function keepRoomForToasts(host) {
+    if (roomKept || typeof ResizeObserver !== 'function') return;
+    roomKept = true;
+    const root = document.documentElement;
+    const update = () => {
+      const h = host.children.length ? Math.max(0, Math.ceil(window.innerHeight - host.getBoundingClientRect().top)) : 0;
+      root.style.setProperty('--toasts-h', h + 'px');
+    };
+    new ResizeObserver(update).observe(host);
+    window.addEventListener('resize', update);
+    update();
+  }
+
+  /**
    * Show a toast in #toasts. kind: 'ok' (default) | 'err' | 'info'. Errors are
    * role=alert and sticky with a ✕; the rest hide after about 6 s unless
    * sticky is set. While the drawer is open, Tab reaches the ✕ after the
@@ -120,6 +141,7 @@
     const sticky = o.sticky != null ? o.sticky : kind === 'err';
     const host = document.getElementById('toasts');
     if (!host) return { node: null, dismiss() {} };
+    keepRoomForToasts(host);
     const msgId = uid('toast');
     const node = el('div', { class: 'toast toast-' + kind, role: kind === 'err' ? 'alert' : 'status' }, [
       el('span', { class: 'toast-msg', id: msgId }, [toText(msg)]),
@@ -163,16 +185,25 @@
   /**
    * An inline status line appended to `container` — the authoritative place a
    * section's result or error is shown; it stays until the next result. ok()
-   * and err() also show a toast (pass { toast: false } to skip it).
+   * and err() also show a toast (pass { toast: false } to skip it). The toast
+   * mirrors the line: a newer result, or clear(), takes down the toast of the
+   * one before, so a sticky error does not stay up once its section has
+   * reported something newer (say, the same form then succeeded).
    */
   function statusLine(container) {
     const node = el('p', { class: 'status-line hidden', role: 'status' });
     if (container) container.appendChild(node);
+    let mirror = null;
+    function unmirror() {
+      if (mirror) mirror.dismiss();
+      mirror = null;
+    }
     function set(kind, msg, o) {
+      unmirror();
       node.className = 'status-line status-' + kind;
       clear(node);
       for (const n of toNodes(msg)) node.appendChild(n);
-      if (!o || o.toast !== false) toast((o && o.toastText) || toText(msg), { kind });
+      if (!o || o.toast !== false) mirror = toast((o && o.toastText) || toText(msg), { kind });
     }
     return {
       node,
@@ -180,6 +211,7 @@
       err: (msg, o) => set('err', msg, o),
       info: (msg, o) => set('info', msg, Object.assign({ toast: false }, o)),
       clear() {
+        unmirror();
         node.className = 'status-line hidden';
         clear(node);
       },
