@@ -2592,7 +2592,8 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   [{ roles: ['r-g1'], maxUses: -1 }, 'maxUses'],
   [{ roles: ['r-g1'], maxUses: 0 }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: [5] }, 'subscriptions'],
-  // A field of the wrong type is refused by name, not dropped: dropped, "5" would be stored as unlimited.
+  // A field given with the wrong type is refused by name, not dropped: dropped, "5" would be stored as unlimited.
+  // A field given as null, '' or false is not given, and mints as if left out (the tests below).
   [{ roles: ['r-g1'], maxUses: '5' }, 'maxUses'],
   [{ roles: ['r-g1'], maxUses: true }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: 'c1' }, 'subscriptions'],
@@ -2774,6 +2775,22 @@ test('invites: a mint whose roles are null, empty, false or 0 beside a grant min
       const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
       assert.equal(inv?.roles, undefined, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
       assert.deepEqual(inv?.grant, grant, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint with no roles and a grant of null, empty or false is refused as needing roles or a grant', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const grant of [null, '', false]) {
+      const before = storeBytes(ctx.dir);
+      const r = await s.call('POST', '/admin/g/G1/invites', { grant });
+      assert.equal(r.status, 400, `${JSON.stringify(grant)}: ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.error.message, 'invite needs roles or a grant', `${JSON.stringify(grant)}: ${JSON.stringify(r.body)}`);
+      assert.deepEqual(storeBytes(ctx.dir), before, `${JSON.stringify(grant)}: nothing stored`);
     }
   } finally {
     await s.close();
