@@ -62,6 +62,9 @@ const state = {
   viewKey: null,   // which list is drawn (guild + tab); a change redraws it
   drawerRoute: null, // the address of the open drawer, if a route opened one
   drawerPushed: false, // that drawer was opened from its list: closing it goes Back
+  histIdx: 0,      // where this entry is in the tab's history (each entry is stamped)
+  routeAt: 0,      // histIdx of the entry state.route was shown at
+  restoring: null, // the address a Cancel is stepping back to, until it lands
   draft: null,     // an unsaved form brought back across a sign-in, until used
   leaving: false,  // on the way to sign in: no "Leave site?" question
   expiryTimer: null,
@@ -310,6 +313,10 @@ function sessionEnded(kind) {
 async function boot() {
   const btn = $('#login-btn');
   if (btn && !boot.bound) { boot.bound = true; btn.addEventListener('click', keepReturnTo); }
+  // This entry's place in the tab's history (kept across a reload).
+  const hs = history.state;
+  state.histIdx = hs && typeof hs.paIdx === 'number' ? hs.paIdx : 0;
+  replaceHash(location.pathname + location.search + location.hash);
   const params = new URLSearchParams(location.search);
   // Why a sign-in came back here: a fixed code, put in words by a fixed
   // table (nothing from the URL is shown), and taken out of the address.
@@ -317,7 +324,7 @@ async function boot() {
   if (params.has('login_error')) {
     params.delete('login_error');
     const rest = params.toString();
-    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+    replaceHash(location.pathname + (rest ? '?' + rest : '') + location.hash);
   }
   let me;
   try { me = await api('GET', '/admin/me', undefined, { boot: true }); }
@@ -351,7 +358,7 @@ async function boot() {
   const returnTo = takeSession('pa.returnTo');
   state.draft = lib.readDraft(takeSession('pa.draft'), { userId: userId(), now: Date.now() });
   const here = lib.parseRoute(location.hash);
-  if (here && here.area === 'home' && lib.isSafeReturnTo(returnTo)) history.replaceState(null, '', returnTo);
+  if (here && here.area === 'home' && lib.isSafeReturnTo(returnTo)) replaceHash(returnTo);
 
   bindApp();
   scheduleExpiry();
@@ -364,8 +371,8 @@ function bindApp() {
   bindApp.done = true;
   $('#logout-btn').addEventListener('click', logout);
   // Back, Forward, a link, an edited address: one place makes the page match.
-  window.addEventListener('popstate', () => applyRoute());
-  window.addEventListener('hashchange', () => applyRoute());
+  window.addEventListener('popstate', onHistory);
+  window.addEventListener('hashchange', onHistory);
   window.addEventListener('beforeunload', (e) => {
     if (state.leaving || !ui.drawer.isDirty()) return;
     e.preventDefault();
@@ -542,14 +549,62 @@ function route(area, gid, view, drawer = null, query = {}) {
   return { area, gid: gid || null, view, drawer, query };
 }
 
+// Every history entry the panel has been at carries its place in the tab's
+// history ({ paIdx }, in history.state). A step Back or Forward can then be
+// told from a new entry (a link, an edited address), and undone exactly: a
+// Cancel on 'Discard changes?' steps back with history.go(), never with a new
+// entry, so Back and Forward stay as they were.
+
+function stamp() { return { paIdx: state.histIdx }; }
+/** history.replaceState, keeping this entry's place. */
+function replaceHash(url) { history.replaceState(stamp(), '', url); }
+/** history.pushState, one place further on. */
+function pushHash(url) {
+  state.histIdx++;
+  history.pushState(stamp(), '', url);
+}
+/** After Back, Forward, a link or an edited address: where are we now? An
+ *  entry without a stamp is a new one, one place further on. */
+function noteHistory() {
+  const s = history.state;
+  if (s && typeof s.paIdx === 'number') {
+    state.histIdx = s.paIdx;
+    return;
+  }
+  state.histIdx++;
+  replaceHash(location.pathname + location.search + location.hash);
+}
+function onHistory() {
+  noteHistory();
+  if (state.restoring) {
+    const want = state.restoring;
+    state.restoring = null;
+    // A Cancel's step back landed elsewhere (an entry this tab hadn't
+    // stamped, from before an update): put the drawer's address on top.
+    if (location.hash !== want) {
+      pushHash(want);
+      state.drawerPushed = false; // under it now is where the admin was going
+    }
+  }
+  applyRoute();
+}
+/** Back to the entry at `at`, whose address is `hash` (Cancel). */
+function stepBackTo(hash, at) {
+  const delta = at - state.histIdx;
+  if (delta) {
+    state.restoring = hash;
+    history.go(delta);
+  } else if (location.hash !== hash) replaceHash(hash);
+}
+
 /** Go to `r`: a new history entry (Back comes back here), or with
  *  { replace: true } in place of this one (search, filters, fixes). */
 function navigate(r, opts = {}) {
   const hash = lib.formatRoute(r);
   if (!hash) return Promise.resolve();
   if (hash !== location.hash) {
-    if (opts.replace) history.replaceState(null, '', hash);
-    else history.pushState(null, '', hash);
+    if (opts.replace) replaceHash(hash);
+    else pushHash(hash);
   }
   return applyRoute();
 }
@@ -578,8 +633,9 @@ function goHome() {
   const h = homeRoute();
   if (h) return navigate(h, { replace: true });
   // Nowhere to land: a guild-admin none of whose guilds is served now.
-  history.replaceState(null, '', '#/');
+  replaceHash('#/');
   state.route = lib.parseRoute('#/');
+  state.routeAt = state.histIdx;
   showNotAdmin(null);
 }
 
@@ -677,38 +733,34 @@ async function applyRoute(opts = {}) {
   }
   r = sup.route;
   const canonical = lib.formatRoute(r);
-  if (canonical !== hash) history.replaceState(null, '', canonical);
+  if (canonical !== hash) replaceHash(canonical);
 
   const prev = state.route;
-  // Leaving a drawer with unsaved changes (Back, a link): put the address
-  // back on top, and ask first. Discard goes Back to where the admin was
-  // going (the entry just under it), which then shows as usual.
+  // Leaving a drawer with unsaved changes (Back, Forward, a link, an edited
+  // address): ask first. The address already shows where the admin was
+  // going; Discard shows that place. Cancel stays: it steps back to the
+  // drawer's own entry with history.go(), so no entry is added or dropped —
+  // Forward and Back still go where they went (stepBackTo).
   if (prev && prev.area !== 'home' && ui.drawer.isOpen() && ui.drawer.isDirty() && lib.formatRoute(prev) !== canonical) {
-    const prevHash = lib.formatRoute(prev);
-    history.pushState(null, '', prevHash);
     if (discardAsked) return;
     discardAsked = true;
+    const prevHash = lib.formatRoute(prev);
+    const at = state.routeAt;
     // One question at a time: Esc may have asked already (ui.drawer shares it).
     const asked = ui.drawer.id();
     const discard = await ui.drawer.confirmDiscard();
     discardAsked = false;
-    // Answered elsewhere (Esc's Discard closed it), or the page moved on.
-    if (!ui.drawer.isOpen() || ui.drawer.id() !== asked || location.hash !== prevHash) return;
-    if (!discard) {
-      // Cancel: stay. Under the address put back is where the admin was
-      // going — the drawer's own list after Back, but after a link, Forward
-      // or an edited address somewhere else, which closing must not go to:
-      // closing then puts the list in place of the drawer instead.
-      if (state.drawerPushed && canonical !== lib.formatRoute(listOf(prev))) state.drawerPushed = false;
-      return;
-    }
+    if (ui.drawer.isOpen() && ui.drawer.id() !== asked) return; // another drawer since
+    if (!discard && ui.drawer.isOpen()) return stepBackTo(prevHash, at);
+    // Discarded (here, or by Esc's question, which closed it): show the
+    // address as it is now.
     closeDrawerFor('route');
-    history.back();
-    return;
+    return applyRoute();
   }
   // A kept form is only for the place it was kept at.
   if (state.draft && state.draft.route !== canonical) state.draft = null;
   state.route = r;
+  state.routeAt = state.histIdx;
 
   if (r.area === 'g' && !canManage(r.gid)) return showNotAdmin(r);
   remember(r);
@@ -779,7 +831,8 @@ function syncQuery() {
   const hash = lib.formatRoute(next);
   if (!hash) return;
   state.route = next;
-  if (hash !== location.hash) history.replaceState(null, '', hash);
+  state.routeAt = state.histIdx;
+  if (hash !== location.hash) replaceHash(hash);
 }
 
 /** Where a persona's drawer is, from the list being shown. From the list of
@@ -977,15 +1030,17 @@ function onDrawerClosed(reason) {
   state.rowKey = null;
   // Closed by the admin (✕, Esc, the scrim, Done): the address follows. Back
   // to the list it was opened from; or, for one reached by a link or a
-  // reload, its list in place of it.
+  // reload, its list in place of it. (Closed by Discard while the address
+  // has already moved on — Back with unsaved changes — the place it moved to
+  // is shown by the applyRoute that asked.)
   if (reason !== 'route') {
     state.drawerRoute = null;
     const r = state.route;
-    if (r && r.drawer) {
+    if (r && r.drawer && location.hash === lib.formatRoute(r)) {
       const list = listOf(r);
       state.route = list;
       if (state.drawerPushed) history.back();
-      else history.replaceState(null, '', lib.formatRoute(list));
+      else replaceHash(lib.formatRoute(list));
     }
   }
   state.drawerPushed = false;

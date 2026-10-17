@@ -110,8 +110,10 @@ or name — with the guilds you do manage and Try again.
 Changing guild, tab or drawer adds a history entry; a search changes `?q=`
 in place, so Back never steps through keystrokes. A drawer opened from its
 list closes with Back; one reached by a link or a reload is replaced by its
-list. Leaving a drawer with unsaved changes (Back, a link, closing the page)
-asks first.
+list. Leaving a drawer with unsaved changes (Back, Forward, a link, closing
+the page) asks first; Cancel steps back to the drawer's own history entry
+(each entry the panel has been at carries its place in `history.state`), so
+Back and Forward still go where they went.
 
 ## When the session ends
 

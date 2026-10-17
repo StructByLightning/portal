@@ -282,12 +282,14 @@ class FakeDocument {
 }
 
 /**
- * The address bar and the history: entries of path+search+hash, Back and
- * Forward, and the window events they fire (popstate, then hashchange, after
- * the current task — as a browser does). pushState/replaceState fire nothing.
+ * The address bar and the history: entries of path+search+hash (each with
+ * its history.state), Back, Forward and go(n), and the window events they
+ * fire (popstate, then hashchange, after the current task — as a browser
+ * does). pushState/replaceState fire nothing.
  */
 class FakeNav {
   entries: string[];
+  states: unknown[] = [null];
   i = 0;
   listeners = new Map<string, Array<(e: unknown) => void>>();
   assigned: string[] = [];
@@ -348,34 +350,45 @@ class FakeNav {
       get length() {
         return nav.entries.length;
       },
-      pushState(_s: unknown, _t: string, u: string) {
+      /** A structured clone, as a browser keeps it. */
+      get state() {
+        const v = nav.states[nav.i];
+        return v == null ? null : JSON.parse(JSON.stringify(v));
+      },
+      pushState(st: unknown, _t: string, u: string) {
         nav.entries.splice(nav.i + 1);
+        nav.states.splice(nav.i + 1);
         nav.entries.push(nav.resolve(u));
+        nav.states.push(st == null ? null : JSON.parse(JSON.stringify(st)));
         nav.i++;
       },
-      replaceState(_s: unknown, _t: string, u: string) {
+      replaceState(st: unknown, _t: string, u: string) {
         nav.entries[nav.i] = nav.resolve(u);
+        nav.states[nav.i] = st == null ? null : JSON.parse(JSON.stringify(st));
+      },
+      go(n: number) {
+        const to = nav.i + n;
+        if (!n || to < 0 || to >= nav.entries.length) return;
+        nav.i = to;
+        nav.fireNav();
       },
       back() {
-        if (nav.i > 0) {
-          nav.i--;
-          nav.fireNav();
-        }
+        this.go(-1);
       },
       forward() {
-        if (nav.i < nav.entries.length - 1) {
-          nav.i++;
-          nav.fireNav();
-        }
+        this.go(1);
       },
     };
   })();
-  /** A link click, or an address typed into the bar: a new entry and the events. */
+  /** A link click, or an address typed into the bar: a new entry (with no
+   *  state) and the events. */
   go(href: string) {
     const to = this.resolve(href);
     if (to === this.entries[this.i]) return;
     this.entries.splice(this.i + 1);
+    this.states.splice(this.i + 1);
     this.entries.push(to);
+    this.states.push(null);
     this.i++;
     this.fireNav();
   }
@@ -2557,9 +2570,11 @@ test('session: Back out of a drawer with unsaved changes asks first; Cancel stay
   await settle();
   const ask = box.doc.querySelector('.modal')!;
   assert.equal(ask.querySelector('h2')!.textContent, 'Discard changes?');
-  assert.equal(box.here(), g + '/invites/new', 'the address is put back while it asks');
+  assert.ok(box.drawerOpen(), 'the drawer stays while it asks');
   clickable(box.doc, 'Cancel', ask).click();
   await settle();
+  assert.equal(box.here(), g + '/invites/new', 'Cancel: the address is the drawer’s again');
+  assert.deepEqual([box.nav.entries.length, box.nav.i], [2, 1], 'the same entry, not a copy of it');
   assert.ok(box.drawerOpen());
   assert.equal(box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, 'x');
   box.nav.back();
@@ -2935,6 +2950,64 @@ test('session: Cancel after a link out of a dirty drawer; closing it then goes t
   await settle();
   assert.equal(box.here(), g + '/personas');
   assert.equal(box.nav.i, depth - 1, 'Back to the list it was opened from');
+});
+
+test('session: Cancel on leaving a dirty drawer leaves Back and Forward as they were', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/personas', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { [`/admin/g/${GA}/personas/sol`]: { id: 'sol', displayName: 'Sol', roles: [], guildPolicy: null, names: { channels: {} } } },
+  });
+  const title = () => box.doc.getElementById('drawer-title')!.textContent;
+  const modal = () => box.doc.querySelector('.modal');
+  // Open Aria, then Sol; Back to Aria; change something there.
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  box.nav.go(g + '/personas/p/sol');
+  await settle();
+  assert.equal(title(), 'Sol sol');
+  box.nav.back();
+  await settle();
+  assert.equal(box.here(), g + '/personas/p/aria');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.random;
+  target.fire('change');
+  const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  read.checked = true;
+  read.fire('change');
+  const entries = [...box.nav.entries];
+  const at = box.nav.i;
+
+  // Back again, Cancel: nothing in the history changes — Sol is still Forward.
+  box.nav.back();
+  await settle();
+  clickable(box.doc, 'Cancel', modal()!).click();
+  await settle();
+  assert.deepEqual(box.nav.entries, entries, 'no entry added or dropped');
+  assert.equal(box.nav.i, at);
+  assert.equal(box.here(), g + '/personas/p/aria');
+  assert.equal(title(), 'Aria aria');
+  assert.equal(form.querySelector('select')!.value, CH.random, 'the change is still there');
+
+  // Forward, Cancel: the same.
+  box.nav.history.forward();
+  await settle();
+  clickable(box.doc, 'Cancel', modal()!).click();
+  await settle();
+  assert.deepEqual(box.nav.entries, entries);
+  assert.equal(box.nav.i, at);
+  assert.equal(box.here(), g + '/personas/p/aria');
+
+  // Forward, Discard: Sol.
+  box.nav.history.forward();
+  await settle();
+  clickable(box.doc, 'Discard changes', modal()!).click();
+  await settle();
+  assert.equal(box.here(), g + '/personas/p/sol');
+  assert.equal(title(), 'Sol sol');
+  assert.equal(modal(), null);
+  assert.deepEqual(box.nav.entries, entries);
 });
 
 test('session: Esc then Back on a dirty drawer asks one question; its answer closes that drawer only', async () => {
