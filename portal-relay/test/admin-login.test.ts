@@ -13,7 +13,7 @@ import type { IncomingMessage } from 'node:http';
 import type { AdminConfig } from '../src/config.js';
 import { IdentityStore } from '../src/identity.js';
 import { PermissionsStore } from '../src/permissions.js';
-import { AdminServer, type AdminDeps } from '../src/admin/server.js';
+import { AdminServer, stateCookieName, type AdminDeps } from '../src/admin/server.js';
 import { AuditLog } from '../src/admin/audit.js';
 import { LoginRateLimit, clientIp } from '../src/admin/login-limit.js';
 
@@ -44,6 +44,9 @@ interface World {
   failToken(status: number | null): void;
   /** Codes Discord was asked to exchange. */
   exchanged: string[];
+  /** Keep Discord's token endpoint from answering until the returned
+   *  function is called. */
+  holdToken(): () => void;
   close(): Promise<void>;
 }
 
@@ -82,6 +85,7 @@ async function world(): Promise<World> {
     newInviteCode: () => 'unused',
   };
   let tokenStatus: number | null = null;
+  let held: Promise<void> | null = null;
   const exchanged: string[] = [];
   const fakeDiscord = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input instanceof Request ? input.url : input);
@@ -89,6 +93,7 @@ async function world(): Promise<World> {
     if (url.endsWith('/oauth2/token')) {
       const code = new URLSearchParams(String(init?.body ?? '')).get('code') ?? '';
       exchanged.push(code);
+      if (held) await held;
       if (tokenStatus !== null) return reply({ error: 'server_error', error_description: 'words Discord chose' }, tokenStatus);
       const who = /^as-(\w+)$/.exec(code)?.[1];
       if (!who || !(who in USERS)) return reply({ error: 'invalid_grant' }, 400);
@@ -107,6 +112,11 @@ async function world(): Promise<World> {
     audit,
     failToken: (s) => { tokenStatus = s; },
     exchanged,
+    holdToken: () => {
+      let release!: () => void;
+      held = new Promise<void>((r) => { release = r; });
+      return () => { held = null; release(); };
+    },
     close: async () => {
       await server.close();
       rmSync(dir, { recursive: true, force: true });
@@ -162,9 +172,15 @@ class Browser {
     return this.cookies.get('portal_admin_session');
   }
 
+  /** The sign-ins in flight in this browser: its state cookies' values,
+   *  newest first. */
   get states(): string[] {
-    const v = this.cookies.get('portal_admin_state');
-    return v ? v.split('.') : [];
+    return [...this.cookies].filter(([k]) => k.startsWith('portal_admin_state_')).map(([, v]) => v).reverse();
+  }
+
+  /** A cookie for `state`, as /admin/login would have set it. */
+  holdState(state: string): void {
+    this.cookies.set(stateCookieName(state), state);
   }
 
   async me(session = this.session): Promise<number> {
@@ -190,19 +206,19 @@ test('two tabs: two sign-ins started in one browser both complete', async () => 
     const b = new Browser(w);
     const s1 = await b.startLogin();
     const s2 = await b.startLogin();
-    assert.deepEqual(b.states, [s2, s1], 'the cookie holds both, newest first');
+    assert.deepEqual(b.states, [s2, s1], 'a cookie for each');
 
     const r1 = await b.finish(s1);
     assert.equal(r1.headers.get('location'), '/done');
     assert.ok(setsSession(r1));
     const first = b.session!;
-    assert.deepEqual(b.states, [s2], 'the spent state leaves the cookie; the other tab’s stays');
+    assert.deepEqual(b.states, [s2], 'the spent state’s cookie goes; the other tab’s stays');
 
     const r2 = await b.finish(s2);
     assert.equal(r2.headers.get('location'), '/done');
     assert.ok(setsSession(r2));
     assert.notEqual(b.session, first, 'a fresh session');
-    assert.deepEqual(b.states, [], 'no sign-in left in flight: the state cookie is cleared');
+    assert.deepEqual(b.states, [], 'no sign-in left in flight: no state cookie left');
     assert.equal(await b.me(), 200);
     assert.equal(records(w, 'login.ok').length, 2);
     assert.equal(records(w, 'login.failed').length, 0);
@@ -211,13 +227,45 @@ test('two tabs: two sign-ins started in one browser both complete', async () => 
   }
 });
 
-test('the state cookie keeps the three newest live sign-ins and drops ones the server no longer knows', async () => {
+test('two tabs: a sign-in started while another tab’s callback waits on Discord is not erased by it', async () => {
   const w = await world();
   try {
     const b = new Browser(w);
-    b.cookies.set('portal_admin_state', `${STRANGER}.not-a-state`);
+    const s1 = await b.startLogin();
+    // Tab one comes back from Discord; Discord takes its time with the code…
+    const release = w.holdToken();
+    const first = b.finish(s1);
+    while (!w.exchanged.includes('as-admin1')) await new Promise((r) => setTimeout(r, 5));
+    // …while tab two starts signing in as someone else.
+    const s2 = await b.startLogin();
+    release();
+    assert.equal((await first).headers.get('location'), '/done');
+    assert.deepEqual(b.states, [s2], 'tab one’s callback took only its own state with it');
+
+    const r2 = await b.finish(s2, 'admin2');
+    assert.equal(r2.headers.get('location'), '/done');
+    assert.ok(setsSession(r2), 'tab two’s sign-in went through');
+    assert.ok(w.exchanged.includes('as-admin2'), 'its code was exchanged');
+    const me = await (await fetch(w.base + '/admin/me', { headers: { cookie: `portal_admin_session=${b.session}` } })).json();
+    assert.equal(me.user.id, 'admin2', 'the account switch happened');
+    assert.deepEqual(b.states, []);
+  } finally {
+    await w.close();
+  }
+});
+
+test('state cookies: the three newest live sign-ins are kept; ones the server no longer knows are dropped', async () => {
+  const w = await world();
+  try {
+    const b = new Browser(w);
+    b.holdState(STRANGER);
+    b.cookies.set('portal_admin_state_0123456789abcdef', 'not-a-state');
+    b.cookies.set('portal_admin_state', `${STRANGER}.not-a-state`); // an earlier version's one cookie
+    b.cookies.set('portal_admin_session_x', 'kept'); // not a state cookie: left alone
     const s1 = await b.startLogin();
     assert.deepEqual(b.states, [s1], 'unknown and malformed states are dropped');
+    assert.equal(b.cookies.has('portal_admin_state'), false, 'and so is the old single cookie');
+    assert.equal(b.cookies.get('portal_admin_session_x'), 'kept');
     const s2 = await b.startLogin();
     const s3 = await b.startLogin();
     const s4 = await b.startLogin();
@@ -226,7 +274,7 @@ test('the state cookie keeps the three newest live sign-ins and drops ones the s
     assert.match(set, /; Max-Age=600(;|$)/);
     assert.match(set, /; HttpOnly/);
     assert.match(set, /; Path=\/admin/);
-    // The oldest still works if it comes back — it is the cookie that forgot it.
+    // The oldest is still live on the server, but this browser forgot it.
     const r = await b.finish(s1);
     assert.equal(r.headers.get('location'), '/done?login_error=mismatch');
     assert.ok((await b.finish(s2)).headers.get('location') === '/done');
@@ -298,10 +346,10 @@ test('a state this server does not know is expired; one not in this browser is m
   try {
     // Known to the cookie, unknown here (issued before a restart, say).
     const b = new Browser(w);
-    b.cookies.set('portal_admin_state', STRANGER);
+    b.holdState(STRANGER);
     const r1 = await b.finish(STRANGER);
     assert.equal(r1.headers.get('location'), '/done?login_error=expired');
-    assert.equal(r1.headers.getSetCookie().length, 0, 'the cookie is left as it was');
+    assert.equal(r1.headers.getSetCookie().length, 0, 'no cookie is touched');
 
     // Issued here for another browser: not in this one's cookie.
     const other = new Browser(w, '198.51.100.8');
@@ -316,7 +364,7 @@ test('a state this server does not know is expired; one not in this browser is m
     const s = await bare.startLogin();
     await bare.finish(s);
     const third = new Browser(w, '198.51.100.10');
-    third.cookies.set('portal_admin_state', s);
+    third.holdState(s);
     assert.equal((await third.finish(s)).headers.get('location'), '/done?login_error=expired');
 
     assert.deepEqual(records(w, 'login.failed').map((r) => r.detail!.reason).reverse(), ['expired', 'mismatch', 'mismatch', 'mismatch', 'expired']);
@@ -351,7 +399,7 @@ test('Discord failing the exchange: discord_error, recorded with the step and st
     // A callback with a good state but no code: discord_error, state kept.
     const s3 = await new Browser(w, '198.51.100.8').startLogin();
     const c = new Browser(w, '198.51.100.8');
-    c.cookies.set('portal_admin_state', s3);
+    c.holdState(s3);
     assert.equal((await c.get(`/admin/callback?state=${s3}`)).headers.get('location'), '/done?login_error=discord_error');
     assert.equal((await c.finish(s3)).headers.get('location'), '/done', 'the state was not spent');
   } finally {

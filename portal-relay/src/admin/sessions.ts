@@ -44,6 +44,8 @@ interface PendingLogin {
   reauth: boolean;
   /** The client address that started it (its share of the cap). */
   client: string;
+  /** Issue order: higher is newer. */
+  seq: number;
 }
 
 /** What consumeState found. */
@@ -54,6 +56,7 @@ export class SessionStore {
   private states = new Map<string, PendingLogin>();
   /** Each client address's states in flight, oldest first. */
   private byClient = new Map<string, Set<string>>();
+  private issued = 0;
   private sweepTimer?: ReturnType<typeof setInterval>;
   private readonly maxPending: number;
   private readonly maxPendingPerClient: number;
@@ -94,7 +97,7 @@ export class SessionStore {
     if (this.states.size >= this.maxPending) this.sweep();
     while (this.states.size >= this.maxPending && this.dropOldest(this.busiestClient()));
     const s = token();
-    this.states.set(s, { expiresAt: this.now() + STATE_TTL_MS, reauth: opts.reauth === true, client });
+    this.states.set(s, { expiresAt: this.now() + STATE_TTL_MS, reauth: opts.reauth === true, client, seq: ++this.issued });
     let set = this.byClient.get(client);
     if (!set) this.byClient.set(client, (set = new Set()));
     set.add(s);
@@ -137,6 +140,12 @@ export class SessionStore {
     const p = state ? this.states.get(state) : undefined;
     if (!p) return 'unknown';
     return p.expiresAt > this.now() ? 'live' : 'expired';
+  }
+
+  /** Where a state came in the order they were issued (higher is newer;
+   *  undefined when it isn't held here). */
+  stateIssueOrder(state: string): number | undefined {
+    return this.states.get(state)?.seq;
   }
 
   /** Validate-and-consume a state value (single use, live or not). */
