@@ -108,9 +108,9 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
     return 'invite maxUses must be a finite number above 0';
   }
   // check() already refuses such an expiry; this names it at load, since the
-  // next save drops it with the expired invites.
+  // relay's next save drops it with the expired invites.
   const at = expiryOf(inv);
-  if (at !== undefined && Number.isNaN(at)) return "invite expiresAt isn't a date, so it reads as expired and the next save drops it";
+  if (at !== undefined && Number.isNaN(at)) return "invite expiresAt isn't a date, so it reads as expired and the relay's next save drops it";
   return grantShapeProblem(inv);
 }
 
@@ -186,10 +186,7 @@ export class InviteStore {
 
   // ── Mutations (persist) — RFC-005 admin API ──
 
-  /** Add a new invite template. Throws on duplicate code. Returns it. A
-   *  template the save can't keep (an expiry that isn't a date or passed more
-   *  than 24h ago, a uses or maxUses that isn't finite) is dropped by this
-   *  mint's own save (prune), so its code is unknown at once. */
+  /** Add a new invite template. Throws on duplicate code. Returns it. */
   mint(template: InviteTemplate): InviteTemplate {
     if (this.byCode.has(template.code)) throw new Error(`duplicate invite code ${template.code}`);
     const inv = { uses: 0, ...template };
@@ -224,7 +221,7 @@ export class InviteStore {
     const bad = [...byCode.values()]
       .map((i) => [i, inviteShapeProblem(i)] as const)
       .filter(([, why]) => why)
-      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why}${nonFiniteCount(i) ? ", and the relay's next save drops it" : ''})`);
+      .map(([i, why]) => `${i.label ?? String(i.code).slice(0, 12)} (${why}${nonFiniteCount(i) ? ", and the relay's next save drops it" : ''})`);
     if (bad.length) {
       console.error(`[portal-relay] invites: ${bad.length} invite(s) will be refused: ${bad.join('; ')}`);
     }

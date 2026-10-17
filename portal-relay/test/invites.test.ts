@@ -148,8 +148,8 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['count-zero', { maxUses: 0 }, 'invite maxUses must be a finite number above 0'],
     ['count-negative', { maxUses: -1 }, 'invite maxUses must be a finite number above 0'],
     ['count-null', { maxUses: null }, 'invite maxUses must be a finite number above 0'],
-    ['expiry-number', { expiresAt: 2030 }, "invite expiresAt isn't a date, so it reads as expired and the next save drops it"],
-    ['expiry-word', { expiresAt: 'tomorrow' }, "invite expiresAt isn't a date, so it reads as expired and the next save drops it"],
+    ['expiry-number', { expiresAt: 2030 }, "invite expiresAt isn't a date, so it reads as expired and the relay's next save drops it"],
+    ['expiry-word', { expiresAt: 'tomorrow' }, "invite expiresAt isn't a date, so it reads as expired and the relay's next save drops it"],
   ];
   const kept: Array<[string, Record<string, unknown>]> = [
     ['plain', {}],
@@ -200,6 +200,22 @@ test('loading names a count or uses that JSON reads as infinite, and says the re
   assert.ok(line.includes("uses-infinite (invite uses must be a finite number, and the relay's next save drops it)"), line);
   assert.ok(line.includes("uses-minus-infinite (invite uses must be a finite number, and the relay's next save drops it)"), line);
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('loading names a refused invite that has no label by its code\'s first 12 characters, a code that isn\'t a string included', (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+  const path = tmpFile({
+    invites: [
+      { code: 42, guildId: 'g1', roles: ['r'], maxUses: 'x' },
+      { code: 'abcdefghijklmnop', guildId: 'g1', roles: ['r'], maxUses: 'x' },
+    ],
+  });
+  new InviteStore(path);
+  const line = errors.find((l) => /will be refused/.test(l)) ?? '';
+  assert.ok(line.includes('42 (invite maxUses must be a finite number above 0)'), line);
+  assert.ok(line.includes('abcdefghijkl (invite maxUses must be a finite number above 0)'), line);
+  rmSync(path, { force: true });
 });
 
 test('a save drops an invite whose count or uses JSON read as infinite, since JSON would write it as null', (t) => {
