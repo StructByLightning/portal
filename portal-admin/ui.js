@@ -1007,7 +1007,8 @@
    * Windows and Linux, and in Firefox, ↑/↓ on a closed select change its
    * value (and fire 'change') at once, so going from — to Write would
    * otherwise save Read on the way. Enter, or leaving the control, applies
-   * what it shows; Esc puts back what is set. A pick with the mouse, or
+   * what it shows; Esc puts back what is set (inside a drawer too: the
+   * drawer's own Esc waits for the next one). A pick with the mouse, or
    * from the open list, applies at once.
    *   opts: { value (caps | null), canBlock, label (the select's name), apply,
    *           busy (drawn while a change to it is still being saved
@@ -1034,6 +1035,10 @@
     function setHeld(on) {
       held = on;
       heldHint.classList.toggle('hidden', !on);
+      // While a step is held, Esc is this control's (it puts back what is
+      // set): the drawer's Esc, which runs first, leaves it to it.
+      if (on) select.setAttribute('data-esc-own', 'true');
+      else select.removeAttribute('data-esc-own');
     }
     function fill() {
       clear(select);
@@ -1139,7 +1144,7 @@
       } else if (e.key === 'Escape' && held) {
         e.preventDefault();
         e.stopPropagation(); // the drawer's Esc is the next one
-        fill();
+        fill(); // not held any more: leaving the control now applies nothing
       }
     });
     select.addEventListener('blur', () => { if (held) commit(); });
@@ -1585,6 +1590,10 @@
       // handler); the next Esc is the drawer's.
       const f = document.activeElement;
       if (e.key === 'Escape' && f && f.getAttribute && f.getAttribute('role') === 'combobox' && f.getAttribute('aria-expanded') === 'true') return;
+      // Esc on a direct-grant control holding a keyboard step cancels the
+      // step (its own handler). Taking it here would move focus off the
+      // control, and leaving it applies the step: the opposite of Esc.
+      if (e.key === 'Escape' && f && f.getAttribute && f.getAttribute('data-esc-own') === 'true') return;
       if (!current) return;
       const d = drawerEls();
       // The toasts sit outside the drawer (above it), but their ✕s join its Tab

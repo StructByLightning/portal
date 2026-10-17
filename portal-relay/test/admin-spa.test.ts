@@ -236,10 +236,18 @@ class FakeElement extends FakeNode {
    *  nothing. (Hiding the focused one leaves it focused, as Chrome reports it.) */
   focus() {
     if (this === this.doc.body || this.disabled || !this.checkVisibility()) return;
+    const was = this.doc.activeElement;
+    if (this.doc.focusEvents && was !== this && was !== this.doc.body) {
+      // As a browser does: the control left gets 'blur' (with focus on <body> meanwhile).
+      this.doc.activeElement = this.doc.body;
+      was.fire('blur');
+    }
     this.doc.activeElement = this;
   }
   blur() {
-    if (this.doc.activeElement === this) this.doc.activeElement = this.doc.body;
+    if (this.doc.activeElement !== this) return;
+    this.doc.activeElement = this.doc.body;
+    if (this.doc.focusEvents) this.fire('blur');
   }
   get isConnected(): boolean {
     let n: FakeNode | null = this;
@@ -257,8 +265,11 @@ class FakeElement extends FakeNode {
 class FakeDocument {
   body: FakeElement;
   activeElement: FakeElement;
-  listeners: Array<[string, unknown]> = [];
+  listeners: Array<[string, unknown, boolean]> = [];
   nav: FakeNav | null = null;
+  /** Moving focus fires 'blur' on the control it leaves (off unless a test
+   *  turns it on). */
+  focusEvents = false;
   visibilityState = 'visible';
   title = '';
   constructor() {
@@ -282,8 +293,8 @@ class FakeDocument {
     };
     return walk(this.body);
   }
-  addEventListener(type: string, fn: unknown) {
-    this.listeners.push([type, fn]);
+  addEventListener(type: string, fn: unknown, capture?: unknown) {
+    this.listeners.push([type, fn, capture === true || (!!capture && typeof capture === 'object' && (capture as { capture?: boolean }).capture === true)]);
   }
   querySelector(sel: string) {
     return this.body.querySelector(sel);
@@ -296,6 +307,27 @@ class FakeDocument {
   key(key: string, opts: { shiftKey?: boolean } = {}) {
     const ev = { key, shiftKey: !!opts.shiftKey, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; }, stopPropagation() {} };
     for (const [type, fn] of this.listeners) if (type === 'keydown') (fn as (e: unknown) => void)(ev);
+    return ev;
+  }
+  /** A key pressed on the focused element, through the phases a browser
+   *  dispatches it in: the document's capture-phase listeners, then the
+   *  element's own and its ancestors' on the way up, then the document's
+   *  bubbling ones. stopPropagation() ends it after the current node. */
+  press(key: string, opts: { shiftKey?: boolean } = {}) {
+    let stopped = false;
+    const target = this.activeElement;
+    const ev = {
+      key, target, shiftKey: !!opts.shiftKey, ctrlKey: false, metaKey: false, altKey: false, defaultPrevented: false,
+      preventDefault() { ev.defaultPrevented = true; }, stopPropagation() { stopped = true; },
+    };
+    const docPhase = (capture: boolean) => {
+      for (const [type, fn, cap] of this.listeners) if (type === 'keydown' && cap === capture) (fn as (e: unknown) => void)(ev);
+    };
+    docPhase(true);
+    for (let n: FakeNode | null = target; n && !stopped; n = n.parentNode) {
+      if (n instanceof FakeElement) for (const fn of n.listeners.get('keydown') ?? []) fn(ev);
+    }
+    if (!stopped) docPhase(false);
     return ev;
   }
 }
@@ -5709,4 +5741,33 @@ test('every channel kind the relay serves: listed with its kind, its access show
   assert.ok(calls.includes(`DELETE ${P}/grants?channelId=${STAGE}`));
   const t = doc.getElementById('toasts')!.querySelectorAll('.toast').find((x) => x.textContent.startsWith('Removed Aria'))!;
   assert.equal(t.querySelector('.toast-action'), null, 'no Undo: the panel can’t give access there');
+});
+
+test('channel drawer: Esc on a direct grant holding a keyboard step cancels the step — the drawer’s Esc doesn’t move focus off it and so apply it', async () => {
+  const { tr, bodies, doc, rowLink, drawerOpen } = await channelsPanel('/#/g/' + GA + '/channels');
+  rowLink(CH.research).click();
+  await settle();
+  doc.focusEvents = true; // leaving the control fires 'blur', as in a browser
+  const sel = tr('aria').querySelector('select')!;
+  sel.focus();
+  const n = bodies.length;
+  // ↓ on the closed select: the browser moves its value and fires 'change' at once.
+  doc.press('ArrowDown');
+  sel.value = 'full';
+  sel.fire('change');
+  assert.ok(!tr('aria').querySelector('.dg-held')!.classList.contains('hidden'), 'the step is held: Enter to apply · Esc to cancel');
+  doc.press('Escape');
+  await settle();
+  assert.equal(bodies.length, n, 'nothing sent: Esc cancelled the step');
+  assert.equal(sel.value, 'write', 'back to what is set');
+  assert.ok(tr('aria').querySelector('.dg-held')!.classList.contains('hidden'), 'nothing held any more');
+  assert.equal(doc.activeElement, sel, 'focus stays on the control');
+  assert.ok(drawerOpen(), 'the drawer stays open');
+  // The next Esc is the drawer's: off the field, then closed — still nothing sent.
+  doc.press('Escape');
+  assert.ok(drawerOpen(), 'the first leaves the field');
+  doc.press('Escape');
+  await settle();
+  assert.ok(!drawerOpen(), 'the next closes the drawer');
+  assert.equal(bodies.length, n, 'nothing was ever sent');
 });
