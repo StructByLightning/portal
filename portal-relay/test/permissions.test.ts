@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PermissionsStore } from '../src/permissions.js';
+import { PermissionsStore, roleGrantsAccess } from '../src/permissions.js';
 import type { Capability } from '@animalabs/portal-protocol';
 import type { PermissionsFile } from '../src/config.js';
 
@@ -464,13 +464,15 @@ test('mirrorCaps of true, false, null, \'\', 0 and 1 load and read by their trut
   }
 });
 
-test('a role that names nothing loads and grants nothing: a scope of {}, an `all` that is off, a mirrorRole of \'\', and caps of \'\'', () => {
+test('a role that names nothing loads and grants nothing: a scope of {}, an `all` that is off, a list of \'\' alone, a mirrorRole of \'\', and caps of \'\'', () => {
   const nothing: Record<string, unknown> = {
     'scope-empty': { caps: ['SEND_MESSAGES'], scope: {}, guildId: 'g1' },
     'all-false': { caps: ['SEND_MESSAGES'], scope: { all: false }, guildId: 'g1' },
     'all-zero': { caps: ['SEND_MESSAGES'], scope: { all: 0 }, guildId: 'g1' },
     'all-blank': { caps: ['SEND_MESSAGES'], scope: { all: '' }, guildId: 'g1' },
     'all-null': { caps: ['SEND_MESSAGES'], scope: { all: null }, guildId: 'g1' },
+    'channels-blank': { caps: ['SEND_MESSAGES'], scope: { channels: [''] }, guildId: 'g1' },
+    'mirrors-blank': { caps: ['SEND_MESSAGES'], scope: { mirrorRoles: [''] }, guildId: 'g1' },
     'mirror-blank': { caps: ['SEND_MESSAGES'], scope: { mirrorRole: '' }, guildId: 'g1' },
     'caps-blank': { caps: '', scope: { all: true }, guildId: 'g1' },
   };
@@ -482,9 +484,11 @@ test('a role that names nothing loads and grants nothing: a scope of {}, an `all
     for (const name of Object.keys(nothing)) {
       assert.notEqual(store.getRole(name), undefined, `${name} is loaded`);
       assert.deepEqual(sorted(store.resolveForRoles([name], 'g1', 'c1')), [], `${name} grants nothing`);
+      assert.equal(roleGrantsAccess(store.getRole(name)), false, `${name} doesn't count as granting access`);
     }
     assert.deepEqual(sorted(store.resolve('p', 'g1', 'c1')), []);
-    assert.equal(store.couldAccessGuild('p', 'g1', () => true), false);
+    // As the relay's lookups answer: g1 holds c1, and no channel's id is ''.
+    assert.equal(store.couldAccessGuild('p', 'g1', (c) => c === 'c1'), false);
   } finally {
     rmSync(path, { force: true });
   }

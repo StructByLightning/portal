@@ -2592,12 +2592,13 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   [{ roles: ['r-g1'], maxUses: -1 }, 'maxUses'],
   [{ roles: ['r-g1'], maxUses: 0 }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: [5] }, 'subscriptions'],
-  // A field of the wrong type is refused by name, not dropped: dropped, "5" was stored as unlimited.
+  // A field of the wrong type is refused by name, not dropped: dropped, "5" would be stored as unlimited.
   [{ roles: ['r-g1'], maxUses: '5' }, 'maxUses'],
   [{ roles: ['r-g1'], maxUses: true }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: 'c1' }, 'subscriptions'],
   [{ roles: ['r-g1'], mode: 'augmnet' }, 'mode'],
-  // Dropped, roles that weren't a list left the grant alone, and an expiry that wasn't a number of days never expired.
+  // Dropped, roles that aren't a list would leave the grant alone, and an expiry that isn't a number of days would
+  // never expire.
   [{ roles: 'r-g1', grant: MINT_GRANT }, 'roles'],
   [{ roles: 0, grant: MINT_GRANT }, 'roles'],
   [{ roles: false, grant: MINT_GRANT }, 'roles'],
@@ -2605,7 +2606,7 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   [{ roles: ['r-g1'], expiresInDays: 0 }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: -1 }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: true }, 'expiresInDays'],
-  // Past a date's range, which threw a 500.
+  // Past a date's range, where building the date would throw and answer 500.
   [{ roles: ['r-g1'], expiresInDays: 1e12 }, 'expiresInDays'],
 ];
 for (const [body, field] of MINT_REFUSED) {
