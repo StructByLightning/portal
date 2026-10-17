@@ -1700,6 +1700,9 @@ function personaModel(ctx, access, meta) {
     n.guilds = { [gid]: guild };
     return n;
   };
+  const busyFns = [];
+  let pending = 0;
+  let idleWaiters = [];
   const m = {
     access,
     meta,
@@ -1707,8 +1710,31 @@ function personaModel(ctx, access, meta) {
     names: namesOf(access),
     path: gpath(gid) + '/personas/' + encodeURIComponent(ctx.id),
     identity: null,
+    /** The drawer's Undo toasts (PA.channels.undoBook): a newer change to a
+     *  channel retires the older one's Undo, and Remove retires them all. */
+    undos: window.PA.channels.undoBook(),
     /** Redraw `fn` from every new read. */
     onChange(fn) { draws.push(fn); },
+    /** Changes of this drawer still being made (a row's, an Add's, an Undo):
+     *  Remove waits for them, so none lands after it. */
+    busy: () => pending > 0,
+    onBusy(fn) { busyFns.push(fn); },
+    /** Count `work` (a promise) as a change in progress until it settles. */
+    track(work) {
+      pending++;
+      if (pending === 1) for (const fn of busyFns) fn(true);
+      const done = () => {
+        pending--;
+        if (pending) return;
+        for (const fn of busyFns) fn(false);
+        const w = idleWaiters;
+        idleWaiters = [];
+        for (const res of w) res();
+      };
+      return Promise.resolve(work).then((v) => { done(); return v; }, (e) => { done(); throw e; });
+    },
+    /** Resolves once no change of this drawer is in progress. */
+    idle: () => (pending ? new Promise((res) => idleWaiters.push(res)) : Promise.resolve()),
     set(a) {
       m.access = a;
       m.names = namesOf(a);
@@ -1939,19 +1965,21 @@ function accessSection(ctx, m) {
 
   /** Send one direct-grant change for channel `cid` (`next`: caps; [] a
    *  block; null removed), with what this drawer showed there as `expect`.
-   *  Resolves { ok, text, undo } or { ok: false, error }. */
-  async function send(cid, next, row) {
+   *  `lift`: the admin was asked, and chose to lift the persona's removal
+   *  from the guild (without it the relay refuses: 409 BANNED). Resolves
+   *  { ok, text, undo } or { ok: false, error }. */
+  async function send(cid, next, row, lift) {
     const expect = row && row.direct !== undefined ? row.direct : null;
     const before = row && Array.isArray(row.effective) ? row.effective : [];
     const w = where(cid);
     try {
-      const r = await Q.enqueue(() => Q.writeGrant(gid, id, cid, next, expect), paused(status));
+      const r = await Q.enqueue(() => Q.writeGrant(gid, id, cid, next, expect, { lift }), paused(status));
       const lifted = !!(r && r.liftedBan);
       markStale();
       return {
         ok: true,
         text: lib.grantResultText({ name: displayName, next, before, ex: r && r.effective, where: w, liftedFrom: lifted ? guild : null }),
-        undo: { cid, where: w, prev: expect, next: next == null ? null : next.slice(), lifted },
+        undo: { key: cid, cid, where: w, prev: expect, next: next == null ? null : next.slice(), lifted },
       };
     } catch (e) {
       return { ok: false, error: e };
@@ -1959,13 +1987,16 @@ function accessSection(ctx, m) {
   }
 
   /** Put changes back as they were, newest first — each sent with what it
-   *  set as `expect`, so one changed again since is refused, not undone. */
-  async function undo(list, line) {
+   *  set as `expect`, so one changed again since is refused, not undone —
+   *  never lifting a removal from the guild made since (the relay refuses
+   *  that unasked). Said on the line the change was said on. */
+  async function undo(entry) {
+    const line = entry.line;
     const lines = [];
     let bad = false;
-    for (const u of list.slice().reverse()) {
+    for (const u of entry.list.slice().reverse()) {
       try {
-        const r = await Q.enqueue(() => Q.writeGrant(gid, id, u.cid, u.prev, u.next), paused(line));
+        const r = await m.track(Q.enqueue(() => Q.writeGrant(gid, id, u.cid, u.prev, u.next), paused(line)));
         const ex = r && r.effective;
         const nowText = ex && Array.isArray(ex.effective) ? lib.effectNowText(ex, u.where) : '';
         lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + displayName + ' in ' + u.where : displayName + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + u.where) +
@@ -1973,7 +2004,7 @@ function accessSection(ctx, m) {
           (u.lifted ? ' Its removal from ' + guild + ' stays lifted. ' + lib.removeAgainText(guild) : ''));
       } catch (e) {
         bad = true;
-        lines.push(lib.errorText(e, 'Not undone', { channelId: u.cid, names: m.names, reloaded: true }));
+        lines.push(lib.undoRefusedText(e, { channelId: u.cid, names: m.names, reloaded: ctx.drawer.isCurrent(), name: displayName, guild }));
       }
     }
     markStale();
@@ -1981,15 +2012,29 @@ function accessSection(ctx, m) {
     else if (state.list && state.tab === 'personas') state.list.refresh(); // the list behind follows
     line[bad ? 'err' : 'ok'](statusParts(lines), { toastText: lines.join(' ') });
   }
-  const undoAction = (list, line, what) => ({ label: 'Undo', ariaLabel: 'Undo ' + what, run: () => undo(list, line) });
+  /** Say a change on `line`, with an Undo of `list` (what each change
+   *  replaced) for 10 s — retiring an older Undo of the same channel. */
+  function said(line, kind, msg, opts, list, what) {
+    const undoable = (list || []).filter(Boolean);
+    const entry = undoable.length ? m.undos.add(undoable, line) : null;
+    const o = Object.assign({}, opts);
+    if (entry) Object.assign(o, { action: { label: 'Undo', ariaLabel: 'Undo ' + what, run: () => undo(entry) }, ms: UNDO_MS });
+    const toast = line[kind](msg, o);
+    if (entry) entry.toast = toast;
+  }
 
   /** A row's direct-grant control picked `next`: ask first when it lowers
    *  guild-wide or default access, or lifts a removal; then send it.
    *  Resolves true when saved. */
-  async function changeDirect(cid, next) {
+  function changeDirect(cid, next) {
+    return m.track(changeDirectNow(cid, next));
+  }
+
+  async function changeDirectNow(cid, next) {
     const row = m.rowOf(cid);
     const w = where(cid);
-    if ((m.access.removed || lib.isRemoved(row)) && next && next.length) {
+    const lift = (!!m.access.removed || lib.isRemoved(row)) && !!next && next.length > 0;
+    if (lift) {
       const go = await ui.confirmDialog({
         title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
         body: [lib.liftText(displayName, next, w, guild), lib.UNDO_KEEPS_LIFT],
@@ -2011,17 +2056,23 @@ function accessSection(ctx, m) {
         if (!go) return false;
       }
     }
-    const res = await send(cid, next, row);
+    const res = await send(cid, next, row, lift);
     if (res.ok) {
       const reloaded = await refresh('dg:' + cid);
-      status.ok(res.text + (reloaded ? '' : ' (Couldn’t read the access again — reopen the drawer to see it.)'),
-        { action: undoAction([res.undo], status, 'the last change in ' + w), ms: UNDO_MS });
+      said(status, 'ok', res.text + (reloaded ? '' : ' (Couldn’t read the access again — reopen the drawer to see it.)'), null, [res.undo], 'the last change in ' + w);
       return true;
     }
     const e = res.error;
     if (e.code === 'CONFLICT') {
       const ok = await refresh('dg:' + cid);
       status.err(lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { reloaded: ok }));
+      return false;
+    }
+    if (e.code === 'BANNED') {
+      // Removed from the guild since this was read: the drawer says so now,
+      // and the next try asks before lifting that.
+      const ok = await refresh('dg:' + cid);
+      status.err(lib.removedSinceText('Not saved', displayName, guild, ok));
       return false;
     }
     status.err(lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { channelId: cid, names: m.names }));
@@ -2037,7 +2088,7 @@ function accessSection(ctx, m) {
     const i = items.findIndex((x) => x.channelId === cid);
     const next = items[i + 1] || items[i - 1] || null;
     try {
-      const r = await Q.enqueue(() => Q.writeGrant(gid, id, cid, null, it.caps), paused(inactiveStatus));
+      const r = await m.track(Q.enqueue(() => Q.writeGrant(gid, id, cid, null, it.caps), paused(inactiveStatus)));
       const ex = r && r.effective;
       let text;
       if (it.reason === 'category') text = 'Removed ' + displayName + '’s direct grant on ' + w + '. A category grants nothing, so nothing changed.';
@@ -2146,7 +2197,8 @@ function accessSection(ctx, m) {
     level.onChange(() => { syncCurrently(); for (const fn of touched) fn(); });
     m.onChange(syncCurrently);
 
-    ui.onSubmit(form, async () => {
+    ui.onSubmit(form, () => m.track(addNow()), { busyLabel: 'Adding…' });
+    async function addNow() {
       const items = ta.items();
       const caps = level.value();
       if (!items.length || !caps.length) return; // Add is off until both are picked
@@ -2168,16 +2220,24 @@ function accessSection(ctx, m) {
       }
       line.clear();
       const lines = [];
-      const undos = [];
+      const done = []; // what Undo puts back
       const left = [];
+      let removedSince = false;
       for (const it of items) {
-        const res = await send(it.value, caps, m.rowOf(it.value));
+        const res = await send(it.value, caps, m.rowOf(it.value), lift);
         if (res.ok) {
           lines.push(res.text);
-          undos.push(res.undo);
+          done.push(res.undo);
           continue;
         }
         left.push(it);
+        if (res.error.code === 'BANNED') {
+          // Removed from the guild since this drawer was read (another admin,
+          // or /ban): said once; the rest are refused the same way.
+          if (!removedSince) lines.push(lib.removedSinceText(items.length === 1 ? 'Not saved' : 'Not saved in ' + it.label, displayName, guild, true));
+          removedSince = true;
+          continue;
+        }
         lines.push(lib.errorText(res.error, items.length === 1 ? 'Not saved' : 'Not saved in ' + it.label, { channelId: it.value, names: m.names, reloaded: res.error.code === 'CONFLICT' }));
         if (res.error.status === 401) {
           // The session ended: the rest would be refused too. They stay
@@ -2188,14 +2248,12 @@ function accessSection(ctx, m) {
       }
       // Read again; focus is the form's to keep (onSubmit gives it to the
       // channel field once nothing is left to add).
-      if (undos.length || left.length) { try { await m.reload(); } catch { /* the lines say what was done */ } }
+      if (done.length || left.length) { try { await m.reload(); } catch { /* the lines say what was done */ } }
       ta.set(left);
       if (!left.length) tracker.reset();
       syncCurrently();
-      const opts = { toastText: lines.join(' ') };
-      if (undos.length) Object.assign(opts, { action: undoAction(undos, line, 'what Add just did'), ms: UNDO_MS });
-      line[left.length ? 'err' : 'ok'](statusParts(lines), opts);
-    }, { busyLabel: 'Adding…' });
+      said(line, left.length ? 'err' : 'ok', statusParts(lines), { toastText: lines.join(' ') }, done, 'what Add just did');
+    }
 
     syncCurrently();
     return {
@@ -2317,7 +2375,8 @@ function rolesSection(ctx, m) {
     picker.setAttribute('aria-busy', 'true');
     while (queue.length) {
       const role = queue.shift();
-      if (m.access.removed) {
+      const lift = !!m.access.removed;
+      if (lift) {
         // Giving it a role here lifts its removal: asked first.
         const go = await ui.confirmDialog({
           title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
@@ -2328,15 +2387,22 @@ function rolesSection(ctx, m) {
         if (!go) continue;
       }
       try {
-        const was = !!m.access.removed;
-        const r = await api('POST', m.path + '/roles', { role });
+        const was = lift;
+        const r = await api('POST', m.path + '/roles', lift ? { role, liftBan: true } : { role });
         held = r.roles || held.concat(role);
         draw();
         markStale();
         let now = '';
         try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
         status.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').' + now + (was && r.banned === false ? ' That lifted its removal from ' + guild + '.' : ''));
-      } catch (e) { status.err(notDone(e)); }
+      } catch (e) {
+        if (e.code === 'BANNED') {
+          // Removed since this drawer was read: it says so now, and the next pick asks first.
+          let ok = false;
+          try { ok = await m.reload(); } catch { ok = false; }
+          status.err(lib.removedSinceText('Not given', displayName, guild, ok));
+        } else status.err(notDone(e));
+      }
       picker.disabled = true; // draw() turned it back on
     }
     assigning = false;
@@ -2373,8 +2439,12 @@ function rolesSection(ctx, m) {
  * 'Remove from <guild>': what slash /ban does — its access roles here and
  * every direct grant here go, guild-wide is denied, and only an admin of the
  * guild can give it access here again. The confirm lists what goes, from the
- * access read the drawer shows. And Resync: re-send its channel list to its
- * running agent (the relay allows one every few seconds).
+ * access read the drawer shows. Remove waits while a change made in this
+ * drawer is still being saved, and goes through the same queue, so no
+ * change lands after it; once done, the drawer's Undo toasts are taken down
+ * (an Undo can't lift a removal anyway: the relay refuses it). And Resync:
+ * re-send its channel list to its running agent (the relay allows one
+ * every few seconds).
  */
 function removeSection(ctx, m) {
   const { displayName } = ctx;
@@ -2386,12 +2456,15 @@ function removeSection(ctx, m) {
   const resync = el('button', { class: 'btn', text: 'Resync', 'aria-describedby': hintId });
   function draw() {
     const gone = !!m.access.removed;
+    const saving = m.busy();
     // Through setDisabled: a removal redraws this while busy() holds the button.
-    ui.setDisabled(remove, gone);
-    removedNote.textContent = gone ? 'Removed from ' + guild + ': nothing it holds applies here.' : '';
-    removedNote.classList.toggle('hidden', !gone);
+    ui.setDisabled(remove, gone || saving);
+    removedNote.textContent = gone ? 'Removed from ' + guild + ': nothing it holds applies here.'
+      : saving ? 'Waiting for the changes being saved here…' : '';
+    removedNote.classList.toggle('hidden', !gone && !saving);
   }
   m.onChange(draw);
+  m.onBusy(draw);
   draw();
 
   remove.addEventListener('click', async () => {
@@ -2400,7 +2473,11 @@ function removeSection(ctx, m) {
     if (!go) return;
     await ui.busy(remove, async () => {
       try {
-        const r = await api('POST', m.path + '/remove');
+        // After every change still being saved here (an Add batch, a row,
+        // an Undo), and behind any write already queued.
+        await m.idle();
+        const r = await window.PA.channels.enqueue(() => api('POST', m.path + '/remove'));
+        m.undos.retireAll();
         markStale();
         try { await m.reload(); } catch { /* the line says what was done */ }
         status[r.accessFullyRevoked === false ? 'err' : 'ok'](lib.removedText(displayName, guild, { rolesRemoved: r.rolesRemoved, grants: c.grants, accessFullyRevoked: r.accessFullyRevoked }));
@@ -2599,6 +2676,7 @@ function moreSection(ctx, m) {
       body.expect = loadedGuildWide();
     }
     try {
+      if (lift) body.liftBan = true; // asked above
       const r = await api('PUT', m.path + '/grants', body);
       markStale();
       // What was sent is saved; a level picked while it was at work is not,
@@ -2609,9 +2687,20 @@ function moreSection(ctx, m) {
         (r && r.liftedBan ? ' That lifted its removal from ' + guild + '.' : ''));
     } catch (e) {
       if (e.code === 'CONFLICT') return conflicted(e, 'Not saved');
+      if (e.code === 'BANNED') return removedSince('Not saved');
       gwStatus.err(notDone(e, 'Not saved'));
     }
   });
+
+  /** The relay refused a level because the persona was removed from the
+   *  guild since this drawer was read: read it again and say so; the next
+   *  Save asks before lifting that. */
+  async function removedSince(prefix) {
+    let reloaded = false;
+    try { reloaded = await m.reload(); } catch { reloaded = false; }
+    markStale();
+    gwStatus.err(lib.removedSinceText(prefix, displayName, guild, reloaded));
+  }
 
   async function denyGuildWide(button) {
     const g = m.access.guildWide;
@@ -2698,15 +2787,32 @@ function moreSection(ctx, m) {
     const sentText = claimCode.value;
     const code = sentText.trim();
     if (!code) { claimStatus.err('Not applied: enter an invite code first.'); return; }
+    const lift = !!m.access.removed;
+    if (lift) {
+      // Applying an invite that gives access here lifts the removal: asked first.
+      const go = await ui.confirmDialog({
+        title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
+        body: [displayName + ' was removed from ' + guild + ', so nothing it holds applies there. Applying an invite that gives it access here lifts that: anything it still holds in ' +
+          guild + ' applies again.', lib.removeAgainText(guild)],
+        confirmLabel: 'Apply and lift',
+      });
+      if (!go) return;
+    }
     try {
-      const was = !!m.access.removed;
-      const r = await api('POST', m.path + '/claim', { code });
+      const was = lift;
+      const r = await api('POST', m.path + '/claim', lift ? { code, liftBan: true } : { code });
       settleField(claimCode, sentText, '', claimTracker); // emptied, unless another code was typed meanwhile
       markStale();
       let now = '';
       try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
       claimStatus.ok('Applied the invite to ' + displayName + '.' + now + (was && r && r.banned === false ? ' That lifted its removal from ' + guild + '.' : ''));
-    } catch (e) { claimStatus.err(notDone(e, 'Not applied')); }
+    } catch (e) {
+      if (e.code === 'BANNED') {
+        let ok = false;
+        try { ok = await m.reload(); } catch { ok = false; }
+        claimStatus.err(lib.removedSinceText('Not applied', displayName, guild, ok));
+      } else claimStatus.err(notDone(e, 'Not applied'));
+    }
   }, { busyLabel: 'Applying…' });
 
   drawGw();

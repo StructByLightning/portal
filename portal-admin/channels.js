@@ -132,8 +132,11 @@ function enqueue(task, onPause) {
  *  null removes it), through the hardened grant route: a preset by name, a
  *  block as {deny}, anything else as caps — with `expect`, what this page
  *  last saw there, so a change made meanwhile is refused (409), not
- *  overwritten. */
-function writeGrant(gid, pid, cid, next, expect) {
+ *  overwritten. `opts.lift`: the admin was asked and chose to lift the
+ *  persona's removal from the guild ({liftBan: true}); without it the relay
+ *  refuses a grant to a removed persona (409 BANNED), so an Undo or a change
+ *  queued before a removal can never lift it. */
+function writeGrant(gid, pid, cid, next, expect, opts) {
   const P = env.gpath(gid) + '/personas/' + encodeURIComponent(pid) + '/grants';
   if (next == null) return env.api('DELETE', P + '?channelId=' + encodeURIComponent(cid), { expect });
   // A relay older than the panel's grant API reads a grant without caps as
@@ -145,7 +148,47 @@ function writeGrant(gid, pid, cid, next, expect) {
   else if (v === 'custom') body.caps = next.slice();
   else body.level = v;
   body.expect = expect;
+  if (opts && opts.lift && next.length) body.liftBan = true;
   return env.api('PUT', P, body);
+}
+
+/**
+ * The Undo toasts of one drawer, so that a newer change to the same persona
+ * in the same channel retires the older one's Undo (it would put back what
+ * was there before the admin's own newer change, and be refused as changed
+ * meanwhile) and so that a removal from the guild can retire them all.
+ * add(list, line) → the entry ({ list, line, toast, retired }) whose list
+ * the Undo runs (set entry.toast to the toast that carries it). Each item
+ * has a `key`: the persona in a channel drawer, the channel in a persona's.
+ */
+function undoBook() {
+  const entries = [];
+  return {
+    add(list, line) {
+      const entry = { list: list.slice(), line, toast: null, retired: false };
+      const keys = new Set(list.map((u) => u.key));
+      for (const old of entries) {
+        if (old.retired) continue;
+        old.list = old.list.filter((u) => !keys.has(u.key));
+        if (!old.list.length) retire(old);
+      }
+      entries.push(entry);
+      if (entries.length > 50) entries.shift();
+      return entry;
+    },
+    /** Every Undo of this drawer (for `pid`, when given) stops applying. */
+    retireAll(pid) {
+      for (const e of entries) {
+        if (e.retired) continue;
+        if (pid !== undefined) e.list = e.list.filter((u) => u.pid !== pid);
+        if (pid === undefined || !e.list.length) retire(e);
+      }
+    },
+  };
+  function retire(e) {
+    e.retired = true;
+    if (e.toast) e.toast.dismiss();
+  }
 }
 
 // ── The Channels tab ───────────────────────────────────────────────────────
@@ -498,6 +541,7 @@ function drawDrawer(d, gid, cid, data, note) {
     tbody,
   ])]);
   const whoEmpty = el('p', { class: 'empty-note hidden', text: 'Nobody can act here yet' + (grantable ? ' — add a persona above.' : '.') });
+  const undos = undoBook();
 
   /** A result about one persona, on the line under its row (where the
    *  change was made); at the top of the table when it has none. */
@@ -506,7 +550,7 @@ function drawDrawer(d, gid, cid, data, note) {
     const after = tr ? tr.nextSibling : tbody.firstChild;
     if (after !== statusRow) tbody.insertBefore(statusRow, after);
     statusRow.classList.remove('hidden');
-    whoStatus[kind](msg, opts);
+    return whoStatus[kind](msg, opts);
   }
   const paused = (pid) => () => report('info', 'Paused for a few seconds (rate limit).', null, pid);
 
@@ -645,16 +689,18 @@ function drawDrawer(d, gid, cid, data, note) {
   }
 
   /** Send one change and take the relay's answer for the row. Resolves
-   *  { ok, text, undo } — undo: what restores it ({ pid, prev, next, lifted }).
-   *  `base`: what is known of a persona without a row here (the Add pick:
-   *  name, picture, whether the directory said it was removed from the guild). */
-  async function send(pid, name, next, base, refocus) {
+   *  { ok, text, undo } — undo: what restores it ({ key, pid, prev, next,
+   *  lifted }). `base`: what is known of a persona without a row here (the
+   *  Add pick: name, picture, whether the directory said it was removed from
+   *  the guild). `lift`: the admin was asked, and chose to lift its removal
+   *  from the guild. */
+  async function send(pid, name, next, base, refocus, lift) {
     const row = rowOf(pid);
     const expect = row ? row.direct : null;
     const before = row ? row.effective : [];
     const wasRemoved = lib.isRemoved(row) || !!(base && base.removed);
     try {
-      const r = await enqueue(() => writeGrant(gid, pid, cid, next, expect), paused(pid));
+      const r = await enqueue(() => writeGrant(gid, pid, cid, next, expect, { lift }), paused(pid));
       learnNames(r);
       const ex = r && r.effective;
       const fresh = rowFrom(pid, row || base, ex);
@@ -666,7 +712,7 @@ function drawDrawer(d, gid, cid, data, note) {
       // Lifted, the persona changed in every channel of the guild: the list asks again.
       patchSummary(gid, cid, rows, lifted);
       env.markStale();
-      return { ok: true, text: resultText(name, next, before, ex, lifted), undo: { pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } };
+      return { ok: true, text: resultText(name, next, before, ex, lifted), undo: { key: pid, pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } };
     } catch (e) {
       return { ok: false, error: e };
     }
@@ -680,8 +726,13 @@ function drawDrawer(d, gid, cid, data, note) {
   }
 
   /** Put changes back as they were, newest first — each sent with what it
-   *  set as `expect`, so one changed again since is refused, not undone. */
-  async function undo(list) {
+   *  set as `expect`, so one changed again since is refused, not undone —
+   *  and never lifting a removal from the guild made since (the relay
+   *  refuses that unasked). The outcome is said on the line the change was
+   *  (`entry.line`), so another change's Undo stays up. */
+  async function undo(entry) {
+    const list = entry.list;
+    const line = entry.line;
     const lines = [];
     let bad = false;
     let conflict = false;
@@ -704,17 +755,29 @@ function drawDrawer(d, gid, cid, data, note) {
           (u.lifted ? ' Its removal from ' + guild + ' stays lifted. ' + lib.removeAgainText(guild) : ''));
       } catch (e) {
         bad = true;
-        if (e.code === 'CONFLICT') conflict = true;
-        lines.push(lib.errorText(e, 'Not undone', { channelId: cid, names, reloaded: true }));
+        if (e.code === 'CONFLICT' || e.code === 'BANNED') conflict = true;
+        lines.push(lib.undoRefusedText(e, { channelId: cid, names, reloaded: d.isCurrent(), name: u.name, guild }));
       }
     }
     if (conflict && d.isCurrent()) await reloadRows(pid);
-    report(bad ? 'err' : 'ok', parts(lines), { toastText: lines.join(' ') }, list.length === 1 ? pid : null);
+    const kind = bad ? 'err' : 'ok';
+    if (line && line !== whoStatus) line[kind](parts(lines), { toastText: lines.join(' ') });
+    else report(kind, parts(lines), { toastText: lines.join(' ') }, list.length === 1 ? pid : null);
     afterClose();
   }
 
   const parts = (lines) => (lines.length === 1 ? lines[0] : lines.map((t) => el('span', { class: 'status-part', text: t })));
-  const undoAction = (list) => ({ label: 'Undo', ariaLabel: 'Undo the last change in ' + where, run: () => undo(list) });
+  /** Say a change on `line` (whoStatus: under the persona's row), with an
+   *  Undo of `list` for 10 s — retiring any older Undo of the same persona
+   *  here. */
+  function said(line, kind, msg, opts, list, pid) {
+    const undoable = (list || []).filter(Boolean);
+    const entry = undoable.length ? undos.add(undoable, line) : null;
+    const o = Object.assign({}, opts);
+    if (entry) Object.assign(o, { action: { label: 'Undo', ariaLabel: 'Undo the last change in ' + where, run: () => undo(entry) }, ms: UNDO_MS });
+    const toast = line === whoStatus ? report(kind, msg, o, pid) : line[kind](msg, o);
+    if (entry) entry.toast = toast;
+  }
 
   /** A row's direct-grant control picked `next`: ask first when it lowers
    *  guild-wide or default access, then send it. Resolves true when saved. */
@@ -722,7 +785,8 @@ function drawDrawer(d, gid, cid, data, note) {
     const row = rowOf(pid);
     const name = (row && row.displayName) || pid;
     const ck = lib.changeKind(row, botCaps, next);
-    if (lib.isRemoved(row) && next && next.length) {
+    const lift = lib.isRemoved(row) && !!next && next.length > 0;
+    if (lift) {
       // Giving access to a persona removed from the guild lifts the removal in the
       // whole guild: asked first, as the confirm says.
       const go = await ui.confirmDialog({
@@ -743,15 +807,22 @@ function drawDrawer(d, gid, cid, data, note) {
       });
       if (!go) return false;
     }
-    const res = await send(pid, name, next, row, true);
+    const res = await send(pid, name, next, row, true, lift);
     if (res.ok) {
-      report('ok', res.text, { action: undoAction([res.undo]), ms: UNDO_MS }, pid);
+      said(whoStatus, 'ok', res.text, null, [res.undo], pid);
       return true;
     }
     const e = res.error;
     if (e.code === 'CONFLICT') {
       const ok = await reloadRows(pid);
       report('err', lib.errorText(e, 'Not saved', { reloaded: ok }), null, pid);
+      return false;
+    }
+    if (e.code === 'BANNED') {
+      // Removed from the guild since this was read: the row says so now, and
+      // the next try asks before lifting that.
+      const ok = await reloadRows(pid);
+      report('err', lib.removedSinceText('Not saved', name, guild, ok), null, pid);
       return false;
     }
     report('err', lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { channelId: cid, names }), null, pid);
@@ -843,18 +914,25 @@ function drawDrawer(d, gid, cid, data, note) {
       }
       addStatus.clear();
       const lines = [];
-      const undos = [];
+      const done = []; // what Undo puts back
       const left = [];
       let conflict = false;
       for (const it of items) {
-        const res = await send(it.value, it.label, caps, { displayName: it.label, avatarUrl: it.avatarUrl, removed: !!it.removed }, false);
+        const lift = removedPick(it); // asked above
+        const res = await send(it.value, it.label, caps, { displayName: it.label, avatarUrl: it.avatarUrl, removed: !!it.removed }, false, lift);
         if (res.ok) {
           lines.push(res.text);
-          undos.push(res.undo);
+          done.push(res.undo);
           continue;
         }
         left.push(it);
-        if (res.error.code === 'CONFLICT') conflict = true;
+        if (res.error.code === 'CONFLICT' || res.error.code === 'BANNED') conflict = true;
+        if (res.error.code === 'BANNED') {
+          // Removed since it was picked: it stays picked, and the next Add asks first.
+          it.removed = true;
+          lines.push(lib.removedSinceText('Not saved for ' + it.label, it.label, guild, true));
+          continue;
+        }
         lines.push(lib.errorText(res.error, 'Not saved for ' + it.label, { channelId: cid, names, reloaded: true }));
         if (res.error.status === 401) {
           // The session ended: the rest would be refused too. They stay
@@ -867,9 +945,7 @@ function drawDrawer(d, gid, cid, data, note) {
       ta.set(left);
       if (!left.length) tracker.reset();
       syncCurrently();
-      const opts = { toastText: lines.join(' ') };
-      if (undos.length) Object.assign(opts, { action: undoAction(undos), ms: UNDO_MS });
-      addStatus[left.length ? 'err' : 'ok'](parts(lines), opts);
+      said(addStatus, left.length ? 'err' : 'ok', parts(lines), { toastText: lines.join(' ') }, done, null);
     }, { busyLabel: 'Adding…' });
 
     /** Put picks kept as ids back as the directory names them (and says
@@ -945,9 +1021,11 @@ PA.channels = {
   render,
   openDrawer,
   /** The persona drawer changes direct grants through the same queue and
-   *  the same hardened route (see enqueue and writeGrant). */
+   *  the same hardened route (see enqueue and writeGrant), and keeps its
+   *  Undo toasts the same way (undoBook). */
   enqueue,
   writeGrant,
+  undoBook,
   /** The guild's access summary (cached with the channels, as the list has
    *  it): the Personas list counts where each persona can act from it. */
   summary: (gid) => load(gid, false).then((v) => v.summary),

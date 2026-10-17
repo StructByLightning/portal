@@ -219,7 +219,9 @@
    * and err() also show a toast (pass { toast: false } to skip it). The toast
    * mirrors the line: a newer result, or clear(), takes down the toast of the
    * one before, so a sticky error does not stay up once its section has
-   * reported something newer (say, the same form then succeeded).
+   * reported something newer (say, the same form then succeeded). ok() and
+   * err() return that toast ({ node, dismiss }, or null), so an Undo it
+   * carries can be taken down on its own once it no longer applies.
    */
   function statusLine(container) {
     const node = el('p', { class: 'status-line hidden', role: 'status' });
@@ -236,12 +238,15 @@
       for (const n of toNodes(msg)) node.appendChild(n);
       // o.action / o.ms: the toast's button (Undo) and how long it stays.
       if (!o || o.toast !== false) mirror = toast((o && o.toastText) || toText(msg), { kind, action: o && o.action, ms: o && o.ms });
+      return mirror;
     }
     return {
       node,
       ok: (msg, o) => set('ok', msg, o),
       err: (msg, o) => set('err', msg, o),
       info: (msg, o) => set('info', msg, Object.assign({ toast: false }, o)),
+      /** Take down this line's toast (its Undo with it); the line stays. */
+      dismissToast: unmirror,
       clear() {
         unmirror();
         node.className = 'status-line hidden';

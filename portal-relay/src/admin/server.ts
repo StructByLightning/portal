@@ -1151,9 +1151,15 @@ export class AdminServer {
     if (typeof name !== 'string' || !name) return sendJson(res, 400, err('INVALID', 'role required'));
     const e = this.roleAssignError(session, guildId, name);
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
-    // An admin granting access in the role's guild ends a /ban there.
+    // An admin granting access in the role's guild ends a /ban there — only
+    // when asked to ({liftBan: true}); otherwise 409 BANNED, nothing given,
+    // so a pick made in a view loaded before the removal can't lift it.
     const role = this.deps.permissions.getRole(name);
-    const liftedBan = role?.guildId && roleGrantsAccess(role) ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
+    const lifts = !!role?.guildId && roleGrantsAccess(role) && this.deps.permissions.isBanned(personaId, role.guildId);
+    if (lifts && body?.liftBan !== true) {
+      return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild (slash /ban or Remove in the panel); this role lifts that — send liftBan: true to do it'));
+    }
+    const liftedBan = lifts ? this.deps.permissions.liftBan(personaId, role!.guildId!) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
@@ -1183,6 +1189,13 @@ export class AdminServer {
    * nothing is written. {batchId} ties a bulk action's writes together in
    * the audit. The answer says what the persona can do now (`effective`):
    * in that channel, or — guild-wide — how many channels at each level.
+   *
+   * A persona removed from G (slash /ban, or Remove in the panel) gets
+   * access there again only when an admin chooses to lift that: a grant
+   * that gives something is refused (409 BANNED, nothing written) unless
+   * the request says {liftBan: true}. A write sent from a view loaded before
+   * the removal — an Undo, a queued change, another admin's /ban meanwhile —
+   * can then never lift it unasked. A deny ({deny: true}) needs no lift.
    */
   private setGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, body: any): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
@@ -1204,7 +1217,11 @@ export class AdminServer {
     if (meta.expect !== undefined && !sameCaps(meta.expect, before)) {
       return sendJson(res, 409, err('CONFLICT', 'this was changed since it was loaded', { current: before }));
     }
-    // An admin granting access here ends a /ban here (an explicit deny doesn't).
+    // An admin granting access here ends a /ban here (an explicit deny
+    // doesn't) — only when the admin was asked and chose to.
+    if (caps.length > 0 && !meta.liftBan && this.deps.permissions.isBanned(personaId, guildId)) {
+      return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild (slash /ban or Remove in the panel); a grant lifts that — send liftBan: true to do it'));
+    }
     const liftedBan = caps.length > 0 && this.deps.permissions.liftBan(personaId, guildId);
     // The guild key written is always the route's G (I3).
     if (channelId !== undefined) this.deps.permissions.setChannel(personaId, guildId, channelId, caps);
@@ -1355,6 +1372,11 @@ export class AdminServer {
     if (!session.isSuper && this.hasForeignRole(inv.roles ?? [], guildId)) {
       return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
     }
+    // An admin's claim lifts the persona's removal wherever the invite gives
+    // access — only when the admin chose to ({liftBan: true}).
+    if (body?.liftBan !== true && this.inviteLiftsBan(personaId, inv)) {
+      return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild (slash /ban or Remove in the panel); this invite lifts that — send liftBan: true to do it'));
+    }
     let result;
     try {
       result = this.deps.applyClaim(personaId, code);
@@ -1363,6 +1385,19 @@ export class AdminServer {
     }
     this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
+  }
+
+  /** Would applying `inv` lift a removal of the persona: does it give
+   *  access (its grant, or a role that grants something) in a guild the
+   *  persona was removed from? As the relay's claim decides it. */
+  private inviteLiftsBan(personaId: string, inv: { guildId?: string; grant?: unknown; caps?: Capability[]; roles?: string[] }): boolean {
+    const grantsIn = new Set<string>();
+    if ((inv.grant || inv.caps?.length) && inv.guildId) grantsIn.add(inv.guildId);
+    for (const name of inv.roles ?? []) {
+      const role = this.deps.permissions.getRole(name);
+      if (role?.guildId && roleGrantsAccess(role)) grantsIn.add(role.guildId);
+    }
+    return [...grantsIn].some((g) => this.deps.permissions.isBanned(personaId, g));
   }
 
   /**
@@ -2120,10 +2155,15 @@ function inactiveReason(caps: Capability[], type: string | undefined, known: boo
 }
 
 /** A grant change's optional fields: `expect` — what the panel last saw at
- *  the target (caps, or null for nothing set) — and `batchId`. */
-function changeMeta(body: unknown): { expect?: Capability[] | null; batchId?: string } | ReturnType<typeof err> {
+ *  the target (caps, or null for nothing set) — `batchId`, and `liftBan`:
+ *  the admin was asked, and chose to lift the persona's removal from G. */
+function changeMeta(body: unknown): { expect?: Capability[] | null; batchId?: string; liftBan?: true } | ReturnType<typeof err> {
   const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
-  const out: { expect?: Capability[] | null; batchId?: string } = {};
+  const out: { expect?: Capability[] | null; batchId?: string; liftBan?: true } = {};
+  if (b.liftBan !== undefined) {
+    if (typeof b.liftBan !== 'boolean') return err('INVALID', 'liftBan must be true or false');
+    if (b.liftBan) out.liftBan = true;
+  }
   if (b.expect !== undefined) {
     const ok = b.expect === null || (Array.isArray(b.expect) && b.expect.length <= 64 && b.expect.every((c) => typeof c === 'string'));
     if (!ok) return err('INVALID', 'expect must be a list of capabilities, or null for nothing set');

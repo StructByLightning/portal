@@ -68,7 +68,9 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     guild-wide here). Every change answers "Effective now: …" (or what is left
     after a removal), offers **Undo** for 10 seconds, and asks first when it
     would lower access that came from guild-wide or a default. A change made
-    meanwhile elsewhere is refused and the rows are read again;
+    meanwhile elsewhere is refused and the rows are read again. A newer change
+    to the same persona retires the older one's Undo, and an Undo's outcome
+    is said where its change was;
   - the slash equivalent, and *Invite a new agent here*.
   Opening a thread's address shows its channel ("Threads use #research's
   access."); a category's opens the list with that category unfolded.
@@ -96,13 +98,18 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     channel, or a block with nothing to block), each with *Remove*. Every
     change answers "Effective now: …" from the relay, offers **Undo** for 10
     seconds, and asks first when it would lower guild-wide or default access,
-    or lift a removal with `/ban`;
+    or lift a removal (`/ban` or *Remove from <guild>*). Only a change the
+    admin was asked about lifts one: the relay refuses any other (an Undo, a
+    change from a view read before the removal), and the drawer then says
+    the persona was removed since and reads it again;
   - *Access roles in <guild>* — this guild's, each with what it means; ✕ asks
     first ("Aria loses Write in 2 channels unless another grant covers them");
   - **Remove from <guild>** — what slash `/ban` does (the same function on the
     relay): its access roles here and every direct grant here go, guild-wide
     is denied, and only an admin of the guild can give it access there again
-    (claiming an invite won't). The confirm lists what goes. **Resync**
+    (claiming an invite won't). The confirm lists what goes. It waits for
+    changes still being saved in the drawer and goes after them, and takes
+    the drawer's Undo toasts down with it. **Resync**
     re-sends its channel list to its running agent (once every few seconds);
   - *More* (folded) — the guild-wide level (*Set level…*, *Unset*: fall back to
     the persona default, *Deny guild-wide*: block the persona default here;
@@ -322,7 +329,10 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   grants here that do nothing; super-admins also get `otherGuildRoleCount`
 - `GET /admin/g/:gid/personas/:id` → `{id,displayName,roles,guildPolicy}` (+ `otherGuildRoleCount` for super-admins).
   A guild-admin gets only that guild's access roles.
-- `POST/DELETE /admin/g/:gid/personas/:id/roles[/:role]`; `POST …/claim`
+- `POST/DELETE /admin/g/:gid/personas/:id/roles[/:role]`; `POST …/claim`. A role that grants
+  something, or an invite that gives access, to a persona removed from that guild is
+  `409 BANNED` (nothing given or applied) unless the body says `liftBan: true` — the admin
+  was asked, and chose to lift the removal.
 - `POST /admin/g/:gid/personas/:id/remove` → `{rolesRemoved, accessFullyRevoked}` — what slash `/ban`
   does in the guild (one shared function): its access roles bound to the guild off, every direct
   grant there dropped, guild-wide pinned to deny, the removal recorded. Audited as
@@ -345,8 +355,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   for the Discord roles its mirror sources follow; guild-wide,
   `{guildWide:true, channels, counts:{read,write,full,custom}, direct:{…}}` — how many
   of the guild's channels at each level, and how many of those through a direct grant.
-  A PUT that ended a `/ban` here says `liftedBan: true` (the persona changed in every
-  channel of the guild).
+  A PUT that gives something to a persona removed from the guild (`/ban`, or Remove) is
+  `409 BANNED` and writes nothing unless it says `liftBan: true` (the admin was asked,
+  and chose to lift the removal); one that did says `liftedBan: true` (the persona
+  changed in every channel of the guild). So an Undo, or any write from a view read
+  before the removal, can never lift it. A deny needs no lift.
 - `GET /admin/g/:gid/invites?q=&status=active|spent|all` → newest first, each with
   `status` (`active` · `used` · `expired`); `POST …/invites`, `DELETE …/invites/:code`
 - `GET /admin/g/:gid/roles` → `{catalog, discordRoles, canAuthor}` (a guild-admin gets

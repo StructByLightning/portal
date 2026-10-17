@@ -4211,7 +4211,7 @@ test('channel drawer: adding a persona removed from the guild says so before, as
   await settle();
   clickable(doc, 'Add and lift', doc.querySelector('.modal')!).click();
   await settle();
-  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null, liftBan: true }, 'the lift the admin chose, said to the relay');
   assert.equal(form.querySelector('.status-line')!.textContent, 'Nyx → Write in #research. Effective now: Write. That lifted its removal from Guild One.');
   assert.equal(addBtn.disabled, true, 'nothing picked now: Add is off');
   assert.equal(doc.activeElement, input, 'focus in the persona field, not on <body>');
@@ -4220,8 +4220,10 @@ test('channel drawer: adding a persona removed from the guild says so before, as
   undo.click();
   await settle();
   assert.equal(calls.at(-1), `DELETE /admin/g/${GA}/personas/nyx/grants?channelId=${CH.research}`);
-  assert.equal((tr('nyx').nextSibling as FakeElement).textContent,
+  // Said where the Add was said (the table's line, and any Undo it holds, are left alone).
+  assert.equal(form.querySelector('.status-line')!.textContent,
     'Undone: no direct grant for Nyx in #research. Effective now: no access. Its removal from Guild One stays lifted. To remove it again, use Remove from Guild One or /ban in Discord.');
+  assert.ok(tr('nyx'), 'the row is there');
 
   // The lift changed Nyx in every channel of the guild: closed, the list asks again.
   const asked = () => calls.filter((c) => c.endsWith('/access/summary')).length;
@@ -4376,6 +4378,8 @@ async function personaPanel(url: string, opts: {
         const refused = opts.refusePut?.(body);
         if (refused) return refused;
         const caps = body.level ? [...(LEVEL_CAPS as Record<string, string[]>)[body.level]] : body.deny ? [] : body.caps;
+        // As the relay: a removal is lifted only when the admin chose to.
+        if (world.removed && caps.length > 0 && body.liftBan !== true) return refuse(409, 'BANNED', 'removed from this guild');
         const lifted = world.removed && caps.length > 0;
         if (lifted) world.removed = false;
         if (body.channelId) setDirect(world, body.channelId, caps);
@@ -5393,3 +5397,123 @@ test('lib.isSafeReturnTo: any address the router accepts can be come back to (a 
   assert.equal(lib.isSafeReturnTo('#/' + 'a'.repeat(3000)), false, 'still bounded');
 });
 
+
+// ── Review fixes: removals lifted only when asked, Undo per target, busy rows, every channel kind ──
+
+test('lib: a change or an Undo refused because of a removal since, and an Undo of something changed again, blame no one', () => {
+  const { lib } = libOnly();
+  assert.equal(lib.removedSinceText('Not saved', 'Aria', 'Guild One', true),
+    'Not saved: Aria was removed from Guild One since this page was loaded. Reloaded — nothing was changed. To give it access again, try once more: you’ll be asked before its removal is lifted.');
+  assert.match(lib.removedSinceText('Not given', 'Aria', 'Guild One', false), /^Not given: Aria was removed from Guild One since this page was loaded\. Nothing was changed\. Reload the page/);
+  assert.equal(lib.undoRefusedText({ status: 409, code: 'BANNED' }, { name: 'Aria', guild: 'Guild One' }),
+    'Not undone: Aria was removed from Guild One after that change, and Undo doesn’t lift a removal. To give it access again, add it again: you’ll be asked first.');
+  const changed = lib.undoRefusedText({ status: 409, code: 'CONFLICT' }, { reloaded: true });
+  assert.equal(changed, 'Not undone: it was changed again since. Reloaded — check it, and change it by hand if you need to.');
+  assert.ok(!/someone else/.test(changed), 'it may have been this admin’s own newer change');
+  assert.match(lib.undoRefusedText({ status: 400, code: 'NOT_GRANTABLE' }, {}), /^Not undone: /);
+});
+
+test('persona drawer: Remove from Guild One takes down the drawer’s Undo toasts — none is left to lift the removal', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { setDirectIn, doc, body, confirm, calls, P } = box;
+  setDirectIn(CH.research, '');
+  await settle();
+  const undoButtons = () => doc.getElementById('toasts')!.querySelectorAll('.toast-action');
+  assert.equal(undoButtons().length, 1, 'the removal of the direct grant can be undone');
+  clickable(doc, 'Remove from Guild One…', body).click();
+  await settle();
+  confirm('Remove from Guild One');
+  await settle();
+  assert.ok(calls.includes(`POST ${P}/remove`));
+  assert.equal(undoButtons().length, 0, 'its Undo went with the removal');
+});
+
+test('persona drawer: a change refused because the persona was removed since says so and reads it again; the next try asks, then lifts', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { setDirectIn, accessLine, bodies, body, world, confirm, modal } = box;
+  world.removed = true; // another admin, or slash /ban, behind this drawer's back
+  setDirectIn(CH.general, 'full');
+  await settle();
+  assert.equal(bodies.at(-1).liftBan, undefined, 'never a lift the admin wasn’t asked about');
+  assert.equal(accessLine().textContent,
+    'Not saved: Aria was removed from Guild One since this page was loaded. Reloaded — nothing was changed. To give it access again, try once more: you’ll be asked before its removal is lifted.');
+  assert.ok(!body.querySelector('.access-section')!.querySelector('.banner')!.classList.contains('hidden'), 'the drawer says it is removed now');
+  assert.equal(world.removed, true);
+  setDirectIn(CH.general, 'full');
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Lift Aria’s removal from Guild One?');
+  confirm('Give access and lift');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.general, level: 'full', expect: null, liftBan: true });
+  assert.equal(world.removed, false);
+  assert.match(accessLine().textContent, /That lifted its removal from Guild One\.$/);
+});
+
+test('persona drawer: an Undo sent after the persona was removed is refused, and says Undo doesn’t lift a removal', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { setDirectIn, accessLine, doc, world } = box;
+  setDirectIn(CH.research, '');
+  await settle();
+  world.removed = true; // slash /ban, during the 10 s
+  doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Removed Aria'))!.querySelector('.toast-action')!.click();
+  await settle();
+  assert.equal(world.removed, true, 'still removed');
+  assert.equal(accessLine().textContent,
+    'Not undone: Aria was removed from Guild One after that change, and Undo doesn’t lift a removal. To give it access again, add it again: you’ll be asked first.');
+});
+
+test('persona drawer: Remove from Guild One waits for an Add still being saved, and is sent after it', async () => {
+  let release!: () => void;
+  let gate: Promise<void> | null = null;
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    handle: async (method) => {
+      if (method === 'PUT' && gate) await gate; // the relay takes its time with grants
+      return undefined;
+    },
+  });
+  const { addForm, typeChannel, pickOption, doc, body, confirm, calls, P } = box;
+  await typeChannel('lab');
+  pickOption('#lab-notes');
+  await typeChannel('ide');
+  pickOption('ideas (forum)');
+  // Remove asked first; while its confirm is up, the Add is sent.
+  const remove = clickable(doc, 'Remove from Guild One…', body);
+  remove.click();
+  await settle();
+  gate = new Promise<void>((r) => { release = r; });
+  addForm().fire('submit');
+  await settle();
+  confirm('Remove from Guild One');
+  await settle();
+  assert.equal(remove.disabled, true, 'off while the Add is saved');
+  assert.match(body.querySelector('.danger-zone')!.textContent, /Waiting for the changes being saved here…/);
+  assert.ok(!calls.includes(`POST ${P}/remove`), 'not sent yet');
+  gate = null;
+  release();
+  await settle();
+  const order = calls.filter((c) => c === `PUT ${P}/grants` || c === `POST ${P}/remove`);
+  assert.deepEqual(order, [`PUT ${P}/grants`, `PUT ${P}/grants`, `POST ${P}/remove`], 'after both of the Add’s writes, none after it');
+});
+
+test('channel drawer: a newer change to the same persona retires the older Undo; the outcome of an Undo leaves other Undo toasts up', async () => {
+  const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    handle: (method, path, body) => {
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/nyx/grants') {
+        const caps = (LEVEL_CAPS as Record<string, string[]>)[body.level];
+        return echo(caps, [{ kind: 'direct', caps }], caps);
+      }
+      return undefined;
+    },
+  });
+  const { doc, drawerBody, pick } = box;
+  const input = await typeAhead(box, 'ny');
+  input.fire('keydown', { key: 'Enter' });
+  drawerBody.querySelector('.add-form')!.fire('submit');
+  await settle();
+  const undoFor = (start: string) => doc.getElementById('toasts')!.querySelectorAll('.toast').filter((t) => t.textContent.startsWith(start) && t.querySelector('.toast-action'));
+  assert.equal(undoFor('Nyx → Write').length, 1, 'the Add can be undone');
+  pick('nyx', 'read');
+  await settle();
+  assert.equal(undoFor('Nyx → Write').length, 0, 'retired: it would undo over this admin’s own newer change');
+  assert.equal(undoFor('Nyx → Read').length, 1);
+});

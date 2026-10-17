@@ -1318,7 +1318,7 @@ test("an invite whose role no longer resolves is hidden from guild admins (it is
   }
 });
 
-test('an explicit deny does not lift a ban; a grant does', async () => {
+test('an explicit deny does not lift a ban; a grant does only when the admin chose to lift it (liftBan: true)', async () => {
   const { deps, permissions, cleanup } = setupDeps([]);
   permissions.clearGuild('p1', 'G1');
   const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
@@ -1331,11 +1331,72 @@ test('an explicit deny does not lift a ban; a grant does', async () => {
     const put = (body: unknown) => fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
     assert.equal((await put({ channelId: 'c1', deny: true })).status, 200);
     assert.equal(permissions.isBanned('p1', 'G1'), true, 'a deny keeps the ban');
-    assert.equal((await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'] })).status, 200);
-    assert.equal(permissions.isBanned('p1', 'G1'), false, 'a grant lifts it');
+    // Unasked, a grant is refused and nothing is written: a write from a view
+    // loaded before the removal (an Undo, a queued change) can't lift it.
+    const before = JSON.stringify(permissions.getEntry('p1'));
+    for (const body of [{ channelId: 'c1', caps: ['VIEW_CHANNEL'] }, { channelId: 'c1', level: 'write', liftBan: false }, { guildDefault: true, level: 'read' }]) {
+      const r = await put(body);
+      assert.equal(r.status, 409, JSON.stringify(body));
+      assert.equal((await r.json()).error.code, 'BANNED');
+    }
+    assert.equal(JSON.stringify(permissions.getEntry('p1')), before, 'nothing written');
+    assert.equal(permissions.isBanned('p1', 'G1'), true);
+    assert.equal((await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'], liftBan: 'yes' })).status, 400, 'liftBan is a boolean');
+    const lifted = await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'], liftBan: true });
+    assert.equal(lifted.status, 200);
+    assert.equal((await lifted.json()).liftedBan, true);
+    assert.equal(permissions.isBanned('p1', 'G1'), false, 'a grant the admin chose to lift with lifts it');
+    // Not removed: liftBan changes nothing.
+    const plain = await put({ channelId: 'c1', level: 'read', liftBan: true });
+    assert.equal(plain.status, 200);
+    assert.equal('liftedBan' in (await plain.json()), false);
   } finally {
     await server.close();
     cleanup();
+  }
+});
+
+test('a removal is never lifted unasked: an Undo sent after Remove, an access role, an invite applied — each 409 BANNED until the admin chooses to lift it', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    // A grant given, then taken away (its Undo would put Write back, expecting nothing there).
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: null })).status, 200);
+    assert.equal((await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1', { expect: WRITE })).status, 200);
+    // Removed from G1 meanwhile (the panel's Remove; slash /ban is the same function).
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/remove')).status, 200);
+    const sets = () => ctx.deps.audit.read({ guildId: 'G1', limit: 100 }).filter((x) => x.action === 'persona.grant.set').length;
+    const n = sets();
+    // The Undo: expect (nothing there) still matches — the removal dropped every grant — but it can't lift the removal.
+    const undo = await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: null });
+    assert.equal(undo.status, 409);
+    assert.equal(undo.body.error.code, 'BANNED');
+    assert.equal(ctx.permissions.isBanned('p1', 'G1'), true, 'still removed');
+    assert.equal(sets(), n, 'nothing written, nothing recorded');
+    assert.equal((await s.get('/admin/g/G1/personas/p1/access')).body.removed, true);
+    // A changed-meanwhile refusal still comes first.
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: READ })).body.error.code, 'CONFLICT');
+
+    // An access role that grants something: the same.
+    const role = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'r-g1' });
+    assert.equal(role.status, 409);
+    assert.equal(role.body.error.code, 'BANNED');
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), [], 'not given');
+    const roleLifted = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'r-g1', liftBan: true });
+    assert.equal(roleLifted.status, 200);
+    assert.equal(roleLifted.body.banned, false);
+    assert.deepEqual(ctx.deps.audit.read({ guildId: 'G1', limit: 1 })[0].after, { role: 'r-g1', liftedBan: true });
+
+    // An invite applied by the admin: the same.
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/remove')).status, 200);
+    const claim = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' });
+    assert.equal(claim.status, 409);
+    assert.equal(claim.body.error.code, 'BANNED');
+    assert.equal(ctx.invites.get('aug-g1')!.uses, 0, 'not applied');
+    const claimLifted = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1', liftBan: true });
+    assert.equal(claimLifted.status, 200);
+  } finally {
+    await s.close();
   }
 });
 
@@ -1386,7 +1447,7 @@ test('Unset guild-wide on a persona removed with /ban: refused unless the ban is
     permissions.clearGuild('p1', 'G1');
     const deny = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=deny`, { method: 'DELETE', headers: hdr });
     assert.equal((await deny.json()).banned, true, 'a deny keeps the ban, and says so');
-    const put = await fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: { ...hdr, 'content-type': 'application/json' }, body: JSON.stringify({ channelId: 'c1', level: 'read' }) });
+    const put = await fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: { ...hdr, 'content-type': 'application/json' }, body: JSON.stringify({ channelId: 'c1', level: 'read', liftBan: true }) });
     assert.equal((await put.json()).banned, false, 'a grant lifts it, and says so');
   } finally {
     await server.close();
@@ -2349,11 +2410,12 @@ test('grants: a channel answer names the Discord roles its mirror sources follow
     const deny = await put('p2', { channelId: 'c1', deny: true });
     assert.equal(deny.body.banned, true);
     assert.equal('liftedBan' in deny.body, false);
-    const grant = await put('p2', { channelId: 'c2', level: 'read' });
+    assert.equal((await put('p2', { channelId: 'c2', level: 'read' })).body.error.code, 'BANNED', 'not without liftBan');
+    const grant = await put('p2', { channelId: 'c2', level: 'read', liftBan: true });
     assert.equal(grant.body.liftedBan, true);
     assert.equal(grant.body.banned, false);
     assert.equal(ctx.permissions.isBanned('p2', 'G1'), false);
-    assert.equal('liftedBan' in (await put('p2', { channelId: 'c2', level: 'write' })).body, false, 'only the grant that ended it');
+    assert.equal('liftedBan' in (await put('p2', { channelId: 'c2', level: 'write', liftBan: true })).body, false, 'only the grant that ended it');
   } finally {
     await s.close();
   }

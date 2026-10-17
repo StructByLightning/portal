@@ -21,7 +21,8 @@
  *   lowerText, currentlyText,          to ask first: the relay says what it did)
  *   sameCapSet                         the same capabilities, in any order
  *   isRemoved, liftText,               a persona removed from the guild (/ban or
- *   removeAgainText                    Remove from <guild>: the page can't tell which), the lift
+ *   removeAgainText, removedSinceText, Remove from <guild>: the page can't tell which), the lift,
+ *   undoRefusedText                    and a change or an Undo the relay refused because of it
  *   grantResultText                    what a direct-grant change did, from the answer
  *   canActInText, personaSummaryText,  the Personas list and the persona drawer:
  *   foldAccessRows, inactiveText,      counts in words, rows that read alike folded,
@@ -685,6 +686,38 @@
 
   /** The last line of a confirm that lifts a removal from the guild. */
   const UNDO_KEEPS_LIFT = 'Undo takes the grant away again, but the removal stays lifted.';
+
+  /**
+   * A change the relay refused because the persona was removed from the
+   * guild after this page read it (409 BANNED: a removal is only lifted when
+   * the admin is asked first): 'Not saved: Aria was removed from Guild One
+   * since this page was loaded. Reloaded — nothing was changed. To give it
+   * access again, try once more: you'll be asked before its removal is
+   * lifted.' (`reloaded` false: the page couldn't read it again.)
+   */
+  function removedSinceText(prefix, name, guild, reloaded) {
+    return (prefix || 'Not saved') + ': ' + name + ' was removed from ' + guild + ' since this page was loaded. ' +
+      (reloaded === false ? 'Nothing was changed. Reload the page to see that.'
+        : 'Reloaded — nothing was changed. To give it access again, try once more: you’ll be asked before its removal is lifted.');
+  }
+
+  /**
+   * An Undo the relay refused, in words that blame no one:
+   *   BANNED   — the persona was removed from the guild after the change;
+   *              an Undo never lifts a removal.
+   *   CONFLICT — it was changed again since (by this admin too, perhaps).
+   * Anything else: errorText. `ctx` is errorText's, with { name, guild }.
+   */
+  function undoRefusedText(e, ctx) {
+    const c = ctx || {};
+    if (e && e.code === 'BANNED') {
+      return 'Not undone: ' + (c.name || 'it') + ' was removed from ' + (c.guild || 'this guild') + ' after that change, and Undo doesn’t lift a removal. To give it access again, add it again: you’ll be asked first.';
+    }
+    if (e && e.code === 'CONFLICT') {
+      return 'Not undone: it was changed again since. ' + (c.reloaded === false ? 'Reload the page to see it now.' : 'Reloaded — check it, and change it by hand if you need to.');
+    }
+    return errorText(e, 'Not undone', c);
+  }
 
   /**
    * What a direct-grant change did, in the copy guide's words, from the
@@ -1444,7 +1477,7 @@
     countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
     channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
     ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, removeAgainText, customOptionText,
-    UNDO_KEEPS_LIFT, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
+    UNDO_KEEPS_LIFT, removedSinceText, undoRefusedText, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, noAnswer, errorText,
