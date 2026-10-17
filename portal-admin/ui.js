@@ -415,14 +415,23 @@
    * Ask before acting: { title, body, confirmLabel, cancelLabel, danger }.
    * Resolves true for the confirm button, false for Cancel or Esc. A danger
    * confirm starts on Cancel, so Enter doesn't destroy anything by itself.
+   * Asked over an open drawer, it belongs to that drawer: when the drawer
+   * closes (Back, a link), the question goes too, as a Cancel — it was about
+   * what that drawer showed.
    */
   function confirmDialog(opts) {
     return new Promise((resolve) => {
       let m = null;
+      const owner = current;
+      let done = false;
       const finish = (v) => {
+        if (done) return;
+        done = true;
+        if (owner) owner.dialogs.delete(finish);
         if (m) m.close();
         resolve(v);
       };
+      if (owner) owner.dialogs.add(finish);
       const cancel = el('button', { class: 'btn', text: opts.cancelLabel || 'Cancel', onclick: () => finish(false) });
       const ok = el('button', { class: 'btn ' + (opts.danger ? 'btn-danger-solid' : 'btn-primary'), text: opts.confirmLabel || 'OK', onclick: () => finish(true) });
       const body = [].concat(opts.body == null ? [] : opts.body).map((b) => (typeof b === 'string' ? el('p', { text: b }) : b));
@@ -671,8 +680,9 @@
   // #drawer-close and #drawer-body, behind #drawer-scrim.
 
   let drawerSeq = 0;
-  let current = null; // { token, trackers, form, onClose, returnFocus }
+  let current = null; // { token, trackers, form, onClose, returnFocus, dialogs }
   let drawerBound = false;
+  let discardQuestion = null; // the 'Discard changes?' that is up, if any
 
   function drawerEls() {
     return {
@@ -709,7 +719,9 @@
       const d = drawerEls();
       const a = document.activeElement;
       const returnFocus = current ? current.returnFocus : a && !d.drawer.contains(a) ? a : null;
-      current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus };
+      // A drawer replaced by this one takes its questions with it.
+      if (current) for (const cancel of [...current.dialogs]) cancel(false);
+      current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus, dialogs: new Set() };
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
@@ -751,6 +763,9 @@
 
     isOpen: () => !!current,
 
+    /** Which drawer is open (a number that changes with every open), or null. */
+    id: () => (current ? current.token : null),
+
     isDirty: () => !!current && current.trackers.some((t) => t.isDirty()),
 
     /** The registered form of the open drawer ({ key, serialize, restore,
@@ -768,6 +783,8 @@
       d.drawer.setAttribute('aria-hidden', 'true');
       d.scrim.classList.add('hidden');
       clear(d.body);
+      // Its open questions go with it, as a Cancel.
+      for (const cancel of [...c.dialogs]) cancel(false);
       // Back to what opened it; failing that, off the control it just hid
       // (a browser leaves focus there), so onClose can find a place for it.
       if (!focusFirst([c.returnFocus])) {
@@ -777,22 +794,33 @@
       if (c.onClose) c.onClose(reason);
     },
 
-    /** 'Discard changes?' — resolves true to discard. */
+    /** 'Discard changes?' — resolves true to discard. Asked once at a time:
+     *  while it is up (Esc asked, then Back asks again), every caller gets
+     *  the same answer to the one question. */
     confirmDiscard() {
-      return confirmDialog({
-        title: 'Discard changes?',
-        body: 'Something in this panel was changed and not saved.',
-        confirmLabel: 'Discard changes',
-        cancelLabel: 'Cancel',
-        danger: true,
-      });
+      if (!discardQuestion) {
+        discardQuestion = confirmDialog({
+          title: 'Discard changes?',
+          body: 'Something in this panel was changed and not saved.',
+          confirmLabel: 'Discard changes',
+          cancelLabel: 'Cancel',
+          danger: true,
+        }).then((v) => {
+          discardQuestion = null;
+          return v;
+        });
+      }
+      return discardQuestion;
     },
 
     /** Close, asking 'Discard changes?' first when a tracked form is dirty.
-     *  Resolves true if the drawer closed. */
+     *  Resolves true if the drawer closed. Only the drawer that asked is
+     *  closed: one closed or replaced meanwhile stays as it is. */
     async requestClose() {
       if (!current) return true;
+      const asking = current;
       if (drawer.isDirty() && !(await drawer.confirmDiscard())) return false;
+      if (current !== asking) return false;
       drawer.close();
       return true;
     },

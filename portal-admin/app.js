@@ -156,7 +156,11 @@ function noteClock(res) {
   if (!isNaN(at)) state.clockSkew = at - Date.now();
 }
 
-const G = () => '/admin/g/' + encodeURIComponent(state.guildId);
+const G = () => gpath(state.guildId);
+/** A guild's admin API prefix. Anything that sends a change later (after a
+ *  confirm, from a drawer) builds its path from the guild it captured when
+ *  it was drawn, never from the guild in view when it is sent. */
+const gpath = (gid) => '/admin/g/' + encodeURIComponent(gid);
 function qs(params) {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) if (v !== '' && v != null) p.set(k, v);
@@ -194,10 +198,10 @@ function loadError(text, retry) {
 
 // Per-guild role catalog + channels, cached (used by editors/pickers). The
 // promise is cached, so a list and a drawer opened together ask once.
-function guildMeta() {
-  const key = state.guildId;
+function guildMeta(gid = state.guildId) {
+  const key = gid;
   if (!state.cache[key]) {
-    const p = Promise.all([api('GET', G() + '/roles'), api('GET', G() + '/channels')]).then(([roles, chans]) => ({
+    const p = Promise.all([api('GET', gpath(gid) + '/roles'), api('GET', gpath(gid) + '/channels')]).then(([roles, chans]) => ({
       catalog: roles.catalog || {}, discordRoles: roles.discordRoles || [],
       canAuthor: !!roles.canAuthor, channels: chans.channels || [],
     }));
@@ -206,21 +210,23 @@ function guildMeta() {
   }
   return state.cache[key];
 }
-function invalidateGuildMeta() { delete state.cache[state.guildId]; }
+/** The role catalog changed: it is global, so every guild's cached copy goes. */
+function invalidateGuildMeta() { state.cache = {}; }
 
-/** Name maps for the selected guild's own pickers: its channels, its Discord
- *  roles and its name. */
-function metaNames(meta) {
+/** Name maps for a guild's own pickers (the selected one by default): its
+ *  channels, its Discord roles and its name. */
+function metaNames(meta, gid = state.guildId) {
   const names = withChannelList(null, meta.channels, meta.discordRoles);
-  names.guilds = { [state.guildId]: currentGuildName() };
+  names.guilds = { [gid]: guildName(gid) };
   return names;
 }
 
-/** The access roles bound to the selected guild, by name. Pickers and chips
- *  show only these; another guild's roles are not this guild's to hand out. */
-function guildRoleNames(meta) {
+/** The access roles bound to a guild (the selected one by default), by name.
+ *  Pickers and chips show only these; another guild's roles are not this
+ *  guild's to hand out. */
+function guildRoleNames(meta, gid = state.guildId) {
   const cat = meta.catalog || {};
-  return Object.keys(cat).filter((n) => cat[n] && cat[n].guildId === state.guildId).sort(byName);
+  return Object.keys(cat).filter((n) => cat[n] && cat[n].guildId === gid).sort(byName);
 }
 
 // ── Boot / auth ──────────────────────────────────────────────────────────────
@@ -250,11 +256,15 @@ function keepReturnTo() {
 }
 
 /** The open drawer's unsaved form, as a draft for after the sign-in: only
- *  its whitelisted fields (PA.lib.DRAFT_FORMS), only when it has changes. */
+ *  its whitelisted fields (PA.lib.DRAFT_FORMS), only when it has changes,
+ *  and only for a drawer that is at its own address — a draft comes back
+ *  where its address is, so one kept under a list's address could open in
+ *  any drawer of that list. */
 function saveDraft() {
   session.del('pa.draft');
   const f = ui.drawer.isOpen() ? ui.drawer.activeForm() : null;
   if (!f || (f.isDirty && !f.isDirty())) return;
+  if (!state.drawerRoute || state.drawerRoute !== location.hash) return;
   let fields;
   try { fields = f.serialize(); } catch { return; }
   const d = lib.makeDraft({ userId: userId(), route: location.hash, form: f.key, fields, at: Date.now() });
@@ -382,8 +392,10 @@ let meInFlight = null;
 /**
  * Who is this tab signed in as, now? (Another tab may have signed in again,
  * or out.) The same admin: take the new CSRF token and session end, and put
- * away "Your session ended" if it was up. Another admin: reload. Resolves
- * the new /admin/me, or null (a 401 has already said the session ended).
+ * away "Your session ended" if it was up. Another admin: reload. A relay
+ * that came back newer (a deploy) gets the same "The panel was updated"
+ * banner as at boot. Resolves the new /admin/me, or null (a 401 has already
+ * said the session ended).
  */
 function refreshMe() {
   if (!meInFlight) {
@@ -394,6 +406,8 @@ function refreshMe() {
         if (((me.user && me.user.id) || '') !== userId()) { otherAdmin(); return null; }
         state.me.csrf = me.csrf;
         state.me.session = me.session;
+        if (typeof me.apiVersion === 'number' && me.apiVersion > CLIENT_API) showUpdateBanner();
+        if (me.levels && me.caps) lib.adoptModel(me.levels, me.caps);
         if (ui.sessionResumed()) ui.toast('You’re signed in again. Carry on where you were.');
         scheduleExpiry();
         return me;
@@ -576,7 +590,8 @@ function supported(r) {
   if (r.view === 'channels' || r.view === 'give') return instead(route('g', r.gid, 'personas'), 'Personas');
   const k = r.drawer && r.drawer.kind;
   if (k === 'add' || k === 'invite' || k === 'role') return instead(route(r.area, r.gid, r.view), TAB_NAMES[r.view]);
-  const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? [] : ['q'];
+  const all = r.area === 'all';
+  const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? (all && k === 'persona' ? ['guild'] : []) : all ? ['q', 'guild'] : ['q'];
   const query = {};
   for (const key of keep) if (r.query[key] !== undefined) query[key] = r.query[key];
   return { route: Object.assign({}, r, { query }), note: null };
@@ -586,8 +601,37 @@ function supported(r) {
  *  super-admin's scope switch between this guild and all personas included). */
 function viewKeyOf(r) {
   if (r.area === 'guilds') return 'guilds';
-  if (r.view === 'personas') return 'personas:' + (r.area === 'g' ? r.gid : state.guildId);
+  if (r.view === 'personas') return 'personas:' + (r.area === 'g' ? r.gid : (r.query && r.query.guild) || state.guildId);
   return r.area + ':' + r.view + ':' + (r.gid || '');
+}
+
+/** The guild a route is about: its own, or on #/all/personas its ?guild=
+ *  (null when it names none). A persona drawer shows this guild's section,
+ *  so the drawer is the same after a reload or a sign-in. */
+function routeGuild(r) {
+  if (r.area === 'g') return r.gid;
+  return (r.area === 'all' && r.query && r.query.guild) || null;
+}
+
+/** The query of `r`'s list as the page shows it now: the search, and on
+ *  #/all/personas the guild in view. */
+function listQuery(r) {
+  const q = {};
+  if (state.q) q.q = state.q;
+  if (r.area === 'all' && r.view === 'personas' && state.guildId) q.guild = state.guildId;
+  return q;
+}
+
+/** The list a drawer route sits on (where closing it goes). */
+function listOf(r) {
+  return route(r.area, r.gid, r.view, null, listQuery(r));
+}
+
+/** The guild a super-admin's all-persona page shows when its address names
+ *  none: the one in view, else the home guild. */
+function homeGuildId() {
+  const h = homeRoute();
+  return h && h.area === 'g' ? h.gid : null;
 }
 
 let discardAsked = false;
@@ -626,9 +670,20 @@ async function applyRoute(opts = {}) {
     history.pushState(null, '', prevHash);
     if (discardAsked) return;
     discardAsked = true;
+    // One question at a time: Esc may have asked already (ui.drawer shares it).
+    const asked = ui.drawer.id();
     const discard = await ui.drawer.confirmDiscard();
     discardAsked = false;
-    if (!discard || location.hash !== prevHash) return;
+    // Answered elsewhere (Esc's Discard closed it), or the page moved on.
+    if (!ui.drawer.isOpen() || ui.drawer.id() !== asked || location.hash !== prevHash) return;
+    if (!discard) {
+      // Cancel: stay. Under the address put back is where the admin was
+      // going — the drawer's own list after Back, but after a link, Forward
+      // or an edited address somewhere else, which closing must not go to:
+      // closing then puts the list in place of the drawer instead.
+      if (state.drawerPushed && canonical !== lib.formatRoute(listOf(prev))) state.drawerPushed = false;
+      return;
+    }
     closeDrawerFor('route');
     history.back();
     return;
@@ -639,6 +694,12 @@ async function applyRoute(opts = {}) {
 
   if (r.area === 'g' && !canManage(r.gid)) return showNotAdmin(r);
   remember(r);
+  // A super-admin's all-persona pages: the guild their address names (or,
+  // naming none, the one in view, else the home guild) is the guild in view.
+  if (r.area === 'all') {
+    if (r.query.guild) state.guildId = r.query.guild;
+    else if (!state.guildId) state.guildId = homeGuildId();
+  }
 
   const vk = viewKeyOf(r);
   const scope = r.area === 'all' ? 'all' : 'guild';
@@ -686,7 +747,7 @@ async function applyRoute(opts = {}) {
 
 function openRouteDrawer(r) {
   const k = r.drawer.kind;
-  if (k === 'persona') return openPersonaDrawer(r.drawer.id);
+  if (k === 'persona') return openPersonaDrawer(r.drawer.id, { gid: routeGuild(r) });
   if (k === 'mint') return openMintDrawer(r.query);
   if (k === 'newRole') return openRoleDrawer();
 }
@@ -696,17 +757,19 @@ function openRouteDrawer(r) {
 function syncQuery() {
   const r = state.route;
   if (!r || r.drawer || !r.view || r.area === 'guilds') return;
-  const next = route(r.area, r.gid, r.view, null, state.q ? { q: state.q } : {});
+  const next = listOf(r);
   const hash = lib.formatRoute(next);
   if (!hash) return;
   state.route = next;
   if (hash !== location.hash) history.replaceState(null, '', hash);
 }
 
-/** Where a persona's drawer is, from the list being shown. */
+/** Where a persona's drawer is, from the list being shown. From the list of
+ *  all personas the address names the guild in view too, so its 'Access in
+ *  <guild>' section comes back on a reload or after signing in again. */
 function personaRoute(id) {
   return state.personaScope === 'all' || !state.guildId
-    ? route('all', null, 'personas', { kind: 'persona', id })
+    ? route('all', null, 'personas', { kind: 'persona', id }, state.guildId ? { guild: state.guildId } : {})
     : route('g', state.guildId, 'personas', { kind: 'persona', id });
 }
 
@@ -901,7 +964,7 @@ function onDrawerClosed(reason) {
     state.drawerRoute = null;
     const r = state.route;
     if (r && r.drawer) {
-      const list = route(r.area, r.gid, r.view, null, state.q ? { q: state.q } : {});
+      const list = listOf(r);
       state.route = list;
       if (state.drawerPushed) history.back();
       else history.replaceState(null, '', lib.formatRoute(list));
@@ -929,12 +992,15 @@ function onDrawerClosed(reason) {
  * Register the drawer's form for "Sign in again" (ui.drawer.registerForm) and,
  * when a draft of it was brought back for this very place, put it back:
  * nothing is sent — the line says so, and the admin saves it. Resolves true
- * when it was restored.
+ * when it was restored. hooks.belongs(fields), when given, says whether a
+ * draft is this form's own (a grant draft names its persona).
  */
 function keepForm(d, key, hooks, status) {
   d.registerForm(key, hooks);
   const dr = state.draft;
   if (!dr || dr.form !== key || !state.route || dr.route !== lib.formatRoute(state.route)) return false;
+  if (!state.drawerRoute || state.drawerRoute !== dr.route) return false;
+  if (hooks.belongs && !hooks.belongs(dr.fields)) return false;
   state.draft = null;
   try { hooks.restore(dr.fields); } catch (e) { console.error('[portal-admin] restore', e); return false; }
   status.info('Restored your unsaved change — review and save. Nothing was submitted.');
@@ -1119,7 +1185,7 @@ async function renderPersonas(view, stale) {
     const id = (prompt('Persona id to grant access to (must already exist):') || '').trim();
     if (!id) return;
     if (!lib.isPersonaId(id)) {
-      list.status.err('Not opened: “' + id + '” isn’t a persona id (letters, digits, dots, colons, dashes and underscores).', { toast: false });
+      list.status.err('Not opened: that isn’t a persona id. Enter one of up to 100 characters, on one line.', { toast: false });
       return;
     }
     navigate(personaRoute(id));
@@ -1173,7 +1239,9 @@ async function renderPersonas(view, stale) {
   if (scope) {
     scope.addEventListener('change', () => {
       const q = state.q ? { q: state.q } : {};
-      navigate(scope.value === 'all' ? route('all', null, 'personas', null, q) : route('g', state.guildId, 'personas', null, q));
+      navigate(scope.value === 'all'
+        ? route('all', null, 'personas', null, Object.assign({ guild: state.guildId }, q))
+        : route('g', state.guildId, 'personas', null, q));
     });
   }
 }
@@ -1183,7 +1251,7 @@ function personaRow(p, meta, all) {
   // The name is a link to the persona's drawer (an address: reload, Back and
   // sharing keep it); the rest of the row opens it too.
   const href = lib.formatRoute(personaRoute(p.id));
-  const open = () => (href ? navigate(personaRoute(p.id)) : openPersonaDrawer(p.id, { name }));
+  const open = () => (href ? navigate(personaRoute(p.id)) : openPersonaDrawer(p.id, { name, gid: state.guildId }));
   // In a guild's list, the guild's own access roles; others are only counted.
   let rolesText = (p.roles || []).join(', ') || '—';
   if (!all && meta) {
@@ -1218,8 +1286,14 @@ function directGrantsBadge(p) {
   return el('span', { class: 'muted', text: '—' });
 }
 
+/**
+ * A persona's drawer. `hint.gid` is the guild its 'Access in <guild>'
+ * section is about — the one its address names (routeGuild), never just the
+ * guild in view — so everything this drawer sends goes to that guild.
+ */
 async function openPersonaDrawer(id, hint = {}) {
   const isSuper = !!(state.me && state.me.isSuper);
+  const gid = hint.gid || null;
   // The name its list row shows, until the persona has loaded.
   const row = Array.from(document.querySelectorAll('[data-key]')).find((n) => n.dataset.key === 'persona:' + id);
   const name = hint.name || (row && row.textContent) || id;
@@ -1232,13 +1306,15 @@ async function openPersonaDrawer(id, hint = {}) {
   try {
     [local, global, meta] = await Promise.all([
       // What an admin of this guild may see and change…
-      state.guildId ? api('GET', G() + '/personas/' + encodeURIComponent(id)).catch(missing) : null,
+      gid ? api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id)).catch(missing) : null,
       // …and, for super-admins, the persona everywhere.
       isSuper ? api('GET', '/admin/personas/' + encodeURIComponent(id)).catch(missing) : null,
-      state.guildId ? guildMeta() : null,
+      gid ? guildMeta(gid) : null,
     ]);
   } catch (e) {
-    if (!d.isCurrent() || e.handled) return;
+    // (A guild route the relay refused has closed it already, for the
+    // Not-an-admin view; from #/all/personas it says so here instead.)
+    if (!d.isCurrent()) return;
     d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad(name, e), () => openPersonaDrawer(id, hint)));
     return;
   }
@@ -1249,7 +1325,7 @@ async function openPersonaDrawer(id, hint = {}) {
   }
   const displayName = (global && global.displayName) || (local && local.displayName) || id;
   d.setTitle(displayName, id);
-  const ctx = { id, displayName, drawer: d };
+  const ctx = { id, displayName, drawer: d, gid };
   const body = el('div', { class: 'drawer-sections' });
 
   // "Access in every guild" is rebuilt after any change made in this drawer,
@@ -1267,7 +1343,7 @@ async function openPersonaDrawer(id, hint = {}) {
     } catch { /* keep what is shown; the next open refreshes */ }
   };
   // This guild first: it is what the drawer was opened for.
-  if (state.guildId && meta) {
+  if (gid && meta) {
     body.appendChild(guildAccessSection(ctx, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta, refreshEverywhere));
   }
   if (global) {
@@ -1329,12 +1405,12 @@ function profileSection(ctx, d) {
 /** Access in the selected guild: its direct grants (open, first), its access
  *  roles, and — folded under More — applying an invite. */
 function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
-  const { id, displayName } = ctx;
-  const P = () => G() + '/personas/' + encodeURIComponent(id);
-  const guild = currentGuildName();
-  const names = metaNames(meta);
+  const { id, displayName, gid } = ctx;
+  const P = () => gpath(gid) + '/personas/' + encodeURIComponent(id);
+  const guild = guildName(gid);
+  const names = metaNames(meta, gid);
   const catalog = meta.catalog || {};
-  const mine = guildRoleNames(meta);
+  const mine = guildRoleNames(meta, gid);
   const mineSet = new Set(mine);
   const meaning = (r) => lib.roleMeaning(catalog[r], names);
 
@@ -1382,25 +1458,47 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
       markStale(); onChange();
     } catch (e) { roleStatus.err(notDone(e, 'Not removed')); }
   }
+  // One request at a time: the picker is off while a role is being given,
+  // and a pick that arrives anyway (a script, a slow relay) waits its turn —
+  // none is dropped.
+  const queue = [];
   let assigning = false;
-  addRole.addEventListener('change', async () => {
-    const role = addRole.value;
-    if (!role || assigning) return;
+  async function giveRoles() {
     assigning = true;
+    const hadFocus = document.activeElement === addRole;
+    addRole.disabled = true;
     addRole.setAttribute('aria-busy', 'true');
-    try {
-      const r = await api('POST', P() + '/roles', { role });
-      drawRoles(r.roles);
-      // The last free role was just given: the picker is off, so keep focus
-      // on the new chip's ✕ rather than lose it.
-      if (addRole.disabled) {
+    while (queue.length) {
+      const role = queue.shift();
+      try {
+        const r = await api('POST', P() + '/roles', { role });
+        drawRoles(r.roles);
+        noteBan(r);
+        roleStatus.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').');
+        markStale(); onChange();
+      } catch (e) { roleStatus.err(notDone(e)); }
+      addRole.disabled = true; // drawRoles turned it back on
+    }
+    assigning = false;
+    addRole.removeAttribute('aria-busy');
+    addRole.value = '';
+    addRole.disabled = addRole.options.length <= 1; // nothing left to give
+    // Turning it off dropped focus: give it back — or, the last free role
+    // given, to the new chip's ✕.
+    const a = document.activeElement;
+    if (hadFocus && (!a || a === document.body || !a.isConnected)) {
+      if (!addRole.disabled) addRole.focus();
+      else {
         const xs = roleTags.querySelectorAll('button.x');
         if (xs.length) xs[xs.length - 1].focus();
       }
-      roleStatus.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').');
-      markStale(); onChange();
-    } catch (e) { roleStatus.err(notDone(e)); }
-    finally { assigning = false; addRole.removeAttribute('aria-busy'); addRole.value = ''; }
+    }
+  }
+  addRole.addEventListener('change', () => {
+    const role = addRole.value;
+    if (!role || queue.includes(role)) return;
+    queue.push(role);
+    if (!assigning) giveRoles();
   });
   drawRoles(detail.roles);
   const rolesBlock = el('div', { class: 'subsection subsection-sep', role: 'group', 'aria-label': 'Access roles' }, [
@@ -1426,6 +1524,7 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
     try {
       const r = await api('POST', P() + '/claim', { code });
       drawRoles(r.roles);
+      noteBan(r);
       claimCode.value = '';
       claimTracker.reset();
       claimStatus.ok('Applied the invite to ' + displayName + '.');
@@ -1434,9 +1533,15 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
   }, { busyLabel: 'Applying…' });
   const more = el('details', { class: 'advanced' }, [el('summary', { text: 'More' }), claimForm]);
 
+  const grants = grantEditor(ctx, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange, !!detail.banned);
+  /** A role given or an invite applied here can lift a /ban: the grants say so. */
+  function noteBan(r) {
+    if (r && typeof r.banned === 'boolean') grants.setBanned(r.banned);
+  }
+
   return el('section', { class: 'drawer-section' }, [
     el('h3', { text: 'Access in ' + guild }),
-    grantEditor(ctx, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange),
+    grants.node,
     rolesBlock,
     more,
   ]);
@@ -1473,13 +1578,17 @@ function everywhereSection(d) {
       : el('p', { class: 'muted', text: 'None.' })]));
 
   const pol = d.policy;
+  const bans = Array.isArray(d.bans) ? d.bans : [];
   const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
+  // A guild it was removed from with /ban, even with nothing set there.
+  for (const gid of bans) if (!polGuilds.some(([g]) => g === gid)) polGuilds.push([gid, {}]);
   if ((pol && pol.default && pol.default.length) || polGuilds.length) {
     const grantKids = [];
-    if (pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', title: capsTitle(pol.default), text: 'Persona default (applies in every guild): ' + capsSummary(pol.default) }));
+    if (pol && pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', title: capsTitle(pol.default), text: 'Persona default (applies in every guild): ' + capsSummary(pol.default) }));
     for (const [gid, gp] of polGuilds) {
       const lines = [];
-      if (Array.isArray(gp.default)) lines.push(el('div', { class: 'cell-roles', title: gp.default.length ? capsTitle(gp.default) : undefined, text: 'Guild-wide: ' + (gp.default.length ? capsSummary(gp.default) : 'denied') }));
+      if (bans.includes(gid)) lines.push(el('div', { class: 'cell-roles', text: 'Removed with /ban: nothing it holds applies here.' }));
+      else if (Array.isArray(gp.default)) lines.push(el('div', { class: 'cell-roles', title: gp.default.length ? capsTitle(gp.default) : undefined, text: 'Guild-wide: ' + (gp.default.length ? capsSummary(gp.default) : 'denied') }));
       const rows = Object.entries(gp.channels || {}).sort((a, b) => byName(chanText(a[0], names), chanText(b[0], names)));
       for (const [cid, caps] of rows) lines.push(el('div', { class: 'grant-line' }, [chanNode(cid, names), el('span', { class: 'muted', title: caps.length ? capsTitle(caps) : undefined, text: ' — ' + (caps.length ? capsSummary(caps) : 'blocked') })]));
       grantKids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: guildText(gid, names), title: gid }), ...lines]));
@@ -1525,23 +1634,32 @@ async function tokenAction(ctx, action, button, status) {
 }
 
 /**
- * Direct grants in the selected guild: what is set (the guild-wide level
+ * Direct grants in the drawer's guild: what is set (the guild-wide level
  * first — set, denied or not set, with Unset and Deny guild-wide — then one
  * row per channel), and a form that sets a level on one channel — text,
  * voice or forum; a thread uses its parent's access and a category grants
  * nothing — or guild-wide. Save stays off until a target and a level are
  * picked, so a grant can't be stored empty by accident. A preset is sent as
  * {level}, Custom… as {caps}.
+ *
+ * A persona removed from the guild with /ban (`banned0`) has nothing there:
+ * the guild-wide row says so, and Unset asks before lifting that. Giving it
+ * access (a level here, an access role) lifts it too; the relay's answer says
+ * which. Returns { node, setBanned(banned) }.
  */
-function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
-  const { id, displayName } = ctx;
-  const P = () => G() + '/personas/' + encodeURIComponent(id) + '/grants';
-  const guild = currentGuildName();
+function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0 = false) {
+  const { id, displayName, gid } = ctx;
+  const P = () => gpath(gid) + '/personas/' + encodeURIComponent(id) + '/grants';
+  const guild = guildName(gid);
   const GUILD_WIDE = '__guild__';
   const det = el('details', { class: 'advanced grants', open: true }, [el('summary', { text: 'Direct grants' })]);
   const tableBox = el('div', {});
+  const banNote = el('p', { class: 'warn-line hidden' });
   const status = ui.statusLine(null);
   let policy = policy0 || null;
+  let banned = banned0;
+  /** Take the relay's word on the ban, from a change's answer. */
+  const noteBanned = (r) => { if (r && typeof r.banned === 'boolean') banned = r.banned; };
 
   /** Why a grant on this channel does nothing, or null. */
   function inertNote(cid) {
@@ -1561,6 +1679,20 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
    *  Deny guild-wide unless it already is. */
   function guildWideRow(gd) {
     const buttons = [];
+    if (banned) {
+      // Removed with /ban: Unset is the one thing to offer here (it asks
+      // before lifting the removal); it is denied already.
+      if (Array.isArray(gd)) {
+        const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal', title: 'Lifts the removal: channels fall back to the persona default.' });
+        unset.addEventListener('click', () => unsetGuildWide(unset));
+        buttons.push(unset);
+      }
+      return el('tr', {}, [
+        el('td', { text: 'Every channel (guild-wide)' }),
+        el('td', { title: displayName + ' was removed from ' + guild + ' with /ban: nothing it holds applies here.' }, [el('span', { class: 'badge badge-warn', text: 'Removed with /ban' })]),
+        el('td', { class: 'col-narrow' }, [el('div', { class: 'inline' }, buttons)]),
+      ]);
+    }
     if (Array.isArray(gd)) {
       const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild, title: 'Falls back to the persona default.' });
       unset.addEventListener('click', () => unsetGuildWide(unset));
@@ -1600,11 +1732,16 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
       ]));
     }
     tableBox.appendChild(table([{ label: 'Where' }, { label: 'Level' }, { label: '', cls: 'col-narrow' }], rows, 'No direct grants in ' + guild + '.'));
+    banNote.textContent = banned
+      ? displayName + ' was removed from ' + guild + ' with /ban, so nothing it holds applies here — not its persona default, direct grants or access roles. Giving it access here (a level below, or an access role) lifts that.'
+      : '';
+    banNote.classList.toggle('hidden', !banned);
   }
 
   async function removeGrant(cid) {
     try {
       const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid));
+      noteBanned(r);
       draw(r.guildPolicy);
       target.focus(); // the row whose button had focus is gone
       if (target.value === cid) preload();
@@ -1629,6 +1766,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     await ui.busy(button, async () => {
       try {
         const r = await api('DELETE', P() + '?guildDefault=deny');
+        noteBanned(r);
         draw(r.guildPolicy);
         target.focus();
         if (target.value === GUILD_WIDE) preload();
@@ -1640,7 +1778,18 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
 
   async function unsetGuildWide(button) {
     const gd = policy && Array.isArray(policy.default) ? policy.default : [];
-    const go = await ui.confirmDialog({
+    // Removed with /ban: unsetting alone would change nothing, so it lifts
+    // the removal too — and says so first.
+    const lift = banned;
+    const go = await ui.confirmDialog(lift ? {
+      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal?',
+      body: [
+        displayName + ' was removed from ' + guild + ' with /ban, so nothing applies to it there. Unsetting lifts that: channels of ' + guild +
+          ' without their own direct grant fall back to ' + displayName + '’s persona default, and access roles given here apply again.',
+        'To undo it, use /ban in ' + guild + ' again.',
+      ],
+      confirmLabel: 'Unset and lift',
+    } : {
       title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + '?',
       body: [
         (gd.length ? displayName + '’s guild-wide ' + levelLabel(gd) : 'The guild-wide deny') + ' is removed: channels of ' + guild +
@@ -1652,11 +1801,14 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', P() + '?guildDefault=unset');
+        const r = await api('DELETE', P() + '?guildDefault=unset' + (lift ? '&liftBan=1' : ''));
+        noteBanned(r);
         draw(r.guildPolicy);
         target.focus();
         if (target.value === GUILD_WIDE) preload();
-        status.ok('Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.');
+        status.ok(lift
+          ? 'Lifted ' + displayName + '’s removal from ' + guild + ' and unset its guild-wide level: channels without their own grant fall back to the persona default.'
+          : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.');
         markStale(); onChange();
       } catch (e) { status.err(notDone(e, 'Not unset')); }
     }, 'Unsetting…');
@@ -1711,20 +1863,24 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     else body.caps = caps;
     try {
       const r = await api('PUT', P(), body);
+      const was = banned;
+      noteBanned(r);
       draw(r.guildPolicy);
       tracker.reset();
-      status.ok(t === GUILD_WIDE
+      status.ok((t === GUILD_WIDE
         ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
-        : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.');
+        : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.') +
+        (was && !banned ? ' That lifted its removal from ' + guild + '.' : ''));
       markStale(); onChange();
     } catch (e) { status.err(notDone(e, 'Not saved', { channelId: t === GUILD_WIDE ? null : t, names })); }
   });
 
   draw(policy0);
   update();
-  // Kept across "Sign in again": where and what level, nothing else.
+  // Kept across "Sign in again": whose, where and what level, nothing else.
   keepForm(ctx.drawer, 'grant', {
-    serialize: () => ({ target: target.value, caps: level.value() }),
+    serialize: () => ({ personaId: id, target: target.value, caps: level.value() }),
+    belongs: (f) => f.personaId === id,
     restore(f) {
       if (f.target && Array.from(target.options).some((o) => o.value === f.target)) {
         target.value = f.target;
@@ -1736,14 +1892,23 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}) {
     isDirty: () => tracker.isDirty(),
   }, status);
   det.appendChild(tableBox);
+  det.appendChild(banNote);
   det.appendChild(form);
-  return det;
+  return {
+    node: det,
+    setBanned(b) {
+      if (b === banned) return;
+      banned = b;
+      draw(policy);
+    },
+  };
 }
 
 // ── Invites (guild-scoped) ─────────────────────────────────────────────────────
 
 async function renderInvites(view, stale) {
-  const meta = await guildMeta();
+  const gid = state.guildId; // a revoke confirmed later goes to this guild
+  const meta = await guildMeta(gid);
   if (stale()) return;
   // A link: the mint drawer has an address (#/g/{gid}/invites/new).
   const mintBtn = el('a', { class: 'btn btn-sm btn-primary', href: lib.formatRoute(route('g', state.guildId, 'invites', { kind: 'mint' })), 'data-key': 'mint', text: '+ Mint invite' });
@@ -1751,7 +1916,7 @@ async function renderInvites(view, stale) {
     placeholder: 'Search invites…',
     actions: [mintBtn],
     load: async () => {
-      const data = await api('GET', G() + '/invites' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
+      const data = await api('GET', gpath(gid) + '/invites' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
       const names = withChannelList(data.names, meta.channels, meta.discordRoles);
       names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
       const now = Date.now();
@@ -1760,7 +1925,7 @@ async function renderInvites(view, stale) {
         const spent = inv.status === 'used' || inv.status === 'expired';
         const verb = spent ? 'Delete' : 'Revoke';
         const revoke = el('button', { class: 'btn btn-sm btn-danger', text: verb, 'aria-label': verb + ' invite ' + (inv.label || inv.code) });
-        revoke.addEventListener('click', () => revokeInvite(inv, revoke, list));
+        revoke.addEventListener('click', () => revokeInvite(gid, inv, revoke, list));
         const grants = lib.grantSummary(inv, names);
         return el('tr', {}, [
           el('td', {}, [el('code', { text: inv.code })]),
@@ -1844,9 +2009,10 @@ function mirrorRoleList(discordRoles) {
  * r (access roles), or c (a channel) with lvl — 'Invite a new agent here'.
  */
 async function openMintDrawer(prefill = {}) {
+  const gid = state.guildId; // the guild this drawer mints for
   const d = openDrawer({ title: 'Mint invite', key: 'mint' });
   let meta;
-  try { meta = await guildMeta(); } catch (e) {
+  try { meta = await guildMeta(gid); } catch (e) {
     if (d.isCurrent() && !e.handled) d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad('this guild’s access roles and channels', e), () => openMintDrawer(prefill)));
     return;
   }
@@ -2006,12 +2172,12 @@ async function openMintDrawer(prefill = {}) {
       }
     }
     try {
-      const r = await api('POST', G() + '/invites', body);
+      const r = await api('POST', gpath(gid) + '/invites', body);
       tracker.reset();
       markStale();
       status.clear();
       ui.toast('Invite minted.');
-      showResult(r.code || '', r.invite || Object.assign({ guildId: state.guildId }, body));
+      showResult(r.code || '', r.invite || Object.assign({ guildId: gid }, body));
     } catch (e) { status.err(notDone(e, 'Not minted')); }
   }, { busyLabel: 'Minting…' });
 
@@ -2045,7 +2211,7 @@ async function openMintDrawer(prefill = {}) {
 
 /** Revoke an active invite, or delete a used-up or expired one (which no
  *  agent can use any more) from the list. */
-async function revokeInvite(inv, button, list) {
+async function revokeInvite(gid, inv, button, list) {
   const name = inv.label ? '“' + inv.label + '”' : inv.code;
   const spent = inv.status === 'used' || inv.status === 'expired';
   const go = await ui.confirmDialog(spent
@@ -2054,7 +2220,7 @@ async function revokeInvite(inv, button, list) {
   if (!go) return;
   await ui.busy(button, async () => {
     try {
-      await api('DELETE', G() + '/invites/' + encodeURIComponent(inv.code));
+      await api('DELETE', gpath(gid) + '/invites/' + encodeURIComponent(inv.code));
       list.status.ok(spent ? 'Deleted invite ' + name + '.' : 'Revoked invite ' + name + '. Agents can no longer use it.');
       list.refresh();
     } catch (e) { list.status.err(notDone(e, spent ? 'Not deleted' : 'Not revoked')); }
@@ -2619,11 +2785,15 @@ function chanNode(cid, names) {
   return el('span', { class: 'name-ref', title }, kids);
 }
 
-/** The scope switcher's label for the selected guild (its name). */
-function currentGuildName() {
-  const opt = Array.from($('#guild-select').options).find((o) => o.value === state.guildId);
-  return (opt && opt.textContent) || $('#guild-static').textContent || state.guildId;
+/** A guild's name, as the switcher shows it (its id when it has none). */
+function guildName(gid) {
+  const g = state.guilds.find((x) => x.id === gid);
+  if (g && g.name) return g.name;
+  const opt = Array.from($('#guild-select').options).find((o) => o.value === gid);
+  return (opt && opt.textContent) || String(gid);
 }
+/** The selected guild's name. */
+function currentGuildName() { return guildName(state.guildId); }
 
 /** Channel picker options: the channels that can hold a grant (text, voice,
  *  forum — never a thread or a category), by name. */

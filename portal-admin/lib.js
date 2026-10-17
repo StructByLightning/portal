@@ -17,6 +17,7 @@
  *   inviteStatusText                   'Active' · 'Used up' · 'Expired'
  *   errorText                          a refusal from the relay, in words
  *   parseRoute, formatRoute            the panel's #/… addresses (round-trip)
+ *   addressText                        a search as an address may hold it
  *   isSafeReturnTo                     a place to come back to after sign-in
  *   makeDraft, readDraft, draftFields  an unsaved form kept across a sign-in
  *   loginErrorText                     why a sign-in came back (?login_error=)
@@ -404,6 +405,7 @@
       case 'EXISTS': return 'A role named ' + (c.roleName || 'that') + ' already exists — edit it instead?';
       case 'GUILD_MISMATCH': return p + ': ' + (c.roleName ? 'access role ' + c.roleName : 'that access role') + ' belongs to another guild now. Reload the page and try again.';
       case 'INVALID_NAME': return p + ': an access role name uses lower-case letters, digits, dots, dashes and underscores (up to 64), starting with a letter or digit.';
+      case 'BANNED': return p + ': it was removed from this guild with /ban since this page was loaded. Reload the page to see that, then try again.';
       default: break;
     }
     if (e && e.status === 401) return p + ': your session ended. Sign in again, then save it.';
@@ -423,26 +425,41 @@
   //   #/g/{gid}/invites[?status&q]         #/g/{gid}/invites/new[?c&lvl&r] · …/invites/i/{inviteId}
   //   #/g/{gid}/roles[?q]                  #/g/{gid}/roles/r/{name} · …/roles/new
   //   #/g/{gid}/audit[?q&actor&persona&channel&action&reads]
-  //   #/all/personas[?q]                   #/all/personas/p/{pid}
+  //   #/all/personas[?q&guild]             #/all/personas/p/{pid}[?guild]
   //   #/all/audit[?guild&q&actor&…]        #/guilds
   //
   // A route is { area: 'home' | 'g' | 'all' | 'guilds', gid, view, drawer,
   // query }: `drawer` is null or { kind, id? } (the panel open over the list),
   // `query` the leaf's parameters (the list's, or the drawer's when one is
   // open). Ids are checked here, so a link can't carry anything else; an
-  // invite appears only as the hash of its code, never as the code. Unknown
-  // query keys are dropped; a bad value makes the whole route invalid (null).
-  // The lists' search boxes keep ?q= on every list, not only the ones above
-  // that list it.
+  // invite appears only as the hash of its code, never as the code — and a
+  // search that looks like one (inv_…) is kept as its first 12 characters,
+  // as the audit shows codes. Unknown query keys are dropped; a bad value
+  // makes the whole route invalid (null). The lists' search boxes keep ?q= on
+  // every list, not only the ones above that list it. On #/all/personas,
+  // ?guild= is the guild in view: the scope switch's, and the one an open
+  // persona's 'Access in <guild>' is about.
 
   const SNOWFLAKE = /^\d{5,25}$/;
-  const PERSONA_ID = /^[A-Za-z0-9._:-]{1,100}$/;
+  /** Any id the relay can hold (operators choose some by hand: spaces, '+'
+   *  and the like), so every persona has an address: up to 100 characters,
+   *  none of them a control character. */
+  const PERSONA_ID = /^[^\u0000-\u001f\u007f]{1,100}$/;
   const INVITE_ID = /^[0-9a-f]{24}$/;
   const MAX_IDS = 20;
   const MAX_TEXT = 200;
+  /** How much of an invite code an address may hold: what the audit shows. */
+  const CODE_SHOWN = 12;
 
   const isSnowflake = (s) => typeof s === 'string' && SNOWFLAKE.test(s);
   const isPersonaId = (s) => typeof s === 'string' && PERSONA_ID.test(s) && s !== '.' && s !== '..';
+
+  /** Search text as an address may hold it: a whole invite code (inv_…) is
+   *  cut to the first 12 characters — the audit's own prefix, which still
+   *  finds it — so a code never lands in the history or a shared link. */
+  function addressText(v) {
+    return /^inv_/i.test(v) && v.length > CODE_SHOWN ? v.slice(0, CODE_SHOWN) : v;
+  }
   const isRoleName = (s) => typeof s === 'string' && s.length >= 1 && s.length <= 64 && s.indexOf('/') < 0 && s !== '.' && s !== '..';
 
   /** Query value kinds: one id, a list of ids, free text, or one of a set. */
@@ -465,7 +482,7 @@
       audit: { query: AUDIT_QUERY },
     },
     all: {
-      personas: { query: { q: 'text' }, drawers: { p: { kind: 'persona', id: 'pid' } } },
+      personas: { query: { q: 'text', guild: 'gid' }, drawers: { p: { kind: 'persona', id: 'pid', query: { guild: 'gid' } } } },
       audit: { query: Object.assign({ guild: 'gid' }, AUDIT_QUERY) },
     },
   };
@@ -498,7 +515,7 @@
     if (kind === 'text') {
       const v = decQ(raw);
       if (v == null || v.length > MAX_TEXT) return undefined;
-      return v.trim();
+      return addressText(v.trim());
     }
     if (kind.slice(-2) === '[]') {
       const check = ONE[kind.slice(0, -2)];
@@ -614,7 +631,8 @@
     for (const k of Object.keys(spec || {})) {
       const val = query[k];
       if (val == null || val === '' || (Array.isArray(val) && !val.length)) continue;
-      parts.push(k + '=' + (Array.isArray(val) ? val.map(enc).join(',') : enc(val)));
+      const one = spec[k] === 'text' ? addressText(String(val)) : val;
+      parts.push(k + '=' + (Array.isArray(one) ? one.map(enc).join(',') : enc(one)));
     }
     return parts.length ? path + '?' + parts.join('&') : path;
   }
@@ -652,8 +670,8 @@
       mirrorRole: FIELD.snowflake, caps: FIELD.caps, uses: oneOf(['1', '5', '25', 'unlimited', 'other']), usesOther: FIELD.digits,
       expires: oneOf(['1', '7', '30', 'never']), mode: oneOf(['mint', 'augment', 'both']),
     },
-    // A direct grant in the persona drawer.
-    grant: { target: FIELD.target, caps: FIELD.caps },
+    // A direct grant in the persona drawer: whose, where and what level.
+    grant: { personaId: isPersonaId, target: FIELD.target, caps: FIELD.caps },
     // Defining an access role.
     role: {
       name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,
@@ -724,7 +742,7 @@
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,
-    isSnowflake, isPersonaId, isRoleName, parseRoute, formatRoute, isSafeReturnTo,
+    isSnowflake, isPersonaId, isRoleName, parseRoute, formatRoute, isSafeReturnTo, addressText,
     DRAFT_FORMS, draftFields, makeDraft, readDraft, loginErrorText,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

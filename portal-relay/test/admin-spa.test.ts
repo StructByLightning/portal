@@ -898,7 +898,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       };
       const sent = req.body ? JSON.parse(req.body) : undefined;
       if (sent !== undefined) bodies.push(sent);
-      let body = opts.handle?.(req.method, route + url.search, sent, req.headers ?? {});
+      let body = await opts.handle?.(req.method, route + url.search, sent, req.headers ?? {});
       if (body === undefined) body = req.method === 'DELETE' ? {} : req.method === 'GET' ? routes[route] : undefined;
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
       // refuse(status, code, message, extra) answers as the relay refuses.
@@ -1802,6 +1802,10 @@ test('lib.parseRoute / formatRoute: every address round-trips', () => {
     g + '/personas/p/aria',
     g + '/personas/p/aria-1a2b3c',
     g + '/personas/p/sol.6d7e8f:x_y',
+    // Ids an operator chose by hand: every persona has an address.
+    g + '/personas/p/ash%20grey',
+    g + '/personas/p/bo%2Bx',
+    g + '/personas/p/a%2Fb',
     g + '/personas/add',
     g + '/give',
     g + '/give?p=aria,sol&c=' + CH.general + ',' + CH.research + '&lvl=write',
@@ -1820,6 +1824,8 @@ test('lib.parseRoute / formatRoute: every address round-trips', () => {
     '#/all/personas',
     '#/all/personas?q=sol',
     '#/all/personas/p/sol',
+    '#/all/personas?q=sol&guild=' + GA,
+    '#/all/personas/p/sol?guild=' + GA,
     '#/all/audit',
     '#/all/audit?guild=' + GB + '&action=roles',
   ];
@@ -1841,6 +1847,15 @@ test('lib.parseRoute / formatRoute: every address round-trips', () => {
   assert.equal(lib.formatRoute(lib.parseRoute(g + '/personas/')), g + '/personas');
   // Characters encodeURIComponent leaves alone are escaped too.
   assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'personas', drawer: null, query: { q: "it's (x)!" } }), g + '/personas?q=it%27s%20%28x%29%21');
+  // A whole invite code never goes into an address: a search for one keeps
+  // the first 12 characters, as the audit shows codes (which still finds it).
+  const code = 'inv_JxYjabcdefghijklmnopqrstuvwx';
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'invites', drawer: null, query: { q: code } }), g + '/invites?q=inv_JxYjabcd');
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'audit', drawer: null, query: { q: code } }), g + '/audit?q=inv_JxYjabcd');
+  assert.equal(lib.parseRoute(g + '/invites?q=' + code)!.query.q, 'inv_JxYjabcd', 'one typed into the address is cut too');
+  assert.equal(lib.parseRoute(g + '/invites?q=INV_JxYjabcdefgh')!.query.q, 'INV_JxYjabcd');
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/invites?q=inv_short')), g + '/invites?q=inv_short');
+  assert.equal(lib.formatRoute(lib.parseRoute(g + '/invites?q=guests%20inv_JxYjabcdefgh')), g + '/invites?q=guests%20inv_JxYjabcdefgh', 'only a search that is a code');
 });
 
 test('lib.parseRoute: a bad id, value or shape is no route at all', () => {
@@ -1848,8 +1863,8 @@ test('lib.parseRoute: a bad id, value or shape is no route at all', () => {
   const g = '#/g/' + GA;
   const bad = [
     '#/g/abc/zzz', '#/g/1234/personas', '#/g/' + '1'.repeat(26) + '/personas', '#/g//personas', '#/g/' + GA,
-    g + '/zzz', g + '/personas/p', g + '/personas/p/a/b', g + '/personas/p/' + encodeURIComponent('a/b'),
-    g + '/personas/p/..', g + '/personas/p/' + 'x'.repeat(101), g + '/personas/p/a%20b', g + '/personas/x/aria',
+    g + '/zzz', g + '/personas/p', g + '/personas/p/a/b', g + '/personas/p/a%0Ab', g + '/personas/p/%00',
+    g + '/personas/p/..', g + '/personas/p/' + 'x'.repeat(101), g + '/personas/x/aria', '#/all/personas/p/sol?guild=abc',
     g + '/channels/c/general', g + '/channels?show=some', g + '/channels?cat=12',
     g + '/invites/i/0123456789ABCDEF01234567', g + '/invites/i/0123', g + '/invites?status=used',
     g + '/invites/new?lvl=admin', g + '/invites/new?r=a%2Fb',
@@ -1862,7 +1877,7 @@ test('lib.parseRoute: a bad id, value or shape is no route at all', () => {
   for (const h of bad) assert.equal(lib.parseRoute(h), null, h);
   // And nothing it can't write is written.
   assert.equal(lib.formatRoute({ area: 'g', gid: 'abc', view: 'personas', drawer: null, query: {} }), null);
-  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'personas', drawer: { kind: 'persona', id: 'a/b' }, query: {} }), null);
+  assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'personas', drawer: { kind: 'persona', id: 'a\nb' }, query: {} }), null);
   assert.equal(lib.formatRoute({ area: 'g', gid: GA, view: 'zzz', drawer: null, query: {} }), null);
 });
 
@@ -2497,4 +2512,408 @@ test('ui.expiryBar: shown in both places, words updated in place, hidden in both
     assert.ok(host.classList.contains('hidden'));
     assert.equal(host.textContent, '');
   }
+});
+
+// ── A drawer acts on what it showed, wherever the page has gone since ──
+
+/** Guild Two's fixture, for an admin of both guilds. */
+const G2_ROUTES = (() => {
+  const g = '/admin/g/' + GB;
+  return {
+    [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
+    [g + '/channels']: { channels: [{ id: '100000000000002011', name: 'lobby', type: 'text' }] },
+    [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
+    [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: null, names: { channels: {} } },
+    [g + '/invites']: { invites: [], total: 0, limit: 50, offset: 0 },
+  };
+})();
+const BOTH_GUILDS = [{ id: GA, name: 'Guild One' }, { id: GB, name: 'Guild Two' }];
+
+test('persona drawer: a question still open when Back leaves the drawer is withdrawn; nothing is sent to the guild now in view', async () => {
+  const box = await panelAt('/#/g/' + GB + '/personas', { me: ME_OP, guilds: BOTH_GUILDS, routes: G2_ROUTES });
+  box.nav.go('#/g/' + GA + '/personas/p/aria');
+  await settle();
+  const deny = box.doc.getElementById('drawer-body')!.querySelectorAll('button').find((b) => b.textContent === 'Deny guild-wide')!;
+  deny.click();
+  await settle();
+  assert.equal(box.doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Deny Aria guild-wide in Guild One?');
+  box.nav.back();
+  await settle();
+  assert.equal(box.here(), '#/g/' + GB + '/personas');
+  assert.equal(box.drawerOpen(), false);
+  assert.equal(box.doc.querySelector('.modal'), null, 'the question about Guild One went with its drawer');
+  assert.ok(!box.calls.some((c) => c.startsWith('DELETE')), box.calls.join('\n'));
+});
+
+test('invites: a revoke confirmed after the page moved to another guild revokes the invite it named, in its own guild', async () => {
+  const code = 'inv_fixtureinvite0000000a';
+  const box = await panelAt('/#/g/' + GA + '/invites', {
+    me: ME_OP, guilds: BOTH_GUILDS, routes: G2_ROUTES,
+  });
+  clickable(box.doc, 'Revoke').click();
+  await settle();
+  box.nav.go('#/g/' + GB + '/invites');
+  await settle();
+  assert.equal(box.here(), '#/g/' + GB + '/invites');
+  box.doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.ok(box.calls.includes(`DELETE /admin/g/${GA}/invites/${code}`), box.calls.join('\n'));
+  assert.ok(!box.calls.some((c) => c.startsWith(`DELETE /admin/g/${GB}`)));
+});
+
+// ── A kept form comes back only in its own drawer ──
+
+test('session: a drawer with no address keeps no draft; a grant draft opens only in its own persona’s drawer', async () => {
+  const g = '#/g/' + GA;
+  const long = 'x'.repeat(101); // more than an address can hold
+  let down = false;
+  const box = await panelAt('/' + g + '/personas', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: {
+      [`/admin/g/${GA}/personas`]: { personas: [{ id: long, displayName: 'Longname', roles: [] }, { id: 'ash grey', displayName: 'Ash', roles: [] }], total: 2, limit: 50, offset: 0 },
+      [`/admin/g/${GA}/personas/${long}`]: { id: long, displayName: 'Longname', roles: [], guildPolicy: null, names: { channels: {} } },
+    },
+    handle: (method) => (down && method !== 'GET' ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
+  });
+  assert.equal(clickable(box.doc, 'Ash').getAttribute('href'), g + '/personas/p/ash%20grey', 'an id with a space has an address');
+  clickable(box.doc, 'Longname').click();
+  await settle();
+  assert.ok(box.drawerOpen());
+  assert.equal(box.here(), g + '/personas', 'no address for this one');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.labNotes;
+  target.fire('change');
+  const full = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'full')!;
+  full.checked = true;
+  full.fire('change');
+  down = true;
+  form.fire('submit');
+  await settle();
+  clickable(box.doc, 'Sign in again', box.doc.querySelector('.modal')!).click();
+  assert.equal(box.sessionStore.getItem('pa.draft'), null, 'kept under the list’s address, it would open in any drawer of the list');
+
+  // A grant draft names its persona: another persona's drawer leaves it.
+  const draft = (personaId: string) => JSON.stringify({
+    v: 1, userId: ME_OP.user.id, route: g + '/personas/p/aria', form: 'grant',
+    fields: { personaId, target: CH.labNotes, caps: [...LEVEL_CAPS.full] }, at: Date.now(),
+  });
+  for (const [who, kept] of [['sol', false], ['aria', true]] as const) {
+    const back = await panelAt('/' + g + '/personas/p/aria', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], session: { 'pa.draft': draft(who) } });
+    const body = back.doc.getElementById('drawer-body')!;
+    assert.equal(body.querySelector('form.grant-form')!.querySelector('select')!.value, kept ? CH.labNotes : '', who);
+    assert.equal(body.textContent.includes('Restored your unsaved change'), kept, who);
+  }
+});
+
+// ── The all-persona drawer names its guild in its address ──
+
+test('app routes: from All personas a drawer’s address names the guild, so a reload keeps its “Access in” section', async () => {
+  const global = { id: 'aria', displayName: 'Aria', roles: [], policy: null, guilds: [{ id: GA, name: 'Guild One' }], names: {} };
+  const routes = {
+    '/admin/personas': { personas: [{ id: 'aria', displayName: 'Aria', roles: [], guildCount: 1 }], total: 1, limit: 50, offset: 0 },
+    '/admin/personas/aria': global,
+  };
+  const box = await panelAt('/#/g/' + GA + '/personas', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes });
+  const scope = box.doc.querySelector('select.scope-select')!;
+  scope.value = 'all';
+  scope.fire('change');
+  await settle();
+  assert.equal(box.here(), '#/all/personas?guild=' + GA, 'the scope switch keeps the guild in the address');
+  const link = clickable(box.doc, 'Aria');
+  assert.equal(link.getAttribute('href'), '#/all/personas/p/aria?guild=' + GA);
+  link.click();
+  await settle();
+  const headings = () => box.doc.getElementById('drawer-body')!.querySelectorAll('h3').map((h) => h.textContent);
+  assert.equal(headings()[0], 'Access in Guild One');
+
+  // Reload there (or come back from signing in): the same drawer.
+  const reload = await panelAt('/#/all/personas/p/aria?guild=' + GA, { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes });
+  const h = reload.doc.getElementById('drawer-body')!.querySelectorAll('h3').map((x) => x.textContent);
+  assert.equal(h[0], 'Access in Guild One');
+  assert.ok(reload.doc.getElementById('drawer-body')!.querySelector('form.grant-form'), 'with its grant form');
+  assert.ok(reload.doc.querySelector('select.scope-select'), 'and the list under it keeps its scope switch');
+  // An address that names no guild has no guild section, whatever was in view.
+  const bare = await panelAt('/#/all/personas/p/aria', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes });
+  assert.ok(!bare.doc.getElementById('drawer-body')!.querySelectorAll('h3').some((x) => x.textContent.startsWith('Access in Guild')));
+});
+
+// ── Leaving a drawer with unsaved changes ──
+
+test('session: Cancel after a link out of a dirty drawer; closing it then goes to its list, not to the link', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/personas', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { [`/admin/g/${GA}/personas/sol`]: { id: 'sol', displayName: 'Sol', roles: [], guildPolicy: null, names: { channels: {} } } },
+  });
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.random;
+  target.fire('change');
+  const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  read.checked = true;
+  read.fire('change');
+  // A link to another drawer (Access in every guild has these).
+  assert.ok(box.drawerOpen() && box.here() === g + '/personas/p/aria', box.here());
+  box.nav.go(g + '/personas/p/sol');
+  await settle();
+  assert.ok(box.doc.querySelector('.modal'), 'asked: ' + box.here() + ' ' + box.doc.getElementById('drawer-title')!.textContent);
+  clickable(box.doc, 'Cancel', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal(box.here(), g + '/personas/p/aria');
+  // Close it (and discard): the list, never Sol.
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  clickable(box.doc, 'Discard changes', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal(box.here(), g + '/personas');
+  assert.equal(box.drawerOpen(), false, 'Sol’s drawer, the cancelled destination, is not opened');
+  assert.ok(!box.calls.includes(`GET /admin/g/${GA}/personas/sol`), box.calls.join('\n'));
+
+  // After Back, Cancel still leaves closing to go Back to the list.
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  const f2 = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const t2 = f2.querySelector('select')!;
+  t2.value = CH.random;
+  t2.fire('change');
+  const r2 = f2.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  r2.checked = true;
+  r2.fire('change');
+  const depth = box.nav.i;
+  box.nav.back();
+  await settle();
+  clickable(box.doc, 'Cancel', box.doc.querySelector('.modal')!).click();
+  await settle();
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  clickable(box.doc, 'Discard changes', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal(box.here(), g + '/personas');
+  assert.equal(box.nav.i, depth - 1, 'Back to the list it was opened from');
+});
+
+test('session: Esc then Back on a dirty drawer asks one question; its answer closes that drawer only', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/invites', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }] });
+  clickable(box.doc, '+ Mint invite').click();
+  await settle();
+  fillMint(box.doc, 'x', 'g1-readers');
+  box.doc.key('Escape');
+  await settle();
+  box.nav.back();
+  await settle();
+  assert.equal(box.doc.getElementById('modals')!.children.length, 1, 'one “Discard changes?”, not two');
+  clickable(box.doc, 'Discard changes', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal(box.drawerOpen(), false);
+  assert.equal(box.here(), g + '/invites');
+  assert.equal(box.doc.querySelector('.modal'), null, 'nothing left over');
+  // Forward: a fresh mint drawer, which nothing closes behind the admin's back.
+  box.nav.history.forward();
+  await settle();
+  assert.equal(box.here(), g + '/invites/new');
+  assert.ok(box.drawerOpen());
+  assert.equal(box.doc.querySelector('.modal'), null);
+});
+
+test('ui.drawer: a question asked over a drawer goes when the drawer closes; requestClose closes only the drawer that asked', async () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, drawer, confirmDialog } = ctx.PA.ui;
+  drawerDom(doc, el);
+  doc.body.appendChild(el('div', { id: 'modals' }));
+  drawer.open({ title: 'One' });
+  const answer = confirmDialog({ title: 'Sure?' });
+  drawer.close('route');
+  assert.equal(await answer, false, 'withdrawn, as a Cancel');
+  assert.equal(doc.querySelector('.modal'), null);
+
+  // Dirty drawer: Esc's question is the one every caller gets.
+  const h = drawer.open({ title: 'Two' });
+  const input = el('input', { type: 'text' });
+  const form = el('form', {}, [input]);
+  h.setBody(form);
+  h.track(form);
+  input.value = 'changed';
+  const closing = drawer.requestClose();
+  const again = drawer.confirmDiscard();
+  assert.equal(doc.getElementById('modals')!.children.length, 1);
+  doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  assert.equal(await again, true);
+  assert.equal(await closing, true);
+  assert.equal(drawer.isOpen(), false);
+});
+
+// ── A persona removed with /ban ──
+
+test('grant editor: a persona removed with /ban says so; Unset asks, then lifts the removal', async () => {
+  const g = '/admin/g/' + G1;
+  let banned = true;
+  const policy: { channels: Record<string, string[]>; default?: string[] } = { channels: {}, default: [] };
+  const box = appSandbox({
+    routes: {
+      [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
+      [g + '/channels']: { channels: G1_CHANNELS },
+      [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
+      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: policy, banned: true, names: { channels: {} } },
+    },
+    handle: (method, path) => {
+      if (method !== 'DELETE' || !path.startsWith(g + '/personas/aria/grants?')) return undefined;
+      const q = new URL(path, 'http://panel.invalid').searchParams;
+      if (q.get('guildDefault') !== 'unset') return undefined;
+      if (banned && q.get('liftBan') !== '1') return refuse(409, 'BANNED');
+      banned = false;
+      delete policy.default;
+      return { guildPolicy: null, banned };
+    },
+  });
+  await box.ctx.PA.app.boot();
+  await settle();
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  const drawer = box.doc.getElementById('drawer-body')!;
+  const row = () => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
+  const note = () => drawer.querySelector('details.grants')!.querySelector('p.warn-line')!;
+  assert.equal(row().children[1].textContent, 'Removed with /ban');
+  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Unset'], 'denied already: no Deny');
+  assert.ok(!note().classList.contains('hidden'));
+  assert.match(note().textContent, /^Aria was removed from Guild One with \/ban, so nothing it holds applies here/);
+
+  row().querySelector('button')!.click();
+  await settle();
+  const dialog = box.doc.querySelector('.modal')!;
+  assert.equal(dialog.querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One and lift its removal?');
+  assert.match(dialog.textContent, /fall back to Aria’s persona default/);
+  clickable(box.doc, 'Unset and lift', dialog).click();
+  await settle();
+  assert.equal(box.calls.at(-1), `DELETE ${g}/personas/aria/grants?guildDefault=unset&liftBan=1`);
+  const status = drawer.querySelector('form.grant-form')!.querySelector('.status-line')!.textContent;
+  assert.equal(status, 'Lifted Aria’s removal from Guild One and unset its guild-wide level: channels without their own grant fall back to the persona default.');
+  assert.equal(row().children[1].textContent, 'Not set');
+  assert.ok(note().classList.contains('hidden'));
+  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Deny guild-wide']);
+});
+
+test('lib.errorText: a removal with /ban the page didn’t know about', () => {
+  const { lib } = libOnly();
+  assert.equal(lib.errorText({ status: 409, code: 'BANNED' }, 'Not unset'),
+    'Not unset: it was removed from this guild with /ban since this page was loaded. Reload the page to see that, then try again.');
+});
+
+// ── Invite codes stay out of the address ──
+
+test('app list search: a whole invite code typed into a search stays out of the address and the place kept for sign-in', async () => {
+  const g = '#/g/' + GA;
+  const code = 'inv_JxYjabcdefghijklmnopqrstuvwx';
+  const { ctx, doc, advance, calls, nav, sessionStore } = appSandbox({ url: '/' + g + '/invites' });
+  await ctx.PA.app.boot();
+  await settle();
+  for (const view of ['invites', 'audit']) {
+    if (view === 'audit') {
+      nav.go(g + '/audit');
+      await settle();
+    }
+    const search = doc.getElementById('list-search')!;
+    search.value = code;
+    search.fire('input');
+    advance(300);
+    await settle();
+    assert.equal(nav.location.hash, g + '/' + view + '?q=inv_JxYjabcd', view);
+    assert.ok(!nav.entries.some((e) => e.includes(code)), 'not in the history either');
+  }
+  assert.ok(calls.some((c) => c.includes('/invites?q=' + code)), 'the search itself is for the whole code');
+  doc.getElementById('login-btn')!.click();
+  assert.ok(!String(sessionStore.getItem('pa.returnTo')).includes(code));
+});
+
+// ── Access roles: one request at a time, none dropped ──
+
+test('persona drawer: picking a second access role while the first is being given gives both, one after the other', async () => {
+  const g = '/admin/g/' + G1;
+  const catalog = {
+    'g1-readers': G1_CATALOG['g1-readers'],
+    'g1-chatters': G1_CATALOG['g1-chatters'],
+    'g1-mods-mirror': { caps: LEVEL_CAPS.full, scope: { mirrorRole: '100000000000003001' }, guildId: G1, mirrorCaps: true },
+  };
+  let held: string[] = [];
+  let inFlight = 0;
+  let most = 0;
+  const box = appSandbox({
+    routes: {
+      [g + '/roles']: { catalog, discordRoles: [], canAuthor: false },
+      [g + '/channels']: { channels: G1_CHANNELS },
+      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: null, names: { channels: {} } },
+    },
+    handle: async (method: string, path: string, body: any) => {
+      if (method !== 'POST' || path !== g + '/personas/aria/roles') return undefined;
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await tick();
+      inFlight--;
+      held = [...held, body.role];
+      return { roles: held, banned: false };
+    },
+  } as any);
+  await box.ctx.PA.app.boot();
+  await settle();
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  const drawer = box.doc.getElementById('drawer-body')!;
+  const picker = drawer.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
+  picker.focus();
+  picker.value = 'g1-mods-mirror';
+  picker.fire('change');
+  assert.equal(picker.disabled, true, 'off while the role is being given');
+  picker.value = 'g1-readers';
+  picker.fire('change'); // a pick that gets through anyway
+  await settle();
+  assert.deepEqual(held, ['g1-mods-mirror', 'g1-readers'], 'both, in the order picked');
+  assert.equal(most, 1, 'one request at a time');
+  const chips = drawer.querySelectorAll('.tag').map((t) => t.querySelector('code')!.textContent);
+  assert.deepEqual(chips, ['g1-mods-mirror', 'g1-readers']);
+  assert.equal(picker.disabled, false);
+  assert.equal(picker.value, '');
+  assert.equal(box.doc.activeElement, picker, 'focus comes back to the picker');
+});
+
+// ── A relay updated mid-session ──
+
+test('session: a relay that came back newer is noticed when the tab checks the session, not only at boot', async () => {
+  class FakeChannel {
+    static last: FakeChannel;
+    onmessage: ((e: { data: unknown }) => void) | null = null;
+    constructor() {
+      FakeChannel.last = this;
+    }
+    postMessage() {}
+  }
+  let apiVersion = 2;
+  const box = appSandbox({
+    url: '/#/g/' + GA + '/personas',
+    handle: (_m, path) => (path === '/admin/me' ? { ...ME_GWEN, apiVersion } : undefined),
+  });
+  box.ctx.BroadcastChannel = FakeChannel;
+  await box.ctx.PA.app.boot();
+  await settle();
+  assert.equal(box.doc.getElementById('update-banner'), null);
+  apiVersion = 3; // deployed; the admin signed in again in another tab
+  FakeChannel.last.onmessage!({ data: { type: 'signed-in' } });
+  await settle();
+  assert.equal(box.doc.getElementById('update-banner')!.textContent, 'The panel was updated — Reload');
+
+  // And coming back to the tab checks too.
+  const other = appSandbox({
+    url: '/#/g/' + GA + '/personas',
+    handle: (_m, path) => (path === '/admin/me' ? { ...ME_GWEN, apiVersion: other.v } : undefined),
+  }) as ReturnType<typeof appSandbox> & { v: number };
+  other.v = 2;
+  await other.ctx.PA.app.boot();
+  await settle();
+  other.v = 3;
+  for (const [type, fn] of other.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
+  await settle();
+  assert.ok(other.doc.getElementById('update-banner'));
 });

@@ -88,9 +88,16 @@ can't carry it), so reload, Back, a shared link and a sign-in keep it:
 #/g/<guild>/invites[?q=]            #/g/<guild>/invites/new[?r=<role>,…|c=<channel>&lvl=read|write|full]
 #/g/<guild>/roles[?q=]              #/g/<guild>/roles/new
 #/g/<guild>/audit[?q=]
-#/all/personas[?q=]                 #/all/personas/p/<persona>          (super-admins)
+#/all/personas[?q=&guild=]          #/all/personas/p/<persona>[?guild=] (super-admins)
 #/guilds                                                                 (super-admins)
 ```
+
+On `#/all/personas`, `?guild=` is the guild in view: the scope switch keeps it,
+and an open persona's "Access in <guild>" section is about that guild, so a
+reload or a sign-in brings the same drawer back. A persona id may be any id the
+relay holds (up to 100 characters, on one line); it is percent-encoded in the
+address. A search that is a whole invite code (`inv_…`) goes into the address
+as its first 12 characters only, as the audit shows codes.
 
 `lib.parseRoute` also knows the addresses later versions add (channels, give
 access, invite detail, role detail, the global audit); this version says
