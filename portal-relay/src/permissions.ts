@@ -289,7 +289,8 @@ export class PermissionsStore {
     return this.isQuarantined(name) ? structuredClone(this.quarantinedRoles[name]) : undefined;
   }
 
-  /** The guild a quarantined entry names, when it names one as a string. */
+  /** The guild a quarantined entry names, when it names one as a string that
+   *  isn't empty. */
   quarantinedGuildId(name: string): string | undefined {
     const e = this.isQuarantined(name) ? (this.quarantinedRoles[name] as { guildId?: unknown } | null) : undefined;
     return typeof e?.guildId === 'string' && e.guildId ? e.guildId : undefined;
@@ -634,16 +635,18 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
 
 /** Why a catalog role can't be read as written, or null: its guild must be
  *  named by a string, its caps must be a list of strings, a `mirrorCaps` must
- *  be a boolean, a number or null, and its scope must be an object naming
+ *  be a boolean, a number, null or '', and its scope must be an object naming
  *  exactly one of `all` (true), `channels`, `mirrorRoles` and `mirrorRole`,
  *  holding that kind's type. That is the shape every relay writer makes: the
  *  admin API allows exactly one scope key and a boolean `mirrorCaps`, and a
  *  mirror grant materializes one key. Every reader takes `mirrorCaps` by its
- *  truth, so a string reads as on whatever it says, "false" included, and so
- *  do a list and an object, which no writer means; a number reads by its
- *  truth, as a writer who means 0 for off and anything else for on means it.
- *  A scope or caps that name nothing make a role that grants nothing, which
- *  is a role still (roleGrantsAccess). Readers don't share one order over a
+ *  truth, so a string that isn't empty reads as on whatever it says, "false"
+ *  included, and so do a list and an object, which no writer means; '' reads
+ *  as off, and a hand-written number reads by its truth, as one who writes 0
+ *  for off and 1 for on means it. A scope whose one list names nothing, or
+ *  caps that name nothing, make a role that grants nothing, which is a role
+ *  still (roleGrantsAccess); a scope of {} names no kind, so it is set aside
+ *  with the rest. Readers don't share one order over a
  *  scope's keys (with `mirrorCaps`, resolveForRoles reads the mirror keys
  *  before `all`), so a scope with two keys reads one way in one place and
  *  another way in the next. Read as found, a scope that is null or not an
@@ -655,7 +658,7 @@ export function roleShapeProblem(role: AccessRole): string | null {
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
   if (typeof r.guildId !== 'string') return 'guildId must be a string';
   if (!strings(r.caps)) return 'caps must be a list of capability names';
-  if (r.mirrorCaps != null && typeof r.mirrorCaps !== 'boolean' && typeof r.mirrorCaps !== 'number') {
+  if (r.mirrorCaps != null && r.mirrorCaps !== '' && typeof r.mirrorCaps !== 'boolean' && typeof r.mirrorCaps !== 'number') {
     return `mirrorCaps must be true or false, not ${typeof r.mirrorCaps === 'string' ? 'a string, which reads as on whatever it says' : 'a list or an object, which reads as on'}`;
   }
   const sc = r.scope;

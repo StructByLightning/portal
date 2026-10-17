@@ -69,11 +69,12 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * consumed, the admin mint route refuses to store one, and loading warns,
  * naming an expiry that isn't a date too.
  * `null` reads as absent, as it always has, except in `maxUses`: a null count
- * has always exhausted the invite, so it is refused rather than opened. So
- * do '', false and 0 in `mode`, `caps` and `subscriptions`, which their
- * readers have always read as none; in `roles`, `uses` and `maxUses` '' threw,
- * grew as text or exhausted the invite, so it is refused. A `grant` that is
- * there must be an object, so '', 0 and false are refused there too.
+ * has always exhausted the invite, so it is refused rather than opened.
+ * '', false and 0 in `mode`, `caps` and `subscriptions` read as none too, as
+ * their readers always have, and a `uses` of false reads as 0, as a claim
+ * always read it. In `roles`, `uses` and `maxUses` '' threw, grew as text or
+ * exhausted the invite, so it is refused. A `grant` that is there must be an
+ * object, so '', 0 and false are refused there too.
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
@@ -87,7 +88,7 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
     ['caps', strings, 'must be a list of capabilities', true],
     ['roles', strings, 'must be a list of access role names'],
     ['subscriptions', strings, 'must be a list of channel ids', true],
-    ['uses', (v) => typeof v === 'number', 'must be a number'],
+    ['uses', (v) => typeof v === 'number' || v === false, 'must be a number'],
   ];
   for (const [field, ok, why, blankIsNone] of checks) {
     const v = f[field];

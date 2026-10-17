@@ -150,6 +150,8 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['caps-empty', { caps: [] }],
     ['fraction', { maxUses: 2.5, uses: 0.5 }],
     ['negative-uses', { uses: -1 }],
+    // A claim reads a uses of false as 0, and consume makes it 1.
+    ['uses-false', { uses: false }],
     ['empty-minter', { mintedBy: '' }],
   ];
   const path = tmpFile({

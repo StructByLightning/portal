@@ -440,15 +440,15 @@ test('each kind of scope, and mirrorCaps of 0, load and resolve as they always h
   rmSync(path, { force: true });
 });
 
-test('mirrorCaps of true, false, null, 0 and 1 load as they always have', () => {
+test('mirrorCaps of true, false, null, \'\', 0 and 1 load as they always have', () => {
   const path = tmpFile({
-    roles: Object.fromEntries([['on', true], ['off', false], ['nulled', null], ['zero', 0], ['one', 1]].map(([name, mc]) =>
+    roles: Object.fromEntries([['on', true], ['off', false], ['nulled', null], ['empty', ''], ['zero', 0], ['one', 1]].map(([name, mc]) =>
       [name, { caps: ['READ_HISTORY'], scope: { mirrorRole: 'r1' }, mirrorCaps: mc, guildId: 'g1' }])),
     personas: {},
   } as any);
   try {
     const store = new PermissionsStore(path);
-    for (const name of ['on', 'off', 'nulled', 'zero', 'one']) assert.notEqual(store.getRole(name), undefined, name);
+    for (const name of ['on', 'off', 'nulled', 'empty', 'zero', 'one']) assert.notEqual(store.getRole(name), undefined, name);
   } finally {
     rmSync(path, { force: true });
   }

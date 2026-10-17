@@ -2713,6 +2713,26 @@ test('a role set aside at load can be revoked from a persona by an admin of the 
   }
 });
 
+test('remove from guild takes off a role set aside at load naming that guild, and says and records it', async () => {
+  const ctx = setupDeps([]);
+  editPermissions(ctx, (f) => {
+    f.roles['aside-g1'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+    f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+    f.personas.p1.roles = ['aside-g1', 'aside-g2'];
+  });
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.call('POST', '/admin/g/G1/personas/p1/remove');
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(r.body.rolesRemoved, ['aside-g1']);
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), ['aside-g2'], 'the other guild\'s set-aside role stays');
+    const rec = ctx.deps.audit.read({ guildId: 'G1' }).find((x) => x.action === 'persona.guild.remove')!;
+    assert.deepEqual(rec.before.roles, ['aside-g1']);
+  } finally {
+    await s.close();
+  }
+});
+
 for (const asSuper of [false, true]) {
   test(`a role set aside at load naming another guild, or none it can read, is revoked by ${asSuper ? 'a super-admin' : 'no guild admin'}`, async () => {
     const ctx = setupDeps(asSuper ? ['admin1'] : []);

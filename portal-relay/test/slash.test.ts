@@ -242,8 +242,14 @@ test("/ban takes off a role set aside at load that names this guild, and leaves 
     file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2', 'aside-noguild'] };
     writeFileSync(path, JSON.stringify(file));
     (t.permissions as any).reload();
-    t.handler.handle(t.inv('ban', { persona: 'evander-1' }));
+    const audited: any[] = [];
+    (t.handler as any).deps.audit = { append: (r: unknown) => audited.push(r) };
+    const reply = t.handler.handle(t.inv('ban', { persona: 'evander-1' }));
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2', 'aside-noguild']);
+    // What the ban says and records names the role it took off.
+    assert.match(reply, /Removed guild role `aside-here`/, reply);
+    const rec = audited.find((a) => a.action === 'slash.ban');
+    assert.deepEqual(rec?.detail?.rolesRemoved, ['aside-here'], JSON.stringify(audited));
   } finally {
     t.cleanup();
   }

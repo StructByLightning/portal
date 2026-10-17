@@ -517,8 +517,13 @@ test('an invite whose grant is null reads it as absent, at enroll and at a claim
     t.relay.invites.mint({ code: 'grant-null-both', mode: 'both', grant: null, caps: [...RW], guildId: GUILD } as any);
     const enrolled = await outcome(() => t.relay.enroll({ invite: 'grant-null-mint', desiredName: 'n-null' }));
     assert.ok(enrolled?.personaId, JSON.stringify(enrolled));
+    // Read as absent, the grant falls back to the invite's legacy caps, across the guild.
+    const held = (pid: string) => t.relay.permissions.resolve(pid, GUILD, CHAN_A);
+    assert.ok(RW.every((c) => held(enrolled.personaId).has(c)), JSON.stringify([...held(enrolled.personaId)]));
+    assert.ok(!held(EXISTING).has('SEND_MESSAGES'), 'EXISTING starts with VIEW_CHANNEL alone');
     const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'grant-null-both'));
     assert.ok(!claimed?.threw, JSON.stringify(claimed));
+    assert.ok(RW.every((c) => held(EXISTING).has(c)), JSON.stringify([...held(EXISTING)]));
   } finally {
     t.cleanup();
   }
