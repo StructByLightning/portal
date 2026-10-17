@@ -1106,7 +1106,7 @@ export class AdminServer {
     // refused by name rather than dropped: a count sent as "5" would otherwise
     // be stored as unlimited, a misspelled mode as mint-only, roles that
     // aren't a list as none, and an expiry that isn't a number of days as
-    // never. Absent, null and '' mean not given, as they always have.
+    // never. Absent, null and '' mean not given.
     const given = (v: unknown) => v !== undefined && v !== null && v !== '';
     if (given(body?.roles) && !Array.isArray(body.roles)) {
       return sendJson(res, 400, err('INVALID', 'roles must be a list of access role names'));

@@ -641,24 +641,26 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
  *  number, null or '', and its scope an object naming at most one of `all`,
  *  `channels`, `mirrorRoles` and `mirrorRole`, holding that kind's type, with
  *  `all` true or off (false, 0, '' or null). Every relay writer makes one
- *  scope key, `all` true and a list of caps, and a `mirrorCaps` only as a
- *  boolean on a mirror scope: the admin API allows no other, and a mirror
- *  grant materializes one key and no `mirrorCaps`.
+ *  scope key (an `all` it makes is true), a list of caps, and a `mirrorCaps`
+ *  only as a boolean on a mirror scope: the admin API allows no other, and a
+ *  mirror grant materializes one key and no `mirrorCaps`.
  *  Every reader takes `mirrorCaps` by its truth, so a string that isn't empty
  *  reads as on whatever it says, "false" included, and so do a list and an
  *  object, which no writer means; '' reads as off, and a hand-written number
  *  reads by its truth, as one who writes 0 for off and 1 for on means it.
- *  A role that names nothing grants nothing in every reader, and the relay
- *  has always kept it as a role (roleGrantsAccess): a scope of {}, an `all`
- *  that is off, a list that names nothing, and caps that are an empty list or
- *  ''. A Discord role or channel id written as anything but a string names
- *  one its writer meant, which no reader finds, since every reader looks ids
- *  up as strings, so it is set aside where the load warning names it.
+ *  A role whose scope is {} or one kind that names nothing (an `all` that is
+ *  off, a list that names nothing, a `mirrorRole` of ''), or whose caps are
+ *  an empty list or '', grants nothing in every reader and is kept as a role
+ *  (roleGrantsAccess). A Discord role or channel id written as anything but a
+ *  string names one its writer meant, which no reader finds, since every
+ *  reader looks ids up as strings, so it is set aside, and the load warning
+ *  names the role and its malformed key.
  *  couldAccessGuild takes `all` by its truth where every
  *  other reader wants true, so an `all` of 1 or "yes" reads two ways, and
  *  readers don't share one order over a scope's keys (with `mirrorCaps`,
  *  resolveForRoles reads the mirror keys before `all`), so a scope with two
- *  keys reads one way in one place and another way in the next. Read as
+ *  keys can read one way in one place and another way in the next, and it is
+ *  set aside whatever its keys name. Read as
  *  found, a scope that is null or not an object throws whenever a persona
  *  holding the role is resolved, caps of a number throw where the role
  *  reaches, a caps string with something in it is read a character at a
@@ -682,10 +684,14 @@ export function roleShapeProblem(role: AccessRole): string | null {
   };
   const keys = Object.keys(sc);
   if (keys.length === 0) return null;
-  if (keys.length > 1) return `scope names ${keys.join(', ')}, where it may name only one of all, channels, mirrorRoles and mirrorRole`;
+  // Each key quoted, so an empty one or one holding a comma shows as itself.
+  const named = (k: string) => JSON.stringify(k);
+  if (keys.length > 1) {
+    return `scope names ${keys.slice(0, -1).map(named).join(', ')} and ${named(keys[keys.length - 1]!)}, but may name only one of all, channels, mirrorRoles and mirrorRole`;
+  }
   // Own keys only: a scope key named like an Object method (constructor,
   // __proto__) is no kind.
-  if (!Object.hasOwn(kinds, keys[0]!)) return `scope names ${keys[0]}, which is none of all, channels, mirrorRoles and mirrorRole`;
+  if (!Object.hasOwn(kinds, keys[0]!)) return `scope names ${named(keys[0]!)}, which is none of all, channels, mirrorRoles and mirrorRole`;
   return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
 }
 

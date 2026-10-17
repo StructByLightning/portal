@@ -425,7 +425,7 @@ for (const [name, role] of MALFORMED_ROLES) {
   });
 }
 
-test('each kind of scope, and mirrorCaps of 0, load and resolve as they always have', () => {
+test('each kind of scope, and mirrorCaps of 0, load and resolve', () => {
   const path = tmpFile({
     roles: {
       everywhere: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' },
@@ -442,7 +442,7 @@ test('each kind of scope, and mirrorCaps of 0, load and resolve as they always h
   rmSync(path, { force: true });
 });
 
-test('mirrorCaps of true, false, null, \'\', 0 and 1 load and read by their truth, as they always have', () => {
+test('mirrorCaps of true, false, null, \'\', 0 and 1 load and read by their truth', () => {
   const forms: Array<[string, unknown]> = [['on', true], ['off', false], ['nulled', null], ['empty', ''], ['zero', 0], ['one', 1]];
   const path = tmpFile({
     roles: Object.fromEntries(forms.map(([name, mc]) =>
@@ -464,13 +464,14 @@ test('mirrorCaps of true, false, null, \'\', 0 and 1 load and read by their trut
   }
 });
 
-test('a role that names nothing loads and grants nothing, as it always has: a scope of {}, an `all` that is off, and caps of \'\'', () => {
+test('a role that names nothing loads and grants nothing: a scope of {}, an `all` that is off, a mirrorRole of \'\', and caps of \'\'', () => {
   const nothing: Record<string, unknown> = {
     'scope-empty': { caps: ['SEND_MESSAGES'], scope: {}, guildId: 'g1' },
     'all-false': { caps: ['SEND_MESSAGES'], scope: { all: false }, guildId: 'g1' },
     'all-zero': { caps: ['SEND_MESSAGES'], scope: { all: 0 }, guildId: 'g1' },
     'all-blank': { caps: ['SEND_MESSAGES'], scope: { all: '' }, guildId: 'g1' },
     'all-null': { caps: ['SEND_MESSAGES'], scope: { all: null }, guildId: 'g1' },
+    'mirror-blank': { caps: ['SEND_MESSAGES'], scope: { mirrorRole: '' }, guildId: 'g1' },
     'caps-blank': { caps: '', scope: { all: true }, guildId: 'g1' },
   };
   const path = tmpFile({ roles: nothing, personas: { p: { roles: Object.keys(nothing) } } } as any);
@@ -484,6 +485,26 @@ test('a role that names nothing loads and grants nothing, as it always has: a sc
     }
     assert.deepEqual(sorted(store.resolve('p', 'g1', 'c1')), []);
     assert.equal(store.couldAccessGuild('p', 'g1', () => true), false);
+  } finally {
+    rmSync(path, { force: true });
+  }
+});
+
+test('the load warning says why a scope is set aside: two kinds, or a key that is no kind', (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+  const path = tmpFile({
+    roles: {
+      'two-kinds': { caps: ['SEND_MESSAGES'], scope: { all: true, mirrorRoles: ['r1'] }, guildId: 'g1' },
+      'no-kind': { caps: ['SEND_MESSAGES'], scope: { constructor: true }, guildId: 'g1' },
+    },
+    personas: {},
+  } as any);
+  try {
+    new PermissionsStore(path);
+    const said = (line: string) => assert.ok(errors.some((l) => l.includes(line)), `${line}\n${errors.join('\n')}`);
+    said(`role "two-kinds" can't be read (scope names "all" and "mirrorRoles", but may name only one of all, channels, mirrorRoles and mirrorRole)`);
+    said(`role "no-kind" can't be read (scope names "constructor", which is none of all, channels, mirrorRoles and mirrorRole)`);
   } finally {
     rmSync(path, { force: true });
   }
@@ -556,9 +577,9 @@ test('setRole refuses a role a reader could not read, as loading quarantines one
   const path = tmpFile({ personas: {} });
   const store = new PermissionsStore(path);
   assert.throws(() => store.setRole('bad', { caps: 5, scope: { all: true }, guildId: 'g1' } as never), /can't be read: caps must be a list/);
-  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope names all, channels, where it may name only one of all, channels, mirrorRoles and mirrorRole/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope names "all" and "channels", but may name only one of all, channels, mirrorRoles and mirrorRole/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 7 } as never), /can't be read: guildId must be a string/);
-  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { constructor: true }, guildId: 'g1' } as never), /can't be read: scope names constructor, which is none of all, channels, mirrorRoles and mirrorRole/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { constructor: true }, guildId: 'g1' } as never), /can't be read: scope names "constructor", which is none of all, channels, mirrorRoles and mirrorRole/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' }, mirrorCaps: 'false', guildId: 'g1' } as never), /can't be read: mirrorCaps must be true or false/);
   assert.equal(store.getRole('bad'), undefined);
   rmSync(path, { force: true });

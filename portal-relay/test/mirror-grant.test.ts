@@ -510,7 +510,7 @@ for (const blank of ['', false, 0]) {
   });
 }
 
-test('an invite whose grant is null reads it as absent, at enroll and at a claim, as it always has', async () => {
+test('an invite whose grant is null reads it as absent, at enroll and at a claim', async () => {
   const t = makeRelay();
   try {
     t.relay.invites.mint({ code: 'grant-null-mint', grant: null, caps: [...RW], guildId: GUILD } as any);
@@ -555,7 +555,7 @@ for (const [fields, why] of MALFORMED_REGISTER) {
   });
 }
 
-test('an empty or false register name, avatar or subscriptions means none, as it always has; a false avatar is stored as none', async () => {
+test('an empty or false register name, avatar or subscriptions means none, and a false avatar is stored as none', async () => {
   const t = makeRelay();
   try {
     for (const fields of [{ desiredName: '' }, { desiredName: false }, { desiredName: null }, { avatar: false }, { avatar: '' }, { subscriptions: null }, { subscriptions: '' }, { subscriptions: 0 }, { subscriptions: false }]) {

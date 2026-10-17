@@ -39,7 +39,7 @@ test('check: unknown / valid / expired / exhausted', () => {
   rmSync(path, { force: true });
 });
 
-test('a uses of false reads as 0, as it always has: a claim is allowed, and a use makes it 1', () => {
+test('a uses of false reads as 0: a claim is allowed, and a use makes it 1', () => {
   const path = tmpFile({ invites: [{ code: 'c', caps: ['VIEW_CHANNEL'], maxUses: 1, uses: false }] });
   try {
     const store = new InviteStore(path);
@@ -129,8 +129,11 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['mode-typo', { mode: 'augmnet' }, 'invite mode must be "mint", "augment" or "both"'],
     ['roles-string', { roles: 'r' }, 'invite roles must be a list of access role names'],
     ['roles-mixed', { roles: ['r', 7] }, 'invite roles must be a list of access role names'],
-    // '' in roles threw before this check; in uses it grew as text; in a count it exhausted the invite.
+    // Unchecked, a role list of '', 0 or false would throw where enroll and a claim read it, '' in uses
+    // would grow as text, and '' in a count would exhaust the invite.
     ['roles-blank', { roles: '' }, 'invite roles must be a list of access role names'],
+    ['roles-zero', { roles: 0 }, 'invite roles must be a list of access role names'],
+    ['roles-false', { roles: false }, 'invite roles must be a list of access role names'],
     ['uses-blank', { uses: '' }, 'invite uses must be a number'],
     ['count-blank', { maxUses: '' }, 'invite maxUses must be a number above 0'],
     ['subs-mixed', { subscriptions: ['c1', 5] }, 'invite subscriptions must be a list of channel ids'],
@@ -152,7 +155,7 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['plain', {}],
     ['nulls', { mintedBy: null, namePrefix: null, mode: null, subscriptions: null, uses: null, expiresAt: null }],
     ['expiry-empty', { expiresAt: '' }],
-    // Their readers have always read '', false and 0 as none.
+    // Their readers read '', false and 0 as none.
     ['blanks', { mode: '', caps: '', subscriptions: '' }],
     ['falses', { mode: false, caps: false, subscriptions: false }],
     ['zeros', { mode: 0, caps: 0, subscriptions: 0 }],

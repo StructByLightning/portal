@@ -46,11 +46,11 @@ const isMode = (v: unknown) => v === 'mint' || v === 'augment' || v === 'both';
 const MODE_RULE = 'must be "mint", "augment" or "both"';
 
 /** '', false and 0: what the readers of an invite's `mode`, `caps` and
- *  `subscriptions` have always read as none. */
+ *  `subscriptions` read as none. */
 const blank = (v: unknown) => v === '' || v === false || v === 0;
 
 /** Why an invite's mode can't be read, or null. None (absent, null, '', false
- *  or 0) reads as "mint", as it always has. */
+ *  or 0) reads as "mint". */
 export function inviteModeProblem(inv: InviteTemplate): string | null {
   const m = (inv as { mode?: unknown }).mode;
   return m === undefined || m === null || blank(m) || isMode(m) ? null : `invite mode ${MODE_RULE}`;
@@ -68,12 +68,13 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * Enroll and claim refuse such an invite before anything is created or
  * consumed, the admin mint route refuses to store one, and loading warns,
  * naming an expiry that isn't a date too.
- * `null` reads as absent, as it always has, except in `maxUses`: a null count
- * has always exhausted the invite, so it is refused rather than opened.
- * '', false and 0 in `mode`, `caps` and `subscriptions` read as none too, as
- * their readers always have, and a `uses` of false reads as 0, as a claim
- * always read it. In `roles`, `uses` and `maxUses` '' threw, grew as text or
- * exhausted the invite, so it is refused. A `grant` that is there must be an
+ * `null` reads as absent, except in `maxUses`: check() reads a null count as
+ * exhausted (0 >= null), so it is refused rather than opened. '', false and
+ * 0 in `mode`, `caps` and `subscriptions` read as none too, as their readers
+ * read them, and a `uses` of false reads as 0, as a claim reads it. In
+ * `roles`, '', 0 and false would throw where enroll and a claim read the
+ * list, and in `uses` and `maxUses` '' would grow as text or exhaust the
+ * invite, so they are refused there. A `grant` that is there must be an
  * object, so '', 0 and false are refused there too.
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
@@ -111,8 +112,8 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
 }
 
 /** When an invite expires, in ms since the epoch, or undefined for never.
- *  Only a string names an expiry: absent, null, '' and false read as none, as
- *  they always have, and any other value can't be read as a time, so it
+ *  Only a string names an expiry: absent, null, '' and false read as none,
+ *  and any other value can't be read as a time, so it
  *  counts as long expired (NaN). That includes 0, which the relay used to
  *  read as none. `Date.parse` would read a number as a date
  *  string: 2030 as 2030-01-01, 99999 as the year 99999. */

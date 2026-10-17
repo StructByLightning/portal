@@ -106,7 +106,7 @@ function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
  *  avatar that isn't a string would throw mid-enroll or be stored as sent, and
  *  subscriptions that aren't a list of channel ids would throw or be read a
  *  character at a time. An empty or false name, avatar or subscriptions ('',
- *  0, false or null) means none: the default name, as it always has, no avatar
+ *  0, false or null) means none: the default name, no avatar
  *  and no subscriptions.
  *  Checked before anything is read or created. */
 function registerFieldProblem(d: RegisterData): string | null {
