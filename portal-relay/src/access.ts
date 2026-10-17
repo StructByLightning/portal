@@ -307,6 +307,43 @@ function roleSource(name: string, role: AccessRole, caps: Set<Capability>): Acce
   };
 }
 
+// ── Removing a persona from a guild (slash /ban, the panel's Remove) ──
+
+export interface RemovedFromGuild {
+  /** The access roles of G it held, now taken away. */
+  rolesRemoved: string[];
+  /** Nothing resolves for it in G any more (the relay's own check). */
+  accessFullyRevoked: boolean;
+}
+
+/**
+ * Take a persona out of guild G: the access roles bound to G off, then
+ * PermissionsStore.clearGuild — every direct grant in G dropped, G's
+ * guild-wide level pinned to deny, and the removal recorded (`bans`), so
+ * nothing the persona does itself (claiming an invite again) gives it access
+ * there; only an admin of G giving it access lifts that. Other guilds are
+ * untouched. Slash /ban and the panel's "Remove from <guild>" both call this,
+ * so the two can't drift.
+ *
+ * Roles are guild-scoped in resolution (2026-07-31), so this IS full
+ * revocation in G; `canAccessGuild` (the relay's own test) verifies it
+ * anyway — an invariant break must surface, not hide.
+ */
+export function removeFromGuild(
+  permissions: PermissionsStore,
+  canAccessGuild: (personaId: string, guildId: string) => boolean,
+  personaId: string,
+  guildId: string,
+): RemovedFromGuild {
+  // Guild-scoped access roles off, inline guild policy pinned to deny.
+  const rolesRemoved = permissions
+    .getRoleNames(personaId)
+    .filter((name) => permissions.getRole(name)?.guildId === guildId);
+  for (const name of rolesRemoved) permissions.removePersonaRole(personaId, name);
+  permissions.clearGuild(personaId, guildId);
+  return { rolesRemoved, accessFullyRevoked: !canAccessGuild(personaId, guildId) };
+}
+
 // ── Counting: who can act where, by level ──
 
 export interface LevelCounts {

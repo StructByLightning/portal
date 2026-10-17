@@ -40,7 +40,7 @@ import type { AccessRole, AdminConfig, GuildPolicy, PersonaIdentity, Scope } fro
 import type { Capability } from '@animalabs/portal-protocol';
 import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
 import {
-  LEVEL_CAPS, accessSummary, countedLevel, explainFor, isGrantable, levelOf, subjectOf, zeroCounts,
+  LEVEL_CAPS, accessSummary, countedLevel, explainFor, isGrantable, levelOf, removeFromGuild, subjectOf, zeroCounts,
   type AccessDeps, type AccessSource, type Explained, type LevelCounts, type Subject,
 } from '../access.js';
 import type { IdentityStore } from '../identity.js';
@@ -68,6 +68,9 @@ const SUMMARY_TTL_MS = 5_000;
 const DIRECTORY_ROWS = 25;
 /** A bulk change's id, kept in the audit record of each of its writes. */
 const BATCH_ID = /^[A-Za-z0-9_-]{1,32}$/;
+/** How often one persona can be resynced from the panel (slash /resync has
+ *  no limit: it is unchanged). */
+export const RESYNC_EVERY_MS = 10_000;
 
 /** New access-role names. Existing names that don't fit are kept (and can be
  *  replaced under the same name). */
@@ -175,9 +178,11 @@ export function accessDepsOf(deps: AdminDeps): AccessDeps {
   };
 }
 
-/** Limits a test can lower. */
+/** Limits a test can lower, and the clock it can drive. */
 export interface AdminLimits {
   accessCellCap?: number;
+  /** Milliseconds since the epoch (default Date.now). */
+  clock?: () => number;
 }
 
 export class AdminServer {
@@ -193,6 +198,9 @@ export class AdminServer {
   /** Access summaries by guild, reused for SUMMARY_TTL_MS. */
   private summaries = new Map<string, { at: number; body: Record<string, unknown> }>();
   private accessCellCap: number;
+  private clock: () => number;
+  /** When each persona was last resynced from the panel (RESYNC_EVERY_MS). */
+  private resynced = new Map<string, number>();
   /** The access model and capsFor disagreed once (said once, loudly). */
   private driftReported = false;
 
@@ -205,6 +213,7 @@ export class AdminServer {
     this.sessions = new SessionStore(deps.config.sessionTtlMs);
     this.audit = deps.audit;
     this.accessCellCap = limits.accessCellCap ?? ACCESS_CELL_CAP;
+    this.clock = limits.clock ?? Date.now;
     // Whoever changed it — this panel, slash, an invite, the file — a
     // summary counted before is no longer what the relay enforces.
     deps.permissions.onChange(() => this.summaries.clear());
@@ -398,6 +407,16 @@ export class AdminServer {
     const claim = /^\/personas\/([^/]+)\/claim$/.exec(sub);
     if (method === 'POST' && claim) {
       return this.claimForPersona(res, session, guildId, decodeURIComponent(claim[1]), await readJson(req));
+    }
+    // POST /admin/g/:gid/personas/:id/remove  (what slash /ban does in G)
+    const remove = /^\/personas\/([^/]+)\/remove$/.exec(sub);
+    if (method === 'POST' && remove) {
+      return this.removePersonaFromGuild(res, session, guildId, decodeURIComponent(remove[1]));
+    }
+    // POST /admin/g/:gid/personas/:id/resync  (what slash /resync does, rate limited)
+    const resync = /^\/personas\/([^/]+)\/resync$/.exec(sub);
+    if (method === 'POST' && resync) {
+      return this.resyncPersona(res, session, guildId, decodeURIComponent(resync[1]));
     }
     // NB: persona token lifecycle is intentionally NOT here — it's a global,
     // super-admin-only action at /admin/personas/:id/token (RFC-005 §5.9).
@@ -896,13 +915,11 @@ export class AdminServer {
     const labels = clipToGuild(await this.channelLabels(away), guildId);
     // Anything not known to be G's reads alike: deleted, hidden, elsewhere.
     for (const cid of away) if (labels[cid]?.guildId !== guildId) labels[cid] = { id: cid, name: null, unavailable: true };
-    const blocksSomething = ((g?.default ?? pol?.default) ?? []).length > 0;
-    const inactive: Array<{ channelId: string; caps: Capability[]; reason: 'thread' | 'category' | 'missing' | 'blocks-nothing' }> = [];
+    const blocks = blocksSomething(g, pol);
+    const inactive: Array<{ channelId: string; caps: Capability[]; reason: InactiveReason }> = [];
     for (const [cid, caps] of Object.entries(g?.channels ?? {})) {
-      const type = byId.get(cid)?.type ?? labels[cid]?.type;
-      if (type === 'thread' || type === 'category') inactive.push({ channelId: cid, caps, reason: type });
-      else if (!byId.has(cid)) inactive.push({ channelId: cid, caps, reason: 'missing' });
-      else if (!caps.length && isGrantable(type) && !blocksSomething) inactive.push({ channelId: cid, caps, reason: 'blocks-nothing' });
+      const reason = inactiveReason(caps, byId.get(cid)?.type ?? labels[cid]?.type, byId.has(cid), blocks);
+      if (reason) inactive.push({ channelId: cid, caps, reason });
     }
     const roles = (s.entry?.roles ?? [])
       .filter((name, i, all) => all.indexOf(name) === i && this.deps.permissions.getRole(name)?.guildId === guildId)
@@ -1010,16 +1027,22 @@ export class AdminServer {
     }).length;
   }
 
-  /** Personas with any possible access in the guild (trimmed for the table). */
+  /** Personas with any possible access in the guild (trimmed for the table),
+   *  with what the list flags: a guild-wide deny, and how many of its direct
+   *  grants here do nothing (as …/personas/:pid/access lists them). */
   private personasFor(guildId: string, q?: string, isSuper = false): any[] {
-    const channelIds = new Set(this.deps.listChannels(guildId).map((c) => c.id));
-    const inGuild = (cid: string) => channelIds.has(cid);
+    const byId = new Map(this.deps.listChannels(guildId).map((c) => [c.id, c] as const));
+    const inGuild = (cid: string) => byId.has(cid);
     const out: any[] = [];
     for (const p of this.deps.identity.all()) {
       if (!this.deps.permissions.couldAccessGuild(p.id, guildId, inGuild)) continue;
       if (q && !matches(q, p.id, p.displayName)) continue;
       const entry = this.deps.permissions.getEntry(p.id);
-      const directGrants = directGrantsIn(entry?.policy?.guilds?.[guildId]);
+      const g = entry?.policy?.guilds?.[guildId];
+      const directGrants = directGrantsIn(g);
+      const blocks = blocksSomething(g, entry?.policy);
+      const inactiveGrants = Object.entries(g?.channels ?? {})
+        .filter(([cid, caps]) => inactiveReason(caps, byId.get(cid)?.type, byId.has(cid), blocks) !== null).length;
       out.push({
         id: p.id,
         displayName: p.displayName,
@@ -1029,6 +1052,8 @@ export class AdminServer {
         // A grant that gives something here, in a channel or guild-wide.
         hasOverride: directGrants === 'grants',
         directGrants,
+        guildWideDenied: Array.isArray(g?.default) && g.default.length === 0,
+        inactiveGrants,
       });
     }
     return out;
@@ -1327,6 +1352,51 @@ export class AdminServer {
     }
     this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
+  }
+
+  /**
+   * Remove a persona from G: exactly what slash /ban does there (one shared
+   * function, access.ts removeFromGuild) — G's access roles off, every direct
+   * grant in G dropped, G's guild-wide level pinned to deny, and the removal
+   * recorded, so the persona can't give itself access in G again (claiming an
+   * invite won't); only an admin of G can, by giving it access. Nothing in
+   * another guild changes. ok in the audit record is the relay's own check
+   * that nothing resolves for it in G any more.
+   */
+  private removePersonaFromGuild(res: ServerResponse, session: AdminSession, guildId: string, personaId: string): void {
+    if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
+    const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
+    const done = removeFromGuild(this.deps.permissions, (p, g) => this.deps.canAccessGuild(p, g), personaId, guildId);
+    this.audit.append({
+      actor: this.actorOf(session), action: 'persona.guild.remove', target: personaId, guildId, ok: done.accessFullyRevoked,
+      before: { roles: done.rolesRemoved, guildPolicy },
+      after: { accessFullyRevoked: done.accessFullyRevoked },
+    });
+    sendJson(res, 200, { rolesRemoved: done.rolesRemoved, accessFullyRevoked: done.accessFullyRevoked });
+  }
+
+  /**
+   * Re-send a persona's channel list to its running agent (slash /resync).
+   * It changes no rights. At most once per RESYNC_EVERY_MS per persona (429
+   * RATE_LIMITED {retryAfterMs}), so it can't be used to churn agents; how
+   * many channels went out — counted over every guild the relay serves — is
+   * told to super-admins only.
+   */
+  private resyncPersona(res: ServerResponse, session: AdminSession, guildId: string, personaId: string): void {
+    if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
+    const now = this.nowMs();
+    const last = this.resynced.get(personaId);
+    if (last !== undefined && now >= last && now - last < RESYNC_EVERY_MS) {
+      return sendJson(res, 429, err('RATE_LIMITED', 'this persona was resynced a moment ago', { retryAfterMs: RESYNC_EVERY_MS - (now - last) }));
+    }
+    if (this.resynced.size > 1000) {
+      for (const [pid, at] of this.resynced) if (now - at >= RESYNC_EVERY_MS || now < at) this.resynced.delete(pid);
+    }
+    this.resynced.set(personaId, now);
+    const pushed = this.deps.resync(personaId);
+    // The count is left out of the record: a guild's audit is read by its admins.
+    this.audit.append({ actor: this.actorOf(session), action: 'persona.resync', target: personaId, guildId, ok: true });
+    sendJson(res, 200, { ok: true, ...(session.isSuper ? { pushed } : {}) });
   }
 
   /** Global persona-token lifecycle (super-admin only; no guildId — it's not a
@@ -1894,7 +1964,7 @@ export class AdminServer {
   }
 
   private nowMs(): number {
-    return Date.now();
+    return this.clock();
   }
 }
 
@@ -2017,6 +2087,25 @@ function directGrantsIn(g: GuildPolicy | undefined): 'none' | 'grants' | 'denied
   const gives = (g.default?.length ?? 0) > 0 || Object.values(g.channels ?? {}).some((caps) => caps.length > 0);
   if (gives) return 'grants';
   return Array.isArray(g.default) ? 'denied' : 'none';
+}
+
+type InactiveReason = 'thread' | 'category' | 'missing' | 'blocks-nothing';
+
+/** Would an empty direct grant (a block) in G block anything: is there a
+ *  guild-wide level, or else a persona default, that gives something? */
+function blocksSomething(g: GuildPolicy | undefined, pol: { default?: Capability[] } | undefined): boolean {
+  return ((g?.default ?? pol?.default) ?? []).length > 0;
+}
+
+/** Why a direct grant in G does nothing, or null when it does something: on
+ *  a thread (it uses its parent's access), a category (it grants nothing), a
+ *  channel G doesn't have now (`known` false), or a block with nothing to
+ *  block. `type` is the channel's kind, when known. */
+function inactiveReason(caps: Capability[], type: string | undefined, known: boolean, blocks: boolean): InactiveReason | null {
+  if (type === 'thread' || type === 'category') return type;
+  if (!known) return 'missing';
+  if (!caps.length && isGrantable(type) && !blocks) return 'blocks-nothing';
+  return null;
 }
 
 /** A grant change's optional fields: `expect` — what the panel last saw at

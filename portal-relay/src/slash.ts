@@ -19,7 +19,7 @@
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
 import { roleGrantsAccess, type PermissionsStore } from './permissions.js';
-import { LEVEL_CAPS, capsLabel, contributingRoles } from './access.js';
+import { LEVEL_CAPS, capsLabel, contributingRoles, removeFromGuild } from './access.js';
 import type { InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
@@ -424,16 +424,12 @@ export class SlashHandler {
   private ban(inv: SlashInvocation): string {
     const persona = this.target(inv);
     if (typeof persona === 'string') return persona;
-    // Guild-scoped access roles off, inline guild policy pinned to deny.
-    const guildRoles = this.deps.permissions
-      .getRoleNames(persona.id)
-      .filter((name) => this.deps.permissions.getRole(name)?.guildId === inv.guildId);
-    for (const name of guildRoles) this.deps.permissions.removePersonaRole(persona.id, name);
-    this.deps.permissions.clearGuild(persona.id, inv.guildId);
-    // Roles are guild-scoped in resolution (2026-07-31), so removing this
-    // guild's roles + pinning the inline policy to deny IS full revocation
-    // here. Verify anyway — an invariant break must surface, not hide.
-    const stillHasAccess = this.deps.canAccessGuild(persona.id, inv.guildId);
+    // The one removal the panel's "Remove from <guild>" makes too: this
+    // guild's access roles off, its inline policy pinned to deny, the ban
+    // recorded — and verified (access.ts removeFromGuild).
+    const removed = removeFromGuild(this.deps.permissions, (p, g) => this.deps.canAccessGuild(p, g), persona.id, inv.guildId);
+    const guildRoles = removed.rolesRemoved;
+    const stillHasAccess = !removed.accessFullyRevoked;
     this.audit(inv, 'slash.ban', persona.id, !stillHasAccess, {
       rolesRemoved: guildRoles,
       accessFullyRevoked: !stillHasAccess,
