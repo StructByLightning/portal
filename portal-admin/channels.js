@@ -575,6 +575,20 @@ function drawDrawer(d, gid, cid, data, note) {
   ])]);
   const whoEmpty = el('p', { class: 'empty-note hidden', text: 'Nobody can act here yet' + (grantable ? ' — add a persona above.' : '.') });
   const undos = undoBook();
+  /** Custom… editors open in rows, not applied (persona id → { caps, start },
+   *  the last touched last): drawn open again by every redraw until Apply or
+   *  Cancel, and unsaved once ticked away from where they started — so
+   *  closing the drawer asks, and Sign in again keeps the last one. */
+  const edits = new Map();
+  const editTouched = [];
+  const ctrlOf = new Map(); // persona id → its row's control as drawn now
+  const editChanged = (e) => !!e && !lib.sameCapSet(e.caps, e.start);
+  d.trackDirty(() => Array.from(edits.values()).some(editChanged));
+  function noteEdit(pid, e) {
+    edits.delete(pid); // re-set: the last touched is last
+    if (e) edits.set(pid, e);
+    for (const fn of editTouched) fn();
+  }
 
   /** A result about one persona, on the line under its row (where the
    *  change was made); at the top of the table when it has none. */
@@ -595,13 +609,20 @@ function drawDrawer(d, gid, cid, data, note) {
     const chips = lib.sourceChips(row, names, { isSuper: env.isSuper(), guild });
     // A channel the panel can't give access on: a direct grant stored there
     // (slash /add run in its chat) can still be removed.
+    const pid = row.personaId;
     const control = grantable || row.direct !== null ? ui.directGrantControl({
       value: row.direct,
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + name + ' in ' + where,
-      apply: (next) => change(row.personaId, next),
+      key: 'dg:' + pid,
+      apply: (next) => change(pid, next),
       removeOnly: !grantable,
+      editing: grantable ? edits.get(pid) || null : null,
+      // Only the row's control as drawn now speaks for it.
+      onEditing: (e) => { if (ctrlOf.get(pid) === control) noteEdit(pid, e); },
     }) : null;
+    if (control) ctrlOf.set(pid, control);
+    else ctrlOf.delete(pid);
     return el('tr', { 'data-pid': row.personaId, class: eff.length ? null : 'who-none' }, [
       el('td', { 'data-label': 'Persona' }, [el('span', { class: 'who-name' }, [
         env.avatarThumb(row.avatarUrl, ''),
@@ -620,8 +641,16 @@ function drawDrawer(d, gid, cid, data, note) {
 
   function drawRows() {
     const keep = statusRow.classList.contains('hidden') ? null : statusRow.previousSibling && statusRow.previousSibling.dataset ? statusRow.previousSibling.dataset.pid : null;
+    // Focus on a row's control (its select, a box of its open Custom…) comes
+    // back to the same one drawn again.
+    const a = document.activeElement;
+    const focusKey = a && tbody.contains(a) && a.dataset ? a.dataset.key || null : null;
     clear(tbody);
     for (const r of rows) tbody.appendChild(rowTr(r));
+    if (focusKey) {
+      const hit = Array.from(tbody.querySelectorAll('[data-key]')).find((x) => x.dataset.key === focusKey);
+      if (hit) hit.focus();
+    }
     const n = rows.filter((r) => Array.isArray(r.effective) && r.effective.length).length;
     whoHead.textContent = 'Who can act here (' + n + ')';
     whoTable.classList.toggle('hidden', !rows.length);
@@ -737,8 +766,9 @@ function drawDrawer(d, gid, cid, data, note) {
    *  lifted }), or null where nothing could put it back (a channel the panel
    *  can't give access on). `base`: what is known of a persona without a row
    *  here (the Add pick: name, picture, whether the directory said it was
-   *  removed from the guild). `lift`: the admin was asked, and chose to lift
-   *  its removal from the guild. */
+   *  removed from the guild). `refocus`: the change came from the row's own
+   *  control. `lift`: the admin was asked, and chose to lift its removal
+   *  from the guild. */
   async function send(pid, name, next, base, refocus, lift) {
     const row = rowOf(pid);
     const expect = row ? row.direct : null;
@@ -747,6 +777,9 @@ function drawDrawer(d, gid, cid, data, note) {
     try {
       const r = await enqueue(() => writeGrant(gid, pid, cid, next, expect, { lift }), paused(pid));
       learnNames(r);
+      // Saved from the row's own control: a Custom… edit it applied is done
+      // (the row is drawn again with it closed).
+      if (refocus) edits.delete(pid);
       const ex = r && r.effective;
       const fresh = rowFrom(pid, row || base, ex);
       if (fresh) put(fresh, refocus);
@@ -1022,8 +1055,9 @@ function drawDrawer(d, gid, cid, data, note) {
       syncCurrently();
     }
 
-    // Kept across "Sign in again": whom to add and at what level.
-    env.keepForm(d, 'chanAdd', {
+    // Kept across "Sign in again": whom to add and at what level — or a
+    // row's Custom… edit, whichever with changes was touched last.
+    const addHooks = {
       serialize: () => ({ personas: ta.values(), caps: level.value() }),
       restore(fl) {
         if (fl.caps) level.set(fl.caps);
@@ -1031,7 +1065,32 @@ function drawDrawer(d, gid, cid, data, note) {
         syncCurrently();
       },
       isDirty: () => tracker.isDirty(),
-    }, addStatus);
+    };
+    const customHooks = {
+      serialize() {
+        const changed = Array.from(edits.entries()).filter(([, e]) => editChanged(e));
+        const last = changed[changed.length - 1];
+        return last ? { personaId: last[0], channelId: cid, caps: last[1].caps.slice() } : {};
+      },
+      // It comes back open — never applied — in this channel's drawer, on a
+      // row that is still here.
+      belongs: (f) => f.channelId === cid && typeof f.personaId === 'string' && !!rowOf(f.personaId),
+      restore(f) {
+        const row = rowOf(f.personaId);
+        edits.set(f.personaId, { caps: (f.caps || []).slice(), start: ui.customStart(row ? row.direct : null) });
+        restoredPid = f.personaId;
+        drawRows();
+      },
+      isDirty: () => Array.from(edits.values()).some(editChanged),
+    };
+    let restoredPid = null;
+    const restoredAdd = env.keepForm(d, 'chanAdd', addHooks, addStatus);
+    // 'Restored your unsaved change…' under the row it is in.
+    const restoredCustom = env.keepForm(d, 'dgCustom', customHooks, { info: (msg) => report('info', msg, null, restoredPid) });
+    if (restoredAdd && !restoredCustom) d.registerForm('chanAdd', addHooks);
+    ta.onChange(() => d.registerForm('chanAdd', addHooks));
+    level.onChange(() => d.registerForm('chanAdd', addHooks));
+    editTouched.push(() => d.registerForm('dgCustom', customHooks));
     syncCurrently();
     addSection = el('section', { class: 'drawer-section' }, [el('h3', { text: 'Add personas' }), form]);
   }

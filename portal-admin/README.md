@@ -75,8 +75,10 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     would lower access that came from guild-wide or a default. A change made
     meanwhile elsewhere is refused and the rows are read again. A newer change
     to the same persona retires the older one's Undo, and an Undo's outcome
-    is said where its change was. On a channel of a kind the panel can't give
-    access on, a direct grant set in Discord can only be removed;
+    is said where its change was. A *Custom…* edit stays open — through a
+    redraw after another row's change — until *Apply* or *Cancel*, and
+    counts as unsaved once a box is ticked. On a channel of a kind the panel
+    can't give access on, a direct grant set in Discord can only be removed;
   - the slash equivalent, and *Invite a new agent here*.
   Opening a thread's address shows its channel ("Threads use #research's
   access."); a category's opens the list with that category unfolded.
@@ -196,7 +198,9 @@ the relay refuses with 401 never throws the page away: "Your session ended"
 comes up over it — "this change was NOT saved" after a change — and the page
 and any open form stay as they were. **Sign in again** keeps this address and
 the open form's unsaved fields (only the fields listed in `PA.lib.DRAFT_FORMS`:
-never an invite code, a token or a picture) in `sessionStorage`, and goes
+never an invite code, a token or a picture) — the last-touched form with
+changes, or a row's *Custom…* edit not yet applied, which comes back open and
+is never applied by itself — in `sessionStorage`, and goes
 through Discord; back in the panel, the same admin within 30 minutes gets the
 same place and the form filled in again, with "Restored your unsaved change —
 review and save. Nothing was submitted." Nothing is ever sent again by itself.
@@ -425,8 +429,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
 - Keyboard: `/` focuses the active search box. Tabs, channel rows and
   persona names are links. A type-ahead opens its list as you type (or with
   `↓`); `↑`/`↓` move, `Enter` picks, `Esc` closes the list (the next `Esc` is
-  the drawer's), `Backspace` in the empty field removes the last pick. In the drawer, `Esc` (or a click on the dimmed page) asks "Discard
-  changes?" when a form has unsaved edits, otherwise leaves a focused field,
+  the drawer's), `Backspace` in the empty field removes the last pick. On a
+  direct grant, a step with the arrow keys is held until `Enter` (or leaving
+  the control) applies it; `Esc` puts back what is set, and the next `Esc` is
+  the drawer's. In the drawer, `Esc` (or a click on the dimmed page) asks "Discard
+  changes?" when a form (or a *Custom…* edit) has unsaved edits, otherwise leaves a focused field,
   otherwise closes the drawer and puts focus back on the link that opened it.
   `Tab` stays inside the drawer and dialogs; `Enter` submits the section's form.
 - Below 640px wide the top bar wraps, the Personas list and both drawers'

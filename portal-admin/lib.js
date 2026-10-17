@@ -1443,6 +1443,10 @@
     chanAdd: { personas: (v) => Array.isArray(v) && v.length <= 10 && v.every(isPersonaId), caps: FIELD.caps },
     // The persona drawer's Add to channels: whose, where (at most 50) and what level.
     personaAdd: { personaId: isPersonaId, channels: (v) => Array.isArray(v) && v.length <= 50 && v.every(isSnowflake), caps: FIELD.caps },
+    // A Custom… editor open in a row of either drawer, not applied: whose
+    // direct grant, in which channel, and the boxes ticked. It comes back
+    // open, never applied.
+    dgCustom: { personaId: isPersonaId, channelId: isSnowflake, caps: FIELD.caps },
     // Defining an access role.
     role: {
       name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,

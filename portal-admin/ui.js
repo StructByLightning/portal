@@ -994,6 +994,12 @@
     return el('span', { class: 'pill pill-' + p.level + (p.limited ? ' pill-limited' : ''), title: p.title, text: p.text });
   }
 
+  /** Where Custom… starts for a direct grant `value`: what is set, or
+   *  Write when nothing (or a block) is. */
+  function customStart(value) {
+    return value && value.length ? value.slice() : PA.lib.LEVEL_CAPS.write.slice();
+  }
+
   /**
    * A persona's direct grant in one channel, changed in place:
    * [— | Read | Write | Full | Custom… | Block guild-wide here]. A pick
@@ -1010,12 +1016,24 @@
    * what it shows; Esc puts back what is set (inside a drawer too: the
    * drawer's own Esc waits for the next one). A pick with the mouse, or
    * from the open list, applies at once.
+   * The Custom… editor's ticks are the admin's until Apply or Cancel: the
+   * owner keeps them (opts.onEditing) and hands them back when it draws the
+   * row again (opts.editing), so a redraw never drops them, and counts them
+   * as unsaved once they differ from where the editor started.
    *   opts: { value (caps | null), canBlock, label (the select's name), apply,
+   *           key (data-key for the select — and, from it, the editor's
+   *           boxes and buttons — so a redraw can give focus back),
    *           busy (drawn while a change to it is still being saved
    *           elsewhere: off, and aria-busy, until setBusy(false)),
    *           removeOnly (a channel the panel can't give access on: what is
-   *           set, or — to remove it; nothing else) }
-   * Returns { node, select, value(), set(value, canBlock), setBusy(on) }.
+   *           set, or — to remove it; nothing else),
+   *           editing ({ caps, start }: a Custom… edit open in this row
+   *           before it was drawn again — reopened as it was),
+   *           onEditing (fn({ caps, start } | null): the open Custom…
+   *           editor, as it opens and as its boxes are ticked; null once it
+   *           closes — applied, cancelled, or another pick made) }
+   * Returns { node, select, value(), editing(), set(value, canBlock,
+   * keepEditing), setBusy(on) }.
    */
   function directGrantControl(opts) {
     const lib = PA.lib;
@@ -1025,8 +1043,9 @@
     let held = false;     // a keyboard step shown, not applied yet
     let stepping = false; // a step key was just pressed: its 'change' is held
     let stepTimer = null;
+    let editing = null;   // the open Custom… editor: { caps, start }
     const label = opts.label || 'Direct grant';
-    const select = el('select', { class: 'dg-select', 'aria-label': label, 'data-no-dirty': true });
+    const select = el('select', { class: 'dg-select', 'aria-label': label, 'data-no-dirty': true, 'data-key': opts.key || null });
     const edit = el('button', { class: 'btn btn-sm btn-ghost hidden', text: 'Edit…', 'aria-label': 'Edit capabilities — ' + label });
     const heldHint = el('span', { class: 'field-hint dg-held hidden', text: 'Enter to apply · Esc to cancel' });
     const editorBox = el('div', { class: 'dg-custom hidden' });
@@ -1063,13 +1082,28 @@
     function closeEditor() {
       clear(editorBox);
       editorBox.classList.add('hidden');
+      if (!editing) return;
+      editing = null;
+      if (opts.onEditing) opts.onEditing(null);
     }
-    function openEditor() {
+    /** Open Custom…: from what is set (Write when nothing is), or — `was`,
+     *  an edit made before this row was drawn again — as it was left. */
+    function openEditor(was) {
       closeEditor();
-      const start = value && value.length ? value : lib.LEVEL_CAPS.write;
-      const editor = capsEditor({ value: start });
-      const apply = el('button', { class: 'btn btn-sm btn-primary', text: 'Apply' });
-      const cancel = el('button', { class: 'btn btn-sm', text: 'Cancel' });
+      const start = was && Array.isArray(was.start) ? was.start.slice() : customStart(value);
+      const editor = capsEditor({ value: was && Array.isArray(was.caps) ? was.caps : start });
+      const keyed = (n, k) => {
+        if (opts.key) n.setAttribute('data-key', opts.key + ':' + k);
+        return n;
+      };
+      for (const cb of editor.node.querySelectorAll('input')) keyed(cb, cb.value);
+      const report = () => {
+        editing = { caps: editor.value(), start: start.slice() };
+        if (opts.onEditing) opts.onEditing({ caps: editing.caps.slice(), start: start.slice() });
+      };
+      editor.onChange(report);
+      const apply = keyed(el('button', { class: 'btn btn-sm btn-primary', text: 'Apply' }), 'apply');
+      const cancel = keyed(el('button', { class: 'btn btn-sm', text: 'Cancel' }), 'cancel');
       const why = el('span', { class: 'field-hint', role: 'status' });
       apply.addEventListener('click', () => {
         const caps = editor.value();
@@ -1088,6 +1122,9 @@
         editor.node, el('div', { class: 'inline' }, [apply, cancel, why]),
       ]));
       editorBox.classList.remove('hidden');
+      // Reopened as it was, the owner has it already; opened now, it is told.
+      if (was) editing = { caps: editor.value(), start: start.slice() };
+      else report();
     }
     async function run(next) {
       if (busyNow) return;
@@ -1155,7 +1192,7 @@
       }
       commit();
     });
-    edit.addEventListener('click', openEditor);
+    edit.addEventListener('click', () => openEditor(null));
     if (opts.busy) {
       busyNow = true;
       select.disabled = true;
@@ -1164,14 +1201,22 @@
     }
     fill();
     if (opts.busy) select.disabled = true;
+    if (opts.editing && !opts.removeOnly) {
+      openEditor(opts.editing);
+      select.value = 'custom'; // as it read when Custom… was picked
+    }
     return {
       node,
       select,
       value: () => (value == null ? null : value.slice()),
-      set(v, cb) {
+      /** The open Custom… editor ({ caps, start }), or null. */
+      editing: () => (editing ? { caps: editing.caps.slice(), start: editing.start.slice() } : null),
+      /** What is set is now `v`. An open Custom… editor closes, unless
+       *  `keepEditing` (a change that wasn't made leaves the admin's ticks). */
+      set(v, cb, keepEditing) {
         value = v == null ? null : v.slice();
         if (cb !== undefined) canBlock = !!cb;
-        closeEditor();
+        if (!keepEditing) closeEditor();
         fill();
       },
       /** Drawn busy (opts.busy): on again once that change is done. */
@@ -1315,7 +1360,7 @@
       const returnFocus = current ? current.returnFocus : a && !d.drawer.contains(a) ? a : null;
       // A drawer replaced by this one takes its questions with it.
       if (current) for (const cancel of [...current.dialogs]) cancel(false);
-      current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus, dialogs: new Set() };
+      current = { token: ++drawerSeq, trackers: [], forms: [], onClose: opts.onClose || null, returnFocus, dialogs: new Set() };
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
@@ -1347,14 +1392,22 @@
           if (handle.isCurrent()) current.trackers.push(t);
           return t;
         },
+        /** Count unsaved state that isn't a form's fields toward "Discard
+         *  changes?": isDirty() says whether there is any. */
+        trackDirty(isDirty) {
+          if (handle.isCurrent()) current.trackers.push({ isDirty });
+        },
         /**
-         * The form whose unsaved state "Sign in again" keeps: key names its
+         * A form whose unsaved state "Sign in again" keeps: key names its
          * draft schema (PA.lib.DRAFT_FORMS); serialize() → its fields;
          * restore(fields) puts them back; isDirty() (optional) says whether
-         * there is anything to keep. The last form registered is the one kept.
+         * there is anything to keep. One form is kept: the one registered
+         * (or registered again — on a touch) last that has anything to keep.
          */
         registerForm(key, hooks) {
-          if (handle.isCurrent()) current.form = Object.assign({ key }, hooks);
+          if (!handle.isCurrent()) return;
+          current.forms = current.forms.filter((f) => f.key !== key);
+          current.forms.push(Object.assign({ key }, hooks));
         },
       };
       handle.setTitle(opts.title || '', opts.subtitle);
@@ -1373,9 +1426,14 @@
 
     isDirty: () => !!current && current.trackers.some((t) => t.isDirty()),
 
-    /** The registered form of the open drawer ({ key, serialize, restore,
-     *  isDirty }), or null. */
-    activeForm: () => (current && current.form) || null,
+    /** The form of the open drawer a sign-in keeps ({ key, serialize,
+     *  restore, isDirty }): the last registered with unsaved changes, else
+     *  the last registered; null when none is. */
+    activeForm() {
+      const forms = current ? current.forms : [];
+      for (let i = forms.length - 1; i >= 0; i--) if (!forms[i].isDirty || forms[i].isDirty()) return forms[i];
+      return forms.length ? forms[forms.length - 1] : null;
+    },
 
     /** Close now, without asking. `reason` reaches onClose (the app tells a
      *  close it asked for from one the admin did: ✕, Esc, the scrim). */
@@ -1637,6 +1695,7 @@
     radioGroup,
     typeahead,
     levelPill,
+    customStart,
     directGrantControl,
     copyText,
     dirtyTracker,

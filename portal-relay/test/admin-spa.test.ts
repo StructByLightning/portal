@@ -5922,3 +5922,120 @@ test('channel drawer: a read of the channel is not drawn over a newer read, nor 
   await settle();
   assert.match(tr('sol').textContent, /Full/, 'not drawn over by the older read');
 });
+
+/** A row's Custom… editor: its boxes by capability, and its buttons. */
+function customIn(row: FakeElement) {
+  const box = (cap: string) => row.querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === cap) ?? null;
+  const tick = (cap: string, on = true) => {
+    const b = box(cap)!;
+    b.checked = on;
+    b.fire('change');
+  };
+  const button = (text: string) => row.querySelectorAll('button').find((b) => b.textContent === text)!;
+  return { box, tick, button, open: () => !!row.querySelector('.dg-editor') };
+}
+
+test('persona drawer: a Custom… edit not applied counts as unsaved — closing asks — and a redraw after another row’s change keeps it open, ticks and all', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { tr, setDirectIn, ctx, doc, bodies } = box;
+  const drawer = ctx.PA.ui.drawer;
+  setDirectIn(CH.research, 'custom');
+  assert.ok(customIn(tr(CH.research)).open(), 'Custom… is open');
+  assert.equal(drawer.isDirty(), false, 'opened, nothing ticked yet: nothing unsaved');
+  customIn(tr(CH.research)).tick('MENTION_EVERYONE');
+  assert.equal(drawer.isDirty(), true, 'a tick not applied is unsaved');
+  // Another row's change reads the persona again and draws the table again.
+  setDirectIn(CH.general, 'read');
+  await settle();
+  const c = customIn(tr(CH.research));
+  assert.ok(c.open(), 'still open after the redraw');
+  assert.equal(c.box('MENTION_EVERYONE')!.checked, true, 'with the tick');
+  assert.equal(tr(CH.research).querySelector('select')!.value, 'custom', 'the select still reads Custom…');
+  assert.equal(drawer.isDirty(), true, 'still unsaved');
+  // Closing asks; Cancel keeps it.
+  clickable(doc, '✕', doc.getElementById('drawer')!).click();
+  await settle();
+  const modal = doc.querySelector('.modal')!;
+  assert.equal(modal.querySelector('h2')!.textContent, 'Discard changes?');
+  clickable(doc, 'Cancel', modal).click();
+  await settle();
+  assert.ok(customIn(tr(CH.research)).open(), 'kept');
+  // Apply sends it; then nothing is unsaved.
+  customIn(tr(CH.research)).button('Apply').click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, caps: ALL_CAPS.filter((x) => [...W8, 'MENTION_EVERYONE'].includes(x)), expect: W8 });
+  assert.ok(!customIn(tr(CH.research)).open(), 'closed once applied');
+  assert.equal(drawer.isDirty(), false, 'nothing unsaved');
+  // Cancel drops an edit, and with it the question.
+  setDirectIn(CH.general, 'custom');
+  customIn(tr(CH.general)).tick('MANAGE_MESSAGES');
+  assert.equal(drawer.isDirty(), true);
+  customIn(tr(CH.general)).button('Cancel').click();
+  assert.equal(drawer.isDirty(), false, 'cancelled: nothing unsaved');
+});
+
+test('channel drawer: a Custom… edit not applied counts as unsaved, and a read of the channel again keeps it open, ticks and all', async () => {
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    handle: (method, path) => {
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/cass/grants') return refuse(409, 'CONFLICT', 'changed', { current: null });
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/aria/grants') return echo(F7, [{ kind: 'direct', caps: F7 }], F7);
+      return undefined;
+    },
+  });
+  const { rowLink, tr, pick, ctx, doc, bodies, calls } = box;
+  const drawer = ctx.PA.ui.drawer;
+  rowLink(CH.research).click();
+  await settle();
+  pick('aria', 'custom');
+  customIn(tr('aria')).tick('MENTION_EVERYONE');
+  assert.equal(drawer.isDirty(), true, 'a tick not applied is unsaved');
+  // Cass's change is refused as changed meanwhile: the channel is read again, every row drawn again.
+  pick('cass', 'write');
+  await settle();
+  assert.ok(calls.filter((c) => c === `GET /admin/g/${GA}/channels/${CH.research}/access`).length >= 2, 'read again');
+  const c = customIn(tr('aria'));
+  assert.ok(c.open(), 'Aria’s Custom… is still open');
+  assert.equal(c.box('MENTION_EVERYONE')!.checked, true, 'with the tick');
+  doc.press('Escape');
+  await settle();
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?', 'closing asks');
+  clickable(doc, 'Cancel', doc.querySelector('.modal')!).click();
+  await settle();
+  customIn(tr('aria')).button('Apply').click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, caps: ALL_CAPS.filter((x) => [...W7, 'MENTION_EVERYONE'].includes(x)), expect: W7 });
+  assert.ok(!customIn(tr('aria')).open(), 'closed once applied — the row is the relay’s answer');
+  assert.equal(drawer.isDirty(), false, 'nothing unsaved');
+});
+
+test('session: a Custom… edit not applied is kept across Sign in again — it comes back open, never applied, only on its own row', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await personaPanel('/' + g + '/personas/p/aria', { handle: (method) => (down && method !== 'GET' ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined) });
+  box.setDirectIn(CH.research, 'custom');
+  customIn(box.tr(CH.research)).tick('MENTION_EVERYONE');
+  down = true;
+  box.setDirectIn(CH.general, 'read'); // refused: the session ended
+  await settle();
+  clickable(box.doc, 'Sign in again', box.modal()).click();
+  const draft = JSON.parse(box.sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.form, 'dgCustom');
+  const caps = ALL_CAPS.filter((x) => [...W8, 'MENTION_EVERYONE'].includes(x));
+  assert.deepEqual(draft.fields, { personaId: 'aria', channelId: CH.research, caps });
+  for (const [who, kept] of [['sol', false], ['aria', true]] as const) {
+    const back = await personaPanel('/' + g + '/personas/p/aria', { session: { 'pa.draft': JSON.stringify({ ...draft, fields: { ...draft.fields, personaId: who } }) } });
+    const c = customIn(back.tr(CH.research));
+    assert.equal(c.open(), kept, who + ': open');
+    if (kept) assert.equal(c.box('MENTION_EVERYONE')!.checked, true, 'with the tick');
+    assert.equal(back.body.textContent.includes('Restored your unsaved change'), kept, who + ': says so');
+    assert.equal(back.ctx.PA.ui.drawer.isDirty(), kept, who + ': unsaved');
+    assert.ok(!back.calls.some((x) => x.startsWith('PUT')), 'nothing was submitted');
+  }
+});
+
+test('lib drafts: a Custom… edit keeps whose grant, which channel and the boxes — nothing else, nothing malformed', () => {
+  const { lib } = libOnly();
+  const fields = { personaId: 'aria', channelId: CH.research, caps: ['VIEW_CHANNEL', 'MENTION_EVERYONE'], code: 'inv_x', token: 't' };
+  assert.deepEqual(plain(lib.draftFields('dgCustom', fields)), { personaId: 'aria', channelId: CH.research, caps: ['VIEW_CHANNEL', 'MENTION_EVERYONE'] }, 'only the listed fields');
+  assert.deepEqual(plain(lib.draftFields('dgCustom', { personaId: 'x'.repeat(101), channelId: 'general', caps: ['<b>'] })), {}, 'malformed fields are dropped');
+});

@@ -1681,7 +1681,7 @@ async function openPersonaDrawer(id, hint = {}) {
   body.appendChild(removeSection(ctx, m));
   body.appendChild(more.node);
   if (identity) body.appendChild(identity.node);
-  keepPersonaForms(ctx, accessPart.add, more);
+  keepPersonaForms(ctx, accessPart.add, more, accessPart.custom);
   d.setBody(body);
 }
 
@@ -1816,8 +1816,10 @@ const statusParts = (lines) => (lines.length === 1 ? lines[0] : lines.map((t) =>
  * removed from the guild, what that means. Every change goes through the channel
  * drawer's queue and grant route, with `expect`, answers 'Effective now: …'
  * from the relay, offers Undo for 10 s, and asks first when it would lower
- * guild-wide or default access or lift a removal.
- * Returns { node, add } (add: the Add form's parts, for drafts).
+ * guild-wide or default access or lift a removal. A Custom… edit open in a
+ * row stays open through redraws until Apply or Cancel, and counts as unsaved.
+ * Returns { node, add, custom } (the Add form's parts and the Custom… edits'
+ * hooks, for drafts).
  */
 function accessSection(ctx, m) {
   const { id, displayName, gid } = ctx;
@@ -1837,6 +1839,14 @@ function accessSection(ctx, m) {
    *  the table's current ones. */
   const pendingCids = new Map();
   let controls = new Map();
+  /** Custom… editors open in rows, not applied (channel → { caps, start },
+   *  the last touched last): drawn open again by every redraw until Apply
+   *  or Cancel, and unsaved once ticked away from where they started — so
+   *  closing the drawer asks, and Sign in again keeps the last one. */
+  const edits = new Map();
+  const editTouched = [];
+  const editChanged = (e) => !!e && !lib.sameCapSet(e.caps, e.start);
+  ctx.drawer.trackDirty(() => Array.from(edits.values()).some(editChanged));
   let node = null;
   const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
   /** Can the panel give access on this channel (text, voice, forum)? One of
@@ -1886,12 +1896,15 @@ function accessSection(ctx, m) {
       value: pendingCids.has(cid) ? pendingCids.get(cid) : row.direct,
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + displayName + ' in ' + w,
+      key: 'dg:' + cid,
       apply: (next) => changeDirect(cid, next),
       busy: pendingCids.has(cid),
       removeOnly: !grantable,
+      editing: grantable ? edits.get(cid) || null : null,
+      // Only the row's control as drawn now speaks for it.
+      onEditing: (e) => { if (controls.get(cid) === control) noteEdit(cid, e); },
     }) : null;
     if (control) {
-      control.select.setAttribute('data-key', 'dg:' + cid);
       control.drawnBusy = pendingCids.has(cid);
       controls.set(cid, control);
     }
@@ -1989,6 +2002,29 @@ function accessSection(ctx, m) {
     drawInactive();
   };
 
+  /** A row's Custom… editor opened, was ticked (`e`), or closed (null). */
+  function noteEdit(cid, e) {
+    edits.delete(cid); // re-set: the last touched is last
+    if (e) edits.set(cid, e);
+    for (const fn of editTouched) fn();
+  }
+  /** Sign in again keeps the last-touched edit that changed something: whose
+   *  grant, where, the boxes. It comes back open — never applied. */
+  const customHooks = {
+    serialize() {
+      const changed = Array.from(edits.entries()).filter(([, e]) => editChanged(e));
+      const last = changed[changed.length - 1];
+      return last ? { personaId: id, channelId: last[0], caps: last[1].caps.slice() } : {};
+    },
+    belongs: (f) => f.personaId === id && typeof f.channelId === 'string' && !!m.rowOf(f.channelId) && grantableAt(f.channelId),
+    restore(f) {
+      const row = m.rowOf(f.channelId);
+      edits.set(f.channelId, { caps: (f.caps || []).slice(), start: ui.customStart(row ? row.direct : null) });
+      drawTable();
+    },
+    isDirty: () => Array.from(edits.values()).some(editChanged),
+  };
+
   /** Read the persona again after a change, then put focus on `key` (or the
    *  heading) if the change took it away. Resolves whether it could read. */
   async function refresh(key) {
@@ -2066,15 +2102,17 @@ function accessSection(ctx, m) {
    *  Resolves true when saved. */
   function changeDirect(cid, next) {
     pendingCids.set(cid, next);
-    return m.track(changeDirectNow(cid, next)).finally(() => {
+    let saved = false;
+    return m.track(changeDirectNow(cid, next)).then((ok) => { saved = !!ok; return ok; }).finally(() => {
       pendingCids.delete(cid);
       const c = controls.get(cid); // drawn busy by a redraw meanwhile, and not since
       if (c && c.drawnBusy) {
         // Not drawn again since it settled (cancelled at a confirm, or the
-        // read after it failed): back to what the drawer last read there.
+        // read after it failed): back to what the drawer last read there —
+        // keeping an unapplied Custom… edit open when the change wasn't made.
         c.drawnBusy = false;
         const row = m.rowOf(cid);
-        c.set(row && row.direct !== undefined ? row.direct : null);
+        c.set(row && row.direct !== undefined ? row.direct : null, undefined, !saved);
         c.setBusy(false);
       }
     });
@@ -2109,6 +2147,8 @@ function accessSection(ctx, m) {
     const res = await send(cid, next, row, lift);
     // Settled: the redraw below draws this row's control as usable again.
     pendingCids.delete(cid);
+    // Saved: a Custom… edit it applied is done (the redraw draws it closed).
+    if (res.ok) edits.delete(cid);
     if (res.ok) {
       const reloaded = await refresh('dg:' + cid);
       said(status, 'ok', res.text + (reloaded ? '' : ' (Couldn’t read the access again — reopen the drawer to see it.)'), null, [res.undo], 'the last change in ' + w);
@@ -2338,6 +2378,7 @@ function accessSection(ctx, m) {
 
   m.onChange(drawAll);
   drawAll();
+  const custom = { hooks: customHooks, status, onTouch: (fn) => editTouched.push(fn) };
   node = el('section', { class: 'drawer-section access-section' }, [
     head,
     banNote,
@@ -2348,7 +2389,7 @@ function accessSection(ctx, m) {
     inactiveBox,
     inactiveStatus.node,
   ]);
-  return { node, add };
+  return { node, add, custom };
 }
 
 /**
@@ -2938,12 +2979,13 @@ function identitySection(ctx, global, open) {
 
 /**
  * The persona drawer's forms kept across "Sign in again": Add to channels
- * (whose, where, what level) or the guild-wide level — whichever was touched
- * last (one form a drawer is kept). A kept form comes back only in its own
- * persona's drawer; an older panel's grant draft (one channel, or guild-wide)
- * comes back in the form that does that now.
+ * (whose, where, what level), the guild-wide level, or a row's Custom…
+ * edit — whichever with changes was touched last (one form a drawer is
+ * kept). A kept form comes back only in its own persona's drawer; an older
+ * panel's grant draft (one channel, or guild-wide) comes back in the form
+ * that does that now.
  */
-function keepPersonaForms(ctx, add, more) {
+function keepPersonaForms(ctx, add, more, custom) {
   const d = ctx.drawer;
   const addHooks = {
     serialize: () => ({ personaId: ctx.id, channels: add.ta.values(), caps: add.level.value() }),
@@ -2969,10 +3011,13 @@ function keepPersonaForms(ctx, add, more) {
   };
   keepForm(d, 'grant', gwHooks, more.status);
   if (keepForm(d, 'personaAdd', addHooks, add.status)) into = 'personaAdd';
+  if (keepForm(d, 'dgCustom', custom.hooks, custom.status)) into = 'dgCustom';
   if (into === 'grant') d.registerForm('grant', gwHooks);
+  else if (into === 'dgCustom') d.registerForm('dgCustom', custom.hooks);
   else d.registerForm('personaAdd', addHooks);
   add.onTouch(() => d.registerForm('personaAdd', addHooks));
   more.onTouch(() => d.registerForm('grant', gwHooks));
+  custom.onTouch(() => d.registerForm('dgCustom', custom.hooks));
 }
 
 /** Super-admin: the persona's profile picture (global — it shows everywhere). */
