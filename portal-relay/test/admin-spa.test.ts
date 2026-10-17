@@ -1211,7 +1211,13 @@ const G1_CATALOG = {
   'g2-desk': { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: '100000000000000002' },
 };
 
-async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>; default?: string[] }; refusePut?: (body: any) => unknown } = {}) {
+async function ariaDrawer(opts: {
+  policy?: { channels: Record<string, string[]>; default?: string[] };
+  refusePut?: (body: any) => unknown;
+  refuseDelete?: (path: string, body: any) => unknown;
+  /** The relay's `effective` for a change's answer. */
+  effective?: (method: string, path: string, body: any) => unknown;
+} = {}) {
   const g = '/admin/g/' + G1;
   const policy: { channels: Record<string, string[]>; default?: string[] } = opts.policy ?? { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
   const box = appSandbox({
@@ -1229,15 +1235,19 @@ async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>;
         if (body.channelId) policy.channels[body.channelId] = caps;
         else if (body.guildDefault === true) policy.default = caps;
         else return refuse(400, 'TARGET_REQUIRED');
-        return { guildPolicy: policy };
+        return { guildPolicy: policy, ...(opts.effective ? { effective: opts.effective(method, path, body) } : {}) };
       }
       if (method === 'DELETE' && path.startsWith(g + '/personas/aria/grants?')) {
+        if (opts.refuseDelete) {
+          const refused = opts.refuseDelete(path, body);
+          if (refused) return refused;
+        }
         const q = new URL(path, 'http://panel.invalid').searchParams;
         if (q.get('guildDefault') === 'deny') policy.default = [];
         else if (q.get('guildDefault') === 'unset') delete policy.default;
         else if (q.get('channelId')) delete policy.channels[q.get('channelId')!];
         else return refuse(400, 'TARGET_REQUIRED');
-        return { guildPolicy: policy };
+        return { guildPolicy: policy, ...(opts.effective ? { effective: opts.effective(method, path, body) } : {}) };
       }
       return undefined;
     },
@@ -1287,7 +1297,7 @@ test('grant editor: picking a target loads its level; Save waits for a level; Wr
   await settle();
   const g = '/admin/g/' + G1;
   assert.equal(calls.at(-1), `PUT ${g}/personas/aria/grants`);
-  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, level: 'write' }, 'a preset goes by its name');
+  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, level: 'write', expect: null }, 'a preset goes by its name, with what the drawer loaded there (nothing)');
   assert.deepEqual(policy.channels[CH.labNotes], [...LEVEL_CAPS.write]);
   const rows = drawer.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
   assert.ok(rows.some((r) => r[0] === '#lab-notes' && r[1] === 'Write'), JSON.stringify(rows));
@@ -1624,13 +1634,13 @@ test('grant editor: Custom… is sent as caps, guild-wide as {guildDefault: true
   box('MENTION_EVERYONE').fire('change');
   form.fire('submit');
   await settle();
-  assert.deepEqual(bodies.at(-1), { channelId: CH.general, caps: ['VIEW_CHANNEL', 'READ_HISTORY', 'MENTION_EVERYONE'] });
+  assert.deepEqual(bodies.at(-1), { channelId: CH.general, caps: ['VIEW_CHANNEL', 'READ_HISTORY', 'MENTION_EVERYONE'], expect: null });
   choose('__guild__');
   radio('read').checked = true;
   radio('read').fire('change');
   form.fire('submit');
   await settle();
-  assert.deepEqual(bodies.at(-1), { guildDefault: true, level: 'read' });
+  assert.deepEqual(bodies.at(-1), { guildDefault: true, level: 'read', expect: null });
   assert.deepEqual(policy.default, [...LEVEL_CAPS.read]);
 });
 
@@ -2916,4 +2926,121 @@ test('session: a relay that came back newer is noticed when the tab checks the s
   for (const [type, fn] of other.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
   await settle();
   assert.ok(other.doc.getElementById('update-banner'));
+});
+
+// ── P6: every grant change says what it leaves the persona with, and is sent with what the drawer loaded ──
+
+test('lib: what a change leaves a persona with, in the copy guide’s words', () => {
+  const { lib } = libOnly();
+  const R = [...LEVEL_CAPS.read];
+  const W = [...LEVEL_CAPS.write];
+  const lacks = W.filter((c) => !R.includes(c));
+  assert.equal(lib.effectNowText({ effective: W, botLimited: false, botLacks: [] }, '#lab-notes'), 'Write');
+  assert.equal(lib.effectNowText({ effective: R, botLimited: true, botLacks: lacks }, '#welcome'), 'Read — the relay bot can’t send in #welcome');
+  assert.equal(lib.effectNowText({ effective: [], botLimited: true, botLacks: R }, '#old-logs'), 'no access — the relay bot can’t see #old-logs');
+  assert.equal(lib.botLimitText(['MANAGE_MESSAGES'], '#general'), 'the relay bot can’t manage messages in #general');
+  assert.equal(lib.botLimitText(['ATTACH_FILES', 'ADD_REACTIONS'], '#general'), 'the relay bot can’t attach files or react in #general');
+  assert.equal(lib.botLimitText(['READ_HISTORY'], '#general'), 'the relay bot can’t read the history of #general');
+
+  const role = { kind: 'role', name: 'g1-chatters', caps: W, how: 'channels' };
+  assert.equal(lib.remainingText({ effective: W, sources: [role], botLacks: [] }, '#research'), 'still Write via role g1-chatters');
+  assert.equal(lib.remainingText({ effective: [], sources: [], botLacks: [] }, '#research'), 'no remaining access in #research');
+  assert.equal(lib.remainingText({
+    effective: R, botLimited: true, botLacks: lacks,
+    sources: [{ ...role, name: 'g1-a' }, { ...role, name: 'g1-b' }, { kind: 'guildWide', caps: R }, { kind: 'personaDefault', caps: R, shadowedBy: 'guildWide' }],
+  }, '#welcome'), 'still Read via roles g1-a, g1-b and the guild-wide level — the relay bot can’t send in #welcome');
+
+  const z = { read: 0, write: 0, full: 0, custom: 0 };
+  assert.equal(lib.guildEffectText({ counts: { ...z, read: 14, write: 2 }, direct: { ...z, write: 2 } }, 'Guild One'), 'Read in 14 channels, Write in 2 (direct grants)');
+  assert.equal(lib.guildEffectText({ counts: { ...z, write: 1 }, direct: z }, 'Guild One'), 'Write in 1 channel');
+  assert.equal(lib.guildEffectText({ counts: z, direct: z }, 'Guild One'), 'no access in any channel of Guild One');
+
+  assert.equal(lib.errorText({ code: 'CONFLICT', status: 409 }, 'Not saved', { reloaded: true }), 'Not saved: someone else changed this a moment ago. Reloaded — check and try again.');
+  assert.equal(lib.errorText({ code: 'CONFLICT', status: 409 }, 'Not removed'), 'Not removed: someone else changed this a moment ago. Reload the page and try again.');
+});
+
+test('grant editor: a change says “Effective now”, from the relay’s answer — the bot’s limits included', async () => {
+  const R = [...LEVEL_CAPS.read];
+  const W = [...LEVEL_CAPS.write];
+  const z = { read: 0, write: 0, full: 0, custom: 0 };
+  const { form, radio, choose, drawer, bodies, calls } = await ariaDrawer({
+    effective: (method, path, body) => {
+      if (method === 'PUT' && body.channelId === CH.welcome) return { effective: R, level: 'read', botLimited: true, botLacks: W.filter((c) => !R.includes(c)), direct: W, sources: [] };
+      if (method === 'PUT' && body.channelId) return { effective: W, level: 'write', botLimited: false, botLacks: [], direct: W, sources: [] };
+      if (method === 'PUT') return { guildWide: true, channels: 8, counts: { ...z, read: 6, write: 2 }, direct: { ...z, write: 2 } };
+      if (path.includes('channelId=')) return { effective: W, botLimited: false, botLacks: [], direct: null, sources: [{ kind: 'role', name: 'g1-chatters', caps: W, how: 'channels' }] };
+      return { guildWide: true, channels: 8, counts: { ...z, write: 2 }, direct: { ...z, write: 2 } };
+    },
+  });
+  const line = () => form.querySelector('.status-line')!.textContent;
+  const pick = (v: string) => {
+    for (const k of ['read', 'write', 'full', 'custom']) radio(k).checked = false; // one radio group, as a browser keeps it
+    radio(v).checked = true;
+    radio(v).fire('change');
+  };
+  choose(CH.welcome);
+  pick('write');
+  form.fire('submit');
+  await settle();
+  assert.equal(line(), 'Aria → Write in #welcome. Effective now: Read — the relay bot can’t send in #welcome.');
+  assert.deepEqual(bodies.at(-1), { channelId: CH.welcome, level: 'write', expect: null });
+
+  // Research held Write when the drawer loaded: that is what goes with the change.
+  choose(CH.research);
+  pick('full');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'full', expect: W });
+  assert.equal(line(), 'Aria → Full in #research. Effective now: Write.');
+
+  choose('__guild__');
+  pick('read');
+  form.fire('submit');
+  await settle();
+  assert.equal(line(), 'Aria → Read guild-wide in Guild One (every channel without its own grant). Effective now: Read in 6 channels, Write in 2 (direct grants).');
+
+  // Removing a direct grant says what is left, and why.
+  const row = drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
+  row.querySelector('button')!.click();
+  await settle();
+  assert.equal(calls.at(-1), `DELETE /admin/g/${G1}/personas/aria/grants?channelId=${CH.research}`);
+  assert.deepEqual(bodies.at(-1), { expect: [...LEVEL_CAPS.full] }, 'what the drawer shows there now');
+  assert.equal(line(), 'Removed Aria’s direct grant in #research — still Write via role g1-chatters.');
+});
+
+test('grant editor: changed meanwhile — “someone else changed this”, the setting is loaded again, nothing is lost silently', async () => {
+  const W = [...LEVEL_CAPS.write];
+  const F = [...LEVEL_CAPS.full];
+  let policyRef: { channels: Record<string, string[]>; default?: string[] } | null = null;
+  const box = await ariaDrawer({
+    // Another tab gave Aria Full in #research a moment ago.
+    refusePut: (body) => {
+      policyRef!.channels[CH.research] = F;
+      return refuse(409, 'CONFLICT', 'this was changed since it was loaded', { current: F });
+    },
+  });
+  policyRef = box.policy;
+  const { form, radio, choose, drawer, calls, bodies } = box;
+  choose(CH.research);
+  assert.equal(radio('write').checked, true, 'the drawer loaded Write');
+  radio('write').checked = false;
+  radio('read').checked = true;
+  radio('read').fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'read', expect: W });
+  const line = form.querySelector('.status-line')!;
+  assert.equal(line.textContent, 'Not saved: someone else changed this a moment ago. Reloaded — check and try again.');
+  assert.ok(line.classList.contains('status-err'));
+  assert.equal(calls.at(-1), `GET /admin/g/${G1}/personas/aria`, 'loaded again');
+  assert.equal(radio('full').checked, true, 'the level shown is the one there now');
+  const row = drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
+  assert.equal(row.children[1].textContent, 'Full');
+
+  // A removal refused the same way.
+  const again = await ariaDrawer({ refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: null }) });
+  const r = again.drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
+  r.querySelector('button')!.click();
+  await settle();
+  assert.equal(again.form.querySelector('.status-line')!.textContent, 'Not removed: someone else changed this a moment ago. Reloaded — check and try again.');
 });

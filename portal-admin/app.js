@@ -90,12 +90,12 @@ const isSuper = () => !!(state.me && state.me.isSuper);
 // ── API layer ──────────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
-  /** `detail`: the rest of the relay's error body (parentId, reason, existing…). */
+  /** `detail`: the rest of the relay's error body (parentId, reason, existing, current…). */
   constructor(status, code, message, detail) {
     super(message || code || ('HTTP ' + status));
     this.status = status;
     this.code = code;
-    for (const k of ['parentId', 'reason', 'existing']) if (detail && detail[k] !== undefined) this[k] = detail[k];
+    for (const k of ['parentId', 'reason', 'existing', 'current']) if (detail && detail[k] !== undefined) this[k] = detail[k];
   }
 }
 
@@ -1646,6 +1646,11 @@ async function tokenAction(ctx, action, button, status) {
  * the guild-wide row says so, and Unset asks before lifting that. Giving it
  * access (a level here, an access role) lifts it too; the relay's answer says
  * which. Returns { node, setBanned(banned) }.
+ *
+ * Every change says what it leaves the persona with — 'Effective now: …',
+ * from the relay's own answer — and is sent with `expect`, the setting this
+ * drawer loaded: changed meanwhile (another tab, slash), the relay refuses
+ * it, and the drawer loads the setting again and says so.
  */
 function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0 = false) {
   const { id, displayName, gid } = ctx;
@@ -1738,16 +1743,46 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     banNote.classList.toggle('hidden', !banned);
   }
 
-  async function removeGrant(cid) {
+  /** What this drawer loaded at a target (caps, or null for nothing set):
+   *  sent as `expect`, so a change made meanwhile isn't overwritten. */
+  function loaded(t) {
+    const caps = currentCaps(t);
+    return Array.isArray(caps) ? caps : null;
+  }
+
+  /** The relay refused a change because the setting changed since this
+   *  drawer loaded it: load it again, then say so in the line. */
+  async function conflicted(e, prefix, ctxErr) {
+    let reloaded = false;
     try {
-      const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid));
+      const d = await api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id));
+      noteBanned(d);
+      draw(d.guildPolicy);
+      preload();
+      reloaded = true;
+      markStale();
+    } catch { /* the line says to reload the page instead */ }
+    status.err(lib.errorText(e, prefix, Object.assign({}, ctxErr, { reloaded })));
+  }
+
+  /** ' Effective now: …' for the guild, from a guild-wide change's answer. */
+  const guildEffect = (r) => (r && r.effective && r.effective.counts ? ' Effective now: ' + lib.guildEffectText(r.effective, guild) + '.' : '');
+
+  async function removeGrant(cid) {
+    const where = chanText(cid, names);
+    try {
+      const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid), { expect: loaded(cid) });
       noteBanned(r);
       draw(r.guildPolicy);
       target.focus(); // the row whose button had focus is gone
       if (target.value === cid) preload();
-      status.ok('Removed ' + displayName + '’s direct grant in ' + chanText(cid, names) + '.');
+      const left = r.effective ? lib.remainingText(r.effective, where) : '';
+      status.ok('Removed ' + displayName + '’s direct grant in ' + where + (left ? ' — ' + left : '') + '.');
       markStale(); onChange();
-    } catch (e) { status.err(notDone(e, 'Not removed')); }
+    } catch (e) {
+      if (e.code === 'CONFLICT') return conflicted(e, 'Not removed', { channelId: cid, names });
+      status.err(notDone(e, 'Not removed'));
+    }
   }
 
   async function denyGuildWide(button) {
@@ -1765,14 +1800,17 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', P() + '?guildDefault=deny');
+        const r = await api('DELETE', P() + '?guildDefault=deny', { expect: loaded(GUILD_WIDE) });
         noteBanned(r);
         draw(r.guildPolicy);
         target.focus();
         if (target.value === GUILD_WIDE) preload();
-        status.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.');
+        status.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.' + guildEffect(r));
         markStale(); onChange();
-      } catch (e) { status.err(notDone(e, 'Not denied')); }
+      } catch (e) {
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not denied');
+        status.err(notDone(e, 'Not denied'));
+      }
     }, 'Denying…');
   }
 
@@ -1801,16 +1839,19 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', P() + '?guildDefault=unset' + (lift ? '&liftBan=1' : ''));
+        const r = await api('DELETE', P() + '?guildDefault=unset' + (lift ? '&liftBan=1' : ''), { expect: loaded(GUILD_WIDE) });
         noteBanned(r);
         draw(r.guildPolicy);
         target.focus();
         if (target.value === GUILD_WIDE) preload();
-        status.ok(lift
+        status.ok((lift
           ? 'Lifted ' + displayName + '’s removal from ' + guild + ' and unset its guild-wide level: channels without their own grant fall back to the persona default.'
-          : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.');
+          : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.') + guildEffect(r));
         markStale(); onChange();
-      } catch (e) { status.err(notDone(e, 'Not unset')); }
+      } catch (e) {
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not unset');
+        status.err(notDone(e, 'Not unset'));
+      }
     }, 'Unsetting…');
   }
 
@@ -1861,18 +1902,25 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     const k = level.level();
     if (k && k !== 'custom') body.level = k;
     else body.caps = caps;
+    body.expect = loaded(t);
+    const where = t === GUILD_WIDE ? null : chanText(t, names);
     try {
       const r = await api('PUT', P(), body);
       const was = banned;
       noteBanned(r);
       draw(r.guildPolicy);
       tracker.reset();
+      const now = t === GUILD_WIDE ? guildEffect(r) : r.effective ? ' Effective now: ' + lib.effectNowText(r.effective, where) + '.' : '';
       status.ok((t === GUILD_WIDE
         ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
-        : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.') +
-        (was && !banned ? ' That lifted its removal from ' + guild + '.' : ''));
+        : displayName + ' → ' + capsSummary(caps) + ' in ' + where + '.') +
+        now + (was && !banned ? ' That lifted its removal from ' + guild + '.' : ''));
       markStale(); onChange();
-    } catch (e) { status.err(notDone(e, 'Not saved', { channelId: t === GUILD_WIDE ? null : t, names })); }
+    } catch (e) {
+      const ctxErr = { channelId: t === GUILD_WIDE ? null : t, names };
+      if (e.code === 'CONFLICT') return conflicted(e, 'Not saved', ctxErr);
+      status.err(notDone(e, 'Not saved', ctxErr));
+    }
   });
 
   draw(policy0);

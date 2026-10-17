@@ -10,6 +10,8 @@
  *   levelOf, levelLabel, capsSummary   caps → 'Write', 'Write +1', 'Custom'
  *   capsTitle, capsWords               the same in words (tooltips)
  *   isGrantableType                    which channels can hold a direct grant
+ *   effectNowText, remainingText,      what the relay lets a persona do after a
+ *   guildEffectText, botLimitText      change ('Read — the relay bot can’t send in #welcome')
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
  *   roleNameTaken                      defining a role under a name in use
@@ -184,6 +186,58 @@
    *  and a category grants nothing, so neither is a grant target. */
   function isGrantableType(type) {
     return type === 'text' || type === 'voice' || type === 'forum';
+  }
+
+  // ── What a change leaves a persona with ───────────────────────────────────
+  // From the relay's answer to a grant change (`effective`): its own account
+  // of what the persona can do there now, within what its bot can do.
+
+  /** Why the relay's bot holds a persona back in a channel, from the
+   *  capabilities it lacks there: 'the relay bot can’t send in #welcome'. */
+  function botLimitText(lacks, where) {
+    const l = lacks || [];
+    if (l.includes('VIEW_CHANNEL')) return 'the relay bot can’t see ' + where;
+    if (l.includes('SEND_MESSAGES')) return 'the relay bot can’t send in ' + where;
+    if (l.includes('READ_HISTORY')) return 'the relay bot can’t read the history of ' + where;
+    return 'the relay bot can’t ' + orList(sortCaps(l).map((c) => CAP_WORDS[c] || String(c).toLowerCase().replace(/_/g, ' '))) + ' in ' + where;
+  }
+
+  /** What a persona can do in a channel now, for 'Effective now: …':
+   *  'Write' · 'Read — the relay bot can’t send in #welcome' · 'no access'. */
+  function effectNowText(ex, where) {
+    if (!ex || !Array.isArray(ex.effective)) return '';
+    const level = ex.effective.length ? capsSummary(ex.effective) : 'no access';
+    return ex.botLimited && ex.botLacks && ex.botLacks.length ? level + ' — ' + botLimitText(ex.botLacks, where) : level;
+  }
+
+  /** After a direct grant is removed: 'still Write via role g1-chatters' ·
+   *  'no remaining access in #research'. */
+  function remainingText(ex, where) {
+    if (!ex || !Array.isArray(ex.effective)) return '';
+    if (!ex.effective.length) return 'no remaining access in ' + where;
+    const live = (ex.sources || []).filter((s) => !s.shadowedBy);
+    const roles = live.filter((s) => s.kind === 'role').map((s) => s.name);
+    const via = [];
+    if (roles.length) via.push((roles.length === 1 ? 'role ' : 'roles ') + roles.join(', '));
+    if (live.some((s) => s.kind === 'guildWide' && s.caps && s.caps.length)) via.push('the guild-wide level');
+    if (live.some((s) => s.kind === 'personaDefault')) via.push('the persona default');
+    if (live.some((s) => s.kind === 'relayDefault')) via.push('the relay default');
+    const bot = ex.botLimited && ex.botLacks && ex.botLacks.length ? ' — ' + botLimitText(ex.botLacks, where) : '';
+    return 'still ' + capsSummary(ex.effective) + (via.length ? ' via ' + via.join(' and ') : '') + bot;
+  }
+
+  /** A guild-wide change's answer, for 'Effective now: …': 'Read in 14
+   *  channels, Write in 2 (direct grants)' — the biggest group first, and
+   *  '(direct grants)' on a group that is all direct grants. */
+  function guildEffectText(e, guild) {
+    const counts = (e && e.counts) || {};
+    const direct = (e && e.direct) || {};
+    const groups = ['full', 'write', 'read', 'custom']
+      .filter((k) => counts[k] > 0)
+      .map((k) => ({ k, n: counts[k], d: direct[k] || 0 }))
+      .sort((a, b) => b.n - a.n);
+    if (!groups.length) return 'no access in any channel of ' + guild;
+    return groups.map((g, i) => LEVEL_NAME[g.k] + ' in ' + (i === 0 ? plural(g.n, 'channel') : g.n) + (g.d === g.n ? ' (direct grants)' : '')).join(', ');
   }
 
   // ── Names ─────────────────────────────────────────────────────────────────
@@ -406,6 +460,8 @@
       case 'GUILD_MISMATCH': return p + ': ' + (c.roleName ? 'access role ' + c.roleName : 'that access role') + ' belongs to another guild now. Reload the page and try again.';
       case 'INVALID_NAME': return p + ': an access role name uses lower-case letters, digits, dots, dashes and underscores (up to 64), starting with a letter or digit.';
       case 'BANNED': return p + ': it was removed from this guild with /ban since this page was loaded. Reload the page to see that, then try again.';
+      // The change was made against what this page loaded, and that changed.
+      case 'CONFLICT': return p + ': someone else changed this a moment ago. ' + (c.reloaded ? 'Reloaded — check and try again.' : 'Reload the page and try again.');
       default: break;
     }
     if (e && e.status === 401) return p + ': your session ended. Sign in again, then save it.';
@@ -739,6 +795,7 @@
   PA.lib = {
     LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS, adoptModel,
     sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType,
+    botLimitText, effectNowText, remainingText, guildEffectText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,
