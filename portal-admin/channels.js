@@ -251,6 +251,12 @@ async function render(view, stale) {
   const store = collapseStore(gid);
 
   clear(view);
+  // A relay older than the access views: say so, in place of a list whose
+  // counts and drawers it can't answer.
+  if (env.accessApi && !env.accessApi()) {
+    view.appendChild(env.relayOutdated('who can act in each channel'));
+    return;
+  }
   const search = el('input', {
     id: 'list-search', class: 'search', type: 'search', placeholder: 'Filter channels…', 'aria-label': 'Filter channels',
     value: f.q, autocomplete: 'off',
@@ -482,12 +488,19 @@ async function openDrawer(gid, cid) {
 }
 
 async function loadInto(d, gid, cid, note) {
+  // A relay older than the access views can't say who can act here.
+  const outdated = () => d.setBody(env.relayOutdated('who can act in this channel'));
+  if (env.accessApi && !env.accessApi()) return outdated();
   let data;
   try {
     data = await env.api('GET', env.gpath(gid) + '/channels/' + encodeURIComponent(cid) + '/access');
   } catch (e) {
     if (!d.isCurrent() || e.handled) return;
     if (e.status === 404) {
+      // No such channel — unless the relay was rolled back since this tab asked.
+      const old = env.outdatedAfter404 ? await env.outdatedAfter404() : false;
+      if (!d.isCurrent()) return;
+      if (old) return outdated();
       d.setTitle('Channel');
       d.setBody(el('p', { class: 'empty-note', role: 'status', title: 'Channel id ' + cid, text: 'This is a deleted channel, or a channel the relay can’t see.' }));
       return;
@@ -1126,7 +1139,8 @@ PA.channels = {
   /** app.js's helpers: { api, gpath, qs, state, route, formatRoute, navigate,
    *  openDrawer, replaceDrawerRoute, markStale, setList, syncQuery,
    *  guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
-   *  keepForm, isSuper, userId, local, grantApi }. */
+   *  keepForm, isSuper, userId, local, grantApi, accessApi, relayOutdated,
+   *  outdatedAfter404 }. */
   attach(e) {
     const first = !env;
     env = e;

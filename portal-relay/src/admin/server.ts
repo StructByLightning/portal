@@ -54,8 +54,14 @@ import { SessionStore, STATE_TTL_MS, type AdminSession } from './sessions.js';
 import { LoginRateLimit, clientIp } from './login-limit.js';
 
 /** What /admin/me reports as apiVersion. The panel compares it with its own
- *  PA.CLIENT_API and asks for a reload when the relay is newer. */
-export const ADMIN_API_VERSION = 2;
+ *  PA.CLIENT_API and asks for a reload when the relay is newer; a panel newer
+ *  than the relay says which views need the relay updated.
+ *   2  direct grants by level, guild-wide as {guildDefault: true}, Unset and
+ *      Deny guild-wide as their own operations
+ *   3  the access views (…/access/summary, …/channels/:cid/access,
+ *      …/personas/:pid/access), the persona directory, Remove from <guild>
+ *      and Resync */
+export const ADMIN_API_VERSION = 3;
 
 /** Personas × channels the access summary counts at most. Past it the counts
  *  are left out (truncated) rather than stalling the event loop or refusing. */

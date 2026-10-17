@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { LEVEL_CAPS } from '../src/slash.js';
 import { ALL_CAPS } from '../src/permissions.js';
+import { ADMIN_API_VERSION } from '../src/admin/server.js';
 
 const ADMIN = fileURLToPath(new URL('../../portal-admin/', import.meta.url));
 const SCRIPTS = ['lib.js', 'ui.js', 'channels.js', 'app.js'];
@@ -507,7 +508,7 @@ test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .channe
   assert.deepEqual(added, ['PA']);
   assert.deepEqual(Object.keys(ctx.PA).sort(), ['CLIENT_API', 'app', 'channels', 'lib', 'ui']);
   assert.equal(typeof ctx.PA.channels.render, 'function');
-  assert.equal(ctx.PA.CLIENT_API, 2);
+  assert.equal(ctx.PA.CLIENT_API, ADMIN_API_VERSION, 'the panel speaks the API this relay does');
   assert.equal(typeof ctx.PA.ui.toast, 'function');
   assert.equal(typeof ctx.PA.app.boot, 'function');
 });
@@ -1087,7 +1088,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       const route = url.pathname;
       const g = '/admin/g/' + G1;
       const routes: Record<string, unknown> = {
-        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
+        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 3 },
         '/admin/guilds': { guilds: [{ id: G1, name: 'Guild One' }] },
         [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
         [g + '/channels']: { channels: [] },
@@ -1441,7 +1442,7 @@ async function rolesTab(more: Record<string, any> = {}, opts: { holdFirstList?: 
   const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void>; holdPost?: Promise<void> } = { down: false };
   const box = appSandbox({
     routes: {
-      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
+      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 3 },
       [g + '/channels']: { channels: G1_CHANNELS },
     },
     handle: async (method, path, body) => {
@@ -1739,7 +1740,7 @@ test('lib.errorText: the relay’s refusal codes in the copy guide’s words', (
 });
 
 test('app: a relay newer than the panel asks for a reload', async () => {
-  for (const [apiVersion, shown] of [[3, true], [2, false], [undefined, false]] as const) {
+  for (const [apiVersion, shown] of [[4, true], [3, false], [2, false], [undefined, false]] as const) {
     const { ctx, doc } = appSandbox({ routes: { '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'c', apiVersion } } });
     await ctx.PA.app.boot();
     await settle();
@@ -2140,8 +2141,8 @@ test('lib.loginErrorText: the fixed table; anything else is a generic line', () 
 
 // ── Addresses in the app: reload, Back, links ──
 
-const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1', apiVersion: 2 };
-const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1', apiVersion: 2 };
+const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1', apiVersion: 3 };
+const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1', apiVersion: 3 };
 
 /** The panel signed in as `me`, at `url`, over Guild One's fixture. */
 async function panelAt(url: string, opts: { me?: unknown; guilds?: unknown[]; handle?: FakeHandler; routes?: Record<string, unknown>; session?: Record<string, string>; local?: Record<string, string> } = {}) {
@@ -3260,7 +3261,7 @@ test('session: a relay that came back newer is noticed when the tab checks the s
     }
     postMessage() {}
   }
-  let apiVersion = 2;
+  let apiVersion = 3;
   const box = appSandbox({
     url: '/#/g/' + GA + '/personas',
     handle: (_m, path) => (path === '/admin/me' ? { ...ME_GWEN, apiVersion } : undefined),
@@ -3269,7 +3270,7 @@ test('session: a relay that came back newer is noticed when the tab checks the s
   await box.ctx.PA.app.boot();
   await settle();
   assert.equal(box.doc.getElementById('update-banner'), null);
-  apiVersion = 3; // deployed; the admin signed in again in another tab
+  apiVersion = 4; // deployed; the admin signed in again in another tab
   FakeChannel.last.onmessage!({ data: { type: 'signed-in' } });
   await settle();
   assert.equal(box.doc.getElementById('update-banner')!.textContent, 'The panel was updated — Reload');
@@ -3279,10 +3280,10 @@ test('session: a relay that came back newer is noticed when the tab checks the s
     url: '/#/g/' + GA + '/personas',
     handle: (_m, path) => (path === '/admin/me' ? { ...ME_GWEN, apiVersion: other.v } : undefined),
   }) as ReturnType<typeof appSandbox> & { v: number };
-  other.v = 2;
+  other.v = 3;
   await other.ctx.PA.app.boot();
   await settle();
-  other.v = 3;
+  other.v = 4;
   for (const [type, fn] of other.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
   await settle();
   assert.ok(other.doc.getElementById('update-banner'));
@@ -3782,6 +3783,9 @@ async function channelsPanel(url: string, opts: { handle?: FakeHandler; research
       ...opts.routes,
     },
     handle: async (method, path, body, headers) => {
+      // A GET opts.handle answers is its; the rest are the fixture's (below).
+      const own = method === 'GET' ? await opts.handle?.(method, path, body, headers) : undefined;
+      if (own !== undefined) return own;
       if (method === 'GET' && path === g + '/channels/' + CH.research + '/access') {
         // readGate: the read is answered as the channel is now, but only once the gate opens.
         const held = opts.readGate?.();
@@ -4937,12 +4941,13 @@ test('persona drawer: a guild-wide level picked while Save is at work stays unsa
   assert.equal(box.modal().querySelector('h2')!.textContent, 'Discard changes?', 'Full was never saved');
 });
 
-test('persona drawer: a relay older than the panel is sent caps it reads right — a channel’s and guild-wide — Deny as a bare DELETE, and no Unset', async () => {
+test('persona drawer: a relay rolled back, after the drawer opened, to one older than the grant API is sent caps it reads right — a channel’s and guild-wide — Deny as a bare DELETE, and no Unset', async () => {
   const sent: string[] = [];
+  let old = false;
   const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
-    me: { ...ME_GWEN, apiVersion: undefined }, // from before apiVersion 2: it sends none
     guildWide: R8,
     handle: (method, path, body) => {
+      if (path === '/admin/me') return old ? { ...ME_GWEN, apiVersion: undefined } : undefined; // from before apiVersion 2: it sends none
       // As that relay does: a PUT stores body.caps (none: a deny), on the
       // channel or, with no channelId, guild-wide; a DELETE without a
       // channelId denies guild-wide, whatever else it says.
@@ -4951,6 +4956,10 @@ test('persona drawer: a relay older than the panel is sent caps it reads right �
       return { guildPolicy: {}, banned: false };
     },
   });
+  // Rolled back while the drawer is open: the tab notices when it is shown again.
+  old = true;
+  for (const [type, fn] of box.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
+  await settle();
   const { addForm, typeChannel, pickOption, bodies, level, gwRow, gwButtons } = box;
   await typeChannel('lab');
   pickOption('#lab-notes');
@@ -4959,6 +4968,7 @@ test('persona drawer: a relay older than the panel is sent caps it reads right �
   await settle();
   assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, caps: W8 }, 'a level as its caps, never a name it would read as a deny');
 
+  // The Add's read drew More again, for the relay as it is now.
   assert.deepEqual(gwButtons(), ['Set level…', 'Deny guild-wide'], 'no Unset: it would store a deny');
   assert.match(gwRow().textContent, /Unset needs the relay updated/);
   clickable(box.doc, 'Set level…', gwRow()).click();
@@ -6038,4 +6048,75 @@ test('lib drafts: a Custom… edit keeps whose grant, which channel and the boxe
   const fields = { personaId: 'aria', channelId: CH.research, caps: ['VIEW_CHANNEL', 'MENTION_EVERYONE'], code: 'inv_x', token: 't' };
   assert.deepEqual(plain(lib.draftFields('dgCustom', fields)), { personaId: 'aria', channelId: CH.research, caps: ['VIEW_CHANNEL', 'MENTION_EVERYONE'] }, 'only the listed fields');
   assert.deepEqual(plain(lib.draftFields('dgCustom', { personaId: 'x'.repeat(101), channelId: 'general', caps: ['<b>'] })), {}, 'malformed fields are dropped');
+});
+
+/** A relay from before API 3 (the access views): what it doesn't have is a 404, as its router answers. */
+const API2_RELAY: FakeHandler = (method, path) => {
+  const p = path.split('?')[0];
+  if (/\/access(\/summary)?$/.test(p) || p.endsWith('/persona-directory') || /\/personas\/[^/]+\/(remove|resync)$/.test(p)) return refuse(404, 'NOT_FOUND', 'no such route');
+  return undefined;
+};
+
+test('a relay older than the panel (API 2, no access views): the persona drawer, the Channels tab and the channel drawer say the relay needs updating — never “No persona”', async () => {
+  const me2 = { ...ME_GWEN, apiVersion: 2 };
+  // The persona drawer, at its address.
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { me: me2, handle: API2_RELAY });
+  const { body, calls } = box;
+  assert.match(body.textContent, /This panel needs the relay updated\./, body.textContent);
+  assert.match(body.textContent, /Reload once the relay is updated\./);
+  assert.doesNotMatch(body.textContent, /No persona/, 'never says the persona is missing');
+  assert.ok(clickable(box.doc, 'Reload', body), 'with Reload');
+  assert.ok(!calls.some((c) => c.includes('/personas/aria/access')), 'not asked for what it doesn’t have');
+  assert.equal(body.querySelector('form'), null, 'nothing to send');
+  // The Personas list behind it lists, without Add persona (its directory needs the update too).
+  assert.ok(!box.doc.querySelectorAll('button').some((b) => b.textContent === 'Add persona to Guild One'), 'no Add persona');
+  assert.ok(!calls.some((c) => c.includes('/access/summary')), 'no counts asked for');
+
+  // The Channels tab, and a channel's drawer.
+  const ch = await channelsPanel('/#/g/' + GA + '/channels', { routes: { '/admin/me': me2 }, handle: API2_RELAY });
+  assert.match(ch.view.textContent, /This panel needs the relay updated\./, ch.view.textContent);
+  assert.ok(!ch.calls.some((c) => c.includes('/access/summary')), 'no counts asked for');
+  const cd = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, { routes: { '/admin/me': me2 }, handle: API2_RELAY });
+  assert.match(cd.drawerBody.textContent, /This panel needs the relay updated\./, cd.drawerBody.textContent);
+  assert.doesNotMatch(cd.drawerBody.textContent, /deleted channel/, 'never says the channel is gone');
+  assert.ok(!cd.calls.some((c) => c.includes('/channels/' + CH.research + '/access')), 'not asked for what it doesn’t have');
+});
+
+test('a super-admin on a relay older than the panel still gets the persona’s Identity under the note', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    me: { ...ME_OP, guilds: [{ id: GA, name: 'Guild One' }], apiVersion: 2 },
+    handle: API2_RELAY,
+    routes: { '/admin/personas/aria': { id: 'aria', displayName: 'Aria', roles: [], guilds: [{ id: GA, name: 'Guild One' }] } },
+  });
+  assert.match(box.body.textContent, /This panel needs the relay updated\./);
+  assert.ok(box.body.querySelector('details.identity'), 'Identity, from what that relay has');
+});
+
+test('a relay rolled back since the panel loaded: a 404 on an access read is checked against /admin/me before saying the persona or channel is gone', async () => {
+  let rolledBack = false;
+  const handle: FakeHandler = (method, path, body, headers) => {
+    if (!rolledBack) return undefined;
+    if (path === '/admin/me') return { ...ME_GWEN, apiVersion: 2 };
+    return API2_RELAY(method, path, body, headers);
+  };
+  const box = await personaPanel('/#/g/' + GA + '/personas', { handle });
+  rolledBack = true;
+  box.nav.go('#/g/' + GA + '/personas/p/aria');
+  await settle();
+  assert.match(box.body.textContent, /This panel needs the relay updated\./, box.body.textContent);
+  assert.doesNotMatch(box.body.textContent, /No persona/);
+  assert.ok(box.calls.includes('GET /admin/me'), 'it asked which relay it is');
+
+  rolledBack = false;
+  const ch = await channelsPanel('/#/g/' + GA + '/channels', { handle });
+  rolledBack = true;
+  ch.rowLink(CH.research).click();
+  await settle();
+  assert.match(ch.drawerBody.textContent, /This panel needs the relay updated\./, ch.drawerBody.textContent);
+  assert.doesNotMatch(ch.drawerBody.textContent, /deleted channel/);
+});
+
+test('persona drawer: on a relay that has the access views, a persona that isn’t there is still “No persona with id …”', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/nobody-0', { handle: (method, path) => (path.endsWith('/personas/nobody-0/access') ? refuse(404, 'NOT_FOUND', 'no such persona') : undefined) });
+  assert.equal(box.body.textContent, 'No persona with id “nobody-0”.');
 });

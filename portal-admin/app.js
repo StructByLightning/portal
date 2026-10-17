@@ -30,21 +30,53 @@ const { chanText, roleText, guildText, levelLabel, capsSummary, capsTitle } = li
 const LIMIT = 50;
 
 /** The admin API this panel speaks. /admin/me says which one the relay
- *  speaks; when the relay is newer, the panel asks for a reload. */
-const CLIENT_API = 2;
+ *  speaks; when the relay is newer, the panel asks for a reload. The panel
+ *  can be deployed before the relay (or the relay rolled back): what an
+ *  older one can't answer says so, by name, instead of failing. */
+const CLIENT_API = 3;
 
 /** The first relay API with the direct-grant operations this panel sends: a
  *  level by name, guild-wide as {guildDefault: true}, and Unset and Deny
  *  guild-wide as their own operations. An older relay (one that sends no
- *  apiVersion: the panel can be deployed before it) reads a grant without
- *  caps as a deny and every guild-wide DELETE as a deny, so it is sent caps
- *  only, and offered no Unset (see moreSection and PA.channels.writeGrant). */
+ *  apiVersion) reads a grant without caps as a deny and every guild-wide
+ *  DELETE as a deny, so it is sent caps only, and offered no Unset (see
+ *  moreSection and PA.channels.writeGrant) — which matters only when the
+ *  relay is rolled back that far under an open drawer: a drawer opens only
+ *  on ACCESS_API. */
 const GRANT_API = 2;
+
+/** The first relay API with the access views (…/access/summary,
+ *  …/channels/:cid/access, …/personas/:pid/access), the persona directory,
+ *  Remove from <guild> and Resync. The Channels tab, a channel's drawer and a
+ *  persona's drawer in a guild need it; on an older relay they say the relay
+ *  needs updating (relayOutdated) — never that a channel or persona is gone. */
+const ACCESS_API = 3;
 
 /** The admin API the relay speaks: 1 for one too old to say. */
 function relayApi() {
   const v = state.me && state.me.apiVersion;
   return typeof v === 'number' ? v : 1;
+}
+const accessApi = () => relayApi() >= ACCESS_API;
+
+/** In place of a view an older relay can't answer: what it can't show
+ *  (`what`, e.g. 'who can act in this channel'), and Reload for after the
+ *  update. */
+function relayOutdated(what) {
+  return el('div', { class: 'relay-outdated', role: 'status' }, [
+    el('p', { class: 'relay-outdated-title', text: 'This panel needs the relay updated.' }),
+    el('p', { text: 'The relay is older than this panel, so it can’t show ' + what + ' here. Reload once the relay is updated.' }),
+    el('div', { class: 'inline' }, [el('button', { class: 'btn btn-sm', text: 'Reload', onclick: () => location.reload() })]),
+  ]);
+}
+
+/** An access read answered 404: no such persona or channel — or a relay
+ *  rolled back, since this tab asked, to one without that read. Asks the
+ *  relay which it is (/admin/me) before anything says the thing is gone.
+ *  Resolves true when the relay is too old for it. */
+async function outdatedAfter404() {
+  await refreshMe();
+  return !accessApi();
 }
 
 const state = {
@@ -427,6 +459,7 @@ function channelsEnv() {
     guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
     isSuper, userId, local,
     grantApi: () => relayApi() >= GRANT_API,
+    accessApi, relayOutdated, outdatedAfter404,
   };
 }
 
@@ -1360,8 +1393,8 @@ async function renderPersonas(view, stale) {
     actions.push(scope);
   }
   // 'Add persona to <guild>': the directory type-ahead, in place under the
-  // toolbar (#/g/<guild>/personas/add).
-  const add = gid ? addPersonaBar(gid) : null;
+  // toolbar (#/g/<guild>/personas/add) — on a relay that has the directory.
+  const add = gid && accessApi() ? addPersonaBar(gid) : null;
   if (add) actions.push(add.button);
   const hint = el('p', { class: 'hint muted' });
 
@@ -1376,8 +1409,9 @@ async function renderPersonas(view, stale) {
           ? api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }))
           : api('GET', gpath(gid) + '/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset })),
         // Where each can act: the guild's access summary, as the Channels tab
-        // has it (without it the list still lists, and says so per row).
-        all ? null : window.PA.channels.summary(gid).catch((e) => {
+        // has it (without it — or on a relay too old to have it — the list
+        // still lists, and says so per row).
+        all || !accessApi() ? null : window.PA.channels.summary(gid).catch((e) => {
           if (e.status === 401 || e.handled) throw e;
           return null;
         }),
@@ -1407,8 +1441,10 @@ async function renderPersonas(view, stale) {
     }
     hint.textContent = all
       ? 'Every persona the relay knows. Open one to see its guilds, its profile picture and its token.'
-      : 'Personas with access in this guild, and in how many channels. To add one that has none yet, use “Add persona to ' +
-        currentGuildName() + '”, or mint an invite for an agent to claim.';
+      : !add
+        ? 'Personas with access in this guild. Where each can act, and Add persona, need the relay updated.'
+        : 'Personas with access in this guild, and in how many channels. To add one that has none yet, use “Add persona to ' +
+          currentGuildName() + '”, or mint an invite for an agent to claim.';
   }
   syncScope();
   list.onScope = () => {
@@ -1447,7 +1483,8 @@ function emptyPersonas(gid, all) {
   const guild = gid ? guildName(gid) : '';
   if (all) return el('p', { class: 'empty-note', role: 'status', text: q ? 'No persona matches “' + q + '”.' : 'No personas yet.' });
   const kids = [el('p', { text: q ? 'No persona with access here matches “' + q + '”.' : 'No persona has access in ' + guild + ' yet.' })];
-  const actions = [el('button', { class: 'btn btn-sm', text: q ? 'Add one to ' + guild : 'Add persona to ' + guild, onclick: () => openAddRoute(gid, q) })];
+  // Add persona needs the relay's persona directory (ACCESS_API).
+  const actions = accessApi() ? [el('button', { class: 'btn btn-sm', text: q ? 'Add one to ' + guild : 'Add persona to ' + guild, onclick: () => openAddRoute(gid, q) })] : [];
   if (q && isSuper()) {
     const href = lib.formatRoute(route('all', null, 'personas', null, { q, guild: gid }));
     if (href) actions.push(el('a', { class: 'btn btn-sm', href, text: 'Search all personas' }));
@@ -1637,17 +1674,21 @@ async function openPersonaDrawer(id, hint = {}) {
   // Open at once; the sections arrive when the persona has loaded.
   const d = openDrawer({ title: name, subtitle: id, key: 'persona:' + id });
   const missing = (e) => { if (e.status === 404) return null; throw e; };
+  // A relay older than the access views can't say where it can act here.
+  let outdated = !!gid && !accessApi();
   let access = null;
   let global = null;
   let meta = null;
   try {
     [access, global, meta] = await Promise.all([
       // Where it can act in this guild, and why (what an admin of it may see)…
-      gid ? api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id) + '/access').catch(missing) : null,
+      gid && !outdated ? api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id) + '/access').catch(missing) : null,
       // …and, for super-admins, the persona everywhere.
       isSuper ? api('GET', '/admin/personas/' + encodeURIComponent(id)).catch(missing) : null,
-      gid ? guildMeta(gid) : null,
+      gid && !outdated ? guildMeta(gid) : null,
     ]);
+    // No access read: no such persona — unless the relay was rolled back since.
+    if (gid && !outdated && !access) outdated = await outdatedAfter404();
   } catch (e) {
     // (A guild route the relay refused has closed it already, for the
     // Not-an-admin view; from #/all/personas it says so here instead.)
@@ -1656,7 +1697,18 @@ async function openPersonaDrawer(id, hint = {}) {
     return;
   }
   if (!d.isCurrent()) return;
-  if (gid ? !access : !global) {
+  if (outdated && !(isSuper && !global)) {
+    // Never 'No persona': that relay can't tell. A super-admin still gets
+    // Identity, which it has.
+    if (global) d.setTitle(global.displayName || id, id);
+    const ctx = { id, displayName: (global && global.displayName) || name, drawer: d, gid };
+    d.setBody(el('div', { class: 'drawer-sections' }, [
+      relayOutdated('where ' + ctx.displayName + ' can act in ' + guildName(gid) + ', or change it'),
+      global ? identitySection(ctx, global, true).node : null,
+    ]));
+    return;
+  }
+  if (gid && !outdated ? !access : !global) {
     d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'No persona with id “' + id + '”.' }));
     return;
   }

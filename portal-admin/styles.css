@@ -150,6 +150,10 @@ body:has(#drawer:not(.hidden)) #session-bar { visibility: hidden; }
 .hint { margin-top: 10px; font-size: 12px; }
 .load-error { padding: 14px; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .load-error p { margin: 0 0 8px; }
+/* A view the relay is too old to answer (PA ACCESS_API): not an error — the relay needs updating. */
+.relay-outdated { padding: 14px; border: 1px solid var(--warn); border-radius: 8px; background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.relay-outdated p { margin: 0 0 8px; }
+.relay-outdated-title { font-weight: 600; }
 .empty-note { color: var(--muted); padding: 12px 0; }
 
 /* ── Status lines: a section's result, where it happened; stays until the next. ── */

@@ -1727,7 +1727,7 @@ test('/admin/me: api version, the relay’s own levels and capabilities, feature
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);
   try {
-    assert.equal(s.me.apiVersion, 2);
+    assert.equal(s.me.apiVersion, 3, 'API 3: the access views, the persona directory, Remove from <guild> and Resync');
     assert.deepEqual(s.me.levels, LEVEL_CAPS);
     assert.deepEqual(s.me.caps, ALL_CAPS);
     assert.deepEqual(s.me.features, { invites: true, avatarUploads: true, allowlistEditable: true });

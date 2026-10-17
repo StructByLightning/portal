@@ -79,6 +79,15 @@ Every name and id in the script is invented; keep it that way, since this repo
 is public. When a change adds a member to `AdminDeps`, give it a fake in this
 script, and in `scripts/admin-dev.mjs`, in the same change.
 
+`/admin/me` reports the admin API the relay speaks (`apiVersion`,
+`ADMIN_API_VERSION` in `src/admin/server.ts`; 3 since the access views,
+the persona directory, Remove from <guild> and Resync). Update the relay
+before the panel: a panel newer than its relay says "This panel needs the
+relay updated" in the Channels tab and the channel and persona drawers, and a
+relay newer than the panel gets a "The panel was updated — Reload" banner. A
+change to what the admin API answers or accepts bumps the version and the
+panel's `CLIENT_API` together (`test/admin-spa.test.ts` checks they match).
+
 CI (`.github/workflows/relay-ci.yml`) type-checks the relay and runs the admin,
 slash, permissions and invite tests, including `test/admin-spa.test.ts`, which
 loads the panel's scripts in `node:vm`.
