@@ -249,7 +249,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   features:{invites,avatarUploads,allowlistEditable}, session:{expiresAt}}` — `levels`
   and `caps` are the relay's Read/Write/Full and capability list (the panel keeps a
   copy for an older relay); a relay whose `apiVersion` is newer than the panel's
-  `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. `POST /admin/logout`
+  `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. A relay older than
+  `apiVersion` 2 (one that sends none) reads a grant without `caps` and every guild-wide
+  `DELETE` as a deny, so the panel sends it direct grants as `{caps}` only (no
+  `channelId` meaning guild-wide), Deny guild-wide as a bare `DELETE`, and offers no
+  *Unset*. `POST /admin/logout`
 - `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride,directGrants}], total,limit,offset}`;
   `directGrants` is `grants` (a direct grant gives something here), `denied` (denied
   guild-wide, nothing given) or `none`; super-admins also get `otherGuildRoleCount`

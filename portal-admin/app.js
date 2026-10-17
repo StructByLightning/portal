@@ -31,6 +31,20 @@ const LIMIT = 50;
  *  speaks; when the relay is newer, the panel asks for a reload. */
 const CLIENT_API = 2;
 
+/** The first relay API with the direct-grant operations this panel sends: a
+ *  level by name, guild-wide as {guildDefault: true}, and Unset and Deny
+ *  guild-wide as their own operations. An older relay (one that sends no
+ *  apiVersion: the panel can be deployed before it) reads a grant without
+ *  caps as a deny and every guild-wide DELETE as a deny, so it is sent caps
+ *  only, and offered no Unset (see grantEditor). */
+const GRANT_API = 2;
+
+/** The admin API the relay speaks: 1 for one too old to say. */
+function relayApi() {
+  const v = state.me && state.me.apiVersion;
+  return typeof v === 'number' ? v : 1;
+}
+
 const state = {
   me: null,        // /admin/me: { user, isSuper, guilds, csrf, apiVersion, levels, caps, features, session }
   guilds: [],      // the guilds this admin may manage (and the relay serves), named
@@ -409,6 +423,7 @@ function refreshMe() {
         if (((me.user && me.user.id) || '') !== userId()) { otherAdmin(); return null; }
         state.me.csrf = me.csrf;
         state.me.session = me.session;
+        state.me.apiVersion = me.apiVersion; // what changes are sent in (relayApi)
         if (typeof me.apiVersion === 'number' && me.apiVersion > CLIENT_API) showUpdateBanner();
         if (me.levels && me.caps) lib.adoptModel(me.levels, me.caps);
         if (ui.sessionResumed()) ui.toast('You’re signed in again. Carry on where you were.');
@@ -1660,10 +1675,17 @@ async function tokenAction(ctx, action, button, status) {
  * the guild-wide row says so, and Unset asks before lifting that. Giving it
  * access (a level here, an access role) lifts it too; the relay's answer says
  * which. Returns { node, setBanned(banned) }.
+ *
+ * A relay older than GRANT_API is asked only what it reads right: a level
+ * as its caps (a channel's, or guild-wide with no channelId) and Deny
+ * guild-wide as a bare DELETE. It can't unset a guild-wide level, so Unset
+ * isn't offered. Which relay it is, is checked when a change is sent.
  */
 function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0 = false) {
   const { id, displayName, gid } = ctx;
   const P = () => gpath(gid) + '/personas/' + encodeURIComponent(id) + '/grants';
+  const grantApi = () => relayApi() >= GRANT_API;
+  const OLD_RELAY_UNSET = 'This relay is older than the panel and can’t unset a guild-wide level. Set another level or deny guild-wide instead, or update the relay.';
   const guild = guildName(gid);
   const GUILD_WIDE = '__guild__';
   const det = el('details', { class: 'advanced grants', open: true }, [el('summary', { text: 'Direct grants' })]);
@@ -1693,10 +1715,13 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
    *  Deny guild-wide unless it already is. */
   function guildWideRow(gd) {
     const buttons = [];
+    // An older relay can't unset (it would store a deny): say so instead.
+    const noUnset = () => el('span', { class: 'muted', text: 'Unset needs the relay updated', title: OLD_RELAY_UNSET });
     if (banned) {
       // Removed with /ban: Unset is the one thing to offer here (it asks
       // before lifting the removal); it is denied already.
-      if (Array.isArray(gd)) {
+      if (Array.isArray(gd) && !grantApi()) buttons.push(noUnset());
+      else if (Array.isArray(gd)) {
         const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal', title: 'Lifts the removal: channels fall back to the persona default.' });
         unset.addEventListener('click', () => unsetGuildWide(unset));
         buttons.push(unset);
@@ -1707,7 +1732,8 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
         el('td', { class: 'col-narrow' }, [el('div', { class: 'inline' }, buttons)]),
       ]);
     }
-    if (Array.isArray(gd)) {
+    if (Array.isArray(gd) && !grantApi()) buttons.push(noUnset());
+    else if (Array.isArray(gd)) {
       const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild, title: 'Falls back to the persona default.' });
       unset.addEventListener('click', () => unsetGuildWide(unset));
       buttons.push(unset);
@@ -1779,7 +1805,8 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', P() + '?guildDefault=deny');
+        // An older relay denies guild-wide on a DELETE that names no channel.
+        const r = await api('DELETE', P() + (grantApi() ? '?guildDefault=deny' : ''));
         noteBanned(r);
         draw(r.guildPolicy);
         target.focus();
@@ -1791,6 +1818,9 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
   }
 
   async function unsetGuildWide(button) {
+    // Offered only by a relay that can do it; one that turned out older
+    // since this was drawn would store a deny instead. Nothing is sent.
+    if (!grantApi()) { status.err('Not unset: ' + OLD_RELAY_UNSET); draw(policy); return; }
     const gd = policy && Array.isArray(policy.default) ? policy.default : [];
     // Removed with /ban: unsetting alone would change nothing, so it lifts
     // the removal too — and says so first.
@@ -1813,6 +1843,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
       confirmLabel: 'Unset guild-wide',
     });
     if (!go) return;
+    if (!grantApi()) { status.err('Not unset: ' + OLD_RELAY_UNSET); draw(policy); return; }
     await ui.busy(button, async () => {
       try {
         const r = await api('DELETE', P() + '?guildDefault=unset' + (lift ? '&liftBan=1' : ''));
@@ -1872,10 +1903,16 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     if (!t || !caps.length) return; // Save is off until both are picked
     const sent = tracker.mark(); // what is saved, if it goes through
     // One target and one operation: a preset by name, Custom… as its caps.
-    const body = t === GUILD_WIDE ? { guildDefault: true } : { channelId: t };
+    // An older relay takes caps only (it would store a missing caps as a
+    // deny), and reads a grant with no channelId as guild-wide.
+    const body = t === GUILD_WIDE ? {} : { channelId: t };
     const k = level.level();
-    if (k && k !== 'custom') body.level = k;
-    else body.caps = caps;
+    if (!grantApi()) body.caps = caps;
+    else {
+      if (t === GUILD_WIDE) body.guildDefault = true;
+      if (k && k !== 'custom') body.level = k;
+      else body.caps = caps;
+    }
     try {
       const r = await api('PUT', P(), body);
       const was = banned;

@@ -911,7 +911,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       const route = url.pathname;
       const g = '/admin/g/' + G1;
       const routes: Record<string, unknown> = {
-        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
         '/admin/guilds': { guilds: [{ id: G1, name: 'Guild One' }] },
         [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
         [g + '/channels']: { channels: [] },
@@ -1234,11 +1234,16 @@ const G1_CATALOG = {
   'g2-desk': { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: '100000000000000002' },
 };
 
-async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>; default?: string[] }; refusePut?: (body: any) => unknown; gate?: { put?: Promise<void> }; me?: Record<string, unknown> } = {}) {
+/** Aria's drawer as Gwen sees it, over a relay that keeps `policy`. With
+ *  `oldRelay`, the relay is one from before apiVersion 2 (it sends none): a
+ *  PUT stores body.caps (none: a deny), on the channel or guild-wide, and a
+ *  DELETE without a channelId denies guild-wide, whatever else it says. */
+async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>; default?: string[] }; refusePut?: (body: any) => unknown; gate?: { put?: Promise<void> }; oldRelay?: boolean } = {}) {
   const g = '/admin/g/' + G1;
   const policy: { channels: Record<string, string[]>; default?: string[] } = opts.policy ?? { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
   const box = appSandbox({
     routes: {
+      ...(opts.oldRelay ? { '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' } } : {}),
       [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
       [g + '/channels']: { channels: G1_CHANNELS },
       [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 },
@@ -1246,6 +1251,18 @@ async function ariaDrawer(opts: { policy?: { channels: Record<string, string[]>;
     },
     handle: async (method, path, body) => {
       // As the relay does: one target, one operation.
+      if (opts.oldRelay && path.startsWith(g + '/personas/aria/grants')) {
+        const cid = new URL(path, 'http://panel.invalid').searchParams.get('channelId');
+        if (method === 'PUT') {
+          const caps = Array.isArray(body.caps) ? body.caps : [];
+          if (body.channelId) policy.channels[body.channelId] = caps;
+          else policy.default = caps;
+        } else if (method === 'DELETE') {
+          if (cid) delete policy.channels[cid];
+          else policy.default = [];
+        }
+        return { guildPolicy: policy };
+      }
       if (method === 'PUT' && path === g + '/personas/aria/grants') {
         if (opts.gate?.put) await opts.gate.put; // the relay takes its time
         if (opts.refusePut) return opts.refusePut(body);
@@ -1401,7 +1418,7 @@ async function rolesTab(more: Record<string, any> = {}) {
   const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void> } = { down: false };
   const box = appSandbox({
     routes: {
-      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
       [g + '/channels']: { channels: G1_CHANNELS },
     },
     handle: async (method, path, body) => {
@@ -1749,6 +1766,65 @@ test('grant editor: guild-wide is set, denied or not set — with Unset and Deny
   assert.deepEqual(buttons(), ['Unset']);
 });
 
+test('grant editor: a relay older than the panel gets caps it reads right, and no Unset', async () => {
+  const policy = { channels: {} as Record<string, string[]>, default: [...LEVEL_CAPS.read] };
+  const { form, radio, choose, bodies, calls, drawer, doc } = await ariaDrawer({ policy, oldRelay: true });
+  const g = '/admin/g/' + G1 + '/personas/aria/grants';
+  // Read, Write, Full: as caps.
+  choose(CH.labNotes);
+  radio('write').checked = true;
+  radio('write').fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, caps: [...LEVEL_CAPS.write] });
+  assert.deepEqual(policy.channels[CH.labNotes], [...LEVEL_CAPS.write], 'a grant, not a deny');
+  // Guild-wide: caps with no channelId.
+  choose('__guild__');
+  radio('read').checked = false;
+  radio('full').checked = true;
+  radio('full').fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { caps: [...LEVEL_CAPS.full] });
+  assert.deepEqual(policy.default, [...LEVEL_CAPS.full]);
+  // No Unset (it would store a deny); Deny guild-wide is the bare DELETE it denies with.
+  const row = () => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
+  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Deny guild-wide']);
+  assert.match(row().textContent, /Unset needs the relay updated/);
+  clickable(doc, 'Deny guild-wide', row()).click();
+  await settle();
+  doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(calls.at(-1), `DELETE ${g}`);
+  assert.deepEqual(policy.default, []);
+  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), [], 'denied: nothing an older relay can undo here but a level');
+  assert.ok(!calls.some((c) => c.includes('guildDefault=unset')));
+});
+
+test('grant editor: a relay that comes back older is noticed when the tab checks the session', async () => {
+  let me: Record<string, unknown> = { ...ME_GWEN };
+  const box = await panelAt('/#/g/' + GA + '/personas/p/aria', {
+    handle: (method, path) => {
+      if (path === '/admin/me') return me;
+      if (method === 'PUT') return { guildPolicy: { channels: {} } };
+      return undefined;
+    },
+  });
+  me = { ...ME_GWEN, apiVersion: undefined }; // rolled back
+  for (const [type, fn] of box.doc.listeners) if (type === 'visibilitychange') (fn as () => void)();
+  await settle();
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.general;
+  target.fire('change');
+  const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  read.checked = true;
+  read.fire('change');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(box.bodies.at(-1), { channelId: CH.general, caps: [...LEVEL_CAPS.read] });
+});
+
 test('grant editor: the relay’s refusal is put in words in the section’s line', async () => {
   const { form, radio, choose, drawer } = await ariaDrawer({
     refusePut: (body) => (body.channelId === CH.labNotes ? refuse(400, 'THREAD_TARGET', 'thread', { parentId: CH.research }) : refuse(400, 'CATEGORY_TARGET')),
@@ -2074,8 +2150,8 @@ test('lib.loginErrorText: the fixed table; anything else is a generic line', () 
 
 // ── Addresses in the app: reload, Back, links ──
 
-const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1' };
-const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1' };
+const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1', apiVersion: 2 };
+const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1', apiVersion: 2 };
 
 /** The panel signed in as `me`, at `url`, over Guild One's fixture. */
 async function panelAt(url: string, opts: { me?: unknown; guilds?: unknown[]; handle?: FakeHandler; routes?: Record<string, unknown>; session?: Record<string, string>; local?: Record<string, string> } = {}) {
