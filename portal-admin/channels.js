@@ -33,8 +33,6 @@ const RETRY_MS = 3_000;
 const MAX_RETRIES = 3;
 /** Personas one Add can take. */
 const MAX_ADD = 10;
-/** The last line of a confirm that lifts a removal with /ban. */
-const UNDO_KEEPS_LIFT = 'Undo takes the grant away again, but the removal stays lifted.';
 
 const el = (tag, attrs, children) => PA.ui.el(tag, attrs, children);
 const clear = (n) => PA.ui.clear(n);
@@ -146,8 +144,6 @@ function writeGrant(gid, pid, cid, next, expect) {
   body.expect = expect;
   return env.api('PUT', P, body);
 }
-
-const sameSet = (a, b) => PA.lib.sameCapSet(a, b);
 
 // ── The Channels tab ───────────────────────────────────────────────────────
 
@@ -638,23 +634,11 @@ function drawDrawer(d, gid, cid, data, note) {
     }
   }
 
-  /** What a change did, in the copy guide's words, from the relay's answer.
+  /** What a change did, in the copy guide's words, from the relay's answer
+   *  (lib.grantResultText, which the persona drawer says it with too).
    *  `liftedBan`: the change ended the persona's removal from the guild. */
   function resultText(name, next, before, ex, liftedBan) {
-    const lifted = liftedBan ? ' That lifted its removal from ' + guild + '.' : '';
-    // An answer without the channel explained (it was deleted meanwhile, or
-    // an older relay): say what was done; the rows are read again.
-    if (!ex || !Array.isArray(ex.effective)) {
-      return next == null ? 'Removed ' + name + '’s direct grant in ' + where + '.'
-        : name + ' → ' + (next.length ? lib.capsSummary(next) : 'blocked') + ' in ' + where + '.' + lifted;
-    }
-    const nowText = lib.effectNowText(ex, where);
-    if (next == null) return 'Removed ' + name + '’s direct grant in ' + where + ' — ' + lib.remainingText(ex, where) + '.';
-    if (!next.length) return 'Blocked guild-wide access for ' + name + ' in ' + where + '. Effective now: ' + nowText + '.';
-    // Nothing it can do changed (a role or guild-wide gave it already) — but
-    // when the relay's bot is what holds it back, that is the news.
-    if (ex && !ex.botLimited && sameSet(before, ex.effective)) return name + ' → ' + lib.capsSummary(next) + ' in ' + where + '. No change to what ' + name + ' can do there: ' + nowText + '.' + lifted;
-    return name + ' → ' + lib.capsSummary(next) + ' in ' + where + '. Effective now: ' + nowText + '.' + lifted;
+    return lib.grantResultText({ name, next, before, ex, where, liftedFrom: liftedBan ? guild : null });
   }
 
   /** Send one change and take the relay's answer for the row. Resolves
@@ -740,7 +724,7 @@ function drawDrawer(d, gid, cid, data, note) {
       // whole guild: asked first, as the confirm says.
       const go = await ui.confirmDialog({
         title: 'Lift ' + name + '’s removal from ' + guild + '?',
-        body: [lib.liftText(name, next, where, guild), UNDO_KEEPS_LIFT],
+        body: [lib.liftText(name, next, where, guild), lib.UNDO_KEEPS_LIFT],
         confirmLabel: 'Give access and lift',
       });
       if (!go) return false;
@@ -849,7 +833,7 @@ function drawDrawer(d, gid, cid, data, note) {
         const go = await ui.confirmDialog({
           title,
           body: asks.map((c) => lib.lowerText(c.it.label, c.ck, where))
-            .concat(lifts.map((it) => lib.liftText(it.label, caps, where, guild)), lifts.length ? [UNDO_KEEPS_LIFT] : []),
+            .concat(lifts.map((it) => lib.liftText(it.label, caps, where, guild)), lifts.length ? [lib.UNDO_KEEPS_LIFT] : []),
           confirmLabel: lifts.length ? 'Add and lift' : 'Add at ' + lib.levelLabel(caps),
         });
         if (!go) return;
@@ -957,6 +941,13 @@ PA.channels = {
   },
   render,
   openDrawer,
+  /** The persona drawer changes direct grants through the same queue and
+   *  the same hardened route (see enqueue and writeGrant). */
+  enqueue,
+  writeGrant,
+  /** The guild's access summary (cached with the channels, as the list has
+   *  it): the Personas list counts where each persona can act from it. */
+  summary: (gid) => load(gid, false).then((v) => v.summary),
   /** Forget what is known about a guild (every guild when none is named):
    *  something changed elsewhere in the panel, so the next look asks again. */
   forget(gid) {

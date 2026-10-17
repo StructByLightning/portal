@@ -21,6 +21,10 @@
  *   lowerText, currentlyText,          to ask first: the relay says what it did)
  *   sameCapSet                         the same capabilities, in any order
  *   isRemoved, liftText                a persona removed with /ban, and the lift
+ *   grantResultText                    what a direct-grant change did, from the answer
+ *   canActInText, personaSummaryText,  the Personas list and the persona drawer:
+ *   foldAccessRows, inactiveText,      counts in words, rows that read alike folded,
+ *   removeConfirm, removedText         grants that do nothing, Remove from <guild>
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
  *   roleNameTaken                      defining a role under a name in use
@@ -667,6 +671,166 @@
       levelLabel(caps) + ' in ' + where + ' lifts that: anything it still holds in ' + guild + ' applies again.';
   }
 
+  /** The last line of a confirm that lifts a removal with /ban. */
+  const UNDO_KEEPS_LIFT = 'Undo takes the grant away again, but the removal stays lifted.';
+
+  /**
+   * What a direct-grant change did, in the copy guide's words, from the
+   * relay's answer (`ex`, its `effective`): 'Aria → Write in #research.
+   * Effective now: Write.' · '… No change to what Aria can do there: Write.'
+   * · 'Removed Aria’s direct grant in #research — still Write via role
+   * g1-chatters.' · 'Blocked guild-wide access for Aria in #research. …'.
+   *   o: { name, next (caps; [] a block; null removed), before (what it could
+   *        do there before), ex, where, liftedFrom (the guild's name, when the
+   *        change ended its removal with /ban), accessWhere (the channel whose
+   *        access applies there, when that is another one: a thread's parent) }
+   * An answer without the channel explained (it was deleted meanwhile, or an
+   * older relay) says what was done.
+   */
+  function grantResultText(o) {
+    const { name, next, before, ex, where } = o;
+    const lifted = o.liftedFrom ? ' That lifted its removal from ' + o.liftedFrom + '.' : '';
+    if (!ex || !Array.isArray(ex.effective)) {
+      return next == null ? 'Removed ' + name + '’s direct grant in ' + where + '.'
+        : name + ' → ' + (next.length ? capsSummary(next) : 'blocked') + ' in ' + where + '.' + lifted;
+    }
+    const nowText = effectNowText(ex, where);
+    if (next == null) {
+      const left = remainingText(ex, where, o.accessWhere);
+      return 'Removed ' + name + '’s direct grant in ' + where + (left ? ' — ' + left : '') + '.';
+    }
+    if (!next.length) return 'Blocked guild-wide access for ' + name + ' in ' + where + '. Effective now: ' + nowText + '.';
+    // Nothing it can do changed (a role or guild-wide gave it already) — but
+    // when the relay's bot is what holds it back, that is the news.
+    if (!ex.botLimited && sameCapSet(before, ex.effective)) return name + ' → ' + capsSummary(next) + ' in ' + where + '. No change to what ' + name + ' can do there: ' + nowText + '.' + lifted;
+    return name + ' → ' + capsSummary(next) + ' in ' + where + '. Effective now: ' + nowText + '.' + lifted;
+  }
+
+  // ── The persona drawer and the Personas list ──────────────────────────────
+
+  const BY_LEVEL = ['full', 'write', 'read', 'custom'];
+
+  /** A persona row's 'Can act in': 'in 14 channels (9 Write · 5 Read)' from
+   *  its per-level counts (the summary's), '—' when it can act nowhere, ''
+   *  when the counts aren't known. */
+  function canActInText(c) {
+    if (!c) return '';
+    const n = countsTotal(c);
+    if (!n) return '—';
+    return 'in ' + plural(n, 'channel') + ' (' + BY_LEVEL.filter((k) => c[k]).map((k) => c[k] + ' ' + LEVEL_NAME[k]).join(' · ') + ')';
+  }
+
+  /** The persona drawer's summary line: 'Write in 3 · Read in 12 channels
+   *  here' (the last number names the unit), or 'No access here'. */
+  function personaSummaryText(c) {
+    const parts = BY_LEVEL.filter((k) => c && c[k]).map((k) => ({ k, n: c[k] }));
+    if (!parts.length) return 'No access here';
+    const last = parts[parts.length - 1];
+    return parts.map((p) => LEVEL_NAME[p.k] + ' in ' + p.n).join(' · ') + (last.n === 1 ? ' channel here' : ' channels here');
+  }
+
+  /** What makes two access rows read alike: the same capabilities, cut down
+   *  by the bot alike, for the same reasons (and the same direct grant). */
+  function rowSignature(row) {
+    const caps = (xs) => sortCaps(xs || []).join(',');
+    const src = ((row && row.sources) || []).map((s) => [s.kind, s.name || '', s.shadowedBy || '', caps(s.caps)].join(':')).sort();
+    return [caps(row && row.effective), row && row.botLimited ? 'limited' : '', row && Array.isArray(row.direct) ? caps(row.direct) + '!' : '-', src.join('|')].join('#');
+  }
+
+  /**
+   * The persona drawer's table, folded: rows that read alike (rowSignature)
+   * six times or more are one line each — 'Write in 240 channels · via role
+   * g1-everyone' — with the rows under it (shown on request); every other row
+   * is on its own. `rows` in the order the table lists them.
+   *   → { runs: [{ key, rows, text }] (largest first), rest: [rows] }
+   */
+  function foldAccessRows(rows, min) {
+    const at = min == null ? 6 : min;
+    const bySig = new Map();
+    for (const r of rows || []) {
+      const k = rowSignature(r);
+      if (!bySig.has(k)) bySig.set(k, []);
+      bySig.get(k).push(r);
+    }
+    const runs = [];
+    const folded = new Set();
+    for (const [key, rs] of bySig) {
+      if (rs.length < at) continue;
+      for (const r of rs) folded.add(r);
+      runs.push({ key, rows: rs, text: runText(rs[0], rs.length) });
+    }
+    runs.sort((a, b) => b.rows.length - a.rows.length);
+    return { runs, rest: (rows || []).filter((r) => !folded.has(r)) };
+  }
+
+  /** 'Write in 240 channels · via role g1-everyone' · 'Read (bot-limited) in
+   *  17 channels · via role g1-everyone' · 'Write in 6 channels · via direct
+   *  grants'. */
+  function runText(row, n) {
+    const eff = (row && row.effective) || [];
+    const via = viaParts(row, 'direct grants');
+    return (eff.length ? levelLabel(eff) : 'No access') + (row && row.botLimited ? ' (bot-limited)' : '') + ' in ' + plural(n, 'channel') +
+      (via.length ? ' · via ' + via.join(' and ') : '');
+  }
+
+  /** A direct grant that does nothing, as the persona drawer lists it (an
+   *  item of …/personas/:pid/access `inactive`): 'design-review — thread;
+   *  uses #research’s access' · 'Research — category' · 'deleted channel, or
+   *  one the relay can’t see' · '#random — blocks nothing (no guild-wide or
+   *  persona default to block)'. */
+  function inactiveText(item, names) {
+    const l = (names && names.channels && names.channels[item.channelId]) || {};
+    const name = l.name || null;
+    switch (item.reason) {
+      case 'thread': return (name || 'a thread') + ' — thread; uses ' + (l.parentName ? '#' + l.parentName : 'its channel') + '’s access';
+      case 'category': return (name || 'a category') + ' — category';
+      case 'blocks-nothing': return chanText(item.channelId, names) + ' — blocks nothing (no guild-wide or persona default to block)';
+      default: return 'deleted channel, or one the relay can’t see';
+    }
+  }
+
+  /**
+   * The confirm before "Remove from <guild>", from what the persona's access
+   * read showed (…/personas/:pid/access): what goes, that other guilds stay
+   * as they are, and that only an admin of the guild can give it access there
+   * again. → { title, body, confirmLabel, grants } (`grants`: how many direct
+   * grants go, for the result line).
+   */
+  function removeConfirm(name, guild, access) {
+    const a = access || {};
+    const roles = (a.roles || []).map((r) => r.name);
+    const grants = (a.rows || []).filter((r) => Array.isArray(r.direct)).length + (a.inactive || []).filter((x) => x.reason !== 'blocks-nothing').length;
+    const parts = [];
+    if (roles.length) parts.push((roles.length === 1 ? 'access role ' : 'access roles ') + roles.join(', '));
+    if (grants) parts.push(plural(grants, 'direct grant'));
+    return {
+      title: 'Remove ' + name + ' from ' + guild + '?',
+      body: [
+        (parts.length ? 'This removes ' + parts.join(' and ') + ', and denies' : 'This denies') + ' guild-wide access here.',
+        name + ' can’t give itself access here again — claiming an invite won’t bring it back. Only an admin of ' + guild + ' can, by giving it access here.',
+        'Other guilds are not affected. You can add ' + name + ' back later.',
+      ],
+      confirmLabel: 'Remove from ' + guild,
+      grants,
+    };
+  }
+
+  /** What "Remove from <guild>" did, from the relay's answer: 'Removed Quill
+   *  from Guild One: access role g1-mods-mirror and 1 direct grant are gone,
+   *  and guild-wide access is denied. No remaining access in Guild One.' */
+  function removedText(name, guild, r) {
+    const roles = (r && r.rolesRemoved) || [];
+    const grants = (r && r.grants) || 0;
+    const parts = [];
+    if (roles.length) parts.push((roles.length === 1 ? 'access role ' : 'access roles ') + roles.join(', '));
+    if (grants) parts.push(plural(grants, 'direct grant'));
+    const gone = parts.length ? parts.join(' and ') + (roles.length + grants === 1 ? ' is' : ' are') + ' gone, and guild-wide access is denied' : 'guild-wide access is denied';
+    if (r && r.accessFullyRevoked === false) {
+      return 'Removed ' + name + ' from ' + guild + ' (' + gone + '), but access still resolves in ' + guild + ' — this should be impossible; please report it.';
+    }
+    return 'Removed ' + name + ' from ' + guild + ': ' + gone + '. No remaining access in ' + guild + '.';
+  }
+
   /** What the direct-grant control's Custom option reads when a custom set
    *  is stored: 'Write +1 (custom)' · 'Custom' · 'Custom — can’t see the
    *  channel' (a set without View). */
@@ -1162,10 +1326,13 @@
       mirrorRole: FIELD.snowflake, caps: FIELD.caps, uses: oneOf(['1', '5', '25', 'unlimited', 'other']), usesOther: FIELD.digits,
       expires: oneOf(['1', '7', '30', 'never']), mode: oneOf(['mint', 'augment', 'both']),
     },
-    // A direct grant in the persona drawer: whose, where and what level.
+    // The persona drawer's guild-wide level (More): whose, and what level.
+    // (An older panel kept one channel here too; it comes back in Add to channels.)
     grant: { personaId: isPersonaId, target: FIELD.target, caps: FIELD.caps },
     // The channel drawer's Add form: whom to add (at most 10) and at what level.
     chanAdd: { personas: (v) => Array.isArray(v) && v.length <= 10 && v.every(isPersonaId), caps: FIELD.caps },
+    // The persona drawer's Add to channels: whose, where (at most 50) and what level.
+    personaAdd: { personaId: isPersonaId, channels: (v) => Array.isArray(v) && v.length <= 50 && v.every(isSnowflake), caps: FIELD.caps },
     // Defining an access role.
     role: {
       name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,
@@ -1237,6 +1404,7 @@
     countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
     channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
     ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, customOptionText,
+    UNDO_KEEPS_LIFT, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,

@@ -62,7 +62,9 @@ It listens on 127.0.0.1 only. Sign in as a fixture user:
 - `--ttl` sets the session lifetime in ms (default 30 minutes), to try expiry.
 - `--no-avatars` starts with no profile pictures and avatar uploads off.
 - `--scale large` adds a busy Guild One: 8 categories of 36 channels with
-  threads, 200 more personas, 60 more invites and 500 audit records.
+  threads, 200 more personas, 60 more invites and 500 audit records; Aria
+  also holds `g1-everyone` (Write in every channel), so her drawer folds
+  hundreds of rows that read alike into one line.
 
 The small world has Guild One (channels in General, Research and Archive
 categories, an announcement channel, a thread, a forum and a channel the bot

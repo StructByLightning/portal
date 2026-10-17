@@ -711,8 +711,10 @@
    *   opts: { label (names the list), ariaLabel (names the field when no
    *           <label for> does), placeholder, multiple
    *           (default true), max, name (of the hidden inputs that hold the
-   *           picks), source(q) → Promise<[{ value, label, hint, group,
-   *           disabled, title }]>, debounce (ms, default 150), empty }
+   *           picks), source(q) → Promise<[{ value, label, hint, tag, group,
+   *           disabled, title }]>, debounce (ms, default 150), empty,
+   *           expand(item) → [items] | null (a pick that stands for several:
+   *           its items are picked instead — a category's channels) }
    * Options come grouped in the order their groups first appear. ↑/↓ move,
    * Enter picks, Esc closes the list (the next Esc is the drawer's), Tab
    * leaves it, Backspace in an empty field removes the last chip. Typing asks
@@ -720,7 +722,8 @@
    * in a hidden input named `name`, so a form's dirty tracking counts it; the
    * typed text doesn't count (it is a search).
    * Returns { node, input, values(), items(), set(items), clear(),
-   * onChange(fn), close() }; onChange fires on the admin's picks and removals.
+   * query(text) (type `text` into the field and ask), onChange(fn), close() };
+   * onChange fires on the admin's picks and removals.
    */
   function typeahead(opts) {
     const o = opts || {};
@@ -800,7 +803,11 @@
           const opt = el('div', {
             id: uid('ta-opt'), class: 'ta-option' + (it.disabled ? ' disabled' : ''), role: 'option', 'aria-selected': 'false',
             'aria-disabled': it.disabled ? 'true' : null, title: it.title || null,
-          }, [el('span', { class: 'ta-label', text: it.label }), it.hint ? el('span', { class: 'ta-hint', text: it.hint }) : null]);
+          }, [
+            el('span', { class: 'ta-label', text: it.label }),
+            it.hint ? el('span', { class: 'ta-hint', text: it.hint }) : null,
+            it.tag ? el('span', { class: 'badge ta-tag', text: it.tag }) : null,
+          ]);
           if (!it.disabled) {
             const i = options.length;
             options.push({ item: it, node: opt });
@@ -844,7 +851,17 @@
       }
     }
     function pick(it) {
-      if (multiple) {
+      const several = multiple && o.expand ? o.expand(it) : null;
+      if (several) {
+        const taken = new Set(picked.map((p) => p.value));
+        const fresh = several.filter((x) => !taken.has(x.value));
+        const room = Math.max(0, max - picked.length);
+        picked.push(...fresh.slice(0, room));
+        input.value = '';
+        live.textContent = fresh.length > room
+          ? 'Picked ' + room + ' of ' + fresh.length + ': at most ' + max + ' can be picked.'
+          : fresh.length + ' picked from ' + it.label + '.';
+      } else if (multiple) {
         if (picked.length >= max) {
           live.textContent = 'At most ' + max + ' can be picked.';
           return;
@@ -931,6 +948,10 @@
         picked = [];
         input.value = '';
         drawChips();
+      },
+      query(text) {
+        input.value = text || '';
+        search();
       },
       close() {
         seq++;

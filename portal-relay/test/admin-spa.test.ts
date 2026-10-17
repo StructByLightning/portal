@@ -948,6 +948,25 @@ class Refusal {
 /** The relay's refusal: {error: {code, message, …extra}} with an HTTP status. */
 const refuse = (status: number, code: string, message = code, extra: Record<string, unknown> = {}) => new Refusal(status, { code, message, ...extra });
 
+/** A row of GET …/personas/:pid/access. */
+function pRow(channelId: string, effective: string[], sources: object[], direct: string[] | null = null, extra: object = {}) {
+  return { channelId, effective, level: 'x', base: null, extra: [], direct, sources, botLimited: false, botLacks: [], ...extra };
+}
+
+/** A persona's access in a guild, as GET …/personas/:pid/access answers. */
+function accessBody(o: {
+  id?: string; name?: string; rows?: unknown[]; inactive?: unknown[]; roles?: unknown[]; guildWide?: unknown; removed?: boolean;
+  personaDefault?: unknown; names?: Record<string, unknown>; otherGuildRoleCount?: number;
+} = {}) {
+  return {
+    persona: { id: o.id ?? 'aria', displayName: o.name ?? 'Aria', avatarUrl: '' },
+    removed: !!o.removed, guildWide: o.guildWide ?? null, personaDefault: o.personaDefault ?? null, relayDefault: null,
+    rows: o.rows ?? [], inactive: o.inactive ?? [], roles: o.roles ?? [],
+    ...(o.otherGuildRoleCount !== undefined ? { otherGuildRoleCount: o.otherGuildRoleCount } : {}),
+    names: { channels: o.names ?? {}, discordRoles: {} },
+  };
+}
+
 /** A sandbox with index.html's shell, signed in as a one-guild admin, on
  *  Guild One's Personas tab unless `url` says otherwise (a first visit, '/',
  *  lands on Channels). Every request lands in `calls` as 'METHOD
@@ -980,6 +999,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
         [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
         [g + '/channels']: { channels: [] },
         [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
+        [g + '/personas/aria/access']: accessBody(),
         [g + '/invites']: { invites: [{ code: 'inv_fixtureinvite0000000a', label: 'test', mode: 'mint', uses: 0, roles: ['g1-readers'] }], total: 1, limit: 50, offset: 0 },
         ...opts.routes,
       };
@@ -1024,6 +1044,17 @@ function clickable(doc: FakeDocument, text: string, root: FakeElement = doc.body
 
 async function settle() {
   for (let i = 0; i < 30; i++) await tick();
+}
+
+/** In a persona drawer's Add to channels: type `q`, then pick `label`. */
+async function pickChannel(box: { advance: (ms: number) => void }, form: FakeElement, q: string, label: string) {
+  const input = form.querySelector('.ta-input')!;
+  input.focus();
+  input.value = q;
+  input.fire('input');
+  box.advance(150);
+  await settle();
+  form.querySelectorAll('.ta-option').find((o) => o.querySelector('.ta-label')!.textContent === label)!.click();
 }
 
 test('app list search: a query typed just before leaving a tab does not follow you to the next one', async () => {
@@ -1270,7 +1301,7 @@ test('ui.levelControl: Custom… ticks View and History with any Write or Modera
   assert.equal(box('VIEW_CHANNEL').checked, false);
 });
 
-// ── The persona drawer's direct grants, driven as Gwen would ──
+// ── Guild One's channels and access roles, as the preview harness has them ──
 
 const CH = {
   welcome: '100000000000001010', catGeneral: '100000000000001001', general: '100000000000001011', random: '100000000000001012',
@@ -1297,117 +1328,6 @@ const G1_CATALOG = {
   // Another guild's role, as a super-admin's catalog would hold it.
   'g2-desk': { caps: LEVEL_CAPS.write, scope: { all: true }, guildId: '100000000000000002' },
 };
-
-async function ariaDrawer(opts: {
-  policy?: { channels: Record<string, string[]>; default?: string[] };
-  refusePut?: (body: any) => unknown;
-  refuseDelete?: (path: string, body: any) => unknown;
-  /** The relay's `effective` for a change's answer. */
-  effective?: (method: string, path: string, body: any) => unknown;
-  /** The persona read's channel labels (the relay's names map). */
-  names?: Record<string, unknown>;
-} = {}) {
-  const g = '/admin/g/' + G1;
-  const policy: { channels: Record<string, string[]>; default?: string[] } = opts.policy ?? { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
-  const box = appSandbox({
-    routes: {
-      [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
-      [g + '/channels']: { channels: G1_CHANNELS },
-      [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 },
-      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters', 'g2-desk'], guildPolicy: policy, names: { channels: opts.names ?? {} } },
-    },
-    handle: (method, path, body) => {
-      // As the relay does: one target, one operation.
-      if (method === 'PUT' && path === g + '/personas/aria/grants') {
-        if (opts.refusePut) return opts.refusePut(body);
-        const caps = body.level ? [...(LEVEL_CAPS as Record<string, string[]>)[body.level]] : body.deny ? [] : body.caps;
-        if (body.channelId) policy.channels[body.channelId] = caps;
-        else if (body.guildDefault === true) policy.default = caps;
-        else return refuse(400, 'TARGET_REQUIRED');
-        return { guildPolicy: policy, ...(opts.effective ? { effective: opts.effective(method, path, body) } : {}) };
-      }
-      if (method === 'DELETE' && path.startsWith(g + '/personas/aria/grants?')) {
-        if (opts.refuseDelete) {
-          const refused = opts.refuseDelete(path, body);
-          if (refused) return refused;
-        }
-        const q = new URL(path, 'http://panel.invalid').searchParams;
-        if (q.get('guildDefault') === 'deny') policy.default = [];
-        else if (q.get('guildDefault') === 'unset') delete policy.default;
-        else if (q.get('channelId')) delete policy.channels[q.get('channelId')!];
-        else return refuse(400, 'TARGET_REQUIRED');
-        return { guildPolicy: policy, ...(opts.effective ? { effective: opts.effective(method, path, body) } : {}) };
-      }
-      return undefined;
-    },
-  });
-  await box.ctx.PA.app.boot();
-  await settle();
-  clickable(box.doc, 'Aria').click();
-  await settle();
-  const drawer = box.doc.getElementById('drawer-body')!;
-  const form = drawer.querySelector('form.grant-form')!;
-  const target = form.querySelector('select')!;
-  const save = form.querySelector('button[type="submit"]')!;
-  const radio = (v: string) => form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === v)!;
-  const choose = (v: string) => {
-    target.value = v;
-    target.fire('change');
-  };
-  return { ...box, drawer, form, target, save, radio, choose, policy };
-}
-
-test('grant editor: open at the top; targets are channels that can hold a grant, then guild-wide', async () => {
-  const { drawer, target } = await ariaDrawer();
-  const section = drawer.querySelector('section')!;
-  const first = section.children[1];
-  assert.equal(first.tagName, 'DETAILS', 'Direct grants come first in the guild section');
-  assert.equal(first.hasAttribute('open'), true);
-  const texts = target.options.map((o) => o.textContent);
-  assert.equal(texts[0], 'Pick a channel…');
-  assert.equal(texts.at(-1), 'Every channel in Guild One (guild-wide)…');
-  assert.deepEqual(texts.slice(1, -1), ['#general', 'ideas (forum)', '#lab-notes', 'lounge (voice)', '#old-logs', '#random', '#research', '#welcome']);
-  assert.ok(!texts.some((t) => /design-review|category/.test(t)), 'no thread, no category');
-});
-
-test('grant editor: picking a target loads its level; Save waits for a level; Write saves exactly the Write caps', async () => {
-  const { form, target, save, radio, choose, calls, bodies, policy, drawer } = await ariaDrawer();
-  assert.equal(save.disabled, true, 'nothing picked yet');
-  choose(CH.research);
-  assert.equal(radio('write').checked, true, 'its direct grant is Write');
-  assert.equal(save.disabled, false);
-  choose(CH.labNotes);
-  assert.equal(['read', 'write', 'full', 'custom'].some((k) => radio(k).checked), false, 'no grant there: no level');
-  assert.equal(save.disabled, true);
-  radio('write').checked = true;
-  radio('write').fire('change');
-  assert.equal(save.disabled, false);
-  form.fire('submit');
-  await settle();
-  const g = '/admin/g/' + G1;
-  assert.equal(calls.at(-1), `PUT ${g}/personas/aria/grants`);
-  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, level: 'write', expect: null }, 'a preset goes by its name, with what the drawer loaded there (nothing)');
-  assert.deepEqual(policy.channels[CH.labNotes], [...LEVEL_CAPS.write]);
-  const rows = drawer.querySelectorAll('tr').map((tr) => tr.children.map((td) => td.textContent));
-  assert.ok(rows.some((r) => r[0] === '#lab-notes' && r[1] === 'Write'), JSON.stringify(rows));
-  assert.equal(target.value, CH.labNotes);
-  // Guild-wide carries its warning.
-  const warn = form.querySelector('.warn-line')!;
-  assert.ok(warn.classList.contains('hidden'));
-  choose('__guild__');
-  assert.ok(!warn.classList.contains('hidden'));
-  assert.equal(warn.textContent, 'Applies to every channel without its own grant, including new ones.');
-});
-
-test('persona drawer: access roles are this guild’s only, with what each means', async () => {
-  const { drawer } = await ariaDrawer();
-  const picker = drawer.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
-  assert.deepEqual(picker.options.map((o) => o.textContent), ['+ Add access role…', 'g1-readers — Read in every channel of Guild One']);
-  const chips = drawer.querySelectorAll('.tag').map((t) => t.textContent);
-  assert.deepEqual(chips, ['g1-chatters— Write in 2 channels✕']);
-  const note = drawer.querySelectorAll('.field-hint').find((n) => /other guilds/.test(n.textContent))!;
-  assert.equal(note.textContent, '+1 role in other guilds');
-});
 
 // ── The access-role drawer, driven as a super-admin would ──
 
@@ -1713,94 +1633,6 @@ test('app: levels come from /admin/me when the relay sends them', async () => {
   assert.deepEqual(plain(ctx.PA.lib.LEVEL_CAPS.read), ['VIEW_CHANNEL']);
 });
 
-test('grant editor: Custom… is sent as caps, guild-wide as {guildDefault: true}', async () => {
-  const { form, radio, choose, bodies, policy } = await ariaDrawer();
-  choose(CH.general);
-  radio('custom').checked = true;
-  radio('custom').fire('change');
-  const box = (c: string) => form.querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === c)!;
-  box('MENTION_EVERYONE').checked = true;
-  box('MENTION_EVERYONE').fire('change');
-  form.fire('submit');
-  await settle();
-  assert.deepEqual(bodies.at(-1), { channelId: CH.general, caps: ['VIEW_CHANNEL', 'READ_HISTORY', 'MENTION_EVERYONE'], expect: null });
-  choose('__guild__');
-  radio('read').checked = true;
-  radio('read').fire('change');
-  form.fire('submit');
-  await settle();
-  assert.deepEqual(bodies.at(-1), { guildDefault: true, level: 'read', expect: null });
-  assert.deepEqual(policy.default, [...LEVEL_CAPS.read]);
-});
-
-test('grant editor: guild-wide is set, denied or not set — with Unset and Deny guild-wide', async () => {
-  const policy = { channels: {} as Record<string, string[]>, default: [...LEVEL_CAPS.read] };
-  const { drawer, doc, calls } = await ariaDrawer({ policy });
-  const g = '/admin/g/' + G1 + '/personas/aria/grants';
-  const row = () => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
-  const buttons = () => row().querySelectorAll('button').map((b) => b.textContent);
-  const status = () => drawer.querySelector('form.grant-form')!.querySelector('.status-line')!.textContent;
-  assert.equal(row().children[1].textContent, 'Read');
-  assert.deepEqual(buttons(), ['Unset', 'Deny guild-wide']);
-
-  // Unset: asked, then DELETE ?guildDefault=unset.
-  row().querySelectorAll('button').find((b) => b.textContent === 'Unset')!.click();
-  await settle();
-  const dialog = doc.querySelector('.modal')!;
-  assert.equal(dialog.querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One?');
-  assert.match(dialog.textContent, /fall back to Aria’s persona default/);
-  dialog.querySelectorAll('button').find((b) => b.textContent === 'Unset guild-wide')!.click();
-  await settle();
-  assert.equal(calls.at(-1), `DELETE ${g}?guildDefault=unset`);
-  assert.equal(status(), 'Unset Aria’s guild-wide level in Guild One: channels without their own grant fall back to the persona default.');
-  assert.equal(row().children[1].textContent, 'Not set');
-  assert.deepEqual(buttons(), ['Deny guild-wide'], 'nothing to unset; a deny can still be set');
-
-  // Deny: asked, then DELETE ?guildDefault=deny.
-  row().querySelectorAll('button')[0].click();
-  await settle();
-  assert.match(doc.querySelector('.modal')!.textContent, /the deny blocks its persona default here/);
-  doc.querySelector('.modal')!.querySelector('button.btn-danger-solid')!.click();
-  await settle();
-  assert.equal(calls.at(-1), `DELETE ${g}?guildDefault=deny`);
-  assert.equal(row().children[1].textContent, 'Denied');
-  assert.deepEqual(buttons(), ['Unset']);
-});
-
-test('grant editor: the relay’s refusal is put in words in the section’s line', async () => {
-  const { form, radio, choose, drawer } = await ariaDrawer({
-    refusePut: (body) => (body.channelId === CH.labNotes ? refuse(400, 'THREAD_TARGET', 'thread', { parentId: CH.research }) : refuse(400, 'CATEGORY_TARGET')),
-  });
-  choose(CH.labNotes);
-  radio('write').checked = true;
-  radio('write').fire('change');
-  form.fire('submit');
-  await settle();
-  const line = drawer.querySelector('form.grant-form')!.querySelector('.status-line')!;
-  assert.equal(line.textContent, 'Not saved: lab-notes is a thread. Threads use #research’s access — give access there.');
-  assert.ok(line.classList.contains('status-err'));
-});
-
-test('persona rows: direct grants that give something, a guild-wide deny, or nothing', async () => {
-  const g = '/admin/g/' + G1;
-  const { ctx, doc } = appSandbox({
-    routes: {
-      [g + '/personas']: {
-        personas: [
-          { id: 'aria', displayName: 'Aria', roles: [], directGrants: 'grants', hasOverride: true },
-          { id: 'quill', displayName: 'Quill', roles: [], directGrants: 'denied', hasOverride: false },
-          { id: 'nyx', displayName: 'Nyx', roles: [], directGrants: 'none', hasOverride: false },
-        ],
-        total: 3, limit: 50, offset: 0,
-      },
-    },
-  });
-  await ctx.PA.app.boot();
-  await settle();
-  const cells = doc.getElementById('view')!.querySelectorAll('tr').slice(1).map((tr) => tr.children.at(-1)!.textContent);
-  assert.deepEqual(cells, ['direct grants', 'denied guild-wide', '—']);
-});
-
 test('invites list: each invite’s status; a spent one is deleted, an active one revoked', async () => {
   const g = '/admin/g/' + G1;
   const { ctx, doc, calls } = appSandbox({
@@ -1836,7 +1668,7 @@ test('persona drawer: Upload is offered only when the relay keeps uploaded pictu
     const { ctx, doc } = appSandbox({
       routes: {
         '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'c', features: { invites: true, avatarUploads, allowlistEditable: true } },
-        [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: null, names: { channels: {} } },
+        [g + '/personas/aria/access']: accessBody(),
         '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatar: '', avatarUrl: '', roles: [], policy: null, guilds: [], names: {} },
       },
     });
@@ -2055,6 +1887,7 @@ async function panelAt(url: string, opts: { me?: unknown; guilds?: unknown[]; ha
       [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
       [g + '/channels']: { channels: G1_CHANNELS },
       [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters'], guildPolicy: { channels: {} }, names: { channels: {} } },
+      [g + '/personas/aria/access']: accessBody({ roles: [{ name: 'g1-chatters', caps: [...LEVEL_CAPS.write], scope: { channels: [CH.general, CH.research] }, guildId: GA, channels: 2 }] }),
       [g + '/audit']: { records: [] },
       ...opts.routes,
     },
@@ -2188,9 +2021,13 @@ test('app routes: a page a later version adds says so and shows the nearest one'
   const { here, doc } = await panelAt('/#/g/' + GA + '/give?c=' + CH.research);
   assert.equal(here(), '#/g/' + GA + '/channels');
   assert.ok(doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Channels instead.'));
+  const inv = await panelAt('/#/g/' + GA + '/invites/i/0123456789abcdef01234567');
+  assert.equal(inv.here(), '#/g/' + GA + '/invites');
+  assert.ok(inv.doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Invites instead.'));
+  // Adding a persona is a page of this version: no note.
   const add = await panelAt('/#/g/' + GA + '/personas/add');
-  assert.equal(add.here(), '#/g/' + GA + '/personas');
-  assert.ok(add.doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Personas instead.'));
+  assert.equal(add.here(), '#/g/' + GA + '/personas/add');
+  assert.ok(!add.doc.getElementById('toasts')!.textContent.includes('isn’t available yet'));
 });
 
 test('app routes: the search box keeps ?q= in place — Back never steps through keystrokes', async () => {
@@ -2385,13 +2222,8 @@ test('session: a stale CSRF token (another tab signed in again) is fetched anew 
     },
   });
   token = 'csrf-newer'; // tab B signed in again
-  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
-  const target = form.querySelector('select')!;
-  target.value = CH.general;
-  target.fire('change');
-  const write = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'write')!;
-  write.checked = true;
-  write.fire('change');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
+  await pickChannel(box, form, 'gen', '#general');
   form.fire('submit');
   await settle();
   assert.deepEqual(sent, ['csrf-new', 'csrf-newer'], 'refused once, then sent with the new token');
@@ -2674,7 +2506,7 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
     me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
     routes: {
       [`/admin/g/${GA}/personas`]: { personas: [{ id: long, displayName: 'Longname', roles: [] }, { id: 'ash grey', displayName: 'Ash', roles: [] }], total: 2, limit: 50, offset: 0 },
-      [`/admin/g/${GA}/personas/${long}`]: { id: long, displayName: 'Longname', roles: [], guildPolicy: null, names: { channels: {} } },
+      [`/admin/g/${GA}/personas/${encodeURIComponent(long)}/access`]: accessBody({ id: long, name: 'Longname' }),
     },
     handle: (method) => (down && method !== 'GET' ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined),
   });
@@ -2683,11 +2515,10 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
   await settle();
   assert.ok(box.drawerOpen());
   assert.equal(box.here(), g + '/personas', 'no address for this one');
-  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
-  const target = form.querySelector('select')!;
-  target.value = CH.labNotes;
-  target.fire('change');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
+  await pickChannel(box, form, 'lab', '#lab-notes');
   const full = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'full')!;
+  for (const r of form.querySelectorAll('input').filter((i) => i.type === 'radio')) r.checked = false;
   full.checked = true;
   full.fire('change');
   down = true;
@@ -2696,7 +2527,8 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
   clickable(box.doc, 'Sign in again', box.doc.querySelector('.modal')!).click();
   assert.equal(box.sessionStore.getItem('pa.draft'), null, 'kept under the list’s address, it would open in any drawer of the list');
 
-  // A grant draft names its persona: another persona's drawer leaves it.
+  // A grant draft (an older panel's: one channel) names its persona: another
+  // persona's drawer leaves it; its own puts the channel in Add to channels.
   const draft = (personaId: string) => JSON.stringify({
     v: 1, userId: ME_OP.user.id, route: g + '/personas/p/aria', form: 'grant',
     fields: { personaId, target: CH.labNotes, caps: [...LEVEL_CAPS.full] }, at: Date.now(),
@@ -2704,7 +2536,7 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
   for (const [who, kept] of [['sol', false], ['aria', true]] as const) {
     const back = await panelAt('/' + g + '/personas/p/aria', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], session: { 'pa.draft': draft(who) } });
     const body = back.doc.getElementById('drawer-body')!;
-    assert.equal(body.querySelector('form.grant-form')!.querySelector('select')!.value, kept ? CH.labNotes : '', who);
+    assert.deepEqual(body.querySelector('form.persona-add')!.querySelectorAll('.tag').map((t) => t.querySelector('span')!.textContent), kept ? ['#lab-notes'] : [], who);
     assert.equal(body.textContent.includes('Restored your unsaved change'), kept, who);
   }
 });
@@ -2734,7 +2566,7 @@ test('app routes: from All personas a drawer’s address names the guild, so a r
   const reload = await panelAt('/#/all/personas/p/aria?guild=' + GA, { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes });
   const h = reload.doc.getElementById('drawer-body')!.querySelectorAll('h3').map((x) => x.textContent);
   assert.equal(h[0], 'Access in Guild One');
-  assert.ok(reload.doc.getElementById('drawer-body')!.querySelector('form.grant-form'), 'with its grant form');
+  assert.ok(reload.doc.getElementById('drawer-body')!.querySelector('form.persona-add'), 'with its Add to channels form');
   assert.ok(reload.doc.querySelector('select.scope-select'), 'and the list under it keeps its scope switch');
   // An address that names no guild has no guild section, whatever was in view.
   const bare = await panelAt('/#/all/personas/p/aria', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes });
@@ -2747,18 +2579,16 @@ test('session: Cancel after a link out of a dirty drawer; closing it then goes t
   const g = '#/g/' + GA;
   const box = await panelAt('/' + g + '/personas', {
     me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
-    routes: { [`/admin/g/${GA}/personas/sol`]: { id: 'sol', displayName: 'Sol', roles: [], guildPolicy: null, names: { channels: {} } } },
+    routes: { [`/admin/g/${GA}/personas/sol/access`]: accessBody({ id: 'sol', name: 'Sol' }) },
   });
   clickable(box.doc, 'Aria').click();
   await settle();
-  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
-  const target = form.querySelector('select')!;
-  target.value = CH.random;
-  target.fire('change');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
   const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  for (const r of form.querySelectorAll('input').filter((i) => i.type === 'radio')) r.checked = false;
   read.checked = true;
   read.fire('change');
-  // A link to another drawer (Access in every guild has these).
+  // A link to another drawer (Identity's other guilds, a channel's persona names).
   assert.ok(box.drawerOpen() && box.here() === g + '/personas/p/aria', box.here());
   box.nav.go(g + '/personas/p/sol');
   await settle();
@@ -2773,16 +2603,14 @@ test('session: Cancel after a link out of a dirty drawer; closing it then goes t
   await settle();
   assert.equal(box.here(), g + '/personas');
   assert.equal(box.drawerOpen(), false, 'Sol’s drawer, the cancelled destination, is not opened');
-  assert.ok(!box.calls.includes(`GET /admin/g/${GA}/personas/sol`), box.calls.join('\n'));
+  assert.ok(!box.calls.includes(`GET /admin/g/${GA}/personas/sol/access`), box.calls.join('\n'));
 
   // After Back, Cancel still leaves closing to go Back to the list.
   clickable(box.doc, 'Aria').click();
   await settle();
-  const f2 = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
-  const t2 = f2.querySelector('select')!;
-  t2.value = CH.random;
-  t2.fire('change');
+  const f2 = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
   const r2 = f2.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  for (const r of f2.querySelectorAll('input').filter((i) => i.type === 'radio')) r.checked = false;
   r2.checked = true;
   r2.fire('change');
   const depth = box.nav.i;
@@ -2850,56 +2678,6 @@ test('ui.drawer: a question asked over a drawer goes when the drawer closes; req
   assert.equal(drawer.isOpen(), false);
 });
 
-// ── A persona removed with /ban ──
-
-test('grant editor: a persona removed with /ban says so; Unset asks, then lifts the removal', async () => {
-  const g = '/admin/g/' + G1;
-  let banned = true;
-  const policy: { channels: Record<string, string[]>; default?: string[] } = { channels: {}, default: [] };
-  const box = appSandbox({
-    routes: {
-      [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
-      [g + '/channels']: { channels: G1_CHANNELS },
-      [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
-      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: policy, banned: true, names: { channels: {} } },
-    },
-    handle: (method, path) => {
-      if (method !== 'DELETE' || !path.startsWith(g + '/personas/aria/grants?')) return undefined;
-      const q = new URL(path, 'http://panel.invalid').searchParams;
-      if (q.get('guildDefault') !== 'unset') return undefined;
-      if (banned && q.get('liftBan') !== '1') return refuse(409, 'BANNED');
-      banned = false;
-      delete policy.default;
-      return { guildPolicy: null, banned };
-    },
-  });
-  await box.ctx.PA.app.boot();
-  await settle();
-  clickable(box.doc, 'Aria').click();
-  await settle();
-  const drawer = box.doc.getElementById('drawer-body')!;
-  const row = () => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
-  const note = () => drawer.querySelector('details.grants')!.querySelector('p.warn-line')!;
-  assert.equal(row().children[1].textContent, 'Removed with /ban');
-  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Unset'], 'denied already: no Deny');
-  assert.ok(!note().classList.contains('hidden'));
-  assert.match(note().textContent, /^Aria was removed from Guild One with \/ban, so nothing it holds applies here/);
-
-  row().querySelector('button')!.click();
-  await settle();
-  const dialog = box.doc.querySelector('.modal')!;
-  assert.equal(dialog.querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One and lift its removal?');
-  assert.match(dialog.textContent, /fall back to Aria’s persona default/);
-  clickable(box.doc, 'Unset and lift', dialog).click();
-  await settle();
-  assert.equal(box.calls.at(-1), `DELETE ${g}/personas/aria/grants?guildDefault=unset&liftBan=1`);
-  const status = drawer.querySelector('form.grant-form')!.querySelector('.status-line')!.textContent;
-  assert.equal(status, 'Lifted Aria’s removal from Guild One and unset its guild-wide level: channels without their own grant fall back to the persona default.');
-  assert.equal(row().children[1].textContent, 'Not set');
-  assert.ok(note().classList.contains('hidden'));
-  assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Deny guild-wide']);
-});
-
 test('lib.errorText: a removal with /ban the page didn’t know about', () => {
   const { lib } = libOnly();
   assert.equal(lib.errorText({ status: 409, code: 'BANNED' }, 'Not unset'),
@@ -2930,56 +2708,6 @@ test('app list search: a whole invite code typed into a search stays out of the 
   assert.ok(calls.some((c) => c.includes('/invites?q=' + code)), 'the search itself is for the whole code');
   doc.getElementById('login-btn')!.click();
   assert.ok(!String(sessionStore.getItem('pa.returnTo')).includes(code));
-});
-
-// ── Access roles: one request at a time, none dropped ──
-
-test('persona drawer: picking a second access role while the first is being given gives both, one after the other', async () => {
-  const g = '/admin/g/' + G1;
-  const catalog = {
-    'g1-readers': G1_CATALOG['g1-readers'],
-    'g1-chatters': G1_CATALOG['g1-chatters'],
-    'g1-mods-mirror': { caps: LEVEL_CAPS.full, scope: { mirrorRole: '100000000000003001' }, guildId: G1, mirrorCaps: true },
-  };
-  let held: string[] = [];
-  let inFlight = 0;
-  let most = 0;
-  const box = appSandbox({
-    routes: {
-      [g + '/roles']: { catalog, discordRoles: [], canAuthor: false },
-      [g + '/channels']: { channels: G1_CHANNELS },
-      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: [], guildPolicy: null, names: { channels: {} } },
-    },
-    handle: async (method: string, path: string, body: any) => {
-      if (method !== 'POST' || path !== g + '/personas/aria/roles') return undefined;
-      inFlight++;
-      most = Math.max(most, inFlight);
-      await tick();
-      inFlight--;
-      held = [...held, body.role];
-      return { roles: held, banned: false };
-    },
-  } as any);
-  await box.ctx.PA.app.boot();
-  await settle();
-  clickable(box.doc, 'Aria').click();
-  await settle();
-  const drawer = box.doc.getElementById('drawer-body')!;
-  const picker = drawer.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
-  picker.focus();
-  picker.value = 'g1-mods-mirror';
-  picker.fire('change');
-  assert.equal(picker.disabled, true, 'off while the role is being given');
-  picker.value = 'g1-readers';
-  picker.fire('change'); // a pick that gets through anyway
-  await settle();
-  assert.deepEqual(held, ['g1-mods-mirror', 'g1-readers'], 'both, in the order picked');
-  assert.equal(most, 1, 'one request at a time');
-  const chips = drawer.querySelectorAll('.tag').map((t) => t.querySelector('code')!.textContent);
-  assert.deepEqual(chips, ['g1-mods-mirror', 'g1-readers']);
-  assert.equal(picker.disabled, false);
-  assert.equal(picker.value, '');
-  assert.equal(box.doc.activeElement, picker, 'focus comes back to the picker');
 });
 
 // ── A relay updated mid-session ──
@@ -3052,55 +2780,6 @@ test('lib: what a change leaves a persona with, in the copy guide’s words', ()
   assert.equal(lib.errorText({ code: 'CONFLICT', status: 409 }, 'Not removed'), 'Not removed: someone else changed this a moment ago. Reload the page and try again.');
 });
 
-test('grant editor: a change says “Effective now”, from the relay’s answer — the bot’s limits included', async () => {
-  const R = [...LEVEL_CAPS.read];
-  const W = [...LEVEL_CAPS.write];
-  const z = { read: 0, write: 0, full: 0, custom: 0 };
-  const { form, radio, choose, drawer, bodies, calls } = await ariaDrawer({
-    effective: (method, path, body) => {
-      if (method === 'PUT' && body.channelId === CH.welcome) return { effective: R, level: 'read', botLimited: true, botLacks: W.filter((c) => !R.includes(c)), direct: W, sources: [] };
-      if (method === 'PUT' && body.channelId) return { effective: W, level: 'write', botLimited: false, botLacks: [], direct: W, sources: [] };
-      if (method === 'PUT') return { guildWide: true, channels: 8, counts: { ...z, read: 6, write: 2 }, direct: { ...z, write: 2 } };
-      if (path.includes('channelId=')) return { effective: W, botLimited: false, botLacks: [], direct: null, sources: [{ kind: 'role', name: 'g1-chatters', caps: W, how: 'channels' }] };
-      return { guildWide: true, channels: 8, counts: { ...z, write: 2 }, direct: { ...z, write: 2 } };
-    },
-  });
-  const line = () => form.querySelector('.status-line')!.textContent;
-  const pick = (v: string) => {
-    for (const k of ['read', 'write', 'full', 'custom']) radio(k).checked = false; // one radio group, as a browser keeps it
-    radio(v).checked = true;
-    radio(v).fire('change');
-  };
-  choose(CH.welcome);
-  pick('write');
-  form.fire('submit');
-  await settle();
-  assert.equal(line(), 'Aria → Write in #welcome. Effective now: Read — the relay bot can’t send in #welcome.');
-  assert.deepEqual(bodies.at(-1), { channelId: CH.welcome, level: 'write', expect: null });
-
-  // Research held Write when the drawer loaded: that is what goes with the change.
-  choose(CH.research);
-  pick('full');
-  form.fire('submit');
-  await settle();
-  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'full', expect: W });
-  assert.equal(line(), 'Aria → Full in #research. Effective now: Write.');
-
-  choose('__guild__');
-  pick('read');
-  form.fire('submit');
-  await settle();
-  assert.equal(line(), 'Aria → Read guild-wide in Guild One (every channel without its own grant). Effective now: Read in 6 channels, Write in 2 (direct grants).');
-
-  // Removing a direct grant says what is left, and why.
-  const row = drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
-  row.querySelector('button')!.click();
-  await settle();
-  assert.equal(calls.at(-1), `DELETE /admin/g/${G1}/personas/aria/grants?channelId=${CH.research}`);
-  assert.deepEqual(bodies.at(-1), { expect: [...LEVEL_CAPS.full] }, 'what the drawer shows there now');
-  assert.equal(line(), 'Removed Aria’s direct grant in #research — still Write via role g1-chatters.');
-});
-
 test('lib: what a removal leaves — a thread’s is its parent’s, a channel that is gone leaves nothing to say, and a set without View ends on the warning', () => {
   const { lib } = libOnly();
   const R = [...LEVEL_CAPS.read];
@@ -3127,100 +2806,6 @@ test('lib: what a removal leaves — a thread’s is its parent’s, a channel t
   assert.equal(lib.effectNowText({ effective: ['SEND_MESSAGES'], botLimited: true, botLacks: ['MANAGE_MESSAGES'] }, '#general'), 'Custom (send) — can’t see the channel; the relay bot can’t manage messages in #general');
   assert.equal(lib.capsSummary(['SEND_MESSAGES']), 'Custom (send) — can’t see the channel', 'on its own, unchanged');
   assert.equal(lib.effectNowText({ missing: true }, '#gone'), '');
-});
-
-test('grant editor: removing a thread’s grant says what the thread is left with — its channel’s access; a gone channel’s says only that it was removed', async () => {
-  const W = [...LEVEL_CAPS.write];
-  const GONE = '100000000000001099';
-  const { drawer, form } = await ariaDrawer({
-    policy: { channels: { [CH.designReview]: W, [CH.research]: W, [GONE]: W } },
-    names: { [GONE]: { id: GONE, name: null, unavailable: true } },
-    effective: (_m, path) => (path.includes(GONE)
-      ? { missing: true }
-      : { effective: W, level: 'write', botLimited: false, botLacks: [], direct: W, sources: [{ kind: 'direct', caps: W }], parentId: CH.research }),
-  });
-  const line = () => form.querySelector('.status-line')!.textContent;
-  const remove = (where: string) => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent?.startsWith(where))!.querySelector('button')!.click();
-  remove('design-review');
-  await settle();
-  assert.equal(line(), 'Removed Aria’s direct grant in design-review (thread in #research) — still Write via the direct grant in #research.');
-  remove('channel the relay can’t see');
-  await settle();
-  assert.equal(line(), 'Removed Aria’s direct grant in channel the relay can’t see.');
-});
-
-test('grant editor: changed meanwhile — “someone else changed this”, the setting is loaded again, nothing is lost silently', async () => {
-  const W = [...LEVEL_CAPS.write];
-  const F = [...LEVEL_CAPS.full];
-  let policyRef: { channels: Record<string, string[]>; default?: string[] } | null = null;
-  const box = await ariaDrawer({
-    // Another tab gave Aria Full in #research a moment ago.
-    refusePut: (body) => {
-      policyRef!.channels[CH.research] = F;
-      return refuse(409, 'CONFLICT', 'this was changed since it was loaded', { current: F });
-    },
-  });
-  policyRef = box.policy;
-  const { form, radio, choose, drawer, calls, bodies } = box;
-  choose(CH.research);
-  assert.equal(radio('write').checked, true, 'the drawer loaded Write');
-  radio('write').checked = false;
-  radio('read').checked = true;
-  radio('read').fire('change');
-  form.fire('submit');
-  await settle();
-  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'read', expect: W });
-  const line = form.querySelector('.status-line')!;
-  assert.equal(line.textContent, 'Not saved: someone else changed this a moment ago. Reloaded — check and try again.');
-  assert.ok(line.classList.contains('status-err'));
-  assert.equal(calls.at(-1), `GET /admin/g/${G1}/personas/aria`, 'loaded again');
-  assert.equal(radio('full').checked, true, 'the level shown is the one there now');
-  const row = drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
-  assert.equal(row.children[1].textContent, 'Full');
-
-  // A removal refused the same way. The table is drawn again, so the
-  // focused Remove is gone: focus goes to Where, as after a removal.
-  const again = await ariaDrawer({ refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: null }) });
-  const r = again.drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
-  const rm = r.querySelector('button')!;
-  rm.focus();
-  rm.click();
-  await settle();
-  assert.equal(again.form.querySelector('.status-line')!.textContent, 'Not removed: someone else changed this a moment ago. Reloaded — check and try again.');
-  assert.equal(rm.isConnected, false, 'its row was drawn again');
-  assert.equal(again.doc.activeElement, again.target, 'focus is on Where, not lost to <body>');
-});
-
-test('grant editor: a guild-wide change refused as changed meanwhile leaves focus on Where, not <body>', async () => {
-  for (const [label, confirm] of [['Deny guild-wide', 'Deny guild-wide'], ['Unset', 'Unset guild-wide']]) {
-    const box = await ariaDrawer({
-      policy: { channels: {}, default: [...LEVEL_CAPS.read] },
-      refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: [...LEVEL_CAPS.write] }),
-    });
-    const row = box.drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
-    const button = row.querySelectorAll('button').find((b) => b.textContent === label)!;
-    button.focus();
-    button.click();
-    await settle();
-    box.doc.querySelector('.modal')!.querySelectorAll('button').find((b) => b.textContent === confirm)!.click();
-    await settle();
-    assert.match(box.form.querySelector('.status-line')!.textContent, /^Not (denied|unset): someone else changed this a moment ago\. Reloaded/, label);
-    assert.equal(button.isConnected, false, label);
-    assert.equal(box.doc.activeElement, box.target, label);
-  }
-});
-
-test('grant editor: Save refused as changed meanwhile keeps focus where it was', async () => {
-  const box = await ariaDrawer({ refusePut: () => refuse(409, 'CONFLICT', 'changed', { current: [...LEVEL_CAPS.full] }) });
-  box.choose(CH.research);
-  box.radio('write').checked = false;
-  box.radio('read').checked = true;
-  box.radio('read').fire('change');
-  box.save.focus();
-  box.form.fire('submit');
-  await settle();
-  assert.match(box.form.querySelector('.status-line')!.textContent, /^Not saved: someone else changed this/);
-  assert.equal(box.doc.activeElement, box.save, 'Save is still there, and keeps focus');
 });
 
 // ── P7: the Channels tab and the channel drawer ──
@@ -3999,6 +3584,7 @@ test('channel drawer: an Add refused because the session ended keeps whom and at
 test('Channels tab: a change made elsewhere in the panel (a persona’s drawer) is counted afresh when the tab is shown again', async () => {
   const box = await channelsPanel('/#/g/' + GA + '/channels', {
     handle: (method, path) => (method === 'PUT' && path === '/admin/g/' + GA + '/personas/aria/grants' ? { guildPolicy: { channels: { [CH.labNotes]: W7 } }, banned: false } : undefined),
+    routes: { [`/admin/g/${GA}/personas/aria/access`]: accessBody() },
   });
   const asked = () => box.calls.filter((c) => c.endsWith('/access/summary')).length;
   box.tabs.personas.click();
@@ -4010,13 +3596,8 @@ test('Channels tab: a change made elsewhere in the panel (a persona’s drawer) 
   await settle();
   clickable(box.doc, 'Aria').click();
   await settle();
-  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
-  const target = form.querySelector('select')!;
-  target.value = CH.labNotes;
-  target.fire('change');
-  const w = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'write')!;
-  w.checked = true;
-  w.fire('change');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
+  await pickChannel(box, form, 'lab', '#lab-notes');
   form.fire('submit');
   await settle();
   box.doc.key('Escape');
@@ -4194,4 +3775,867 @@ test('ui.directGrantControl: a stored set that holds no level reads Custom once,
   assert.equal(text(['READ_HISTORY', 'SEND_MESSAGES']), 'Custom — can’t see the channel');
   assert.equal(text(['VIEW_CHANNEL', 'SEND_MESSAGES']), 'Custom');
   assert.equal(text([...W7, 'MENTION_EVERYONE']), 'Write +1 (custom)');
+});
+
+// ── P8: the Personas tab and the persona drawer ──
+
+const W8 = [...LEVEL_CAPS.write];
+const R8 = [...LEVEL_CAPS.read];
+const F8 = [...LEVEL_CAPS.full];
+const ROLE_CHATTERS = { name: 'g1-chatters', caps: W8, scope: { channels: [CH.general, CH.research] }, guildId: GA, channels: 2 };
+/** Aria in Guild One: Write in #general through g1-chatters, and in #research through it and a direct grant. */
+const ARIA_ROWS = () => [
+  pRow(CH.general, W8, [roleSrc('g1-chatters', W8)]),
+  pRow(CH.research, W8, [roleSrc('g1-chatters', W8), { kind: 'direct', caps: W8 }], W8),
+];
+
+/** The fake relay's change to a persona's direct grant in a channel, as its
+ *  access read then shows it (simply: what the grant gives, with the roles). */
+function setDirect(world: { rows: any[] }, cid: string, caps: string[]) {
+  let row = world.rows.find((r) => r.channelId === cid);
+  if (!row) world.rows.push((row = pRow(cid, [], [], null)));
+  const roles = row.sources.filter((s: { kind: string }) => s.kind === 'role');
+  row.direct = caps;
+  row.sources = [...roles, caps.length ? { kind: 'direct', caps } : { kind: 'block' }];
+  const all = new Set<string>([...caps, ...roles.flatMap((s: { caps: string[] }) => s.caps)]);
+  row.effective = ALL_CAPS.filter((c) => all.has(c));
+}
+function clearDirect(world: { rows: any[]; inactive: any[] }, cid: string) {
+  world.inactive = world.inactive.filter((x) => x.channelId !== cid);
+  const row = world.rows.find((r) => r.channelId === cid);
+  if (!row) return;
+  row.direct = null;
+  row.sources = row.sources.filter((s: { kind: string }) => s.kind === 'role');
+  const all = new Set<string>(row.sources.flatMap((s: { caps: string[] }) => s.caps));
+  row.effective = ALL_CAPS.filter((c) => all.has(c));
+  if (!row.sources.length) world.rows = world.rows.filter((r) => r !== row);
+}
+
+/**
+ * The panel at `url` over Guild One's fixture, with a persona the fake relay
+ * keeps in `world`: GET …/personas/<pid>/access answers from it, grant
+ * writes change it (and answer with the channel's row as `effective`, unless
+ * `effective` says otherwise), and Remove and Resync act on it. `handle`
+ * runs first.
+ */
+async function personaPanel(url: string, opts: {
+  pid?: string; name?: string; rows?: any[]; inactive?: any[]; roles?: any[]; guildWide?: unknown; removed?: boolean; personaDefault?: string[] | null;
+  names?: Record<string, unknown>; otherGuildRoleCount?: number; me?: unknown; guilds?: unknown[]; routes?: Record<string, unknown>; handle?: FakeHandler;
+  effective?: (method: string, path: string, body: any) => unknown; refusePut?: (body: any) => unknown; refuseDelete?: (path: string, body: any) => unknown;
+  session?: Record<string, string>; directory?: any[]; summary?: unknown; resync?: (n: number) => unknown;
+} = {}) {
+  const pid = opts.pid ?? 'aria';
+  const name = opts.name ?? 'Aria';
+  const g = '/admin/g/' + GA;
+  const P = g + '/personas/' + encodeURIComponent(pid);
+  const world = {
+    rows: opts.rows ?? ARIA_ROWS(), inactive: opts.inactive ?? [], roles: opts.roles ?? [ROLE_CHATTERS],
+    guildWide: opts.guildWide ?? null, removed: !!opts.removed, personaDefault: opts.personaDefault ?? null, resyncs: 0,
+  };
+  const access = () => accessBody({
+    id: pid, name, rows: world.rows, inactive: world.inactive, roles: world.roles, guildWide: world.guildWide, removed: world.removed,
+    personaDefault: world.personaDefault, names: opts.names, otherGuildRoleCount: opts.otherGuildRoleCount,
+  });
+  const rowEcho = (cid: string) => {
+    const r = world.rows.find((x) => x.channelId === cid);
+    return r ? JSON.parse(JSON.stringify(r)) : { effective: [], level: 'none', base: null, extra: [], direct: null, sources: [], botLimited: false, botLacks: [] };
+  };
+  const guildEcho = { guildWide: true, channels: 8, counts: z7(), direct: z7() };
+  const box = await panelAt(url, {
+    me: opts.me,
+    guilds: opts.guilds,
+    session: opts.session,
+    routes: {
+      [g + '/channels']: G1_CHANNELS_VIEW,
+      [g + '/access/summary']: opts.summary ?? G1_SUMMARY,
+      [g + '/personas']: { personas: [{ id: pid, displayName: name, roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 },
+      ...opts.routes,
+    },
+    handle: async (method, path, body, headers) => {
+      const own = await opts.handle?.(method, path, body, headers);
+      if (own !== undefined) return own;
+      if (method === 'GET' && path === P + '/access') return access();
+      if (method === 'GET' && path.startsWith(g + '/persona-directory')) {
+        const q = (new URL(path, 'http://panel.invalid').searchParams.get('q') ?? '').toLowerCase();
+        const all = opts.directory ?? [{ id: 'nyx-7a8b9c', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false }, { id: 'aria', displayName: 'Aria', avatarUrl: '', hasAccessHere: true }];
+        return { personas: all.filter((p) => p.displayName.toLowerCase().includes(q) || p.id.includes(q)) };
+      }
+      if (method === 'PUT' && path === P + '/grants') {
+        const refused = opts.refusePut?.(body);
+        if (refused) return refused;
+        const caps = body.level ? [...(LEVEL_CAPS as Record<string, string[]>)[body.level]] : body.deny ? [] : body.caps;
+        const lifted = world.removed && caps.length > 0;
+        if (lifted) world.removed = false;
+        if (body.channelId) setDirect(world, body.channelId, caps);
+        else if (body.guildDefault === true) world.guildWide = caps.length ? caps : 'deny';
+        else return refuse(400, 'TARGET_REQUIRED');
+        const effective = opts.effective ? opts.effective(method, path, body) : body.channelId ? rowEcho(body.channelId) : guildEcho;
+        return { guildPolicy: {}, banned: world.removed, ...(lifted ? { liftedBan: true } : {}), effective };
+      }
+      if (method === 'DELETE' && path.startsWith(P + '/grants?')) {
+        const refused = opts.refuseDelete?.(path, body);
+        if (refused) return refused;
+        const q = new URL(path, 'http://panel.invalid').searchParams;
+        const cid = q.get('channelId');
+        if (q.get('guildDefault') === 'deny') world.guildWide = 'deny';
+        else if (q.get('guildDefault') === 'unset') {
+          if (world.removed && q.get('liftBan') !== '1') return refuse(409, 'BANNED');
+          world.removed = false;
+          world.guildWide = null;
+        } else if (cid) clearDirect(world, cid);
+        else return refuse(400, 'TARGET_REQUIRED');
+        const effective = opts.effective ? opts.effective(method, path, body) : cid ? rowEcho(cid) : guildEcho;
+        return { guildPolicy: {}, banned: world.removed, effective };
+      }
+      if (method === 'POST' && path === P + '/remove') {
+        const rolesRemoved = world.roles.map((r) => r.name);
+        Object.assign(world, { rows: [], inactive: [], roles: [], removed: true, guildWide: 'deny' });
+        return { rolesRemoved, accessFullyRevoked: true };
+      }
+      if (method === 'POST' && path === P + '/resync') {
+        world.resyncs++;
+        return opts.resync ? opts.resync(world.resyncs) : { ok: true };
+      }
+      return undefined;
+    },
+  });
+  const body = box.doc.getElementById('drawer-body')!;
+  const addForm = () => body.querySelector('form.persona-add')!;
+  const radioIn = (form: FakeElement, v: string) => form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === v)!;
+  /** Pick level `v` in `form`'s level control, as a browser keeps one radio group. */
+  const level = (form: FakeElement, v: string) => {
+    for (const r of form.querySelectorAll('input').filter((i) => i.type === 'radio')) r.checked = false;
+    radioIn(form, v).checked = true;
+    radioIn(form, v).fire('change');
+  };
+  /** Type `q` into the Add form's channel type-ahead and wait for its options. */
+  const typeChannel = async (q: string) => {
+    const input = addForm().querySelector('.ta-input')!;
+    input.focus();
+    input.value = q;
+    input.fire('input');
+    box.advance(150);
+    await settle();
+    return input;
+  };
+  const options = () => addForm().querySelectorAll('.ta-option').map((o) => o.querySelector('.ta-label')!.textContent);
+  const pickOption = (label: string) => addForm().querySelectorAll('.ta-option').find((o) => o.querySelector('.ta-label')!.textContent === label)!.click();
+  const tr = (cid: string) => body.querySelectorAll('tr').find((t) => t.dataset.cid === cid)!;
+  /** Pick `v` in a row's direct-grant control (from the keyboard: it has focus). */
+  const setDirectIn = (cid: string, v: string) => {
+    const s = tr(cid).querySelector('select')!;
+    s.focus();
+    s.value = v;
+    s.fire('change');
+  };
+  const accessLine = () => body.querySelector('.access-section')!.children.find((n) => n.classList.contains('status-line'))!;
+  const gwRow = () => body.querySelector('.gw-row')!;
+  const gwButtons = () => gwRow().querySelectorAll('button').map((b) => b.textContent);
+  const gwLine = () => body.querySelector('details.more')!.querySelector('.subsection')!.children.find((n) => n.classList.contains('status-line'))!;
+  const modal = () => box.doc.querySelector('.modal')!;
+  const confirm = (label: string) => clickable(box.doc, label, modal()).click();
+  return { ...box, world, body, addForm, level, radioIn, typeChannel, options, pickOption, tr, setDirectIn, accessLine, gwRow, gwButtons, gwLine, modal, confirm, g, P };
+}
+
+test('lib: the Personas list and the persona drawer in words — where it can act, rows that read alike, grants that do nothing, Remove', () => {
+  const { lib } = libOnly();
+  const z = { read: 0, write: 0, full: 0, custom: 0 };
+  assert.equal(lib.canActInText({ ...z, write: 9, read: 5 }), 'in 14 channels (9 Write · 5 Read)');
+  assert.equal(lib.canActInText({ ...z, write: 3 }), 'in 3 channels (3 Write)');
+  assert.equal(lib.canActInText({ ...z, read: 1 }), 'in 1 channel (1 Read)');
+  assert.equal(lib.canActInText({ ...z, full: 1, custom: 2 }), 'in 3 channels (1 Full · 2 Custom)');
+  assert.equal(lib.canActInText(z), '—');
+  assert.equal(lib.canActInText(undefined), '');
+  assert.equal(lib.personaSummaryText({ ...z, write: 3, read: 12 }), 'Write in 3 · Read in 12 channels here');
+  assert.equal(lib.personaSummaryText({ ...z, write: 1 }), 'Write in 1 channel here');
+  assert.equal(lib.personaSummaryText(z), 'No access here');
+
+  // Six or more alike fold into one line; the rest stay rows, in order.
+  const everyone = roleSrc('g1-everyone', W8, { how: 'all' });
+  const rows = [
+    pRow('c1', W8, [everyone]), pRow('c2', W8, [everyone]), pRow('c3', R8, [everyone], null, { botLimited: true, botLacks: W8.filter((c) => !R8.includes(c)) }),
+    pRow('c4', W8, [everyone]), pRow('c5', W8, [everyone]), pRow('c6', W8, [everyone]), pRow('c7', W8, [everyone, { kind: 'direct', caps: W8 }], W8), pRow('c8', W8, [everyone]),
+  ];
+  const fold = lib.foldAccessRows(rows);
+  assert.equal(fold.runs.length, 1);
+  assert.deepEqual(plain(fold.runs[0].rows.map((r: any) => r.channelId)), ['c1', 'c2', 'c4', 'c5', 'c6', 'c8']);
+  assert.equal(fold.runs[0].text, 'Write in 6 channels · via role g1-everyone');
+  assert.deepEqual(plain(fold.rest.map((r: any) => r.channelId)), ['c3', 'c7'], 'bot-limited and direct-grant rows read otherwise');
+  assert.equal(lib.foldAccessRows(rows.slice(0, 5)).runs.length, 0, 'five alike stay rows');
+  assert.equal(lib.runText(rows[2], 17), 'Read (bot-limited) in 17 channels · via role g1-everyone');
+  assert.equal(lib.runText(pRow('x', W8, [{ kind: 'direct', caps: W8 }], W8), 6), 'Write in 6 channels · via direct grants');
+
+  const names = { channels: {
+    [CH.designReview]: { id: CH.designReview, name: 'design-review', type: 'thread', parentId: CH.research, parentName: 'research' },
+    [CH.catResearch]: { id: CH.catResearch, name: 'Research', type: 'category' },
+    [CH.random]: { id: CH.random, name: 'random', type: 'text' },
+    gone: { id: 'gone', name: null, unavailable: true },
+  } };
+  assert.equal(lib.inactiveText({ channelId: CH.designReview, caps: W8, reason: 'thread' }, names), 'design-review — thread; uses #research’s access');
+  assert.equal(lib.inactiveText({ channelId: CH.catResearch, caps: R8, reason: 'category' }, names), 'Research — category');
+  assert.equal(lib.inactiveText({ channelId: 'gone', caps: W8, reason: 'missing' }, names), 'deleted channel, or one the relay can’t see');
+  assert.equal(lib.inactiveText({ channelId: CH.random, caps: [], reason: 'blocks-nothing' }, names), '#random — blocks nothing (no guild-wide or persona default to block)');
+
+  const quill = { roles: [{ name: 'g1-mods-mirror' }], rows: [pRow(CH.random, F8, [], [])], inactive: [{ channelId: CH.random, caps: [], reason: 'blocks-nothing' }, { channelId: 'gone', caps: W8, reason: 'missing' }] };
+  const c = plain(lib.removeConfirm('Quill', 'Guild One', quill));
+  assert.equal(c.title, 'Remove Quill from Guild One?');
+  assert.deepEqual(c.body, [
+    'This removes access role g1-mods-mirror and 2 direct grants, and denies guild-wide access here.',
+    'Quill can’t give itself access here again — claiming an invite won’t bring it back. Only an admin of Guild One can, by giving it access here.',
+    'Other guilds are not affected. You can add Quill back later.',
+  ]);
+  assert.equal(c.confirmLabel, 'Remove from Guild One');
+  assert.equal(c.grants, 2, 'a block that blocks nothing is a row and an inactive grant: counted once');
+  assert.equal(plain(lib.removeConfirm('Nyx', 'Guild One', { roles: [], rows: [], inactive: [] })).body[0], 'This denies guild-wide access here.');
+  assert.equal(lib.removedText('Quill', 'Guild One', { rolesRemoved: ['g1-mods-mirror'], grants: 0, accessFullyRevoked: true }),
+    'Removed Quill from Guild One: access role g1-mods-mirror is gone, and guild-wide access is denied. No remaining access in Guild One.');
+  assert.equal(lib.removedText('Quill', 'Guild One', { rolesRemoved: ['a', 'b'], grants: 1, accessFullyRevoked: true }),
+    'Removed Quill from Guild One: access roles a, b and 1 direct grant are gone, and guild-wide access is denied. No remaining access in Guild One.');
+  assert.match(lib.removedText('Quill', 'Guild One', { rolesRemoved: [], grants: 0, accessFullyRevoked: false }), /but access still resolves in Guild One — this should be impossible/);
+});
+
+test('panel scripts: no window.prompt() anywhere — every question is asked in the page', () => {
+  for (const f of SCRIPTS) assert.equal(/\bprompt\(/.test(source(f)), false, f);
+});
+
+test('Personas tab: where each persona can act, from the access summary; flags for a guild-wide deny and grants that do nothing', async () => {
+  const g = '/admin/g/' + GA;
+  const box = await panelAt('/#/g/' + GA + '/personas', {
+    routes: {
+      [g + '/channels']: G1_CHANNELS_VIEW,
+      [g + '/personas']: {
+        personas: [
+          { id: 'aria', displayName: 'Aria', roles: ['g1-chatters'], guildWideDenied: false, inactiveGrants: 0 },
+          { id: 'cass', displayName: 'Cass', roles: [], guildWideDenied: true, inactiveGrants: 0 },
+          { id: 'juniper-3c4d5e', displayName: 'Juniper', roles: [], guildWideDenied: false, inactiveGrants: 2 },
+        ],
+        total: 3, limit: 50, offset: 0,
+      },
+      [g + '/access/summary']: { ...G1_SUMMARY, personas: [{ id: 'aria', counts: { ...z7(), write: 2 } }, { id: 'cass', counts: { ...z7(), read: 5, write: 9 } }, { id: 'juniper-3c4d5e', counts: z7() }] },
+    },
+  });
+  const view = box.doc.getElementById('view')!;
+  const cells = view.querySelectorAll('tr').slice(1).map((r) => r.children.map((td) => td.textContent));
+  assert.deepEqual(view.querySelectorAll('th').map((th) => th.textContent), ['', 'Name', 'Id', 'Can act in', 'Access roles here', 'Flags']);
+  assert.deepEqual(cells.map((c) => c[3]), ['in 2 channels (2 Write)', 'in 14 channels (9 Write · 5 Read)', '—']);
+  assert.deepEqual(cells.map((c) => c[5]), ['—', 'denied guild-wide', '2 inactive grants']);
+  assert.ok(view.querySelector('table.cards'), 'cards on a phone');
+  assert.equal(view.querySelectorAll('td').find((td) => td.textContent === 'in 2 channels (2 Write)')!.getAttribute('data-label'), 'Can act in');
+  // Too big to count: said, not zero.
+  const big = await panelAt('/#/g/' + GA + '/personas', { routes: { [g + '/access/summary']: { ...G1_SUMMARY, truncated: true, personas: [{ id: 'aria' }] } } });
+  assert.equal(big.doc.getElementById('view')!.querySelectorAll('tr')[1].children[3].textContent, 'not counted');
+});
+
+test('Personas tab: Add persona finds anyone by name (no exact id needed) — its own address, Esc closes it, picking opens the persona', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas', {
+    pid: 'nyx-7a8b9c', name: 'Nyx', rows: [], roles: [],
+    routes: { ['/admin/g/' + GA + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 } },
+  });
+  const { doc, here, nav, calls } = box;
+  const button = clickable(doc, 'Add persona to Guild One');
+  assert.equal(button.getAttribute('aria-expanded'), 'false');
+  button.click();
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/personas/add', 'its own address');
+  assert.equal(button.getAttribute('aria-expanded'), 'true');
+  const bar = doc.getElementById(button.getAttribute('aria-controls')!)!;
+  assert.ok(!bar.classList.contains('hidden'), "expected: !bar.classList.contains('hidden')");
+  const input = bar.querySelector('.ta-input')!;
+  assert.ok(doc.activeElement === input, 'focus: ' + describe(doc.activeElement) + (' — ' + 'focus is in the field'));
+  assert.equal(bar.querySelector('label')!.textContent, 'Add persona to Guild One');
+  input.value = 'ny';
+  input.fire('input');
+  box.advance(150);
+  await settle();
+  assert.ok(calls.includes(`GET /admin/g/${GA}/persona-directory?q=ny`), 'expected: calls.includes(`GET /admin/g/${GA}/persona-directory?q=ny`)');
+  const opt = bar.querySelector('.ta-option')!;
+  assert.equal(opt.querySelector('.ta-label')!.textContent, 'Nyx (nyx-7a8b9c)');
+  assert.equal(opt.querySelector('.ta-tag')!.textContent, 'no access here');
+
+  // Esc closes the list first, then the bar: Back to the list.
+  input.fire('keydown', { key: 'Escape' });
+  assert.ok(!bar.classList.contains('hidden'), 'the first Esc is the list’s');
+  input.fire('keydown', { key: 'Escape' });
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/personas');
+  assert.ok(bar.classList.contains('hidden'), "expected: bar.classList.contains('hidden')");
+  assert.ok(doc.activeElement === button, 'focus: ' + describe(doc.activeElement) + (' — ' + ''));
+
+  // Pick: the drawer takes the bar's place; closing it is Back to the list.
+  button.click();
+  await settle();
+  const depth = nav.i;
+  input.value = 'ny';
+  input.fire('input');
+  box.advance(150);
+  await settle();
+  input.fire('keydown', { key: 'Enter' });
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/personas/p/nyx-7a8b9c');
+  assert.equal(nav.i, depth, 'in place of the bar’s entry');
+  assert.ok(bar.classList.contains('hidden'), "expected: bar.classList.contains('hidden')");
+  assert.equal(doc.getElementById('drawer-title')!.textContent, 'Nyx nyx-7a8b9c');
+  assert.ok(box.body.textContent.includes('No access in Guild One yet — add it to channels above.'), "expected: box.body.textContent.includes('No access in Guild One yet — add it to channels a");
+  assert.equal(box.body.querySelector('.persona-summary')!.textContent, 'No access here');
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/personas');
+  assert.equal(nav.i, depth - 1, 'Back to the list it was opened from');
+
+  // A deep link opens the bar too; closing it then puts the list in its place.
+  const deep = await personaPanel('/#/g/' + GA + '/personas/add');
+  const b2 = deep.doc.querySelector('.add-persona')!;
+  assert.ok(!b2.classList.contains('hidden'), "expected: !b2.classList.contains('hidden')");
+  clickable(deep.doc, '✕', b2).click();
+  await settle();
+  assert.equal(deep.here(), '#/g/' + GA + '/personas');
+  assert.equal(deep.nav.entries.length, 1, 'replaced, not a new entry');
+});
+
+test('Personas tab: an empty search offers to add one with that name, and super-admins to search all personas', async () => {
+  const g = '/admin/g/' + GA;
+  const empty = { personas: [], total: 0, limit: 50, offset: 0 };
+  const box = await personaPanel('/#/g/' + GA + '/personas?q=ny', { routes: { [g + '/personas']: empty } });
+  const view = box.doc.getElementById('view')!;
+  assert.ok(view.textContent.includes('No persona with access here matches “ny”.'), "expected: view.textContent.includes('No persona with access here matches “ny”.')");
+  assert.equal(view.querySelectorAll('a').some((a) => a.textContent === 'Search all personas'), false, 'not for a guild admin');
+  clickable(box.doc, 'Add one to Guild One').click();
+  box.advance(150);
+  await settle();
+  assert.equal(box.here(), '#/g/' + GA + '/personas/add');
+  const input = box.doc.querySelector('.add-persona')!.querySelector('.ta-input')!;
+  assert.equal(input.value, 'ny', 'the search goes with it');
+  assert.ok(box.calls.includes(`GET ${g}/persona-directory?q=ny`), 'expected: box.calls.includes(`GET ${g}/persona-directory?q=ny`)');
+
+  const sup = await personaPanel('/#/g/' + GA + '/personas?q=ny', { me: ME_OP, routes: { [g + '/personas']: empty } });
+  const all = sup.doc.getElementById('view')!.querySelectorAll('a').find((a) => a.textContent === 'Search all personas')!;
+  assert.equal(all.getAttribute('href'), '#/all/personas?q=ny&guild=' + GA);
+  const none = await personaPanel('/#/g/' + GA + '/personas', { routes: { [g + '/personas']: empty } });
+  assert.ok(none.doc.getElementById('view')!.textContent.includes('No persona has access in Guild One yet.'), "expected: none.doc.getElementById('view')!.textContent.includes('No persona has access in ");
+});
+
+test('persona drawer: it opens on where the persona can act here — by category, why, its direct grant in place; its id, with Copy', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { body, tr } = box;
+  const sections = body.querySelectorAll('h3').map((h) => h.textContent);
+  assert.deepEqual(sections.slice(0, 3), ['Access in Guild One', 'Access roles in Guild One', 'Remove from Guild One']);
+  assert.equal(body.querySelector('.persona-id')!.textContent, 'aria');
+  assert.equal(clickable(box.doc, 'Copy', body).getAttribute('aria-label'), 'Copy Aria’s id');
+  assert.equal(body.querySelector('.persona-summary')!.textContent, 'Write in 2 channels here');
+  const table = body.querySelector('table.access-table')!;
+  assert.ok(table.classList.contains('cards'), "expected: table.classList.contains('cards')");
+  assert.deepEqual(table.querySelectorAll('th').map((t) => t.textContent), ['Channel', 'Can do here', 'Why', 'Direct grant', 'General', 'Research']);
+  const cells = (cid: string) => tr(cid).children.map((td) => td.textContent);
+  assert.deepEqual(cells(CH.general).slice(0, 3), ['#general', 'Write', 'role g1-chatters']);
+  assert.deepEqual(cells(CH.research).slice(0, 3), ['#research', 'Write', 'direct grantrole g1-chatters']);
+  assert.equal(tr(CH.research).querySelector('a')!.getAttribute('href'), '#/g/' + GA + '/channels/c/' + CH.research, 'a channel is a link to its drawer');
+  assert.equal(tr(CH.research).querySelector('select')!.value, 'write');
+  assert.equal(tr(CH.general).querySelector('select')!.value, '');
+  // More and Identity are folded; a guild admin has no Identity.
+  assert.equal(body.querySelector('details.more')!.hasAttribute('open'), false);
+  assert.equal(body.querySelector('details.identity'), null);
+});
+
+test('persona drawer: Add to channels — only channels that can hold a grant; a category picks its channels now; Add sends each with expect and says what each can do now', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/nyx-7a8b9c', { pid: 'nyx-7a8b9c', name: 'Nyx', rows: [], roles: [] });
+  const { addForm, typeChannel, options, pickOption, bodies, calls, P, body, doc } = box;
+  assert.ok(body.textContent.includes('No access in Guild One yet — add it to channels above.'), "expected: body.textContent.includes('No access in Guild One yet — add it to channels above");
+  const add = addForm().querySelector('button[type="submit"]')!;
+  assert.equal(add.disabled, true, 'nothing picked yet');
+  assert.equal(add.nextSibling!.textContent, 'Pick a channel to add.');
+  await typeChannel('');
+  assert.ok(!options().some((o) => /design-review|thread/.test(o)), 'never a thread');
+  assert.deepEqual(options().filter((o) => o.startsWith('Category')), ['Category General (3 channels)', 'Category Research (3 channels)', 'Category Archive (1 channel)']);
+  assert.ok(!options().includes('Research (category)'), 'a category is never a grant target itself');
+
+  await typeChannel('Research');
+  assert.deepEqual(options(), ['Category Research (3 channels)', '#research']);
+  pickOption('Category Research (3 channels)');
+  const chips = addForm().querySelectorAll('.tag').map((t) => t.querySelector('span')!.textContent);
+  assert.deepEqual(chips, ['#research', '#lab-notes', 'ideas (forum)']);
+  assert.match(addForm().textContent, /Picked the 3 channels in Research now — channels added to it later aren’t covered\./);
+  assert.equal(addForm().querySelector('.currently')!.textContent, 'Currently:#research: no access#lab-notes: no accessideas (forum): no access');
+  const write = addForm().querySelectorAll('input').find((i) => i.type === 'radio' && i.checked)!;
+  assert.equal(write.value, 'write', 'Write is preselected');
+  assert.equal(add.disabled, false);
+  add.focus();
+  addForm().fire('submit');
+  await settle();
+  const puts = calls.filter((c) => c === `PUT ${P}/grants`);
+  assert.equal(puts.length, 3, 'one at a time, through the grant route');
+  assert.deepEqual(bodies.slice(-3), [CH.research, CH.labNotes, CH.ideas].map((channelId) => ({ channelId, level: 'write', expect: null })));
+  const line = addForm().querySelector('.status-line')!;
+  assert.deepEqual(line.querySelectorAll('.status-part').map((s) => s.textContent), [
+    'Nyx → Write in #research. Effective now: Write.',
+    'Nyx → Write in #lab-notes. Effective now: Write.',
+    'Nyx → Write in ideas (forum). Effective now: Write.',
+  ]);
+  assert.ok(calls.at(-1) === `GET ${P}/access`, 'and the persona is read again');
+  assert.deepEqual(body.querySelectorAll('tr[data-cid]').map((t) => t.dataset.cid), [CH.research, CH.labNotes, CH.ideas]);
+  assert.equal(body.querySelector('.persona-summary')!.textContent, 'Write in 3 channels here');
+  assert.ok(body.querySelector('.access-section')!.children.find((n) => n.textContent.startsWith('No access in Guild One yet'))!.classList.contains('hidden'), 'the empty note goes');
+  assert.equal(addForm().querySelectorAll('.tag').length, 0, 'the picks are done');
+  assert.equal(add.disabled, true);
+  assert.ok(doc.activeElement === addForm().querySelector('.ta-input'), 'focus: ' + describe(doc.activeElement) + (' — ' + 'focus goes on to the channel field'));
+  // Undo puts them all back as they were.
+  doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Nyx → Write'))!.querySelector('.toast-action')!.click();
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith(`DELETE ${P}/grants?channelId=`)).length, 3);
+  assert.deepEqual(bodies.slice(-3).map((b) => b.expect), [W8, W8, W8], 'each expecting what it set');
+  assert.equal(body.querySelectorAll('tr[data-cid]').length, 0);
+});
+
+test('persona drawer: a change in place says “Effective now” from the relay — the bot’s limits included; lowering guild-wide access asks first; Undo', async () => {
+  const lacks = W8.filter((c) => !R8.includes(c));
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    rows: [...ARIA_ROWS(), pRow(CH.welcome, R8, [{ kind: 'guildWide', caps: R8 }]), pRow(CH.random, W8, [{ kind: 'guildWide', caps: W8 }])],
+    guildWide: W8,
+    effective: (method, path, body) => {
+      if (method === 'PUT' && body.channelId === CH.welcome) return { effective: R8, botLimited: true, botLacks: lacks, direct: F8, sources: [{ kind: 'direct', caps: F8 }] };
+      if (method === 'PUT' && body.channelId === CH.research) return { effective: W8, botLimited: false, botLacks: [], direct: F8, sources: [{ kind: 'direct', caps: F8 }, roleSrc('g1-chatters', W8)] };
+      if (method === 'PUT') return { effective: R8, botLimited: false, botLacks: [], direct: R8, sources: [{ kind: 'direct', caps: R8 }] };
+      return { effective: W8, botLimited: false, botLacks: [], direct: null, sources: [roleSrc('g1-chatters', W8)] };
+    },
+  });
+  const { setDirectIn, accessLine, bodies, calls, P, doc, tr, confirm, modal } = box;
+  setDirectIn(CH.welcome, 'full');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.welcome, level: 'full', expect: null });
+  assert.equal(accessLine().textContent, 'Aria → Full in #welcome. Effective now: Read — the relay bot can’t send in #welcome.');
+
+  setDirectIn(CH.research, 'full');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'full', expect: W8 }, 'with what the drawer showed there');
+  assert.equal(accessLine().textContent, 'Aria → Full in #research. No change to what Aria can do there: Write.');
+
+  // Lowering Write that came from guild-wide asks first; Cancel sends nothing.
+  const sent = calls.length;
+  setDirectIn(CH.random, 'read');
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Lower Aria’s access in #random?');
+  assert.match(modal().textContent, /This lowers Aria from Write \(guild-wide\) to Read in #random\. Roles still apply\./);
+  confirm('Cancel');
+  await settle();
+  assert.equal(calls.length, sent, 'nothing sent');
+  assert.equal(tr(CH.random).querySelector('select')!.value, '', 'the control goes back');
+  setDirectIn(CH.random, 'read');
+  await settle();
+  confirm('Lower to Read');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.random, level: 'read', expect: null });
+  assert.ok(doc.activeElement === tr(CH.random).querySelector('select'), 'focus: ' + describe(doc.activeElement) + (' — ' + 'focus is on the row’s control again, not <body>'));
+
+  // Removing a direct grant says what is left, and why; Undo puts it back.
+  setDirectIn(CH.research, '');
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith('DELETE')).at(-1), `DELETE ${P}/grants?channelId=${CH.research}`);
+  assert.deepEqual(bodies.at(-1), { expect: F8 });
+  assert.equal(accessLine().textContent, 'Removed Aria’s direct grant in #research — still Write via role g1-chatters.');
+  doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Removed Aria'))!.querySelector('.toast-action')!.click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'full', expect: null });
+  assert.match(accessLine().textContent, /^Undone: Aria → Full in #research\./);
+});
+
+test('persona drawer: changed meanwhile — “someone else changed this”, the persona is read again, focus isn’t lost; a refusal is put in words', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    refusePut: (body) => {
+      if (body.channelId === CH.labNotes) return refuse(400, 'THREAD_TARGET', 'thread', { parentId: CH.research });
+      return refuse(409, 'CONFLICT', 'this was changed since it was loaded', { current: F8 });
+    },
+    refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: null }),
+  });
+  const { setDirectIn, accessLine, calls, P, doc, tr, addForm, typeChannel, pickOption } = box;
+  setDirectIn(CH.research, 'read');
+  await settle();
+  assert.equal(accessLine().textContent, 'Not saved: someone else changed this a moment ago. Reloaded — check and try again.');
+  assert.ok(accessLine().classList.contains('status-err'), "expected: accessLine().classList.contains('status-err')");
+  assert.equal(calls.at(-1), `GET ${P}/access`, 'read again');
+  assert.equal(tr(CH.research).querySelector('select')!.value, 'write', 'what is there now');
+  assert.ok(doc.activeElement === tr(CH.research).querySelector('select'), 'focus: ' + describe(doc.activeElement) + (' — ' + ''));
+  setDirectIn(CH.research, '');
+  await settle();
+  assert.equal(accessLine().textContent, 'Not removed: someone else changed this a moment ago. Reloaded — check and try again.');
+
+  // The Add form's own line; Add keeps focus when the relay refuses.
+  await typeChannel('lab');
+  pickOption('#lab-notes');
+  const add = addForm().querySelector('button[type="submit"]')!;
+  add.focus();
+  addForm().fire('submit');
+  await settle();
+  assert.equal(addForm().querySelector('.status-line')!.textContent, 'Not saved: lab-notes is a thread. Threads use #research’s access — give access there.');
+  assert.equal(addForm().querySelectorAll('.tag').length, 1, 'the pick stays');
+  assert.ok(doc.activeElement === add, 'focus: ' + describe(doc.activeElement) + (' — ' + 'Add is still there, and keeps focus'));
+});
+
+test('persona drawer: Custom… goes as caps; More sets the guild-wide level ({guildDefault: true}), Unset and Deny ask first', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { guildWide: R8, personaDefault: null });
+  const { addForm, typeChannel, pickOption, bodies, calls, P, gwRow, gwButtons, gwLine, body, confirm, modal, level } = box;
+  await typeChannel('gen');
+  pickOption('#general');
+  level(addForm(), 'custom');
+  const tick = (c: string) => {
+    const cb = addForm().querySelectorAll('input').find((i) => i.type === 'checkbox' && i.value === c)!;
+    cb.checked = true;
+    cb.fire('change');
+  };
+  tick('MENTION_EVERYONE');
+  addForm().fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.general, caps: [...W8.slice(0, 7), 'MENTION_EVERYONE', ...W8.slice(7)], expect: null });
+
+  const value = () => gwRow().querySelector('.gw-level')!.textContent;
+  assert.equal(value(), 'Read');
+  assert.deepEqual(gwButtons(), ['Set level…', 'Unset', 'Deny guild-wide']);
+  clickable(box.doc, 'Set level…', gwRow()).click();
+  const form = body.querySelector('form.guild-wide-form')!;
+  assert.ok(!form.classList.contains('hidden'), "expected: !form.classList.contains('hidden')");
+  assert.ok(body.querySelector('details.more')!.hasAttribute('open'), "expected: body.querySelector('details.more')!.hasAttribute('open')");
+  assert.equal(form.querySelector('.gw-warn')!.textContent, 'Applies to every channel without its own grant, including new ones.');
+  assert.equal(box.radioIn(form, 'read').checked, true, 'it starts at the level set now');
+  level(form, 'write');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { guildDefault: true, level: 'write', expect: R8 });
+  assert.match(gwLine().textContent, /^Aria → Write guild-wide in Guild One \(every channel without its own grant\)\. Effective now: no access in any channel of Guild One\.$/);
+  assert.equal(value(), 'Write');
+  assert.ok(form.classList.contains('hidden'), "expected: form.classList.contains('hidden')");
+
+  // Unset: asked, then DELETE ?guildDefault=unset.
+  clickable(box.doc, 'Unset', gwRow()).click();
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One?');
+  assert.match(modal().textContent, /fall back to Aria’s persona default/);
+  confirm('Unset guild-wide');
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith('DELETE')).at(-1), `DELETE ${P}/grants?guildDefault=unset`);
+  assert.match(gwLine().textContent, /^Unset Aria’s guild-wide level in Guild One: channels without their own grant fall back to the persona default\./);
+  assert.equal(value(), 'Not set');
+  assert.match(gwRow().textContent, /fall back to the persona default \(none\)/);
+  assert.deepEqual(gwButtons(), ['Set level…', 'Deny guild-wide'], 'nothing to unset');
+
+  // Deny: asked, then DELETE ?guildDefault=deny.
+  clickable(box.doc, 'Deny guild-wide', gwRow()).click();
+  await settle();
+  assert.match(modal().textContent, /the deny blocks its persona default here/);
+  modal().querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith('DELETE')).at(-1), `DELETE ${P}/grants?guildDefault=deny`);
+  assert.equal(value(), 'Denied');
+  assert.deepEqual(gwButtons(), ['Set level…', 'Unset']);
+});
+
+test('persona drawer: a guild-wide change refused as changed meanwhile says so, reads again, and leaves focus on Set level…', async () => {
+  for (const [label, confirmLabel] of [['Deny guild-wide', 'Deny guild-wide'], ['Unset', 'Unset guild-wide']]) {
+    const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { guildWide: R8, refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: W8 }) });
+    box.body.querySelector('details.more')!.setAttribute('open', ''); // More, unfolded
+    const button = box.gwRow().querySelectorAll('button').find((b) => b.textContent === label)!;
+    button.focus();
+    button.click();
+    await settle();
+    box.confirm(confirmLabel);
+    await settle();
+    assert.match(box.gwLine().textContent, /^Not (denied|unset): someone else changed this a moment ago\. Reloaded/, label);
+    assert.equal(button.isConnected, false, label + ': drawn again');
+    assert.ok(box.doc.activeElement === clickable(box.doc, 'Set level…', box.gwRow()), 'focus: ' + describe(box.doc.activeElement) + (' — ' + label));
+  }
+});
+
+test('persona drawer: a persona removed with /ban says so; giving it access asks first; Unset asks, then lifts the removal', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: [], roles: [], removed: true, guildWide: 'deny' });
+  const { body, gwRow, gwButtons, gwLine, confirm, modal, calls, P } = box;
+  const banner = body.querySelector('.access-section')!.querySelector('.banner')!;
+  assert.ok(!banner.classList.contains('hidden'), "expected: !banner.classList.contains('hidden')");
+  assert.match(banner.textContent, /^Aria was removed from Guild One \(with \/ban, or Remove from Guild One\), so nothing it holds applies here.*It can’t give itself access here again/);
+  assert.equal(body.querySelector('.persona-summary')!.textContent, 'Removed from Guild One — nothing it holds applies here');
+  assert.equal(gwRow().querySelector('.gw-level')!.textContent, 'Removed with /ban');
+  assert.deepEqual(gwButtons(), ['Set level…', 'Unset'], 'denied already: no Deny');
+  assert.equal(clickable(box.doc, 'Remove from Guild One…', body).disabled, true, 'removed already');
+
+  // Add asks before it lifts the removal.
+  await box.typeChannel('gen');
+  box.pickOption('#general');
+  assert.match(box.addForm().querySelector('.currently')!.textContent, /Aria was removed from Guild One with \/ban — adding access here lifts that\./);
+  box.addForm().fire('submit');
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Lift Aria’s removal from Guild One?');
+  confirm('Cancel');
+  await settle();
+  assert.ok(!calls.some((c) => c.startsWith('PUT')), 'nothing sent');
+
+  clickable(box.doc, 'Unset', gwRow()).click();
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Unset Aria’s guild-wide level in Guild One and lift its removal?');
+  confirm('Unset and lift');
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith('DELETE')).at(-1), `DELETE ${P}/grants?guildDefault=unset&liftBan=1`);
+  assert.match(gwLine().textContent, /^Lifted Aria’s removal from Guild One and unset its guild-wide level: channels without their own grant fall back to the persona default\. Effective now: /);
+  assert.equal(gwRow().querySelector('.gw-level')!.textContent, 'Not set');
+  assert.ok(banner.classList.contains('hidden'), "expected: banner.classList.contains('hidden')");
+  assert.equal(clickable(box.doc, 'Remove from Guild One…', body).disabled, false);
+});
+
+test('persona drawer: inactive grants — each says why it does nothing, with Remove; a thread’s removal says what its channel gives; the list empties', async () => {
+  const GONE = '100000000000001099';
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/juniper-3c4d5e', {
+    pid: 'juniper-3c4d5e', name: 'Juniper', rows: [], roles: [],
+    inactive: [
+      { channelId: CH.designReview, caps: W8, reason: 'thread' },
+      { channelId: CH.catResearch, caps: R8, reason: 'category' },
+      { channelId: GONE, caps: W8, reason: 'missing' },
+    ],
+    names: {
+      [CH.designReview]: { id: CH.designReview, name: 'design-review', type: 'thread', parentId: CH.research, parentName: 'research' },
+      [CH.catResearch]: { id: CH.catResearch, name: 'Research', type: 'category' },
+      [GONE]: { id: GONE, name: null, unavailable: true },
+    },
+    effective: (_m, path) => (path.includes(GONE) ? { missing: true }
+      : path.includes(CH.designReview) ? { effective: [], botLimited: false, botLacks: [], direct: null, sources: [], parentId: CH.research }
+        : { effective: [], botLimited: false, botLacks: [], direct: null, sources: [] }),
+  });
+  const { body, calls, bodies, P, doc } = box;
+  const box2 = () => body.querySelector('.inactive')!;
+  const items = () => box2().querySelectorAll('li').map((li) => li.querySelector('span')!.textContent);
+  assert.equal(box2().querySelector('h4')!.textContent, 'Inactive grants (3)');
+  assert.deepEqual(items(), ['design-review — thread; uses #research’s access', 'Research — category', 'deleted channel, or one the relay can’t see']);
+  const line = () => body.querySelector('.access-section')!.children.filter((n) => n.classList.contains('status-line'))[1];
+  const remove = (i: number) => {
+    const b = box2().querySelectorAll('li')[i].querySelector('button')!;
+    b.focus();
+    b.click();
+  };
+  remove(0);
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith('DELETE')).at(-1), `DELETE ${P}/grants?channelId=${CH.designReview}`);
+  assert.deepEqual(bodies.at(-1), { expect: W8 });
+  assert.equal(line().textContent, 'Removed Juniper’s direct grant in design-review (thread in #research) — no remaining access in design-review (thread in #research).');
+  assert.deepEqual(items(), ['Research — category', 'deleted channel, or one the relay can’t see']);
+  assert.ok(doc.activeElement === box2().querySelectorAll('li')[0].querySelector('button'), 'focus: ' + describe(doc.activeElement) + (' — ' + 'focus moves to the next Remove'));
+  remove(0);
+  await settle();
+  assert.equal(line().textContent, 'Removed Juniper’s direct grant on Research (category). A category grants nothing, so nothing changed.');
+  remove(0);
+  await settle();
+  assert.equal(line().textContent, 'Removed Juniper’s direct grant in channel the relay can’t see.');
+  assert.ok(box2().classList.contains('hidden'), 'the list empties');
+  assert.ok(doc.activeElement === box.addForm().querySelector('.ta-input'), 'focus: ' + describe(doc.activeElement) + (' — ' + 'focus goes to Add to channels'));
+});
+
+test('persona drawer: Remove from Guild One — the confirm lists what goes and that only an admin there can give access back; then no remaining access', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/quill-4d5e6f', {
+    pid: 'quill-4d5e6f', name: 'Quill',
+    rows: [pRow(CH.general, F8, [roleSrc('g1-mods-mirror', F8, { how: 'mirror', mirror: [{ id: MODS }], mirrorCaps: true })]), pRow(CH.random, F8, [roleSrc('g1-mods-mirror', F8, { how: 'mirror', mirror: [{ id: MODS }], mirrorCaps: true }), { kind: 'block' }], [])],
+    inactive: [{ channelId: CH.random, caps: [], reason: 'blocks-nothing' }],
+    roles: [{ name: 'g1-mods-mirror', caps: F8, scope: { mirrorRole: MODS }, guildId: GA, mirrorCaps: true, channels: 2 }],
+  });
+  const { body, modal, confirm, calls, P, doc } = box;
+  clickable(doc, 'Remove from Guild One…', body).click();
+  await settle();
+  assert.equal(modal().getAttribute('role'), 'alertdialog');
+  assert.equal(modal().querySelector('h2')!.textContent, 'Remove Quill from Guild One?');
+  assert.deepEqual(modal().querySelectorAll('p').map((p) => p.textContent), [
+    'This removes access role g1-mods-mirror and 1 direct grant, and denies guild-wide access here.',
+    'Quill can’t give itself access here again — claiming an invite won’t bring it back. Only an admin of Guild One can, by giving it access here.',
+    'Other guilds are not affected. You can add Quill back later.',
+  ]);
+  assert.equal(doc.activeElement!.textContent, 'Cancel', 'a danger confirm starts on Cancel');
+  confirm('Remove from Guild One');
+  await settle();
+  assert.ok(calls.includes(`POST ${P}/remove`), 'expected: calls.includes(`POST ${P}/remove`)');
+  const line = body.querySelector('.danger-zone')!.querySelector('.status-line')!;
+  assert.equal(line.textContent, 'Removed Quill from Guild One: access role g1-mods-mirror and 1 direct grant are gone, and guild-wide access is denied. No remaining access in Guild One.');
+  assert.ok(line.textContent.endsWith('No remaining access in Guild One.'), "expected: line.textContent.endsWith('No remaining access in Guild One.')");
+  assert.equal(body.querySelectorAll('tr[data-cid]').length, 0);
+  assert.equal(body.querySelector('.persona-summary')!.textContent, 'Removed from Guild One — nothing it holds applies here');
+  assert.equal(clickable(doc, 'Remove from Guild One…', body).disabled, true);
+  // Closing it, the list is asked again (Quill has no access there now).
+  const before = calls.filter((c) => c.startsWith(`GET /admin/g/${GA}/personas?`)).length;
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(calls.filter((c) => c.startsWith(`GET /admin/g/${GA}/personas?`)).length, before + 1);
+});
+
+test('persona drawer: Resync re-sends the channel list; a second one at once is “Try again in a few seconds.”; a super-admin is told how many', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    resync: (n) => (n === 1 ? { ok: true } : refuse(429, 'RATE_LIMITED', 'resynced a moment ago', { retryAfterMs: 9000 })),
+  });
+  const resync = clickable(box.doc, 'Resync', box.body);
+  assert.equal(box.doc.getElementById(resync.getAttribute('aria-describedby')!)!.textContent, 'Re-sends this persona’s channel list to its running agent.');
+  const line = () => box.body.querySelector('.danger-zone')!.querySelector('.status-line')!;
+  resync.click();
+  await settle();
+  assert.match(line().textContent, /^Asked the relay to re-send Aria’s channel list\./);
+  resync.click();
+  await settle();
+  assert.equal(line().textContent, 'Resync was sent a moment ago. Try again in a few seconds.');
+  assert.ok(line().textContent.includes('Try again in a few seconds.'), "expected: line().textContent.includes('Try again in a few seconds.')");
+  const sup = await personaPanel('/#/g/' + GA + '/personas/p/aria', { me: ME_OP, resync: () => ({ ok: true, pushed: 4 }), routes: { '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatarUrl: '', roles: [], guilds: [], names: {} } } });
+  clickable(sup.doc, 'Resync', sup.body).click();
+  await settle();
+  assert.equal(sup.body.querySelector('.danger-zone')!.querySelector('.status-line')!.textContent, 'Re-sent 4 channels to Aria’s running agent.');
+});
+
+test('persona drawer: super-admins get Identity, folded — other guilds as links to the persona there, its picture and token; +N roles elsewhere opens it', async () => {
+  const global = {
+    id: 'sol-6d7e8f', displayName: 'Sol', avatar: '', avatarUrl: '', policy: null, bans: [],
+    roles: [{ name: 'g2-desk', caps: W8, scope: { all: true }, guildId: GB }],
+    guilds: [{ id: GA, name: 'Guild One' }, { id: GB, name: 'Guild Two' }], names: {},
+  };
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/sol-6d7e8f', {
+    pid: 'sol-6d7e8f', name: 'Sol', me: ME_OP, guilds: BOTH_GUILDS, rows: [pRow(CH.general, R8, [{ kind: 'personaDefault', caps: R8 }])], roles: [], otherGuildRoleCount: 1,
+    routes: { '/admin/personas/sol-6d7e8f': global },
+  });
+  const identity = box.body.querySelector('details.identity')!;
+  assert.equal(identity.hasAttribute('open'), false, 'folded');
+  assert.equal(identity.querySelector('.field-label')!.textContent, 'Other guilds');
+  const link = identity.querySelectorAll('a').find((a) => a.textContent === 'Guild Two')!;
+  assert.equal(link.getAttribute('href'), '#/g/' + GB + '/personas/p/sol-6d7e8f');
+  assert.ok(identity.textContent.includes('access roles: g2-desk'), "expected: identity.textContent.includes('access roles: g2-desk')");
+  assert.ok(!identity.querySelectorAll('a').some((a) => a.textContent === 'Guild One'), 'not the guild it is in');
+  assert.ok(identity.querySelectorAll('h3').some((h) => h.textContent === 'Profile picture'), "expected: identity.querySelectorAll('h3').some((h) => h.textContent === 'Profile picture')");
+  assert.ok(identity.querySelectorAll('button').some((b) => b.textContent === 'Rotate token'), "expected: identity.querySelectorAll('button').some((b) => b.textContent === 'Rotate token'");
+  const elsewhere = clickable(box.doc, '+1 role in other guilds', box.body);
+  elsewhere.click();
+  assert.equal(identity.hasAttribute('open'), true);
+  assert.ok(box.doc.activeElement === identity.querySelector('summary'), 'focus: ' + describe(box.doc.activeElement) + (' — ' + ''));
+  // A guild admin gets neither.
+  const gwen = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  assert.equal(gwen.body.querySelector('details.identity'), null);
+  assert.equal(gwen.body.textContent.includes('in other guilds'), false);
+});
+
+test('persona drawer: rows that read alike six times or more are one line with Show; Show lists them by category, and Hide folds them', async () => {
+  const everyone = roleSrc('g1-everyone', W8, { how: 'all' });
+  const chans = [CH.general, CH.random, CH.lounge, CH.research, CH.labNotes, CH.ideas];
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    rows: [...chans.map((c) => pRow(c, W8, [everyone])), pRow(CH.welcome, R8, [everyone], null, { botLimited: true, botLacks: W8.filter((c) => !R8.includes(c)) })],
+  });
+  const table = () => box.body.querySelector('table.access-table')!;
+  const run = () => table().querySelector('tr.run-row')!;
+  assert.match(run().textContent, /^Write.*Write in 6 channels · via role g1-everyone.*Show$/);
+  const show = run().querySelector('button')!;
+  assert.equal(show.getAttribute('aria-expanded'), 'false');
+  assert.equal(show.getAttribute('aria-label'), 'Show the 6 channels: Write in 6 channels · via role g1-everyone');
+  assert.deepEqual(table().querySelectorAll('tr[data-cid]').map((t) => t.dataset.cid), [CH.welcome], 'the one that reads otherwise stays a row');
+  show.focus();
+  show.click();
+  assert.deepEqual(table().querySelectorAll('tr[data-cid]').map((t) => t.dataset.cid), [CH.general, CH.random, CH.lounge, CH.research, CH.labNotes, CH.ideas, CH.welcome]);
+  assert.deepEqual(table().querySelectorAll('tr.cat-row').map((t) => t.textContent), ['General', 'Research']);
+  const hide = run().querySelector('button')!;
+  assert.equal(hide.textContent, 'Hide');
+  assert.ok(box.doc.activeElement === hide, 'focus: ' + describe(box.doc.activeElement) + (' — ' + 'focus stays on the toggle'));
+  hide.click();
+  assert.equal(table().querySelectorAll('tr[data-cid]').length, 1);
+});
+
+test('persona drawer: an unknown id says so — nothing is made up', async () => {
+  const box = await panelAt('/#/g/' + GA + '/personas/p/nobody-0');
+  const body = box.doc.getElementById('drawer-body')!;
+  assert.equal(body.textContent, 'No persona with id “nobody-0”.');
+  assert.equal(body.querySelector('form'), null);
+});
+
+test('persona drawer: Add to channels is kept across Sign in again — only in its own persona’s drawer', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await personaPanel('/' + g + '/personas/p/aria', { handle: (method) => (down && method !== 'GET' ? refuse(401, 'UNAUTHENTICATED', 'login required') : undefined) });
+  await box.typeChannel('lab');
+  box.pickOption('#lab-notes');
+  box.level(box.addForm(), 'full');
+  down = true;
+  box.addForm().fire('submit');
+  await settle();
+  clickable(box.doc, 'Sign in again', box.modal()).click();
+  const draft = JSON.parse(box.sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.form, 'personaAdd');
+  assert.deepEqual(draft.fields, { personaId: 'aria', channels: [CH.labNotes], caps: F8 });
+  for (const [who, kept] of [['sol', false], ['aria', true]] as const) {
+    const back = await personaPanel('/' + g + '/personas/p/aria', { session: { 'pa.draft': JSON.stringify({ ...draft, fields: { ...draft.fields, personaId: who } }) } });
+    assert.deepEqual(back.addForm().querySelectorAll('.tag').map((t) => t.querySelector('span')!.textContent), kept ? ['#lab-notes'] : [], who);
+    assert.equal(back.addForm().textContent.includes('Restored your unsaved change'), kept, who);
+    assert.equal(back.radioIn(back.addForm(), 'full').checked, kept, who);
+    assert.ok(!back.calls.some((c) => c.startsWith('PUT')), 'nothing was submitted');
+  }
+  // A guild-wide level kept by an older panel comes back in More.
+  const old = JSON.stringify({ v: 1, userId: ME_GWEN.user.id, route: g + '/personas/p/aria', form: 'grant', fields: { personaId: 'aria', target: '__guild__', caps: R8 }, at: Date.now() });
+  const gw = await personaPanel('/' + g + '/personas/p/aria', { session: { 'pa.draft': old } });
+  const form = gw.body.querySelector('form.guild-wide-form')!;
+  assert.ok(!form.classList.contains('hidden'), "expected: !form.classList.contains('hidden')");
+  assert.equal(gw.radioIn(form, 'read').checked, true);
+});
+
+/** A focused element in words, for an assertion's message (a failing equal
+ *  on two DOM nodes would print — and diff — the whole page). */
+function describe(n: FakeElement | null): string {
+  if (!n) return 'nothing';
+  const key = n.getAttribute('data-key');
+  return n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') + (key ? '[data-key=' + key + ']' : '') + ' “' + n.textContent.slice(0, 40) + '”';
+}
+
+test('persona drawer: access roles are this guild’s only, each with what it means; ✕ asks, removes it and says what is left', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    handle: (method, path) => (method === 'DELETE' && path === '/admin/g/' + GA + '/personas/aria/roles/g1-chatters' ? { roles: [] } : undefined),
+  });
+  const section = box.body.querySelectorAll('section').find((s) => s.querySelector('h3')?.textContent === 'Access roles in Guild One')!;
+  const picker = section.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
+  assert.deepEqual(picker.options.map((o) => o.textContent), ['+ Add access role…', 'g1-readers — Read in every channel of Guild One'], 'not another guild’s g2-desk');
+  assert.deepEqual(section.querySelectorAll('.tag').map((t) => t.textContent), ['g1-chatters— Write in 2 channels✕']);
+  const x = section.querySelector('.tag')!.querySelector('button')!;
+  assert.equal(x.getAttribute('aria-label'), 'Remove access role g1-chatters from Aria');
+  x.click();
+  await settle();
+  assert.equal(box.modal().querySelector('h2')!.textContent, 'Remove access role g1-chatters from Aria?');
+  assert.equal(box.modal().querySelector('p')!.textContent, 'Aria loses Write in 2 channels unless another grant covers them.');
+  box.world.roles = [];
+  box.world.rows = [pRow(CH.research, W8, [{ kind: 'direct', caps: W8 }], W8)];
+  box.confirm('Remove access role');
+  await settle();
+  assert.ok(box.calls.includes(`DELETE /admin/g/${GA}/personas/aria/roles/g1-chatters`), box.calls.join('\n'));
+  assert.equal(section.querySelector('.status-line')!.textContent, 'Removed access role g1-chatters from Aria. Effective now: Write in 1 channel here.');
+  assert.equal(section.querySelectorAll('.tag').length, 0);
+  assert.ok(section.textContent.includes('No access roles in Guild One.'), 'says there are none');
+});
+
+test('persona drawer: picking a second access role while the first is being given gives both, one after the other', async () => {
+  const g = '/admin/g/' + GA;
+  const catalog = {
+    'g1-readers': G1_CATALOG['g1-readers'],
+    'g1-chatters': G1_CATALOG['g1-chatters'],
+    'g1-mods-mirror': { caps: LEVEL_CAPS.full, scope: { mirrorRole: MODS }, guildId: GA, mirrorCaps: true },
+  };
+  let held: string[] = [];
+  let inFlight = 0;
+  let most = 0;
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    rows: [], roles: [],
+    routes: { [g + '/roles']: { catalog, discordRoles: [], canAuthor: false } },
+    handle: async (method: string, path: string, body: any) => {
+      if (method === 'GET' && path === g + '/personas/aria/access') return accessBody({ roles: held.map((name) => ({ name, ...(catalog as any)[name], channels: 1 })) });
+      if (method !== 'POST' || path !== g + '/personas/aria/roles') return undefined;
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await tick();
+      inFlight--;
+      held = [...held, body.role];
+      return { roles: held, banned: false };
+    },
+  });
+  const picker = box.body.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
+  picker.focus();
+  picker.value = 'g1-mods-mirror';
+  picker.fire('change');
+  assert.equal(picker.disabled, true, 'off while the role is being given');
+  picker.value = 'g1-readers';
+  picker.fire('change'); // a pick that gets through anyway
+  await settle();
+  assert.deepEqual(held, ['g1-mods-mirror', 'g1-readers'], 'both, in the order picked');
+  assert.equal(most, 1, 'one request at a time');
+  const chips = box.body.querySelectorAll('.tag').map((t) => t.querySelector('code')!.textContent);
+  assert.deepEqual(chips, ['g1-mods-mirror', 'g1-readers']);
+  assert.equal(picker.disabled, false);
+  assert.equal(picker.value, '');
+  assert.ok(box.doc.activeElement === picker, 'focus: ' + describe(box.doc.activeElement) + ' — focus comes back to the picker');
+  const roles = box.body.querySelectorAll('section').find((x) => x.querySelector('h3')?.textContent === 'Access roles in Guild One')!;
+  assert.match(roles.querySelector('.status-line')!.textContent, /^Gave Aria access role g1-readers \(Read in every channel of Guild One\)\. Effective now: /);
 });

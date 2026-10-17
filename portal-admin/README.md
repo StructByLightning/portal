@@ -73,25 +73,48 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
   Opening a thread's address shows its channel ("Threads use #research's
   access."); a category's opens the list with that category unfolded.
 - **Personas** — the one place for a persona (portal's only kind of speaker).
-  The table (avatar · name · id · access roles · direct grants?) lists the
-  personas with access in the selected guild; super-admins can switch it to
-  **All personas** (with each one's guild count). Click a row → a right-side
-  **drawer**:
-  - *Access in <guild>* — its direct grants in this guild first: set Read,
-    Write, Full or Custom… on one channel (text, voice or forum — a thread
-    uses its parent's access and a category grants nothing) or guild-wide.
-    The guild-wide row says whether it is set, denied or not set, with *Unset*
-    (fall back to the persona default) and *Deny guild-wide* (block the
-    persona default here; access roles still apply). Then this guild's access
-    roles, each with what it means; and, under
-    *More*, applying an invite made for an existing persona;
-  - *(super-admin)* Profile picture (Upload only when the relay keeps uploads,
-    `PORTAL_AVATAR_DIR`), *Access in every guild* (where it can act,
-    what each access role confers, its direct grants everywhere) and **Token**
-    (rotate / revoke) — a token authenticates a persona everywhere, so it is
-    not a per-guild action.
+  The table (avatar · name · id · *Can act in* "in 14 channels (9 Write · 5
+  Read)", from the access summary · this guild's access roles · flags: denied
+  guild-wide, inactive grants) lists the personas with access in the selected
+  guild; super-admins can switch it to **All personas** (with each one's guild
+  count). **Add persona to <guild>** opens a type-ahead over the guild's
+  persona directory (the people slash `/add` offers): any persona, by name or
+  id — "Nyx (nyx-7a8b9c)" with a *no access here* tag — and picking one opens
+  its drawer. An empty search offers to add one with that name (super-admins
+  can also search all personas). Click a row → a right-side **drawer**:
+  - its picture, its id (with Copy) and where it can act here ("Write in 3 ·
+    Read in 12 channels here");
+  - *Access in <guild>* — *Add to channels*: a channel type-ahead (only
+    channels that can hold a grant; typing a category offers "Category
+    Research (3 channels)", which picks the channels it has now), a level
+    (Write unless changed) and *Add*, with a *Currently:* line per channel.
+    Then where it can act, by category in Discord's order: what it can do,
+    why, and its direct grant, changed in place with the channel drawer's
+    control. Six or more rows that read alike fold into one line ("Write in
+    240 channels · via role g1-everyone" — *Show*). *Inactive grants* lists
+    the direct grants that do nothing (on a thread, a category or a deleted
+    channel, or a block with nothing to block), each with *Remove*. Every
+    change answers "Effective now: …" from the relay, offers **Undo** for 10
+    seconds, and asks first when it would lower guild-wide or default access,
+    or lift a removal with `/ban`;
+  - *Access roles in <guild>* — this guild's, each with what it means; ✕ asks
+    first ("Aria loses Write in 2 channels unless another grant covers them");
+  - **Remove from <guild>** — what slash `/ban` does (the same function on the
+    relay): its access roles here and every direct grant here go, guild-wide
+    is denied, and only an admin of the guild can give it access there again
+    (claiming an invite won't). The confirm lists what goes. **Resync**
+    re-sends its channel list to its running agent (once every few seconds);
+  - *More* (folded) — the guild-wide level (*Set level…*, *Unset*: fall back to
+    the persona default, *Deny guild-wide*: block the persona default here;
+    access roles still apply) and applying an invite made for an existing
+    persona;
+  - *(super-admin)* **Identity** (folded) — the other guilds it can act in, each
+    a link to its drawer there; its profile picture (Upload only when the relay
+    keeps uploads, `PORTAL_AVATAR_DIR`); and its **Token** (rotate / revoke) —
+    a token authenticates a persona everywhere, so it is not a per-guild
+    action. From *All personas* (no guild) the drawer is Identity alone.
 
-  "Grant access by id" reaches a persona that has no access yet. (The former
+  An id that isn't a persona's says "No persona with id …". (The former
   *Identities* tab was the same personas, globally; it is folded in here.)
 - **Invites** *(guild-scoped)* — mint (access roles, channels at a level, or a
   mirrored Discord role; single use and 7 days unless changed; who can use
@@ -119,7 +142,7 @@ can't carry it), so reload, Back, a shared link and a sign-in keep it:
 #/                                  the last guild and tab you used here
 #/g/<guild>/channels[?q=&show=agents|empty&cat=<category>]
 #/g/<guild>/channels/c/<channel>    (a thread's → its channel's; a category's → ?cat=)
-#/g/<guild>/personas[?q=]           #/g/<guild>/personas/p/<persona>
+#/g/<guild>/personas[?q=]           #/g/<guild>/personas/p/<persona> · …/personas/add (Add persona)
 #/g/<guild>/invites[?q=]            #/g/<guild>/invites/new[?r=<role>,…|c=<channel>&lvl=read|write|full]
 #/g/<guild>/roles[?q=]              #/g/<guild>/roles/new
 #/g/<guild>/audit[?q=]
@@ -135,7 +158,7 @@ address. A search that is a whole invite code (`inv_…`) goes into the address
 as its first 12 characters only, as the audit shows codes.
 
 `lib.parseRoute` also knows the addresses later versions add (give access,
-adding a persona, invite detail, role detail, the global audit); this version says
+invite detail, role detail, the global audit); this version says
 "That page isn't available yet" and shows the nearest page there is. Ids are
 checked (guilds and channels are 5–25 digits; an invite is only ever the hash
 of its code, never the code); anything else is "That link wasn't valid" and
@@ -270,7 +293,7 @@ it routes the request, so a request without it changes nothing.
   manage invites, personas' access roles, and per-guild direct grants — scoped to guilds
   they administer. They express access by mirroring their own Discord roles or
   picking channels. A guild-admin's tool for "remove an agent from my guild" is
-  revoking its guild-scoped roles/grants.
+  *Remove from <guild>* in its drawer (slash `/ban`).
 - **Super-admins** (in `PORTAL_SUPERADMINS`): all of the above in **any** guild,
   plus authoring the global access-role catalog (Access roles tab) and, on
   Personas, the *All personas* view, profile pictures and **token lifecycle**
@@ -287,12 +310,20 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   and `caps` are the relay's Read/Write/Full and capability list (the panel keeps a
   copy for an older relay); a relay whose `apiVersion` is newer than the panel's
   `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. `POST /admin/logout`
-- `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride,directGrants}], total,limit,offset}`;
-  `directGrants` is `grants` (a direct grant gives something here), `denied` (denied
-  guild-wide, nothing given) or `none`; super-admins also get `otherGuildRoleCount`
+- `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride,directGrants,guildWideDenied,
+  inactiveGrants}], total,limit,offset}`; `directGrants` is `grants` (a direct grant gives something
+  here), `denied` (denied guild-wide, nothing given) or `none`; `inactiveGrants` counts the direct
+  grants here that do nothing; super-admins also get `otherGuildRoleCount`
 - `GET /admin/g/:gid/personas/:id` → `{id,displayName,roles,guildPolicy}` (+ `otherGuildRoleCount` for super-admins).
   A guild-admin gets only that guild's access roles.
 - `POST/DELETE /admin/g/:gid/personas/:id/roles[/:role]`; `POST …/claim`
+- `POST /admin/g/:gid/personas/:id/remove` → `{rolesRemoved, accessFullyRevoked}` — what slash `/ban`
+  does in the guild (one shared function): its access roles bound to the guild off, every direct
+  grant there dropped, guild-wide pinned to deny, the removal recorded. Audited as
+  `persona.guild.remove`.
+- `POST /admin/g/:gid/personas/:id/resync` → `{ok}` (+ `pushed`, the channels re-sent, for super-admins
+  only) — at most once per 10 s per persona, else `429 RATE_LIMITED {retryAfterMs}`. Audited as
+  `persona.resync`.
 - `PUT /admin/g/:gid/personas/:id/grants` — one target, `{channelId}` or `{guildDefault:true}`,
   and one operation, `{level:'read'|'write'|'full'}`, `{caps:[…]}` (non-empty, known) or
   `{deny:true}`. Refusals: `TARGET_REQUIRED`, `EMPTY_CAPS`, `UNKNOWN_CAP`, `THREAD_TARGET`
@@ -369,6 +400,6 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   changes?" when a form has unsaved edits, otherwise leaves a focused field,
   otherwise closes the drawer and puts focus back on the link that opened it.
   `Tab` stays inside the drawer and dialogs; `Enter` submits the section's form.
-- Below 640px wide the top bar wraps, the channel drawer's rows become
-  labelled cards, other tables scroll sideways inside their box, and the
-  drawer takes the whole screen.
+- Below 640px wide the top bar wraps, the Personas list and both drawers'
+  rows become labelled cards, other tables scroll sideways inside their box,
+  and the drawer takes the whole screen.

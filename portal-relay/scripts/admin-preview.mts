@@ -240,13 +240,14 @@ const PERMISSIONS: Record<string, unknown> = {
   // Cass: reads all of Guild One guild-wide, but is blocked in #random.
   [P.cass]: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
   // Nyx: no entry at all — no access anywhere.
-  // Juniper: grants on a thread id, a category id and a deleted channel,
-  // which grant nothing.
-  [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ, [C.gone]: WRITE } } } } },
-  // Quill: mirrors @Mods with their per-channel permissions.
-  [P.quill]: { roles: ['g1-mods-mirror'] },
-  // Sol: a persona default (every guild) plus Guild Two's desk role.
-  [P.sol]: { roles: ['g2-desk'], policy: { default: READ } },
+  // Juniper: grants on a thread id and a category id, which grant nothing.
+  [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ } } } } },
+  // Quill: mirrors @Mods with their per-channel permissions, and holds a block
+  // in #random that blocks nothing (no guild-wide level or persona default).
+  [P.quill]: { roles: ['g1-mods-mirror'], policy: { default: [], guilds: { [G1]: { channels: { [C.random]: [] } } } } },
+  // Sol: a persona default (every guild) plus Guild Two's desk role, and a
+  // grant in Guild One on a channel since deleted.
+  [P.sol]: { roles: ['g2-desk'], policy: { default: READ, guilds: { [G1]: { channels: { [C.gone]: WRITE } } } } },
 };
 
 const newCode = () => `inv_${randomBytes(18).toString('base64url')}`;
@@ -299,6 +300,10 @@ if (opts.scale === 'large') {
     }
   }
   CHANNELS.push(...big);
+  // Aria also holds an access role for every channel of Guild One, so her
+  // drawer folds hundreds of rows that read alike into one line.
+  (ACCESS_ROLES as Record<string, unknown>)['g1-everyone'] = { caps: WRITE, scope: { all: true }, guildId: G1 };
+  (PERMISSIONS[P.aria] as { roles: string[] }).roles.push('g1-everyone');
   const rooms = big.filter((c) => c.type === 'text' || c.type === 'voice');
   for (let i = 1; i <= 200; i++) {
     const id = `persona-${String(i).padStart(3, '0')}`;

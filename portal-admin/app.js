@@ -50,6 +50,9 @@ const state = {
   viewKey: null,   // which list is drawn (guild + tab); a change redraws it
   drawerRoute: null, // the address of the open drawer, if a route opened one
   drawerPushed: false, // that drawer was opened from its list: closing it goes Back
+  addPushed: false,  // the Add persona bar was opened from its list: closing it goes Back
+  addQuery: '',      // text to start the Add persona bar with (an empty search's 'Add one')
+  addPickPushed: false, // a persona picked in that bar replaced its entry, which was pushed
   draft: null,     // an unsaved form brought back across a sign-in, until used
   leaving: false,  // on the way to sign in: no "Leave site?" question
   expiryTimer: null,
@@ -621,7 +624,7 @@ function supported(r) {
   if (r.area !== 'g' && r.area !== 'all') return { route: r, note: null };
   if (r.view === 'give') return instead(route('g', r.gid, 'channels'), 'Channels');
   const k = r.drawer && r.drawer.kind;
-  if (k === 'add' || k === 'invite' || k === 'role') return instead(route(r.area, r.gid, r.view), TAB_NAMES[r.view]);
+  if (k === 'invite' || k === 'role') return instead(route(r.area, r.gid, r.view), TAB_NAMES[r.view]);
   const all = r.area === 'all';
   const listKeys = all ? ['q', 'guild'] : r.view === 'channels' ? ['q', 'show', 'cat'] : ['q'];
   const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? (all && k === 'persona' ? ['guild'] : []) : listKeys;
@@ -771,17 +774,25 @@ async function applyRoute(opts = {}) {
     syncShell();
   }
 
-  const dk = r.drawer ? canonical : null;
+  // #/g/<guild>/personas/add is the Personas list with its Add persona bar
+  // open, not a drawer.
+  const adding = !!r.drawer && r.drawer.kind === 'add';
+  const dk = r.drawer && !adding ? canonical : null;
   if (dk !== state.drawerRoute) {
     closeDrawerFor('route');
-    if (r.drawer) {
+    if (dk) {
       // Opened from its own list (a link, a row): closing it goes Back there.
       // Reached by a link from elsewhere or a reload: closing replaces it.
-      state.drawerPushed = !!prev && !prev.drawer && prev.area !== 'home' && viewKeyOf(prev) === vk;
+      // Picked in the Add persona bar, it took the bar's place: closing goes
+      // Back when the bar had been opened from the list.
+      const fromAdd = !!prev && !!prev.drawer && prev.drawer.kind === 'add';
+      state.drawerPushed = fromAdd ? state.addPickPushed : !!prev && !prev.drawer && prev.area !== 'home' && viewKeyOf(prev) === vk;
       state.drawerRoute = dk;
       openRouteDrawer(r);
     }
   }
+  state.addPickPushed = false;
+  if (state.list && state.list.setAdding) state.list.setAdding(adding);
 }
 
 function openRouteDrawer(r) {
@@ -1104,7 +1115,8 @@ async function render() {
  * A tab's list: the toolbar is built once, and only the results container is
  * redrawn — by search (debounced), paging, or a drawer that changed the list —
  * so the search box keeps its focus and caret.
- *   opts: { placeholder, label, actions, search (default true), load }
+ *   opts: { placeholder, label, actions, below (a node under the toolbar),
+ *           search (default true), load }
  *   load() → Promise<Node> builds the results for the current state.
  * Returns { refresh, search, status, results }; also kept as state.list.
  */
@@ -1136,6 +1148,7 @@ function listView(view, opts) {
   bar.push(...(opts.toolbar || []));
   bar.push(el('div', { class: 'toolbar-actions' }, opts.actions || []));
   view.appendChild(el('div', { class: 'toolbar' }, bar));
+  if (opts.below) view.appendChild(opts.below); // e.g. the Add persona bar
   view.appendChild(status.node);
   view.appendChild(results);
   results.appendChild(el('p', { class: 'muted loading', role: 'status', text: 'Loading…' }));
@@ -1182,9 +1195,10 @@ function pager(meta, refresh) {
   ]);
 }
 
-/** A table in a .table-wrap (which scrolls sideways on a phone). */
-function table(headers, rows, emptyText) {
-  return el('div', { class: 'table-wrap' }, [el('table', { class: 'grid' }, [
+/** A table in a .table-wrap (which scrolls sideways on a phone, or with
+ *  opts.cards becomes one labelled card per row: cells need data-label). */
+function table(headers, rows, emptyText, opts = {}) {
+  return el('div', { class: 'table-wrap' }, [el('table', { class: 'grid' + (opts.cards ? ' cards' : '') + (opts.cls ? ' ' + opts.cls : '') }, [
     el('thead', {}, [el('tr', {}, headers.map((h) => el('th', { class: h.cls, scope: 'col', text: h.label })))]),
     el('tbody', {}, rows.length ? rows : [el('tr', {}, [el('td', { class: 'muted empty-row', colspan: String(headers.length), text: emptyText || 'Nothing here.' })])]),
   ])]);
@@ -1205,20 +1219,34 @@ function section(title, children) {
 
 // ── Personas ─────────────────────────────────────────────────────────────────
 // One place for a persona — the only kind of speaker portal has. The list is
-// scoped to the selected guild (personas with access there); super-admins can
-// widen it to every persona. The drawer shows what an admin of this guild may
-// change, and — for super-admins — the persona's profile, its access in every
-// guild, and its token.
+// scoped to the selected guild: the personas with access there, and in how
+// many channels at each level (the relay's access summary). 'Add persona to
+// <guild>' finds any persona by name or id in the guild's persona directory
+// (the people slash /add offers) and opens it. Super-admins can widen the
+// list to every persona.
+//
+// The drawer opens on where the persona can act in the guild and how — the
+// relay's own explanation (…/personas/:pid/access), edited in place with the
+// channel drawer's direct-grant control — then its access roles there, Remove
+// from <guild> (what slash /ban does) and Resync, More (the guild-wide level,
+// applying an invite), and, for super-admins, Identity: its other guilds,
+// profile picture and token.
+
+/** Channels one 'Add to channels' can take (a category brings all of its own). */
+const MAX_ADD_CHANNELS = 50;
+/** How long the Undo of a change stays up (as in the channel drawer). */
+const UNDO_MS = 10_000;
 
 async function renderPersonas(view, stale) {
   const isSuper = !!(state.me && state.me.isSuper);
-  const meta = state.guildId ? await guildMeta() : null;
+  const gid = state.guildId;
+  const meta = gid ? await guildMeta(gid) : null;
   if (stale()) return;
   const isAll = () => isSuper && (state.personaScope === 'all' || !state.guildId);
 
   const actions = [];
   let scope = null;
-  if (isSuper && state.guildId) {
+  if (isSuper && gid) {
     scope = el('select', { class: 'scope-select', 'aria-label': 'Which personas to list' }, [
       el('option', { value: 'guild', text: 'With access in ' + currentGuildName() }),
       el('option', { value: 'all', text: 'All personas' }),
@@ -1226,38 +1254,36 @@ async function renderPersonas(view, stale) {
     scope.value = isAll() ? 'all' : 'guild';
     actions.push(scope);
   }
-  const grantById = el('button', { class: 'btn btn-sm btn-primary', text: '+ Grant access by id' });
-  grantById.addEventListener('click', () => {
-    const id = (prompt('Persona id to grant access to (must already exist):') || '').trim();
-    if (!id) return;
-    if (!lib.isPersonaId(id)) {
-      list.status.err('Not opened: that isn’t a persona id. Enter one of up to 100 characters, on one line.', { toast: false });
-      return;
-    }
-    navigate(personaRoute(id));
-  });
-  actions.push(grantById);
+  // 'Add persona to <guild>': the directory type-ahead, in place under the
+  // toolbar (#/g/<guild>/personas/add).
+  const add = gid ? addPersonaBar(gid) : null;
+  if (add) actions.push(add.button);
   const hint = el('p', { class: 'hint muted' });
 
   const list = listView(view, {
     placeholder: 'Search personas with access here…',
     actions,
+    below: add ? add.node : null,
     load: async () => {
       const all = isAll();
-      const data = all
-        ? await api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }))
-        : await api('GET', G() + '/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }));
-      const rows = (data.personas || []).map((p) => personaRow(p, meta, all));
-      const empty = state.q
-        ? 'No persona matches “' + state.q + '”.'
-        : all ? 'No personas yet.' : 'No persona has access in ' + currentGuildName() + ' yet.';
-      return el('div', {}, [
-        table([
-          { label: '', cls: 'col-narrow' }, { label: 'Name' }, { label: 'Id' }, { label: 'Access roles' },
-          all ? { label: 'Guilds', cls: 'col-narrow' } : { label: 'Direct grants', cls: 'col-narrow' },
-        ], rows, empty),
-        pager(data, () => list.refresh()),
+      const [data, summary] = await Promise.all([
+        all
+          ? api('GET', '/admin/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset }))
+          : api('GET', gpath(gid) + '/personas' + qs({ q: state.q, limit: LIMIT, offset: state.offset })),
+        // Where each can act: the guild's access summary, as the Channels tab
+        // has it (without it the list still lists, and says so per row).
+        all ? null : window.PA.channels.summary(gid).catch((e) => {
+          if (e.status === 401 || e.handled) throw e;
+          return null;
+        }),
       ]);
+      const counts = summaryCounts(summary);
+      const rows = (data.personas || []).map((p) => personaRow(p, meta, all, counts));
+      if (!rows.length) return emptyPersonas(gid, all);
+      const headers = all
+        ? [{ label: '', cls: 'col-narrow' }, { label: 'Name' }, { label: 'Id' }, { label: 'Access roles' }, { label: 'Guilds', cls: 'col-narrow' }]
+        : [{ label: '', cls: 'col-narrow' }, { label: 'Name' }, { label: 'Id' }, { label: 'Can act in' }, { label: 'Access roles here' }, { label: 'Flags' }];
+      return el('div', {}, [table(headers, rows, '', { cards: true, cls: 'persona-table' }), pager(data, () => list.refresh())]);
     },
   });
   view.appendChild(hint);
@@ -1270,11 +1296,14 @@ async function renderPersonas(view, stale) {
     const ph = all ? 'Search all personas…' : 'Search personas with access here…';
     list.search.placeholder = ph;
     list.search.setAttribute('aria-label', ph.replace(/…$/, ''));
-    grantById.classList.toggle('hidden', all);
+    if (add) {
+      add.button.classList.toggle('hidden', all);
+      if (all) add.show(false);
+    }
     hint.textContent = all
-      ? 'Every persona the relay knows. Open one to see its access in every guild, its profile picture and its token.'
-      : 'Personas with access in this guild. To add one that has none yet, use “Grant access by id”' +
-        (isSuper ? ', switch to All personas,' : '') + ' or mint an invite for an agent to claim.';
+      ? 'Every persona the relay knows. Open one to see its guilds, its profile picture and its token.'
+      : 'Personas with access in this guild, and in how many channels. To add one that has none yet, use “Add persona to ' +
+        currentGuildName() + '”, or mint an invite for an agent to claim.';
   }
   syncScope();
   list.onScope = () => {
@@ -1282,6 +1311,12 @@ async function renderPersonas(view, stale) {
     list.search.value = state.q;
     list.refresh();
   };
+  // #/g/<guild>/personas/add opens the bar; any other address of the list closes it.
+  list.setAdding = (on) => {
+    if (!add || isAll()) return;
+    add.show(on, on ? takeAddQuery() : null);
+  };
+  if (state.route && state.route.drawer && state.route.drawer.kind === 'add') list.setAdding(true);
   if (scope) {
     scope.addEventListener('change', () => {
       const q = state.q ? { q: state.q } : {};
@@ -1292,7 +1327,31 @@ async function renderPersonas(view, stale) {
   }
 }
 
-function personaRow(p, meta, all) {
+/** The summary's per-persona counts: { map: id → counts } — or { truncated }
+ *  for a guild too big to count, or null when the summary isn't there. */
+function summaryCounts(summary) {
+  if (!summary) return null;
+  if (summary.truncated) return { truncated: true, map: new Map() };
+  return { truncated: false, map: new Map((summary.personas || []).map((p) => [p.id, p.counts])) };
+}
+
+/** An empty list says why, and what to do: add one, or (super-admins) look
+ *  among all personas. */
+function emptyPersonas(gid, all) {
+  const q = state.q;
+  const guild = gid ? guildName(gid) : '';
+  if (all) return el('p', { class: 'empty-note', role: 'status', text: q ? 'No persona matches “' + q + '”.' : 'No personas yet.' });
+  const kids = [el('p', { text: q ? 'No persona with access here matches “' + q + '”.' : 'No persona has access in ' + guild + ' yet.' })];
+  const actions = [el('button', { class: 'btn btn-sm', text: q ? 'Add one to ' + guild : 'Add persona to ' + guild, onclick: () => openAddRoute(gid, q) })];
+  if (q && isSuper()) {
+    const href = lib.formatRoute(route('all', null, 'personas', null, { q, guild: gid }));
+    if (href) actions.push(el('a', { class: 'btn btn-sm', href, text: 'Search all personas' }));
+  }
+  kids.push(el('div', { class: 'inline' }, actions));
+  return el('div', { class: 'empty-note', role: 'status' }, kids);
+}
+
+function personaRow(p, meta, all, counts) {
   const name = p.displayName || p.id;
   // The name is a link to the persona's drawer (an address: reload, Back and
   // sharing keep it); the rest of the row opens it too.
@@ -1308,34 +1367,161 @@ function personaRow(p, meta, all) {
     const elsewhere = typeof p.otherGuildRoleCount === 'number' ? p.otherGuildRoleCount : (p.roles || []).length - here.length;
     rolesText = (here.join(', ') || '—') + (elsewhere ? ' (+' + elsewhere + ' elsewhere)' : '');
   }
-  return openableRow(open, [
-    el('td', { class: 'col-narrow' }, [avatarThumb(p.avatarUrl, '')]),
-    el('td', {}, [href
+  const cells = [
+    el('td', { class: 'col-narrow cell-avatar' }, [avatarThumb(p.avatarUrl, '')]),
+    el('td', { 'data-label': 'Name' }, [href
       ? el('a', { class: 'link', href, 'data-key': 'persona:' + p.id, text: name })
       : el('button', { class: 'link', 'data-key': 'persona:' + p.id, text: name, onclick: open })]),
-    el('td', {}, [el('code', { text: p.id })]),
-    el('td', { class: 'cell-roles', text: rolesText }),
-    all
-      ? el('td', { class: 'col-narrow', text: String(p.guildCount != null ? p.guildCount : '—') })
-      : el('td', {}, [directGrantsBadge(p)]),
-  ]);
+    el('td', { 'data-label': 'Id' }, [el('code', { text: p.id })]),
+  ];
+  if (all) {
+    cells.push(el('td', { class: 'cell-roles', 'data-label': 'Access roles', text: rolesText }));
+    cells.push(el('td', { class: 'col-narrow', 'data-label': 'Guilds', text: String(p.guildCount != null ? p.guildCount : '—') }));
+    return openableRow(open, cells);
+  }
+  cells.push(el('td', { 'data-label': 'Can act in' }, [canActCell(p, counts)]));
+  cells.push(el('td', { class: 'cell-roles', 'data-label': 'Access roles here', text: rolesText }));
+  cells.push(el('td', { 'data-label': 'Flags' }, [personaFlags(p)]));
+  return openableRow(open, cells);
 }
 
-/** A guild list row's 'Direct grants' cell: whether its direct grants give
- *  anything here, or deny it guild-wide. */
-function directGrantsBadge(p) {
-  const dg = p.directGrants || (p.hasOverride ? 'grants' : 'none');
-  if (dg === 'grants') return el('span', { class: 'badge badge-warn', text: 'direct grants' });
-  if (dg === 'denied') {
-    return el('span', { class: 'badge badge-warn', text: 'denied guild-wide', title: 'Its persona default doesn’t apply in ' + currentGuildName() + '. Access roles still do.' });
+/** 'in 14 channels (9 Write · 5 Read)', from the guild's access summary. */
+function canActCell(p, counts) {
+  if (!counts) return el('span', { class: 'muted', text: '—', title: 'Counts unavailable right now — open the persona to see where it can act.' });
+  if (counts.truncated) return el('span', { class: 'muted', text: 'not counted', title: 'Counts unavailable for a guild this size — open the persona to see where it can act.' });
+  const c = counts.map.get(p.id);
+  const text = lib.canActInText(c) || '—';
+  return el('span', { class: text === '—' ? 'muted' : null, text });
+}
+
+/** A guild list row's flags: a guild-wide deny, and direct grants here that
+ *  do nothing. */
+function personaFlags(p) {
+  const out = [];
+  const denied = typeof p.guildWideDenied === 'boolean' ? p.guildWideDenied : p.directGrants === 'denied';
+  if (denied) out.push(el('span', { class: 'badge badge-warn', text: 'denied guild-wide', title: 'Its persona default doesn’t apply in ' + currentGuildName() + '. Access roles and direct grants still do.' }));
+  if (p.inactiveGrants) out.push(el('span', { class: 'badge badge-warn', text: lib.plural(p.inactiveGrants, 'inactive grant'), title: 'Direct grants here that do nothing (on a thread, a category or a deleted channel, or a block with nothing to block). Open the persona to remove them.' }));
+  return out.length ? el('span', { class: 'flags' }, out) : el('span', { class: 'muted', text: '—' });
+}
+
+/** The search text to put in the Add persona bar once (from an empty search's
+ *  'Add one to <guild>'). */
+function takeAddQuery() {
+  const q = state.addQuery || '';
+  state.addQuery = '';
+  return q;
+}
+
+/** Open the Add persona bar: its own address, pushed (Back closes it). */
+function openAddRoute(gid, q) {
+  state.addPushed = true;
+  state.addQuery = q || '';
+  navigate(route('g', gid, 'personas', { kind: 'add' }));
+}
+
+/** Close the Add persona bar: Back, when it was opened from the list;
+ *  otherwise the list's address in its place. */
+function closeAddRoute() {
+  const r = state.route;
+  if (!r || !r.drawer || r.drawer.kind !== 'add') return;
+  const pushed = state.addPushed;
+  state.addPushed = false;
+  if (pushed) history.back();
+  else navigate(listOf(r), { replace: true });
+}
+
+/** A persona picked in the Add persona bar: its drawer, in place of the bar's
+ *  address (so closing the drawer goes back to the list). */
+function pickAddedPersona(gid, id) {
+  const r = route('g', gid, 'personas', { kind: 'persona', id });
+  if (!lib.formatRoute(r)) {
+    // An id no address can hold: open it without one.
+    closeAddRoute();
+    openPersonaDrawer(id, { gid });
+    return;
   }
-  return el('span', { class: 'muted', text: '—' });
+  state.addPickPushed = state.addPushed;
+  state.addPushed = false;
+  navigate(r, { replace: true });
+}
+
+/**
+ * 'Add persona to <guild>': the button, and the bar it opens under the
+ * toolbar — a type-ahead over the guild's persona directory, each result
+ * 'Nyx (nyx-7a8b9c)' with a 'no access here' tag. Picking one opens its
+ * drawer, where it is given access. Esc (in the empty field) or ✕ closes it.
+ * Returns { node, button, show(on, query) }.
+ */
+function addPersonaBar(gid) {
+  const guild = guildName(gid);
+  const barId = ui.uid('add-persona');
+  const button = el('button', {
+    class: 'btn btn-sm btn-primary', 'data-key': 'add-persona', 'aria-expanded': 'false', 'aria-controls': barId, text: 'Add persona to ' + guild,
+  });
+  const ta = ui.typeahead({
+    label: 'Personas',
+    placeholder: 'Type a persona’s name or id…',
+    multiple: false,
+    name: 'persona',
+    empty: 'No persona matches.',
+    source: async (q) => {
+      const r = await api('GET', gpath(gid) + '/persona-directory' + qs({ q }));
+      return (r.personas || []).map((p) => ({
+        value: p.id,
+        label: (p.displayName || p.id) + ' (' + p.id + ')',
+        title: p.id,
+        tag: p.removed ? 'removed from ' + guild + ' with /ban' : p.hasAccessHere ? null : 'no access here',
+      }));
+    },
+  });
+  ta.input.id = barId + '-input';
+  const close = el('button', { class: 'btn btn-sm btn-ghost', text: '✕', 'aria-label': 'Close Add persona to ' + guild, title: 'Close (Esc)' });
+  const node = el('div', { id: barId, class: 'add-persona hidden' }, [
+    el('label', { for: ta.input.id, text: 'Add persona to ' + guild }),
+    el('div', { class: 'add-persona-row' }, [ta.node, close]),
+    el('p', { class: 'field-hint', text: 'Pick a persona to open it, then give it access here. Any persona the relay knows can be found by name or id.' }),
+  ]);
+  let open = false;
+  function show(on, q) {
+    if (on === open && !q) return;
+    open = on;
+    node.classList.toggle('hidden', !on);
+    button.setAttribute('aria-expanded', String(on));
+    if (!on) {
+      ta.close();
+      ta.clear();
+      return;
+    }
+    ta.input.focus();
+    if (q) ta.query(q);
+  }
+  button.addEventListener('click', () => {
+    if (open) ta.input.focus();
+    else openAddRoute(gid);
+  });
+  close.addEventListener('click', () => {
+    closeAddRoute();
+    button.focus();
+  });
+  // Esc with the list closed (an open list's Esc is the type-ahead's own).
+  ta.input.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    e.preventDefault();
+    closeAddRoute();
+    button.focus();
+  });
+  ta.onChange((ids) => {
+    if (ids.length) pickAddedPersona(gid, ids[0]);
+  });
+  return { node, button, show };
 }
 
 /**
  * A persona's drawer. `hint.gid` is the guild its 'Access in <guild>'
  * section is about — the one its address names (routeGuild), never just the
- * guild in view — so everything this drawer sends goes to that guild.
+ * guild in view — so everything this drawer sends goes to that guild. With
+ * no guild (a super-admin's #/all/personas/p/<id>) it shows the persona's
+ * Identity only: access is edited in a guild.
  */
 async function openPersonaDrawer(id, hint = {}) {
   const isSuper = !!(state.me && state.me.isSuper);
@@ -1346,13 +1532,13 @@ async function openPersonaDrawer(id, hint = {}) {
   // Open at once; the sections arrive when the persona has loaded.
   const d = openDrawer({ title: name, subtitle: id, key: 'persona:' + id });
   const missing = (e) => { if (e.status === 404) return null; throw e; };
-  let local = null;
+  let access = null;
   let global = null;
   let meta = null;
   try {
-    [local, global, meta] = await Promise.all([
-      // What an admin of this guild may see and change…
-      gid ? api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id)).catch(missing) : null,
+    [access, global, meta] = await Promise.all([
+      // Where it can act in this guild, and why (what an admin of it may see)…
+      gid ? api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id) + '/access').catch(missing) : null,
       // …and, for super-admins, the persona everywhere.
       isSuper ? api('GET', '/admin/personas/' + encodeURIComponent(id)).catch(missing) : null,
       gid ? guildMeta(gid) : null,
@@ -1365,40 +1551,1127 @@ async function openPersonaDrawer(id, hint = {}) {
     return;
   }
   if (!d.isCurrent()) return;
-  if (!local && !global) {
+  if (gid ? !access : !global) {
     d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'No persona with id “' + id + '”.' }));
     return;
   }
-  const displayName = (global && global.displayName) || (local && local.displayName) || id;
+  const displayName = (access && access.persona && access.persona.displayName) || (global && global.displayName) || id;
   d.setTitle(displayName, id);
   const ctx = { id, displayName, drawer: d, gid };
   const body = el('div', { class: 'drawer-sections' });
-
-  // "Access in every guild" is rebuilt after any change made in this drawer,
-  // so the two sections never disagree.
-  const everywhere = el('div', {});
-  let refreshSeq = 0; // only the latest refresh may draw: replies can land out of order
-  const refreshEverywhere = async () => {
-    if (!isSuper) return;
-    const seq = ++refreshSeq;
-    try {
-      const fresh = await api('GET', '/admin/personas/' + encodeURIComponent(id));
-      if (seq !== refreshSeq) return;
-      clear(everywhere);
-      everywhere.appendChild(everywhereSection(fresh));
-    } catch { /* keep what is shown; the next open refreshes */ }
-  };
-  // This guild first: it is what the drawer was opened for.
-  if (gid && meta) {
-    body.appendChild(guildAccessSection(ctx, local || { id, roles: (global && global.roles || []).map((r) => r.name), guildPolicy: null }, meta, refreshEverywhere));
+  if (!gid) {
+    body.appendChild(personaHead(ctx, global.avatarUrl, null));
+    body.appendChild(identitySection(ctx, global, true).node);
+    d.setBody(body);
+    return;
   }
-  if (global) {
-    body.appendChild(profileSection(ctx, global));
-    everywhere.appendChild(everywhereSection(global));
-    body.appendChild(everywhere);
-    body.appendChild(tokenSection(ctx));
-  }
+  const m = personaModel(ctx, access, meta);
+  const identity = global ? identitySection(ctx, global, false) : null;
+  m.identity = identity;
+  const accessPart = accessSection(ctx, m);
+  const more = moreSection(ctx, m);
+  body.appendChild(personaHead(ctx, access.persona && access.persona.avatarUrl, m));
+  body.appendChild(accessPart.node);
+  body.appendChild(rolesSection(ctx, m));
+  body.appendChild(removeSection(ctx, m));
+  body.appendChild(more.node);
+  if (identity) body.appendChild(identity.node);
+  keepPersonaForms(ctx, accessPart.add, more);
   d.setBody(body);
+}
+
+/**
+ * What a persona drawer shows of the relay, kept in one place: its access
+ * read (…/personas/:pid/access) and the guild's catalog and channels. Every
+ * change reads the access again (reload) and every section redraws from it,
+ * so the drawer always says what the relay enforces now.
+ */
+function personaModel(ctx, access, meta) {
+  const { gid } = ctx;
+  const draws = [];
+  const guild = guildName(gid);
+  const namesOf = (a) => {
+    const n = withChannelList(a && a.names, meta.channels, meta.discordRoles);
+    n.guilds = { [gid]: guild };
+    return n;
+  };
+  const m = {
+    access,
+    meta,
+    guild,
+    names: namesOf(access),
+    path: gpath(gid) + '/personas/' + encodeURIComponent(ctx.id),
+    identity: null,
+    /** Redraw `fn` from every new read. */
+    onChange(fn) { draws.push(fn); },
+    set(a) {
+      m.access = a;
+      m.names = namesOf(a);
+      for (const fn of draws) fn(a);
+    },
+    /** Read the persona's access again; resolves true once redrawn. */
+    async reload() {
+      const a = await api('GET', m.path + '/access');
+      if (ctx.drawer.isCurrent()) m.set(a);
+      return true;
+    },
+    rowOf: (cid) => (m.access.rows || []).find((r) => r.channelId === cid) || null,
+    counts: () => lib.countsFromRows(m.access.rows),
+    /** 'Write in 3 · Read in 12 channels here', or 'no access in Guild One'. */
+    effectText() {
+      if (m.access.removed) return 'nothing (removed from ' + guild + ')';
+      const t = lib.personaSummaryText(m.counts());
+      return t === 'No access here' ? 'no access in ' + guild : t;
+    },
+  };
+  return m;
+}
+
+/** The persona drawer's top: its picture, its id with Copy, and (in a
+ *  guild) where it can act there, at what level. */
+function personaHead(ctx, avatarUrl, m) {
+  const idCode = el('code', { class: 'persona-id', text: ctx.id });
+  const copied = el('span', { class: 'field-hint', role: 'status' });
+  const copy = el('button', { class: 'btn btn-sm btn-ghost', text: 'Copy', 'aria-label': 'Copy ' + ctx.displayName + '’s id' });
+  copy.addEventListener('click', async () => {
+    copied.textContent = (await ui.copyText(ctx.id, idCode)) ? 'Copied.' : 'Selected — copy it with Ctrl+C (⌘C on a Mac).';
+  });
+  const summary = m ? el('p', { class: 'persona-summary' }) : null;
+  if (m) {
+    const draw = () => {
+      summary.textContent = m.access.removed
+        ? 'Removed from ' + m.guild + ' — nothing it holds applies here'
+        : lib.personaSummaryText(m.counts());
+    };
+    draw();
+    m.onChange(draw);
+  }
+  return el('div', { class: 'persona-head' }, [
+    avatarThumb(avatarUrl, '', 'avatar-preview'),
+    el('div', { class: 'persona-head-text' }, [el('div', { class: 'inline' }, [idCode, copy, copied]), summary]),
+  ]);
+}
+
+/** Focus the control `key` names (data-key) inside `root` when focus was
+ *  lost (on <body>, or on a control that is gone), else `fallback`. */
+function refocus(root, key, fallback) {
+  const a = document.activeElement;
+  if (a && a !== document.body && a.isConnected) return; // it wasn't lost
+  const hit = key ? Array.from(root.querySelectorAll('[data-key]')).find((n) => n.dataset.key === key) : null;
+  if (hit && !hit.disabled) hit.focus();
+  if ((!hit || document.activeElement !== hit) && fallback) fallback.focus();
+}
+
+/** Status-line text in parts (one per change), as the channel drawer says it. */
+const statusParts = (lines) => (lines.length === 1 ? lines[0] : lines.map((t) => el('span', { class: 'status-part', text: t })));
+
+/**
+ * 'Access in <guild>': Add to channels (a channel type-ahead — a category
+ * picks its channels — a level, Add), then where the persona can act, by
+ * category in Discord's order — what it can do, why, and its direct grant,
+ * changed in place — with rows that read alike folded into one line, the
+ * direct grants that do nothing (each with Remove), and, for a persona
+ * removed with /ban, what that means. Every change goes through the channel
+ * drawer's queue and grant route, with `expect`, answers 'Effective now: …'
+ * from the relay, offers Undo for 10 s, and asks first when it would lower
+ * guild-wide or default access or lift a removal.
+ * Returns { node, add } (add: the Add form's parts, for drafts).
+ */
+function accessSection(ctx, m) {
+  const { id, displayName, gid } = ctx;
+  const guild = m.guild;
+  const Q = window.PA.channels;
+  const head = el('h3', { tabindex: '-1', 'data-key': 'access-head', text: 'Access in ' + guild });
+  const banNote = el('p', { class: 'banner banner-warn hidden', role: 'note' });
+  const status = ui.statusLine(null); // changes made in the table
+  const inactiveStatus = ui.statusLine(null);
+  const tableBox = el('div', { class: 'access-box' });
+  const empty = el('p', { class: 'empty-note hidden', role: 'status', text: 'No access in ' + guild + ' yet — add it to channels above.' });
+  const inactiveBox = el('div', { class: 'inactive hidden' });
+  const expanded = new Set(); // the folded runs shown
+  let node = null;
+
+  /** What the relay's bot can do in a channel, as far as the persona's row
+   *  says: every capability but those it says the bot lacks. It is exact for
+   *  what a change would take away (the persona can do all it does now, so
+   *  the bot can too) — which is all it decides here: whether to ask before
+   *  lowering. What the change did is always the relay's answer. */
+  const botOf = (row) => {
+    const lacks = new Set((row && row.botLacks) || []);
+    return lib.ALL_CAPS.filter((c) => !lacks.has(c));
+  };
+  const where = (cid) => chanText(cid, m.names);
+  const paused = (line) => () => line.info('Paused for a few seconds (rate limit).');
+
+  // ── Rows: in Discord's order, by category ──
+
+  const layout = lib.channelLayout({ channels: m.meta.channels }, null);
+  const order = new Map();
+  const catOf = new Map();
+  for (const g of layout.groups) {
+    for (const r of g.rows) {
+      order.set(r.id, order.size);
+      catOf.set(r.id, g.id ? { id: g.id, name: g.name } : null);
+    }
+  }
+  const ordered = (rows) => rows.slice().sort((a, b) =>
+    (order.has(a.channelId) ? order.get(a.channelId) : 1e9) - (order.has(b.channelId) ? order.get(b.channelId) : 1e9) ||
+    (a.channelId < b.channelId ? -1 : a.channelId > b.channelId ? 1 : 0));
+
+  function rowTr(row) {
+    const cid = row.channelId;
+    const w = where(cid);
+    const href = lib.formatRoute(route('g', gid, 'channels', { kind: 'channel', id: cid }));
+    const eff = Array.isArray(row.effective) ? row.effective : [];
+    const blocked = Array.isArray(row.direct) && !row.direct.length;
+    const chips = lib.sourceChips(row, m.names, { isSuper: isSuper() });
+    const control = ui.directGrantControl({
+      value: row.direct,
+      canBlock: lib.canBlock(row),
+      label: 'Direct grant for ' + displayName + ' in ' + w,
+      apply: (next) => changeDirect(cid, next),
+    });
+    control.select.setAttribute('data-key', 'dg:' + cid);
+    return el('tr', { 'data-cid': cid, class: eff.length ? null : 'who-none' }, [
+      el('td', { 'data-label': 'Channel' }, [href ? el('a', { class: 'link', href, title: cid, text: w }) : el('span', { title: cid, text: w })]),
+      el('td', { 'data-label': 'Can do here' }, [el('span', { class: 'who-can' }, [
+        ui.levelPill(row, w),
+        blocked ? el('span', { class: 'badge badge-warn', title: 'Blocks guild-wide and persona-default access in this channel. Roles still apply.', text: 'Blocked here' }) : null,
+      ])]),
+      el('td', { 'data-label': 'Why' }, [chips.length
+        ? el('span', { class: 'src-chips' }, chips.map((c) => el('span', { class: 'src-chip src-' + c.kind, title: c.title, text: c.text })))
+        : el('span', { class: 'muted', text: '—' })]),
+      el('td', { 'data-label': 'Direct grant' }, [control.node]),
+    ]);
+  }
+
+  function drawTable() {
+    const a = document.activeElement;
+    const focusKey = a && tableBox.contains(a) && a.dataset ? a.dataset.key || null : null;
+    clear(tableBox);
+    const rows = ordered(m.access.rows || []);
+    empty.classList.toggle('hidden', rows.length > 0 || !!m.access.removed);
+    if (!rows.length) return;
+    const fold = lib.foldAccessRows(rows);
+    const tbody = el('tbody');
+    const emit = (rs) => {
+      let last = '';
+      for (const r of rs) {
+        const cat = catOf.get(r.channelId) || null;
+        const k = cat ? cat.id : '';
+        if (k !== last && cat) tbody.appendChild(el('tr', { class: 'cat-row' }, [el('th', { colspan: '4', scope: 'colgroup', text: cat.name })]));
+        last = k;
+        tbody.appendChild(rowTr(r));
+      }
+    };
+    for (const run of fold.runs) {
+      const open = expanded.has(run.key);
+      const n = lib.plural(run.rows.length, 'channel');
+      const btn = el('button', {
+        class: 'btn btn-sm', 'data-key': 'run:' + run.key, 'aria-expanded': String(open), text: open ? 'Hide' : 'Show',
+        'aria-label': (open ? 'Hide the ' : 'Show the ') + n + ': ' + run.text,
+      });
+      btn.addEventListener('click', () => {
+        if (expanded.has(run.key)) expanded.delete(run.key);
+        else expanded.add(run.key);
+        drawTable();
+      });
+      tbody.appendChild(el('tr', { class: 'run-row' }, [el('td', { colspan: '4' }, [el('div', { class: 'run-line' }, [
+        ui.levelPill(run.rows[0], 'these channels'), el('span', { class: 'run-text', text: run.text }), btn,
+      ])])]));
+      if (open) emit(run.rows);
+    }
+    emit(fold.rest);
+    tableBox.appendChild(el('div', { class: 'table-wrap' }, [el('table', { class: 'grid cards access-table' }, [
+      el('thead', {}, [el('tr', {}, ['Channel', 'Can do here', 'Why', 'Direct grant'].map((h) => el('th', { scope: 'col', text: h })))]),
+      tbody,
+    ])]));
+    if (focusKey) {
+      const hit = Array.from(tableBox.querySelectorAll('[data-key]')).find((x) => x.dataset.key === focusKey);
+      if (hit) hit.focus();
+    }
+  }
+
+  function drawInactive() {
+    const items = m.access.inactive || [];
+    clear(inactiveBox);
+    inactiveBox.classList.toggle('hidden', !items.length);
+    if (!items.length) return;
+    inactiveBox.appendChild(el('h4', { text: 'Inactive grants (' + items.length + ')' }));
+    inactiveBox.appendChild(el('p', { class: 'field-hint', text: 'These direct grants do nothing here. Remove them to tidy up — nothing changes for ' + displayName + '.' }));
+    inactiveBox.appendChild(el('ul', { class: 'inactive-list' }, items.map((it) => {
+      const text = lib.inactiveText(it, m.names);
+      const rm = el('button', { class: 'btn btn-sm btn-danger', text: 'Remove', 'data-key': 'inactive:' + it.channelId, 'aria-label': 'Remove ' + displayName + '’s direct grant: ' + text });
+      rm.addEventListener('click', () => ui.busy(rm, () => removeInactive(it), 'Removing…'));
+      return el('li', { title: it.channelId }, [el('span', { text }), rm]);
+    })));
+  }
+
+  function drawBan() {
+    const on = !!m.access.removed;
+    banNote.textContent = on
+      ? displayName + ' was removed from ' + guild + ' (with /ban, or Remove from ' + guild + '), so nothing it holds applies here — not its access roles, direct grants, guild-wide level or persona default. It can’t give itself access here again; giving it access here (a channel below, or an access role) lifts that.'
+      : '';
+    banNote.classList.toggle('hidden', !on);
+  }
+
+  const drawAll = () => {
+    drawBan();
+    drawTable();
+    drawInactive();
+  };
+
+  /** Read the persona again after a change, then put focus on `key` (or the
+   *  heading) if the change took it away. Resolves whether it could read. */
+  async function refresh(key) {
+    let ok = false;
+    try { ok = await m.reload(); } catch { ok = false; }
+    if (ok && node && ctx.drawer.isCurrent()) refocus(node, key, head);
+    return ok;
+  }
+
+  // ── Changes ──
+
+  /** Send one direct-grant change for channel `cid` (`next`: caps; [] a
+   *  block; null removed), with what this drawer showed there as `expect`.
+   *  Resolves { ok, text, undo } or { ok: false, error }. */
+  async function send(cid, next, row) {
+    const expect = row && row.direct !== undefined ? row.direct : null;
+    const before = row && Array.isArray(row.effective) ? row.effective : [];
+    const w = where(cid);
+    try {
+      const r = await Q.enqueue(() => Q.writeGrant(gid, id, cid, next, expect), paused(status));
+      const lifted = !!(r && r.liftedBan);
+      markStale();
+      return {
+        ok: true,
+        text: lib.grantResultText({ name: displayName, next, before, ex: r && r.effective, where: w, liftedFrom: lifted ? guild : null }),
+        undo: { cid, where: w, prev: expect, next: next == null ? null : next.slice(), lifted },
+      };
+    } catch (e) {
+      return { ok: false, error: e };
+    }
+  }
+
+  /** Put changes back as they were, newest first — each sent with what it
+   *  set as `expect`, so one changed again since is refused, not undone. */
+  async function undo(list, line) {
+    const lines = [];
+    let bad = false;
+    for (const u of list.slice().reverse()) {
+      try {
+        const r = await Q.enqueue(() => Q.writeGrant(gid, id, u.cid, u.prev, u.next), paused(line));
+        const ex = r && r.effective;
+        const nowText = ex && Array.isArray(ex.effective) ? lib.effectNowText(ex, u.where) : '';
+        lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + displayName + ' in ' + u.where : displayName + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + u.where) +
+          '.' + (nowText ? ' Effective now: ' + nowText + '.' : '') +
+          (u.lifted ? ' Its removal from ' + guild + ' stays lifted: /ban in Discord removes it again.' : ''));
+      } catch (e) {
+        bad = true;
+        lines.push(lib.errorText(e, 'Not undone', { channelId: u.cid, names: m.names, reloaded: true }));
+      }
+    }
+    markStale();
+    if (ctx.drawer.isCurrent()) await refresh();
+    else if (state.list && state.tab === 'personas') state.list.refresh(); // the list behind follows
+    line[bad ? 'err' : 'ok'](statusParts(lines), { toastText: lines.join(' ') });
+  }
+  const undoAction = (list, line, what) => ({ label: 'Undo', ariaLabel: 'Undo ' + what, run: () => undo(list, line) });
+
+  /** A row's direct-grant control picked `next`: ask first when it lowers
+   *  guild-wide or default access, or lifts a removal; then send it.
+   *  Resolves true when saved. */
+  async function changeDirect(cid, next) {
+    const row = m.rowOf(cid);
+    const w = where(cid);
+    if ((m.access.removed || lib.isRemoved(row)) && next && next.length) {
+      const go = await ui.confirmDialog({
+        title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
+        body: [lib.liftText(displayName, next, w, guild), lib.UNDO_KEEPS_LIFT],
+        confirmLabel: 'Give access and lift',
+      });
+      if (!go) return false;
+    } else {
+      const ck = lib.changeKind(row, botOf(row), next);
+      if (lib.needsLowerConfirm(ck, next)) {
+        const go = await ui.confirmDialog(next.length ? {
+          title: 'Lower ' + displayName + '’s access in ' + w + '?',
+          body: [lib.lowerText(displayName, ck, w), 'You can undo it for a few seconds afterwards, or set it again any time.'],
+          confirmLabel: 'Lower to ' + lib.levelLabel(next),
+        } : {
+          title: 'Block guild-wide access for ' + displayName + ' in ' + w + '?',
+          body: ['Blocks guild-wide and persona-default access in this channel. ' + lib.lowerText(displayName, ck, w)],
+          confirmLabel: 'Block guild-wide here',
+        });
+        if (!go) return false;
+      }
+    }
+    const res = await send(cid, next, row);
+    if (res.ok) {
+      const reloaded = await refresh('dg:' + cid);
+      status.ok(res.text + (reloaded ? '' : ' (Couldn’t read the access again — reopen the drawer to see it.)'),
+        { action: undoAction([res.undo], status, 'the last change in ' + w), ms: UNDO_MS });
+      return true;
+    }
+    const e = res.error;
+    if (e.code === 'CONFLICT') {
+      const ok = await refresh('dg:' + cid);
+      status.err(lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { reloaded: ok }));
+      return false;
+    }
+    status.err(lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { channelId: cid, names: m.names }));
+    return false;
+  }
+
+  /** Remove a direct grant that does nothing; say what is left where the
+   *  relay checks it (a thread: its channel). */
+  async function removeInactive(it) {
+    const cid = it.channelId;
+    const w = where(cid);
+    const items = m.access.inactive || [];
+    const i = items.findIndex((x) => x.channelId === cid);
+    const next = items[i + 1] || items[i - 1] || null;
+    try {
+      const r = await Q.enqueue(() => Q.writeGrant(gid, id, cid, null, it.caps), paused(inactiveStatus));
+      const ex = r && r.effective;
+      let text;
+      if (it.reason === 'category') text = 'Removed ' + displayName + '’s direct grant on ' + w + '. A category grants nothing, so nothing changed.';
+      else if (it.reason === 'blocks-nothing') text = 'Removed ' + displayName + '’s block in ' + w + '. It blocked nothing, so nothing changed.';
+      else text = lib.grantResultText({ name: displayName, next: null, before: [], ex, where: w, accessWhere: ex && ex.parentId ? where(ex.parentId) : undefined });
+      markStale();
+      await refresh(next ? 'inactive:' + next.channelId : 'add-input');
+      inactiveStatus.ok(text);
+    } catch (e) {
+      if (e.code === 'CONFLICT') {
+        const ok = await refresh('inactive:' + cid);
+        inactiveStatus.err(lib.errorText(e, 'Not removed', { reloaded: ok }));
+        return;
+      }
+      inactiveStatus.err(notDone(e, 'Not removed', { channelId: cid, names: m.names }));
+    }
+  }
+
+  // ── Add to channels ──
+
+  const add = (() => {
+    const line = ui.statusLine(null);
+    const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
+    const cats = layout.groups.filter((g) => g.id);
+    const all = layout.groups.flatMap((g) => g.rows.map((r) => r.id));
+    const hereNow = (cid) => {
+      const r = m.rowOf(cid);
+      return r && Array.isArray(r.effective) && r.effective.length ? lib.levelLabel(r.effective) + ' now' : 'no access now';
+    };
+    const itemOf = (cid) => ({ value: cid, label: where(cid), title: cid, hint: hereNow(cid) });
+    const catNote = el('p', { class: 'field-hint hidden' });
+    const ta = ui.typeahead({
+      label: 'Channels',
+      placeholder: 'Type a channel or category…',
+      max: MAX_ADD_CHANNELS,
+      name: 'channel',
+      empty: 'No channel matches.',
+      source: async (q) => {
+        const needle = q.trim().toLowerCase().replace(/^#/, '');
+        const out = [];
+        for (const g of cats) {
+          if (needle && String(g.name || '').toLowerCase().indexOf(needle) < 0) continue;
+          out.push({
+            value: 'cat:' + g.id, group: 'Categories', channels: g.rows.map((r) => r.id),
+            label: 'Category ' + g.name + ' (' + lib.plural(g.rows.length, 'channel') + ')',
+            title: 'Picks the ' + lib.plural(g.rows.length, 'channel') + ' in ' + g.name + ' now. Channels added to it later aren’t covered.',
+          });
+        }
+        let n = 0;
+        for (const cid of all) {
+          const c = chanById.get(cid);
+          if (needle && String((c && c.name) || '').toLowerCase().indexOf(needle) < 0) continue;
+          if (++n > 40) break;
+          out.push(Object.assign(itemOf(cid), { group: 'Channels' }));
+        }
+        return out;
+      },
+      expand: (it) => {
+        if (!it.channels) return null;
+        catNote.textContent = 'Picked the ' + lib.plural(it.channels.length, 'channel') + ' in ' + it.label.replace(/^Category /, '').replace(/ \(\d+ channels?\)$/, '') +
+          ' now — channels added to it later aren’t covered.';
+        catNote.classList.remove('hidden');
+        return it.channels.map(itemOf);
+      },
+    });
+    ta.input.id = ui.uid('field');
+    ta.input.setAttribute('data-key', 'add-input');
+    const level = ui.levelControl({ value: lib.LEVEL_CAPS.write, label: 'Level' });
+    const currentlyList = el('ul', { class: 'currently-list' });
+    const currently = el('div', { class: 'currently hidden' }, [el('div', { class: 'field-label', text: 'Currently:' }), currentlyList]);
+    const addBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Add' });
+    const why = el('span', { class: 'field-hint' });
+    const form = el('form', { class: 'add-form persona-add', novalidate: true }, [
+      el('div', { class: 'field' }, [el('label', { for: ta.input.id, text: 'Channels' }), ta.node, catNote]),
+      ui.field({ label: 'Level', control: level.node }),
+      currently,
+      el('div', { class: 'inline' }, [addBtn, why]),
+      line.node,
+    ]);
+    const tracker = ctx.drawer.track(form);
+    const touched = [];
+
+    function syncCurrently() {
+      const items = ta.items();
+      const caps = level.value();
+      clear(currentlyList);
+      if (items.length && m.access.removed) {
+        currentlyList.appendChild(el('li', { text: displayName + ' was removed from ' + guild + ' with /ban — adding access here lifts that.' }));
+      } else {
+        for (const it of items.slice(0, 10)) {
+          const row = m.rowOf(it.value);
+          const ck = caps.length ? lib.changeKind(row, botOf(row), caps) : null;
+          currentlyList.appendChild(el('li', { text: lib.currentlyText(it.label, row, ck, null) }));
+        }
+        if (items.length > 10) currentlyList.appendChild(el('li', { class: 'muted', text: '…and ' + (items.length - 10) + ' more' }));
+      }
+      currently.classList.toggle('hidden', !items.length);
+      if (!items.length) catNote.classList.add('hidden');
+      const missing = !items.length ? 'Pick a channel to add.' : !caps.length ? 'Pick a level.' : '';
+      // Through setDisabled: after an Add clears the picks this runs inside
+      // the submit, and busy() would otherwise turn the button back on.
+      ui.setDisabled(addBtn, !!missing);
+      why.textContent = missing;
+    }
+    ta.onChange(() => { syncCurrently(); for (const fn of touched) fn(); });
+    level.onChange(() => { syncCurrently(); for (const fn of touched) fn(); });
+    m.onChange(syncCurrently);
+
+    ui.onSubmit(form, async () => {
+      const items = ta.items();
+      const caps = level.value();
+      if (!items.length || !caps.length) return; // Add is off until both are picked
+      const asks = items
+        .map((it) => ({ it, ck: lib.changeKind(m.rowOf(it.value), botOf(m.rowOf(it.value)), caps) }))
+        .filter((c) => lib.needsLowerConfirm(c.ck, caps));
+      const lift = !!m.access.removed;
+      if (asks.length || lift) {
+        const what = items.length === 1 ? items[0].label : lib.plural(items.length, 'channel');
+        const go = await ui.confirmDialog({
+          title: lift ? 'Lift ' + displayName + '’s removal from ' + guild + '?'
+            : asks.length === 1 ? 'Lower ' + displayName + '’s access in ' + asks[0].it.label + '?'
+              : 'Lower ' + displayName + '’s access in ' + lib.plural(asks.length, 'channel') + '?',
+          body: asks.map((c) => lib.lowerText(displayName, c.ck, c.it.label))
+            .concat(lift ? [lib.liftText(displayName, caps, what, guild), lib.UNDO_KEEPS_LIFT] : []),
+          confirmLabel: lift ? 'Add and lift' : 'Add at ' + lib.levelLabel(caps),
+        });
+        if (!go) return;
+      }
+      line.clear();
+      const lines = [];
+      const undos = [];
+      const left = [];
+      for (const it of items) {
+        const res = await send(it.value, caps, m.rowOf(it.value));
+        if (res.ok) {
+          lines.push(res.text);
+          undos.push(res.undo);
+          continue;
+        }
+        left.push(it);
+        lines.push(lib.errorText(res.error, items.length === 1 ? 'Not saved' : 'Not saved in ' + it.label, { channelId: it.value, names: m.names, reloaded: res.error.code === 'CONFLICT' }));
+        if (res.error.status === 401) {
+          // The session ended: the rest would be refused too. They stay
+          // picked (and kept across Sign in again).
+          for (const rest of items.slice(items.indexOf(it) + 1)) left.push(rest);
+          break;
+        }
+      }
+      // Read again; focus is the form's to keep (onSubmit gives it to the
+      // channel field once nothing is left to add).
+      if (undos.length || left.length) { try { await m.reload(); } catch { /* the lines say what was done */ } }
+      ta.set(left);
+      if (!left.length) tracker.reset();
+      syncCurrently();
+      const opts = { toastText: lines.join(' ') };
+      if (undos.length) Object.assign(opts, { action: undoAction(undos, line, 'what Add just did'), ms: UNDO_MS });
+      line[left.length ? 'err' : 'ok'](statusParts(lines), opts);
+    }, { busyLabel: 'Adding…' });
+
+    syncCurrently();
+    return {
+      form, ta, level, tracker, status: line,
+      /** Put picks kept as ids back (channels this guild still has). */
+      restore(ids, caps) {
+        if (caps && caps.length) level.set(caps);
+        ta.set(ids.filter((cid) => chanById.has(cid) && order.has(cid)).slice(0, MAX_ADD_CHANNELS).map(itemOf));
+        syncCurrently();
+      },
+      onTouch: (fn) => touched.push(fn),
+    };
+  })();
+
+  m.onChange(drawAll);
+  drawAll();
+  node = el('section', { class: 'drawer-section access-section' }, [
+    head,
+    banNote,
+    el('div', { class: 'subsection' }, [el('h4', { text: 'Add to channels' }), add.form]),
+    status.node,
+    tableBox,
+    empty,
+    inactiveBox,
+    inactiveStatus.node,
+  ]);
+  return { node, add };
+}
+
+/**
+ * 'Access roles in <guild>': the guild's access roles it holds, each with
+ * what it means (✕ asks, then removes it), and a picker of the guild's other
+ * roles that gives one the moment it is picked. Super-admins also see how
+ * many it holds in other guilds (a link to Identity).
+ */
+function rolesSection(ctx, m) {
+  const { displayName, gid } = ctx;
+  const guild = m.guild;
+  const catalog = m.meta.catalog || {};
+  const mine = guildRoleNames(m.meta, gid);
+  const mineSet = new Set(mine);
+  const meaning = (r) => lib.roleMeaning(catalog[r], m.names);
+  const tags = el('div', { class: 'tags' });
+  const elsewhere = el('button', { class: 'link elsewhere-link hidden' });
+  elsewhere.addEventListener('click', () => { if (m.identity) m.identity.reveal(); });
+  const status = ui.statusLine(null);
+  const picker = el('select', { 'aria-label': 'Add an access role to ' + displayName, 'data-no-dirty': true });
+  let held = (m.access.roles || []).map((r) => r.name);
+
+  function draw() {
+    clear(tags);
+    const here = held.filter((r) => mineSet.has(r));
+    for (const r of here) {
+      const label = 'Remove access role ' + r + ' from ' + displayName;
+      const x = el('button', { class: 'x', text: '✕', 'aria-label': label, title: label });
+      x.addEventListener('click', () => revoke(r, x));
+      tags.appendChild(el('span', { class: 'tag', title: lib.capsTitle(catalog[r].caps) }, [
+        el('code', { text: r }), el('span', { class: 'tag-meaning', text: '— ' + meaning(r) }), x,
+      ]));
+    }
+    if (!here.length) tags.appendChild(el('span', { class: 'muted', text: 'No access roles in ' + guild + '.' }));
+    const other = typeof m.access.otherGuildRoleCount === 'number' ? m.access.otherGuildRoleCount : 0;
+    elsewhere.textContent = other ? '+' + lib.plural(other, 'role') + ' in other guilds' : '';
+    elsewhere.classList.toggle('hidden', !other || !m.identity);
+    // The picker offers what isn't held yet.
+    clear(picker);
+    const free = mine.filter((r) => !held.includes(r));
+    picker.appendChild(el('option', { value: '', text: free.length ? '+ Add access role…' : mine.length ? 'Holds every access role here' : 'No access roles defined here' }));
+    for (const r of free) picker.appendChild(el('option', { value: r, text: r + ' — ' + meaning(r) }));
+    picker.disabled = !free.length || assigning;
+  }
+  m.onChange((a) => {
+    held = (a.roles || []).map((r) => r.name);
+    draw();
+  });
+
+  /** 'Aria loses Write in 2 channels unless another grant covers them.' */
+  function lossText(r) {
+    const def = catalog[r];
+    const what = def && lib.isMirror(def.scope) && def.mirrorCaps
+      ? 'up to ' + lib.levelLabel(def.caps) + ' wherever ' + lib.wherePhrase(def.scope, m.names, def.guildId).replace(/^wherever /, '').replace(/ can see$/, '') + ' may act'
+      : meaning(r);
+    return displayName + ' loses ' + what + ' unless another grant covers them.';
+  }
+
+  async function revoke(role, x) {
+    const go = await ui.confirmDialog({
+      title: 'Remove access role ' + role + ' from ' + displayName + '?',
+      body: lossText(role),
+      confirmLabel: 'Remove access role',
+      danger: true,
+    });
+    if (!go) return;
+    await ui.busy(x, async () => {
+      try {
+        const r = await api('DELETE', m.path + '/roles/' + encodeURIComponent(role));
+        held = r.roles || held.filter((n) => n !== role);
+        draw();
+        markStale();
+        let now = '';
+        try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
+        if (!document.activeElement || document.activeElement === document.body || !document.activeElement.isConnected) {
+          if (!picker.disabled) picker.focus(); // the chip that had focus is gone
+        }
+        status.ok('Removed access role ' + role + ' from ' + displayName + '.' + now);
+      } catch (e) { status.err(notDone(e, 'Not removed')); }
+    }, '…');
+  }
+
+  // One request at a time: the picker is off while a role is being given,
+  // and a pick that arrives anyway (a script, a slow relay) waits its turn —
+  // none is dropped.
+  const queue = [];
+  let assigning = false;
+  async function giveRoles() {
+    assigning = true;
+    const hadFocus = document.activeElement === picker;
+    picker.disabled = true;
+    picker.setAttribute('aria-busy', 'true');
+    while (queue.length) {
+      const role = queue.shift();
+      if (m.access.removed) {
+        // Giving it a role here lifts its removal: asked first.
+        const go = await ui.confirmDialog({
+          title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
+          body: [displayName + ' was removed from ' + guild + ' with /ban, so nothing it holds applies there. Giving it access role ' + role +
+            ' lifts that: anything it still holds in ' + guild + ' applies again.'],
+          confirmLabel: 'Give role and lift',
+        });
+        if (!go) continue;
+      }
+      try {
+        const was = !!m.access.removed;
+        const r = await api('POST', m.path + '/roles', { role });
+        held = r.roles || held.concat(role);
+        draw();
+        markStale();
+        let now = '';
+        try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
+        status.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').' + now + (was && r.banned === false ? ' That lifted its removal from ' + guild + '.' : ''));
+      } catch (e) { status.err(notDone(e)); }
+      picker.disabled = true; // draw() turned it back on
+    }
+    assigning = false;
+    picker.removeAttribute('aria-busy');
+    picker.value = '';
+    picker.disabled = picker.options.length <= 1; // nothing left to give
+    // Turning it off dropped focus: give it back — or, the last free role
+    // given, to the new chip's ✕.
+    const a = document.activeElement;
+    if (hadFocus && (!a || a === document.body || !a.isConnected)) {
+      if (!picker.disabled) picker.focus();
+      else {
+        const xs = tags.querySelectorAll('button.x');
+        if (xs.length) xs[xs.length - 1].focus();
+      }
+    }
+  }
+  picker.addEventListener('change', () => {
+    const role = picker.value;
+    if (!role || queue.includes(role)) return;
+    queue.push(role);
+    if (!assigning) giveRoles();
+  });
+  draw();
+  return el('section', { class: 'drawer-section' }, [
+    el('h3', { text: 'Access roles in ' + guild }),
+    el('div', { class: 'inline' }, [tags, picker]),
+    elsewhere,
+    status.node,
+  ]);
+}
+
+/**
+ * 'Remove from <guild>': what slash /ban does — its access roles here and
+ * every direct grant here go, guild-wide is denied, and only an admin of the
+ * guild can give it access here again. The confirm lists what goes, from the
+ * access read the drawer shows. And Resync: re-send its channel list to its
+ * running agent (the relay allows one every few seconds).
+ */
+function removeSection(ctx, m) {
+  const { displayName } = ctx;
+  const guild = m.guild;
+  const status = ui.statusLine(null);
+  const hintId = ui.uid('hint');
+  const remove = el('button', { class: 'btn btn-danger-solid', 'data-key': 'remove', text: 'Remove from ' + guild + '…' });
+  const removedNote = el('span', { class: 'field-hint hidden' });
+  const resync = el('button', { class: 'btn', text: 'Resync', 'aria-describedby': hintId });
+  function draw() {
+    const gone = !!m.access.removed;
+    // Through setDisabled: a removal redraws this while busy() holds the button.
+    ui.setDisabled(remove, gone);
+    removedNote.textContent = gone ? 'Removed from ' + guild + ': nothing it holds applies here.' : '';
+    removedNote.classList.toggle('hidden', !gone);
+  }
+  m.onChange(draw);
+  draw();
+
+  remove.addEventListener('click', async () => {
+    const c = lib.removeConfirm(displayName, guild, m.access);
+    const go = await ui.confirmDialog({ title: c.title, body: c.body, confirmLabel: c.confirmLabel, danger: true });
+    if (!go) return;
+    await ui.busy(remove, async () => {
+      try {
+        const r = await api('POST', m.path + '/remove');
+        markStale();
+        try { await m.reload(); } catch { /* the line says what was done */ }
+        status[r.accessFullyRevoked === false ? 'err' : 'ok'](lib.removedText(displayName, guild, { rolesRemoved: r.rolesRemoved, grants: c.grants, accessFullyRevoked: r.accessFullyRevoked }));
+      } catch (e) { status.err(notDone(e, 'Not removed')); }
+    }, 'Removing…', () => resync);
+  });
+
+  resync.addEventListener('click', () => ui.busy(resync, async () => {
+    try {
+      const r = await api('POST', m.path + '/resync');
+      if (typeof r.pushed === 'number') {
+        status.ok(r.pushed
+          ? 'Re-sent ' + lib.plural(r.pushed, 'channel') + ' to ' + displayName + '’s running agent.'
+          : 'No agent is connected as ' + displayName + ' right now: it gets a fresh channel list when it next connects.');
+      } else {
+        status.ok('Asked the relay to re-send ' + displayName + '’s channel list. A running agent gets it now; one that isn’t connected gets a fresh list when it next connects.');
+      }
+    } catch (e) {
+      if (e.status === 429 || e.code === 'RATE_LIMITED') status.err('Resync was sent a moment ago. Try again in a few seconds.');
+      else status.err(notDone(e, 'Not resynced'));
+    }
+  }, 'Resyncing…'));
+
+  return el('section', { class: 'drawer-section danger-zone' }, [
+    el('h3', { text: 'Remove from ' + guild }),
+    el('p', { class: 'field-hint', text: 'Takes away ' + displayName + '’s access roles and direct grants here and denies guild-wide access, as /ban does. ' +
+      displayName + ' can’t give itself access here again; only an admin of ' + guild + ' can. Other guilds are not affected.' }),
+    el('div', { class: 'inline' }, [remove, removedNote]),
+    el('div', { class: 'inline resync-row' }, [resync, el('span', { id: hintId, class: 'field-hint', text: 'Re-sends this persona’s channel list to its running agent.' })]),
+    status.node,
+  ]);
+}
+
+/**
+ * 'More' (folded): the guild-wide level — set, denied or not set, with Set
+ * level…, Unset (fall back to the persona default) and Deny guild-wide (block
+ * the persona default here) — and applying an invite made for an existing
+ * persona. Returns { node, level, tracker, status, restore(caps), onTouch }.
+ */
+function moreSection(ctx, m) {
+  const { displayName } = ctx;
+  const guild = m.guild;
+  const det = el('details', { class: 'advanced more' }, [el('summary', { text: 'More' })]);
+  const touched = [];
+
+  // ── Guild-wide level ──
+  const gwRow = el('div', { class: 'gw-row' });
+  const gwHint = el('p', { class: 'field-hint' });
+  const gwStatus = ui.statusLine(null);
+  const formId = ui.uid('guild-wide');
+  const level = ui.levelControl({ label: 'Guild-wide level' });
+  const save = el('button', { type: 'submit', class: 'btn btn-sm btn-primary', text: 'Save' });
+  const cancel = el('button', { class: 'btn btn-sm', text: 'Cancel' });
+  const why = el('span', { class: 'field-hint' });
+  const gwForm = el('form', { id: formId, class: 'subsection guild-wide-form hidden', novalidate: true }, [
+    ui.field({ label: 'Guild-wide level in ' + guild, control: level.node }),
+    el('p', { class: 'warn-line gw-warn', text: 'Applies to every channel without its own grant, including new ones.' }),
+    el('div', { class: 'inline' }, [save, cancel, why]),
+  ]);
+  const tracker = ctx.drawer.track(gwForm);
+  let setBtn = null;
+
+  /** What the guild-wide setting is now (caps; [] denied; null not set),
+   *  as `expect` for a change. */
+  const loadedGuildWide = () => {
+    const g = m.access.guildWide;
+    return g === 'deny' ? [] : Array.isArray(g) ? g : null;
+  };
+
+  function drawGw() {
+    const g = m.access.guildWide;
+    const removed = !!m.access.removed;
+    clear(gwRow);
+    const buttons = [];
+    setBtn = el('button', { class: 'btn btn-sm', 'aria-expanded': String(!gwForm.classList.contains('hidden')), 'aria-controls': formId, text: 'Set level…' });
+    setBtn.addEventListener('click', () => openSet(true));
+    buttons.push(setBtn);
+    if (g !== null && g !== undefined) {
+      const unset = el('button', {
+        class: 'btn btn-sm', text: 'Unset',
+        'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild + (removed ? ' and lift its removal' : ''),
+        title: removed ? 'Lifts the removal: channels fall back to the persona default.' : 'Falls back to the persona default.',
+      });
+      unset.addEventListener('click', () => unsetGuildWide(unset));
+      buttons.push(unset);
+    }
+    if (!removed && g !== 'deny') {
+      const deny = el('button', { class: 'btn btn-sm btn-danger', text: 'Deny guild-wide', 'aria-label': 'Deny ' + displayName + ' guild-wide in ' + guild, title: 'Blocks the persona default here; access roles still apply.' });
+      deny.addEventListener('click', () => denyGuildWide(deny));
+      buttons.push(deny);
+    }
+    let levelNode;
+    let explain;
+    if (removed) {
+      levelNode = el('span', { class: 'badge badge-warn gw-level', text: 'Removed with /ban' });
+      explain = 'Nothing it holds applies in ' + guild + '. Unset (or a level) lifts that.';
+    } else if (g === 'deny') {
+      levelNode = el('span', { class: 'badge badge-warn gw-level', text: 'Denied' });
+      explain = displayName + '’s persona default doesn’t apply in ' + guild + '. Access roles and direct grants still do.';
+    } else if (Array.isArray(g)) {
+      levelNode = el('span', { class: 'gw-level', title: lib.capsTitle(g), text: lib.levelLabel(g) });
+      explain = 'In every channel without its own grant.';
+    } else {
+      levelNode = el('span', { class: 'muted gw-level', text: 'Not set' });
+      const pd = m.access.personaDefault;
+      explain = 'Channels without their own grant fall back to the persona default' + (pd && pd.length ? ' (' + lib.capsSummary(pd) + ')' : ' (none)') + '.';
+    }
+    gwRow.appendChild(el('div', { class: 'gw-value' }, [levelNode, el('span', { class: 'gw-explain muted', text: ' ' + explain })]));
+    gwRow.appendChild(el('div', { class: 'inline' }, buttons));
+    const hints = [];
+    if (buttons.some((b) => b.textContent === 'Unset')) hints.push('Unset: falls back to the persona default.');
+    if (buttons.some((b) => b.textContent === 'Deny guild-wide')) hints.push('Deny guild-wide: blocks the persona default here; roles still apply.');
+    gwHint.textContent = hints.join(' ');
+    gwHint.classList.toggle('hidden', !hints.length);
+  }
+  m.onChange(drawGw);
+
+  function update() {
+    const missing = !level.value().length ? 'Pick a level to save.' : '';
+    save.disabled = !!missing;
+    why.textContent = missing;
+  }
+  level.onChange(() => { update(); for (const fn of touched) fn(); });
+  function openSet(on, caps) {
+    gwForm.classList.toggle('hidden', !on);
+    if (setBtn) setBtn.setAttribute('aria-expanded', String(on));
+    if (on) {
+      det.setAttribute('open', '');
+      level.set(caps || loadedGuildWide() || []);
+      tracker.reset();
+      update();
+      const first = gwForm.querySelector('input');
+      if (first && !caps) first.focus();
+    } else {
+      tracker.reset();
+    }
+  }
+  cancel.addEventListener('click', () => {
+    openSet(false);
+    if (setBtn) setBtn.focus();
+  });
+
+  /** ' Effective now: Read in 14 channels, Write in 2 (direct grants).' */
+  const guildEffect = (r) => (r && r.effective && r.effective.counts ? ' Effective now: ' + lib.guildEffectText(r.effective, guild) + '.' : '');
+
+  /** The relay refused a guild-wide change as changed meanwhile: read the
+   *  persona again, then say so; focus goes to Set level… if the button
+   *  that made the change was drawn again. */
+  async function conflicted(e, prefix) {
+    let reloaded = false;
+    try { reloaded = await m.reload(); } catch { reloaded = false; }
+    markStale();
+    const a = document.activeElement;
+    if ((!a || a === document.body || !a.isConnected) && setBtn) setBtn.focus();
+    gwStatus.err(lib.errorText(e, prefix, { reloaded }));
+  }
+
+  /** After a guild-wide change: read again, keep focus on the row. */
+  async function after() {
+    try { await m.reload(); } catch { /* the line says what was done */ }
+    const a = document.activeElement;
+    if ((!a || a === document.body || !a.isConnected) && setBtn) setBtn.focus();
+  }
+
+  ui.onSubmit(gwForm, async () => {
+    const caps = level.value();
+    if (!caps.length) return; // Save is off until a level is picked
+    const lift = !!m.access.removed;
+    if (lift) {
+      const go = await ui.confirmDialog({
+        title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
+        body: [lib.liftText(displayName, caps, 'every channel of ' + guild + ' without its own grant', guild)],
+        confirmLabel: 'Set level and lift',
+      });
+      if (!go) return;
+    }
+    const body = { guildDefault: true };
+    const k = level.level();
+    if (k && k !== 'custom') body.level = k;
+    else body.caps = caps;
+    body.expect = loadedGuildWide();
+    try {
+      const r = await api('PUT', m.path + '/grants', body);
+      tracker.reset();
+      markStale();
+      openSet(false);
+      await after();
+      gwStatus.ok(displayName + ' → ' + lib.capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).' + guildEffect(r) +
+        (r && r.liftedBan ? ' That lifted its removal from ' + guild + '.' : ''));
+    } catch (e) {
+      if (e.code === 'CONFLICT') return conflicted(e, 'Not saved');
+      gwStatus.err(notDone(e, 'Not saved'));
+    }
+  });
+
+  async function denyGuildWide(button) {
+    const g = m.access.guildWide;
+    const gd = Array.isArray(g) && g.length ? g : null;
+    const go = await ui.confirmDialog({
+      title: 'Deny ' + displayName + ' guild-wide in ' + guild + '?',
+      body: [
+        (gd ? displayName + '’s guild-wide ' + lib.levelLabel(gd) + ' is replaced by a deny. ' : '') + 'In every channel of ' + guild +
+          ' without its own direct grant, ' + displayName + ' then gets nothing from its own settings: the deny blocks its persona default here.',
+        'Access roles and direct grants still apply. To undo it, use Unset' + (gd ? ' or set a guild-wide level again' : '') + '.',
+      ],
+      confirmLabel: 'Deny guild-wide',
+      danger: true,
+    });
+    if (!go) return;
+    await ui.busy(button, async () => {
+      try {
+        const r = await api('DELETE', m.path + '/grants?guildDefault=deny', { expect: loadedGuildWide() });
+        markStale();
+        await after();
+        gwStatus.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.' + guildEffect(r));
+      } catch (e) {
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not denied');
+        gwStatus.err(notDone(e, 'Not denied'));
+      }
+    }, 'Denying…');
+  }
+
+  async function unsetGuildWide(button) {
+    const g = m.access.guildWide;
+    const gd = Array.isArray(g) ? g : [];
+    // Removed with /ban: unsetting alone would change nothing, so it lifts
+    // the removal too — and says so first.
+    const lift = !!m.access.removed;
+    const go = await ui.confirmDialog(lift ? {
+      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal?',
+      body: [
+        displayName + ' was removed from ' + guild + ' with /ban, so nothing applies to it there. Unsetting lifts that: channels of ' + guild +
+          ' without their own direct grant fall back to ' + displayName + '’s persona default, and access roles given here apply again.',
+        'To undo it, use /ban in ' + guild + ' again.',
+      ],
+      confirmLabel: 'Unset and lift',
+    } : {
+      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + '?',
+      body: [
+        (gd.length ? displayName + '’s guild-wide ' + lib.levelLabel(gd) : 'The guild-wide deny') + ' is removed: channels of ' + guild +
+          ' without their own direct grant fall back to ' + displayName + '’s persona default.',
+        'Access roles and direct grants still apply. To undo it, ' + (gd.length ? 'set a guild-wide level again' : 'deny guild-wide again') + '.',
+      ],
+      confirmLabel: 'Unset guild-wide',
+    });
+    if (!go) return;
+    await ui.busy(button, async () => {
+      try {
+        const r = await api('DELETE', m.path + '/grants?guildDefault=unset' + (lift ? '&liftBan=1' : ''), { expect: loadedGuildWide() });
+        markStale();
+        await after();
+        gwStatus.ok((lift
+          ? 'Lifted ' + displayName + '’s removal from ' + guild + ' and unset its guild-wide level: channels without their own grant fall back to the persona default.'
+          : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.') + guildEffect(r));
+      } catch (e) {
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not unset');
+        gwStatus.err(notDone(e, 'Not unset'));
+      }
+    }, 'Unsetting…');
+  }
+
+  // ── Apply an invite (an "augment" invite; a new-agent one can't be
+  // applied to a persona that exists) ──
+  const claimCode = el('input', { type: 'text', name: 'code', autocomplete: 'off', spellcheck: 'false', placeholder: 'inv_…' });
+  const claimBtn = el('button', { type: 'submit', class: 'btn btn-sm', text: 'Apply' });
+  const claimStatus = ui.statusLine(null);
+  const claimForm = el('form', { class: 'subsection subsection-sep', novalidate: true }, [
+    ui.field({ label: 'Apply an invite to ' + displayName, control: claimCode, after: [claimBtn], hint: 'Only invites made for an existing persona can be applied.' }),
+    claimStatus.node,
+  ]);
+  const claimTracker = ctx.drawer.track(claimForm);
+  ui.onSubmit(claimForm, async () => {
+    const code = claimCode.value.trim();
+    if (!code) { claimStatus.err('Not applied: enter an invite code first.'); return; }
+    try {
+      const was = !!m.access.removed;
+      const r = await api('POST', m.path + '/claim', { code });
+      claimCode.value = '';
+      claimTracker.reset();
+      markStale();
+      let now = '';
+      try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
+      claimStatus.ok('Applied the invite to ' + displayName + '.' + now + (was && r && r.banned === false ? ' That lifted its removal from ' + guild + '.' : ''));
+    } catch (e) { claimStatus.err(notDone(e, 'Not applied')); }
+  }, { busyLabel: 'Applying…' });
+
+  drawGw();
+  update();
+  det.appendChild(el('div', { class: 'more-body' }, [
+    el('div', { class: 'subsection', role: 'group', 'aria-labelledby': formId + '-label' }, [
+      el('div', { class: 'field-label', id: formId + '-label', text: 'Guild-wide level' }),
+      gwRow, gwHint, gwForm, gwStatus.node,
+    ]),
+    claimForm,
+  ]));
+  return {
+    node: det, level, tracker, status: gwStatus,
+    /** A kept guild-wide level, put back (More opens on it). */
+    restore(caps) { openSet(true, caps || []); },
+    onTouch: (fn) => touched.push(fn),
+  };
+}
+
+/**
+ * Super-admins: the persona beyond this guild — the other guilds it can act
+ * in (each a link to its drawer there), its profile picture and its token.
+ * Folded in a guild's drawer; open in the global one (no guild).
+ * Returns { node, reveal() } — reveal unfolds it and moves focus to it.
+ */
+function identitySection(ctx, global, open) {
+  const det = el('details', { class: 'advanced identity' }, [el('summary', { text: 'Identity' })]);
+  if (open) det.setAttribute('open', '');
+  const others = (global.guilds || []).filter((g) => g.id !== ctx.gid);
+  const rolesIn = {};
+  for (const r of global.roles || []) if (r && r.guildId) (rolesIn[r.guildId] = rolesIn[r.guildId] || []).push(r.name);
+  const list = others.length
+    ? el('ul', { class: 'plain' }, others.map((g) => {
+        const href = lib.formatRoute(route('g', g.id, 'personas', { kind: 'persona', id: ctx.id }));
+        return el('li', {}, [
+          href ? el('a', { href, title: g.id, text: g.name || g.id }) : el('span', { title: g.id, text: g.name || g.id }),
+          rolesIn[g.id] ? el('span', { class: 'muted', text: ' — access roles: ' + rolesIn[g.id].join(', ') }) : null,
+        ]);
+      }))
+    : el('p', { class: 'muted', text: ctx.gid ? 'It can’t act in any other guild.' : 'It can’t act in any guild.' });
+  det.appendChild(el('div', { class: 'drawer-sections identity-body' }, [
+    el('div', { class: 'field' }, [el('div', { class: 'field-label', text: ctx.gid ? 'Other guilds' : 'Guilds' }), list]),
+    profileSection(ctx, global),
+    tokenSection(ctx),
+  ]));
+  return {
+    node: det,
+    reveal() {
+      det.setAttribute('open', '');
+      const s = det.querySelector('summary');
+      if (s) s.focus();
+    },
+  };
+}
+
+/**
+ * The persona drawer's forms kept across "Sign in again": Add to channels
+ * (whose, where, what level) or the guild-wide level — whichever was touched
+ * last (one form a drawer is kept). A kept form comes back only in its own
+ * persona's drawer; an older panel's grant draft (one channel, or guild-wide)
+ * comes back in the form that does that now.
+ */
+function keepPersonaForms(ctx, add, more) {
+  const d = ctx.drawer;
+  const addHooks = {
+    serialize: () => ({ personaId: ctx.id, channels: add.ta.values(), caps: add.level.value() }),
+    belongs: (f) => f.personaId === ctx.id,
+    restore: (f) => add.restore(f.channels || [], f.caps),
+    isDirty: () => add.tracker.isDirty(),
+  };
+  let into = null;
+  const gwHooks = {
+    serialize: () => ({ personaId: ctx.id, target: '__guild__', caps: more.level.value() }),
+    belongs: (f) => f.personaId === ctx.id,
+    restore(f) {
+      if (f.target === '__guild__') {
+        more.restore(f.caps);
+        into = 'grant';
+      } else if (f.target) {
+        add.restore([f.target], f.caps);
+        add.status.info('Restored your unsaved change — review and save. Nothing was submitted.');
+        into = 'personaAdd';
+      }
+    },
+    isDirty: () => more.tracker.isDirty(),
+  };
+  keepForm(d, 'grant', gwHooks, more.status);
+  if (keepForm(d, 'personaAdd', addHooks, add.status)) into = 'personaAdd';
+  if (into === 'grant') d.registerForm('grant', gwHooks);
+  else d.registerForm('personaAdd', addHooks);
+  add.onTouch(() => d.registerForm('personaAdd', addHooks));
+  more.onTouch(() => d.registerForm('grant', gwHooks));
 }
 
 /** Super-admin: the persona's profile picture (global — it shows everywhere). */
@@ -1448,202 +2721,6 @@ function profileSection(ctx, d) {
   return section('Profile picture', [form]);
 }
 
-/** Access in the selected guild: its direct grants (open, first), its access
- *  roles, and — folded under More — applying an invite. */
-function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
-  const { id, displayName, gid } = ctx;
-  const P = () => gpath(gid) + '/personas/' + encodeURIComponent(id);
-  const guild = guildName(gid);
-  const names = metaNames(meta, gid);
-  const catalog = meta.catalog || {};
-  const mine = guildRoleNames(meta, gid);
-  const mineSet = new Set(mine);
-  const meaning = (r) => lib.roleMeaning(catalog[r], names);
-
-  // Access roles: this guild's, as chips with a remove button each, and a
-  // picker (with what each role means) that assigns the moment one is picked.
-  const roleTags = el('div', { class: 'tags' });
-  const roleNote = el('p', { class: 'field-hint hidden' });
-  const roleStatus = ui.statusLine(null);
-  const addRole = el('select', { 'aria-label': 'Add an access role to ' + displayName, 'data-no-dirty': true });
-  function drawRoles(roles) {
-    const held = roles || [];
-    clear(roleTags);
-    const here = held.filter((r) => mineSet.has(r));
-    for (const r of here) {
-      const label = 'Remove access role ' + r + ' from ' + displayName;
-      const x = el('button', { class: 'x', text: '✕', 'aria-label': label, title: label });
-      x.addEventListener('click', () => ui.busy(x, () => revokeRole(r), '…'));
-      roleTags.appendChild(el('span', { class: 'tag', title: capsTitle(catalog[r].caps) }, [
-        el('code', { text: r }), el('span', { class: 'tag-meaning', text: '— ' + meaning(r) }), x,
-      ]));
-    }
-    if (!here.length) roleTags.appendChild(el('span', { class: 'muted', text: 'No access roles in ' + guild + '.' }));
-    // A super-admin sees every role the persona holds; the ones that aren't
-    // this guild's are counted, not offered here.
-    const other = held.filter((r) => !mineSet.has(r));
-    const elsewhere = other.filter((r) => catalog[r]).length;
-    const notes = [];
-    if (elsewhere) notes.push('+' + lib.plural(elsewhere, 'role') + ' in other guilds');
-    if (other.length > elsewhere) notes.push(lib.plural(other.length - elsewhere, 'role') + ' no longer defined');
-    roleNote.textContent = notes.join(' · ');
-    roleNote.classList.toggle('hidden', !notes.length);
-    // The picker offers what isn't held yet.
-    clear(addRole);
-    const free = mine.filter((r) => !held.includes(r));
-    addRole.appendChild(el('option', { value: '', text: free.length ? '+ Add access role…' : mine.length ? 'Holds every access role here' : 'No access roles defined here' }));
-    for (const r of free) addRole.appendChild(el('option', { value: r, text: r + ' — ' + meaning(r) }));
-    addRole.disabled = !free.length;
-  }
-  async function revokeRole(role) {
-    try {
-      const r = await api('DELETE', P() + '/roles/' + encodeURIComponent(role));
-      drawRoles(r.roles);
-      addRole.focus(); // the chip that had focus is gone
-      roleStatus.ok('Removed access role ' + role + ' from ' + displayName + '.');
-      markStale(); onChange();
-    } catch (e) { roleStatus.err(notDone(e, 'Not removed')); }
-  }
-  // One request at a time: the picker is off while a role is being given,
-  // and a pick that arrives anyway (a script, a slow relay) waits its turn —
-  // none is dropped.
-  const queue = [];
-  let assigning = false;
-  async function giveRoles() {
-    assigning = true;
-    const hadFocus = document.activeElement === addRole;
-    addRole.disabled = true;
-    addRole.setAttribute('aria-busy', 'true');
-    while (queue.length) {
-      const role = queue.shift();
-      try {
-        const r = await api('POST', P() + '/roles', { role });
-        drawRoles(r.roles);
-        noteBan(r);
-        roleStatus.ok('Gave ' + displayName + ' access role ' + role + ' (' + meaning(role) + ').');
-        markStale(); onChange();
-      } catch (e) { roleStatus.err(notDone(e)); }
-      addRole.disabled = true; // drawRoles turned it back on
-    }
-    assigning = false;
-    addRole.removeAttribute('aria-busy');
-    addRole.value = '';
-    addRole.disabled = addRole.options.length <= 1; // nothing left to give
-    // Turning it off dropped focus: give it back — or, the last free role
-    // given, to the new chip's ✕.
-    const a = document.activeElement;
-    if (hadFocus && (!a || a === document.body || !a.isConnected)) {
-      if (!addRole.disabled) addRole.focus();
-      else {
-        const xs = roleTags.querySelectorAll('button.x');
-        if (xs.length) xs[xs.length - 1].focus();
-      }
-    }
-  }
-  addRole.addEventListener('change', () => {
-    const role = addRole.value;
-    if (!role || queue.includes(role)) return;
-    queue.push(role);
-    if (!assigning) giveRoles();
-  });
-  drawRoles(detail.roles);
-  const rolesBlock = el('div', { class: 'subsection subsection-sep', role: 'group', 'aria-label': 'Access roles' }, [
-    el('div', { class: 'field-label', text: 'Access roles' }),
-    el('div', { class: 'inline' }, [roleTags, addRole]),
-    roleNote,
-    roleStatus.node,
-  ]);
-
-  // Apply an invite to this persona (an "augment" invite; a new-agent one
-  // can't be applied to a persona that exists).
-  const claimCode = el('input', { type: 'text', name: 'code', autocomplete: 'off', spellcheck: 'false', placeholder: 'inv_…' });
-  const claimBtn = el('button', { type: 'submit', class: 'btn btn-sm', text: 'Apply' });
-  const claimStatus = ui.statusLine(null);
-  const claimForm = el('form', { class: 'subsection', novalidate: true }, [
-    ui.field({ label: 'Apply an invite to ' + displayName, control: claimCode, after: [claimBtn], hint: 'Only invites made for an existing persona can be applied here.' }),
-    claimStatus.node,
-  ]);
-  const claimTracker = ctx.drawer.track(claimForm);
-  ui.onSubmit(claimForm, async () => {
-    const code = claimCode.value.trim();
-    if (!code) { claimStatus.err('Not applied: enter an invite code first.'); return; }
-    try {
-      const r = await api('POST', P() + '/claim', { code });
-      drawRoles(r.roles);
-      noteBan(r);
-      claimCode.value = '';
-      claimTracker.reset();
-      claimStatus.ok('Applied the invite to ' + displayName + '.');
-      markStale(); onChange();
-    } catch (e) { claimStatus.err(notDone(e, 'Not applied')); }
-  }, { busyLabel: 'Applying…' });
-  const more = el('details', { class: 'advanced' }, [el('summary', { text: 'More' }), claimForm]);
-
-  const grants = grantEditor(ctx, detail.guildPolicy, meta.channels, withChannelList(detail.names, meta.channels), onChange, !!detail.banned);
-  /** A role given or an invite applied here can lift a /ban: the grants say so. */
-  function noteBan(r) {
-    if (r && typeof r.banned === 'boolean') grants.setBanned(r.banned);
-  }
-
-  return el('section', { class: 'drawer-section' }, [
-    el('h3', { text: 'Access in ' + guild }),
-    grants.node,
-    rolesBlock,
-    more,
-  ]);
-}
-
-/** Super-admin: where the persona can act, what each access role confers, and
- *  its direct grants in every guild (read-only — edit them per guild). */
-function everywhereSection(d) {
-  const guilds = d.guilds || [];
-  const names = d.names || {};
-  names.guilds = Object.assign({}, names.guilds);
-  guilds.forEach((g) => { if (g.name && !names.guilds[g.id]) names.guilds[g.id] = g.name; });
-
-  const kids = [];
-  // Each guild links to this persona's drawer there.
-  const there = (gid) => (d.id ? lib.formatRoute(route('g', gid, 'personas', { kind: 'persona', id: d.id })) : null);
-  kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Guilds it can act in' }),
-    guilds.length
-      ? el('ul', { class: 'plain' }, guilds.map((g) => el('li', {}, [
-          there(g.id) ? el('a', { href: there(g.id), text: g.name || g.id }) : g.name || g.id,
-          el('span', { class: 'muted mono', text: ' ' + g.id }),
-        ])))
-      : el('p', { class: 'muted', text: 'None.' })]));
-
-  const roles = d.roles || [];
-  kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Access roles' }),
-    roles.length
-      ? el('ul', { class: 'plain' }, roles.map((r) => el('li', { title: r.caps ? capsTitle(r.caps) : undefined }, [
-          el('code', { text: r.name }),
-          el('span', { class: 'muted', text: ' — ' + (r.scope
-            ? lib.roleMeaning(r, names) + (r.scope.all || !r.guildId ? '' : ' · ' + guildText(r.guildId, names))
-            : 'no longer defined') }),
-        ])))
-      : el('p', { class: 'muted', text: 'None.' })]));
-
-  const pol = d.policy;
-  const bans = Array.isArray(d.bans) ? d.bans : [];
-  const polGuilds = pol && pol.guilds ? Object.entries(pol.guilds) : [];
-  // A guild it was removed from with /ban, even with nothing set there.
-  for (const gid of bans) if (!polGuilds.some(([g]) => g === gid)) polGuilds.push([gid, {}]);
-  if ((pol && pol.default && pol.default.length) || polGuilds.length) {
-    const grantKids = [];
-    if (pol && pol.default && pol.default.length) grantKids.push(el('div', { class: 'cell-roles', title: capsTitle(pol.default), text: 'Persona default (applies in every guild): ' + capsSummary(pol.default) }));
-    for (const [gid, gp] of polGuilds) {
-      const lines = [];
-      if (bans.includes(gid)) lines.push(el('div', { class: 'cell-roles', text: 'Removed with /ban: nothing it holds applies here.' }));
-      else if (Array.isArray(gp.default)) lines.push(el('div', { class: 'cell-roles', title: gp.default.length ? capsTitle(gp.default) : undefined, text: 'Guild-wide: ' + (gp.default.length ? capsSummary(gp.default) : 'denied') }));
-      const rows = Object.entries(gp.channels || {}).sort((a, b) => byName(chanText(a[0], names), chanText(b[0], names)));
-      for (const [cid, caps] of rows) lines.push(el('div', { class: 'grant-line' }, [chanNode(cid, names), el('span', { class: 'muted', title: caps.length ? capsTitle(caps) : undefined, text: ' — ' + (caps.length ? capsSummary(caps) : 'blocked') })]));
-      grantKids.push(el('div', { class: 'grant-guild' }, [el('strong', { text: guildText(gid, names), title: gid }), ...lines]));
-    }
-    kids.push(el('div', { class: 'field' }, [el('div', { class: 'field-label', text: 'Direct grants' }), ...grantKids]));
-  }
-  return section('Access in every guild', kids);
-}
-
 /** Super-admin: the token authenticates the persona everywhere, so its
  *  lifecycle isn't a per-guild action. */
 function tokenSection(ctx) {
@@ -1677,331 +2754,6 @@ async function tokenAction(ctx, action, button, status) {
       }
     } catch (e) { status.err(notDone(e, rotate ? 'Not rotated' : 'Not revoked')); }
   }, rotate ? 'Rotating…' : 'Revoking…');
-}
-
-/**
- * Direct grants in the drawer's guild: what is set (the guild-wide level
- * first — set, denied or not set, with Unset and Deny guild-wide — then one
- * row per channel), and a form that sets a level on one channel — text,
- * voice or forum; a thread uses its parent's access and a category grants
- * nothing — or guild-wide. Save stays off until a target and a level are
- * picked, so a grant can't be stored empty by accident. A preset is sent as
- * {level}, Custom… as {caps}.
- *
- * A persona removed from the guild with /ban (`banned0`) has nothing there:
- * the guild-wide row says so, and Unset asks before lifting that. Giving it
- * access (a level here, an access role) lifts it too; the relay's answer says
- * which. Returns { node, setBanned(banned) }.
- *
- * Every change says what it leaves the persona with — 'Effective now: …',
- * from the relay's own answer — and is sent with `expect`, the setting this
- * drawer loaded: changed meanwhile (another tab, slash), the relay refuses
- * it, and the drawer loads the setting again and says so.
- */
-function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0 = false) {
-  const { id, displayName, gid } = ctx;
-  const P = () => gpath(gid) + '/personas/' + encodeURIComponent(id) + '/grants';
-  const guild = guildName(gid);
-  const GUILD_WIDE = '__guild__';
-  const det = el('details', { class: 'advanced grants', open: true }, [el('summary', { text: 'Direct grants' })]);
-  const tableBox = el('div', {});
-  const banNote = el('p', { class: 'warn-line hidden' });
-  const status = ui.statusLine(null);
-  let policy = policy0 || null;
-  let banned = banned0;
-  /** Take the relay's word on the ban, from a change's answer. */
-  const noteBanned = (r) => { if (r && typeof r.banned === 'boolean') banned = r.banned; };
-
-  /** Why a grant on this channel does nothing, or null. */
-  function inertNote(cid) {
-    const l = names.channels && names.channels[cid];
-    if (!l) return null;
-    if (l.type === 'thread') return 'Does nothing: threads use ' + (l.parentName ? '#' + l.parentName : 'their channel') + '’s access.';
-    if (l.type === 'category') return 'Does nothing: a category grants nothing. Pick its channels instead.';
-    return null;
-  }
-  function levelCell(caps, emptyBadge, emptyNote) {
-    if (!caps.length) return el('td', { title: emptyNote }, [el('span', { class: 'badge badge-warn', text: emptyBadge })]);
-    return el('td', { title: capsTitle(caps), text: levelLabel(caps) });
-  }
-
-  /** The guild-wide row: its level, 'Denied' or 'Not set', and what can be
-   *  done — Unset (fall back to the persona default) when something is set,
-   *  Deny guild-wide unless it already is. */
-  function guildWideRow(gd) {
-    const buttons = [];
-    if (banned) {
-      // Removed with /ban: Unset is the one thing to offer here (it asks
-      // before lifting the removal); it is denied already.
-      if (Array.isArray(gd)) {
-        const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal', title: 'Lifts the removal: channels fall back to the persona default.' });
-        unset.addEventListener('click', () => unsetGuildWide(unset));
-        buttons.push(unset);
-      }
-      return el('tr', {}, [
-        el('td', { text: 'Every channel (guild-wide)' }),
-        el('td', { title: displayName + ' was removed from ' + guild + ' with /ban: nothing it holds applies here.' }, [el('span', { class: 'badge badge-warn', text: 'Removed with /ban' })]),
-        el('td', { class: 'col-narrow' }, [el('div', { class: 'inline' }, buttons)]),
-      ]);
-    }
-    if (Array.isArray(gd)) {
-      const unset = el('button', { class: 'btn btn-sm', text: 'Unset', 'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild, title: 'Falls back to the persona default.' });
-      unset.addEventListener('click', () => unsetGuildWide(unset));
-      buttons.push(unset);
-    }
-    if (!Array.isArray(gd) || gd.length) {
-      const deny = el('button', { class: 'btn btn-sm btn-danger', text: 'Deny guild-wide', 'aria-label': 'Deny ' + displayName + ' guild-wide in ' + guild, title: 'Blocks the persona default here; access roles still apply.' });
-      deny.addEventListener('click', () => denyGuildWide(deny));
-      buttons.push(deny);
-    }
-    const level = Array.isArray(gd)
-      ? levelCell(gd, 'Denied', 'Denied guild-wide: ' + displayName + '’s persona default doesn’t apply in ' + guild + '. Access roles and direct grants still do.')
-      : el('td', { class: 'muted', text: 'Not set', title: 'No guild-wide level: channels without their own grant fall back to the persona default.' });
-    return el('tr', {}, [
-      el('td', { text: 'Every channel (guild-wide)' }),
-      level,
-      el('td', { class: 'col-narrow' }, [el('div', { class: 'inline' }, buttons)]),
-    ]);
-  }
-
-  function draw(p) {
-    policy = p || null;
-    clear(tableBox);
-    const gd = policy ? policy.default : undefined; // undefined: not set here
-    const chans = (policy && policy.channels) || {};
-    const keys = Object.keys(chans).sort((a, b) => byName(chanText(a, names), chanText(b, names)));
-    const rows = [guildWideRow(gd)];
-    for (const cid of keys) {
-      const where = chanText(cid, names);
-      const note = inertNote(cid);
-      const rm = el('button', { class: 'btn btn-sm btn-danger', text: 'Remove', 'aria-label': 'Remove ' + displayName + '’s direct grant in ' + where });
-      rm.addEventListener('click', () => ui.busy(rm, () => removeGrant(cid, rm), 'Removing…'));
-      rows.push(el('tr', {}, [
-        el('td', {}, [chanNode(cid, names), note ? el('div', { class: 'cell-note', text: note }) : null]),
-        levelCell(chans[cid] || [], 'Blocked', 'An empty direct grant: it blocks the guild-wide level and the persona default in this channel. Access roles still apply.'),
-        el('td', { class: 'col-narrow' }, [rm]),
-      ]));
-    }
-    tableBox.appendChild(table([{ label: 'Where' }, { label: 'Level' }, { label: '', cls: 'col-narrow' }], rows, 'No direct grants in ' + guild + '.'));
-    banNote.textContent = banned
-      ? displayName + ' was removed from ' + guild + ' with /ban, so nothing it holds applies here — not its persona default, direct grants or access roles. Giving it access here (a level below, or an access role) lifts that.'
-      : '';
-    banNote.classList.toggle('hidden', !banned);
-  }
-
-  /** What this drawer loaded at a target (caps, or null for nothing set):
-   *  sent as `expect`, so a change made meanwhile isn't overwritten. */
-  function loaded(t) {
-    const caps = currentCaps(t);
-    return Array.isArray(caps) ? caps : null;
-  }
-
-  /** The relay refused a change because the setting changed since this
-   *  drawer loaded it: load it again, then say so in the line. `from` is the
-   *  table's button that made the change: drawn again, it is gone, so focus
-   *  goes to Where, as after a change that went through. */
-  async function conflicted(e, prefix, ctxErr, from) {
-    let reloaded = false;
-    try {
-      const d = await api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id));
-      noteBanned(d);
-      draw(d.guildPolicy);
-      preload();
-      reloaded = true;
-      markStale();
-    } catch { /* the line says to reload the page instead */ }
-    const a = document.activeElement;
-    if (from && !from.isConnected && (!a || a === document.body || !a.isConnected)) target.focus();
-    status.err(lib.errorText(e, prefix, Object.assign({}, ctxErr, { reloaded })));
-  }
-
-  /** ' Effective now: …' for the guild, from a guild-wide change's answer. */
-  const guildEffect = (r) => (r && r.effective && r.effective.counts ? ' Effective now: ' + lib.guildEffectText(r.effective, guild) + '.' : '');
-
-  async function removeGrant(cid, button) {
-    const where = chanText(cid, names);
-    try {
-      const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid), { expect: loaded(cid) });
-      noteBanned(r);
-      draw(r.guildPolicy);
-      target.focus(); // the row whose button had focus is gone
-      if (target.value === cid) preload();
-      // A thread's answer is its parent's access (what the relay checks there).
-      const ex = r.effective;
-      const left = ex ? lib.remainingText(ex, where, ex.parentId ? chanText(ex.parentId, names) : where) : '';
-      status.ok('Removed ' + displayName + '’s direct grant in ' + where + (left ? ' — ' + left : '') + '.');
-      markStale(); onChange();
-    } catch (e) {
-      if (e.code === 'CONFLICT') return conflicted(e, 'Not removed', { channelId: cid, names }, button);
-      status.err(notDone(e, 'Not removed'));
-    }
-  }
-
-  async function denyGuildWide(button) {
-    const gd = policy && Array.isArray(policy.default) && policy.default.length ? policy.default : null;
-    const go = await ui.confirmDialog({
-      title: 'Deny ' + displayName + ' guild-wide in ' + guild + '?',
-      body: [
-        (gd ? displayName + '’s guild-wide ' + levelLabel(gd) + ' is replaced by a deny. ' : '') + 'In every channel of ' + guild +
-          ' without its own direct grant, ' + displayName + ' then gets nothing from its own settings: the deny blocks its persona default here.',
-        'Access roles and direct grants still apply. To undo it, use Unset' + (gd ? ' or set a guild-wide level again' : '') + '.',
-      ],
-      confirmLabel: 'Deny guild-wide',
-      danger: true,
-    });
-    if (!go) return;
-    await ui.busy(button, async () => {
-      try {
-        const r = await api('DELETE', P() + '?guildDefault=deny', { expect: loaded(GUILD_WIDE) });
-        noteBanned(r);
-        draw(r.guildPolicy);
-        target.focus();
-        if (target.value === GUILD_WIDE) preload();
-        status.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.' + guildEffect(r));
-        markStale(); onChange();
-      } catch (e) {
-        if (e.code === 'CONFLICT') return conflicted(e, 'Not denied', undefined, button);
-        status.err(notDone(e, 'Not denied'));
-      }
-    }, 'Denying…');
-  }
-
-  async function unsetGuildWide(button) {
-    const gd = policy && Array.isArray(policy.default) ? policy.default : [];
-    // Removed with /ban: unsetting alone would change nothing, so it lifts
-    // the removal too — and says so first.
-    const lift = banned;
-    const go = await ui.confirmDialog(lift ? {
-      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal?',
-      body: [
-        displayName + ' was removed from ' + guild + ' with /ban, so nothing applies to it there. Unsetting lifts that: channels of ' + guild +
-          ' without their own direct grant fall back to ' + displayName + '’s persona default, and access roles given here apply again.',
-        'To undo it, use /ban in ' + guild + ' again.',
-      ],
-      confirmLabel: 'Unset and lift',
-    } : {
-      title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + '?',
-      body: [
-        (gd.length ? displayName + '’s guild-wide ' + levelLabel(gd) : 'The guild-wide deny') + ' is removed: channels of ' + guild +
-          ' without their own direct grant fall back to ' + displayName + '’s persona default.',
-        'Access roles and direct grants still apply. To undo it, ' + (gd.length ? 'set a guild-wide level again' : 'deny guild-wide again') + '.',
-      ],
-      confirmLabel: 'Unset guild-wide',
-    });
-    if (!go) return;
-    await ui.busy(button, async () => {
-      try {
-        const r = await api('DELETE', P() + '?guildDefault=unset' + (lift ? '&liftBan=1' : ''), { expect: loaded(GUILD_WIDE) });
-        noteBanned(r);
-        draw(r.guildPolicy);
-        target.focus();
-        if (target.value === GUILD_WIDE) preload();
-        status.ok((lift
-          ? 'Lifted ' + displayName + '’s removal from ' + guild + ' and unset its guild-wide level: channels without their own grant fall back to the persona default.'
-          : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.') + guildEffect(r));
-        markStale(); onChange();
-      } catch (e) {
-        if (e.code === 'CONFLICT') return conflicted(e, 'Not unset', undefined, button);
-        status.err(notDone(e, 'Not unset'));
-      }
-    }, 'Unsetting…');
-  }
-
-  const target = el('select', { name: 'target' }, [el('option', { value: '', text: 'Pick a channel…' })]
-    .concat(channelOptions(channels).map((o) => el('option', { value: o.value, text: o.text })))
-    .concat([el('option', { value: GUILD_WIDE, text: 'Every channel in ' + guild + ' (guild-wide)…' })]));
-  const wideWarn = el('p', { class: 'warn-line hidden', text: 'Applies to every channel without its own grant, including new ones.' });
-  const level = ui.levelControl({ label: 'Level' });
-  const save = el('button', { type: 'submit', class: 'btn btn-sm btn-primary', text: 'Save' });
-  const why = el('span', { class: 'field-hint' });
-  const form = el('form', { class: 'subsection grant-form', novalidate: true }, [
-    ui.field({ label: 'Where', control: target }),
-    wideWarn,
-    ui.field({ label: 'Level', control: level.node }),
-    el('div', { class: 'inline' }, [save, why]),
-    status.node,
-  ]);
-  const tracker = ctx.drawer.track(form);
-
-  /** The target's current setting: caps, or undefined when it has none. */
-  function currentCaps(t) {
-    if (!t || !policy) return undefined;
-    if (t === GUILD_WIDE) return policy.default;
-    return policy.channels ? policy.channels[t] : undefined;
-  }
-  function update() {
-    const missing = !target.value ? 'Pick a channel and a level to save.' : !level.value().length ? 'Pick a level to save.' : '';
-    save.disabled = !!missing;
-    why.textContent = missing;
-  }
-  /** Load the picked target's level; picking alone changes nothing. */
-  function preload() {
-    const caps = currentCaps(target.value);
-    level.set(Array.isArray(caps) ? caps : []);
-    wideWarn.classList.toggle('hidden', target.value !== GUILD_WIDE);
-    tracker.reset();
-    update();
-  }
-  target.addEventListener('change', preload);
-  level.onChange(update);
-
-  ui.onSubmit(form, async () => {
-    const t = target.value;
-    const caps = level.value();
-    if (!t || !caps.length) return; // Save is off until both are picked
-    // One target and one operation: a preset by name, Custom… as its caps.
-    const body = t === GUILD_WIDE ? { guildDefault: true } : { channelId: t };
-    const k = level.level();
-    if (k && k !== 'custom') body.level = k;
-    else body.caps = caps;
-    body.expect = loaded(t);
-    const where = t === GUILD_WIDE ? null : chanText(t, names);
-    try {
-      const r = await api('PUT', P(), body);
-      const was = banned;
-      noteBanned(r);
-      draw(r.guildPolicy);
-      tracker.reset();
-      const now = t === GUILD_WIDE ? guildEffect(r) : r.effective ? ' Effective now: ' + lib.effectNowText(r.effective, where) + '.' : '';
-      status.ok((t === GUILD_WIDE
-        ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
-        : displayName + ' → ' + capsSummary(caps) + ' in ' + where + '.') +
-        now + (was && !banned ? ' That lifted its removal from ' + guild + '.' : ''));
-      markStale(); onChange();
-    } catch (e) {
-      const ctxErr = { channelId: t === GUILD_WIDE ? null : t, names };
-      if (e.code === 'CONFLICT') return conflicted(e, 'Not saved', ctxErr);
-      status.err(notDone(e, 'Not saved', ctxErr));
-    }
-  });
-
-  draw(policy0);
-  update();
-  // Kept across "Sign in again": whose, where and what level, nothing else.
-  keepForm(ctx.drawer, 'grant', {
-    serialize: () => ({ personaId: id, target: target.value, caps: level.value() }),
-    belongs: (f) => f.personaId === id,
-    restore(f) {
-      if (f.target && Array.from(target.options).some((o) => o.value === f.target)) {
-        target.value = f.target;
-        preload();
-      }
-      if (f.caps) level.set(f.caps);
-      update();
-    },
-    isDirty: () => tracker.isDirty(),
-  }, status);
-  det.appendChild(tableBox);
-  det.appendChild(banNote);
-  det.appendChild(form);
-  return {
-    node: det,
-    setBanned(b) {
-      if (b === banned) return;
-      banned = b;
-      draw(policy);
-    },
-  };
 }
 
 // ── Invites (guild-scoped) ─────────────────────────────────────────────────────
