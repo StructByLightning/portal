@@ -714,6 +714,8 @@
     const list = el('div', { id: listId, class: 'ta-list hidden', role: 'listbox', 'aria-label': o.label || 'Suggestions' });
     const live = el('span', { class: 'visually-hidden', role: 'status' });
     const node = el('div', { class: 'typeahead' }, [el('div', { class: 'ta-box' }, [chips, input]), list, live]);
+    // A press anywhere in the list (its scrollbar too) keeps focus in the field.
+    list.addEventListener('mousedown', (e) => e.preventDefault());
     const listeners = [];
     let picked = [];
     let options = []; // the options that can be picked: { item, node }
@@ -777,8 +779,6 @@
             id: uid('ta-opt'), class: 'ta-option' + (it.disabled ? ' disabled' : ''), role: 'option', 'aria-selected': 'false',
             'aria-disabled': it.disabled ? 'true' : null, title: it.title || null,
           }, [el('span', { class: 'ta-label', text: it.label }), it.hint ? el('span', { class: 'ta-hint', text: it.hint }) : null]);
-          // A click on an option keeps focus in the field.
-          opt.addEventListener('mousedown', (e) => e.preventDefault());
           if (!it.disabled) {
             const i = options.length;
             options.push({ item: it, node: opt });

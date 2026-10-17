@@ -40,8 +40,9 @@ const now = () => (typeof performance !== 'undefined' && performance.now ? perfo
 
 // ── Data: per guild, its channels and the access summary ──────────────────
 // Cached per guild (the list and a drawer opened from it share it), asked
-// for again on window focus once older than a minute, and patched from the
-// answers to changes, so the list follows a change without a round trip.
+// for again once older than a minute (on window focus, or when the list is
+// drawn again), and patched from the answers to changes, so the list follows
+// a change without a round trip.
 
 const cache = {};    // gid → { chans, summary, at } — at 0: ask again
 const inflight = {}; // gid → the request in flight
@@ -49,7 +50,7 @@ let generation = 0;  // forget() bumps it: an answer asked for before is not kep
 
 function load(gid, force) {
   const have = cache[gid];
-  if (!force && have && have.at) return Promise.resolve(have);
+  if (!force && have && have.at && Date.now() - have.at <= REFETCH_AFTER_MS) return Promise.resolve(have);
   if (inflight[gid]) return inflight[gid];
   const g = env.gpath(gid);
   const gen = generation;
@@ -629,6 +630,12 @@ function drawDrawer(d, gid, cid, data, note) {
 
   /** What a change did, in the copy guide's words, from the relay's answer. */
   function resultText(name, next, before, ex, wasRemoved) {
+    // An answer without the channel explained (it was deleted meanwhile, or
+    // an older relay): say what was done; the rows are read again.
+    if (!ex || !Array.isArray(ex.effective)) {
+      return next == null ? 'Removed ' + name + '’s direct grant in ' + where + '.'
+        : name + ' → ' + (next.length ? lib.capsSummary(next) : 'blocked') + ' in ' + where + '.';
+    }
     const nowText = lib.effectNowText(ex, where);
     const lifted = wasRemoved && ex && !(ex.sources || []).some((s) => s.kind === 'removed') ? ' That lifted its removal from ' + guild + '.' : '';
     if (next == null) return 'Removed ' + name + '’s direct grant in ' + where + ' — ' + lib.remainingText(ex, where) + '.';
@@ -651,6 +658,7 @@ function drawDrawer(d, gid, cid, data, note) {
       const ex = r && r.effective;
       const fresh = rowFrom(pid, row || base, ex);
       if (fresh) put(fresh, refocus);
+      else await reloadRows(refocus ? pid : null);
       patchSummary(gid, cid, rows, wasRemoved && !!fresh && !(fresh.sources || []).some((s) => s.kind === 'removed'));
       env.markStale();
       return { ok: true, text: resultText(name, next, before, ex, wasRemoved), undo: { pid, name, prev: expect, next: next == null ? null : next.slice() } };
@@ -680,10 +688,12 @@ function drawDrawer(d, gid, cid, data, note) {
         const r = await enqueue(() => writeGrant(gid, u.pid, cid, u.prev, u.next), paused(u.pid));
         const fresh = rowFrom(u.pid, row || { displayName: u.name }, r && r.effective);
         if (fresh) put(fresh, false);
+        else if (d.isCurrent()) await reloadRows(null);
         patchSummary(gid, cid, rows, false);
         env.markStale();
+        const nowText = fresh ? lib.effectNowText(r.effective, where) : '';
         lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + u.name + ' in ' + where : u.name + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + where) +
-          '. Effective now: ' + lib.effectNowText(r && r.effective, where) + '.');
+          '.' + (nowText ? ' Effective now: ' + nowText + '.' : ''));
       } catch (e) {
         bad = true;
         if (e.code === 'CONFLICT') conflict = true;
