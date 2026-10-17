@@ -39,6 +39,20 @@ test('check: unknown / valid / expired / exhausted', () => {
   rmSync(path, { force: true });
 });
 
+test('a uses of false reads as 0, as it always has: a claim is allowed, and a use makes it 1', () => {
+  const path = tmpFile({ invites: [{ code: 'c', caps: ['VIEW_CHANNEL'], maxUses: 1, uses: false }] });
+  try {
+    const store = new InviteStore(path);
+    assert.ok(typeof store.check('c', NOW) !== 'string', String(store.check('c', NOW)));
+    store.consume('c');
+    assert.equal(store.check('c', NOW), 'exhausted');
+    const onDisk = JSON.parse(readFileSync(path, 'utf8')) as { invites: Array<{ uses: unknown }> };
+    assert.equal(onDisk.invites[0].uses, 1);
+  } finally {
+    rmSync(path, { force: true });
+  }
+});
+
 test('consume: bumps uses, persists, and eventually exhausts', () => {
   const path = tmpFile({ invites: [{ code: 'c', caps: ['VIEW_CHANNEL'], maxUses: 2, uses: 0 }] });
   const store = new InviteStore(path);

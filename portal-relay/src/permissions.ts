@@ -633,46 +633,53 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   VOICE_SPEAK: F.Speak,
 };
 
-/** Why a catalog role can't be read as written, or null: its guild must be
- *  named by a string, its caps must be a list of strings, a `mirrorCaps` must
- *  be a boolean, a number, null or '', and its scope must be an object naming
- *  exactly one of `all` (true), `channels`, `mirrorRoles` and `mirrorRole`,
- *  holding that kind's type. That is the shape every relay writer makes: the
- *  admin API allows exactly one scope key and a boolean `mirrorCaps`, and a
- *  mirror grant materializes one key. Every reader takes `mirrorCaps` by its
- *  truth, so a string that isn't empty reads as on whatever it says, "false"
- *  included, and so do a list and an object, which no writer means; '' reads
- *  as off, and a hand-written number reads by its truth, as one who writes 0
- *  for off and 1 for on means it. A scope whose one list names nothing, or
- *  caps that name nothing, make a role that grants nothing, which is a role
- *  still (roleGrantsAccess); a scope of {} names no kind, so it is set aside
- *  with the rest. Readers don't share one order over a
- *  scope's keys (with `mirrorCaps`, resolveForRoles reads the mirror keys
- *  before `all`), so a scope with two keys reads one way in one place and
- *  another way in the next. Read as found, a scope that is null or not an
- *  object throws whenever a persona holding the role is resolved, caps of a
- *  number throw where the role reaches, a caps string is read a character at
- *  a time, and channels as a string match channel ids as substrings. */
+/** Why a catalog role can't be read as written, or null. A role is set aside
+ *  only where its readers would misread it or throw: its guild must be a
+ *  string (loading sets aside one with no guild, '' included, before asking
+ *  here), its caps a list of strings or '', a `mirrorCaps` a boolean, a
+ *  number, null or '', and its scope an object naming at most one of `all`,
+ *  `channels`, `mirrorRoles` and `mirrorRole`, holding that kind's type, with
+ *  `all` true or off (false, 0, '' or null). Every relay writer makes one
+ *  scope key, `all` true and a list of caps, and a `mirrorCaps` only as a
+ *  boolean on a mirror scope: the admin API allows no other, and a mirror
+ *  grant materializes one key and no `mirrorCaps`.
+ *  Every reader takes `mirrorCaps` by its truth, so a string that isn't empty
+ *  reads as on whatever it says, "false" included, and so do a list and an
+ *  object, which no writer means; '' reads as off, and a hand-written number
+ *  reads by its truth, as one who writes 0 for off and 1 for on means it.
+ *  A role that names nothing grants nothing in every reader, and main has it
+ *  as a role still (roleGrantsAccess): a scope of {}, an `all` that is off, a
+ *  list that names nothing, and caps that are an empty list or ''.
+ *  couldAccessGuild takes `all` by its truth where every
+ *  other reader wants true, so an `all` of 1 or "yes" reads two ways, and
+ *  readers don't share one order over a scope's keys (with `mirrorCaps`,
+ *  resolveForRoles reads the mirror keys before `all`), so a scope with two
+ *  keys reads one way in one place and another way in the next. Read as
+ *  found, a scope that is null or not an object throws whenever a persona
+ *  holding the role is resolved, caps of a number throw where the role
+ *  reaches, a caps string with something in it is read a character at a
+ *  time, and channels as a string match channel ids as substrings. */
 export function roleShapeProblem(role: AccessRole): string | null {
   const r = role as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
   if (typeof r.guildId !== 'string') return 'guildId must be a string';
-  if (!strings(r.caps)) return 'caps must be a list of capability names';
+  if (!strings(r.caps) && r.caps !== '') return 'caps must be a list of capability names';
   if (r.mirrorCaps != null && r.mirrorCaps !== '' && typeof r.mirrorCaps !== 'boolean' && typeof r.mirrorCaps !== 'number') {
     return `mirrorCaps must be true or false, not ${typeof r.mirrorCaps === 'string' ? 'a string, which reads as on whatever it says' : 'a list or an object, which reads as on'}`;
   }
   const sc = r.scope;
   if (!sc || typeof sc !== 'object' || Array.isArray(sc)) return 'scope must be an object';
   const kinds: Record<string, (v: unknown) => boolean> = {
-    all: (v) => v === true,
+    all: (v) => v === true || !v,
     channels: strings,
     mirrorRoles: strings,
     mirrorRole: (v) => typeof v === 'string',
   };
   const keys = Object.keys(sc);
+  if (keys.length === 0) return null;
   // Own keys only: a scope key named like an Object method (constructor,
   // __proto__) is no kind.
-  if (keys.length !== 1 || !Object.hasOwn(kinds, keys[0]!)) return 'scope must name exactly one of all, channels, mirrorRoles and mirrorRole';
+  if (keys.length !== 1 || !Object.hasOwn(kinds, keys[0]!)) return 'scope may name only one of all, channels, mirrorRoles and mirrorRole';
   return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
 }
 

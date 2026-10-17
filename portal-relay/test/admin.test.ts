@@ -2665,7 +2665,11 @@ function editPermissions(ctx: ReturnType<typeof setupDeps>, edit: (file: any) =>
 test('role catalog: a name set aside at load is in use: refused unless replaced in its own guild, with the entry as the audit\'s before', async () => {
   const ctx = setupDeps(['admin1']);
   const twoKeys = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
-  editPermissions(ctx, (f) => { f.roles['two-keys'] = twoKeys; f.roles['no-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true } }; });
+  editPermissions(ctx, (f) => {
+    f.roles['two-keys'] = twoKeys;
+    f.roles['no-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true } };
+    f.roles['empty-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: '' };
+  });
   const s = await signedIn(ctx, []);
   const post = (body: unknown) => s.call('POST', '/admin/roles', body);
   try {
@@ -2686,6 +2690,10 @@ test('role catalog: a name set aside at load is in use: refused unless replaced 
     // An entry that names no guild has none to keep, so replace is enough.
     const noGuild = await post({ name: 'no-guild', role: { caps: READ, scope: { all: true }, guildId: 'G1' }, replace: true });
     assert.equal(noGuild.status, 200, JSON.stringify(noGuild.body));
+    // Nor does one whose guild is '', which names none.
+    assert.equal(ctx.permissions.isQuarantined('empty-guild'), true);
+    const emptyGuild = await post({ name: 'empty-guild', role: { caps: READ, scope: { all: true }, guildId: 'G1' }, replace: true });
+    assert.equal(emptyGuild.status, 200, JSON.stringify(emptyGuild.body));
   } finally {
     await s.close();
   }
