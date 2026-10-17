@@ -115,6 +115,10 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['mode-typo', { mode: 'augmnet' }, 'invite mode must be "mint", "augment" or "both"'],
     ['roles-string', { roles: 'r' }, 'invite roles must be a list of access role names'],
     ['roles-mixed', { roles: ['r', 7] }, 'invite roles must be a list of access role names'],
+    // '' in roles threw on main; in uses it grew as text; in a count it exhausted the invite.
+    ['roles-blank', { roles: '' }, 'invite roles must be a list of access role names'],
+    ['uses-blank', { uses: '' }, 'invite uses must be a number'],
+    ['count-blank', { maxUses: '' }, 'invite maxUses must be a number above 0'],
     ['subs-mixed', { subscriptions: ['c1', 5] }, 'invite subscriptions must be a list of channel ids'],
     ['caps-number', { roles: undefined, caps: 5 }, 'invite caps must be a list of capabilities'],
     ['caps-text', { roles: undefined, caps: 'VIEW_CHANNEL' }, 'invite caps must be a list of capabilities'],
@@ -131,6 +135,8 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['plain', {}],
     ['nulls', { mintedBy: null, namePrefix: null, mode: null, subscriptions: null, uses: null, expiresAt: null }],
     ['expiry-empty', { expiresAt: '' }],
+    // Their readers have always read '' as none.
+    ['blanks', { mode: '', caps: '', subscriptions: '' }],
     ['expiry-false', { expiresAt: false }],
     ['expiry-date', { expiresAt: '2099-01-01T00:00:00.000Z' }],
     ['roles-null', { roles: null, grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } }],

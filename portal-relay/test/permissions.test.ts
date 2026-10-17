@@ -387,6 +387,12 @@ const MALFORMED_ROLES: Array<[string, unknown]> = [
   ['two-kinds', { caps: ['SEND_MESSAGES'], scope: { all: true, mirrorRoles: ['r1'] }, guildId: 'g1' }],
   ['both-mirror-keys', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1', mirrorRoles: ['r1'] }, guildId: 'g1' }],
   ['unknown-kind', { caps: ['SEND_MESSAGES'], scope: { everywhere: true }, guildId: 'g1' }],
+  // Names an object inherits are no kind of scope.
+  ['scope-constructor', { caps: ['SEND_MESSAGES'], scope: { constructor: true }, guildId: 'g1' }],
+  ['scope-tostring', { caps: ['SEND_MESSAGES'], scope: { toString: true }, guildId: 'g1' }],
+  ['scope-proto', { caps: ['SEND_MESSAGES'], scope: { ['__proto__']: true }, guildId: 'g1' }],
+  // Every reader takes a string mirrorCaps as on, "false" included.
+  ['mirrorcaps-string', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1' }, mirrorCaps: 'false', guildId: 'g1' }],
 ];
 for (const [name, role] of MALFORMED_ROLES) {
   test(`role ${name}: quarantined at load, inert, warned about and kept on disk`, (t) => {
@@ -428,6 +434,36 @@ test('each kind of scope, and mirrorCaps of 0, load and resolve as they always h
   assert.deepEqual(sorted(store.resolve('q', 'g1', 'c1')), ['ADD_REACTIONS', 'READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL']);
   for (const name of ['everywhere', 'listed', 'several', 'zero']) assert.notEqual(store.getRole(name), undefined, name);
   rmSync(path, { force: true });
+});
+
+test('mirrorCaps of true, false, null and 0 load as they always have', () => {
+  const path = tmpFile({
+    roles: Object.fromEntries([['on', true], ['off', false], ['nulled', null], ['zero', 0]].map(([name, mc]) =>
+      [name, { caps: ['READ_HISTORY'], scope: { mirrorRole: 'r1' }, mirrorCaps: mc, guildId: 'g1' }])),
+    personas: {},
+  } as any);
+  try {
+    const store = new PermissionsStore(path);
+    for (const name of ['on', 'off', 'nulled', 'zero']) assert.notEqual(store.getRole(name), undefined, name);
+  } finally {
+    rmSync(path, { force: true });
+  }
+});
+
+test('a role named __proto__ set aside at load is kept on disk through a save, and removeRole removes it', () => {
+  const path = tmpFile({ roles: { ['__proto__']: { caps: 5, scope: { all: true }, guildId: 'g1' } }, personas: {} } as any);
+  try {
+    const store = new PermissionsStore(path);
+    assert.equal(store.isQuarantined('__proto__'), true);
+    store.setRole('another', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' });
+    const saved = JSON.parse(readFileSync(path, 'utf8')) as { roles: Record<string, unknown> };
+    assert.ok(Object.hasOwn(saved.roles, '__proto__'), JSON.stringify(saved.roles));
+    assert.equal(store.removeRole('__proto__'), true);
+    const after = JSON.parse(readFileSync(path, 'utf8')) as { roles: Record<string, unknown> };
+    assert.ok(!Object.hasOwn(after.roles, '__proto__'), JSON.stringify(after.roles));
+  } finally {
+    rmSync(path, { force: true });
+  }
 });
 
 test('a role written under a quarantined name replaces it, so removing that role later leaves nothing on disk', () => {
@@ -483,6 +519,8 @@ test('setRole refuses a role a reader could not read, as loading quarantines one
   assert.throws(() => store.setRole('bad', { caps: 5, scope: { all: true }, guildId: 'g1' } as never), /can't be read: caps must be a list/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope must name exactly one/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 7 } as never), /can't be read: guildId must be a string/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { constructor: true }, guildId: 'g1' } as never), /can't be read: scope must name exactly one/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' }, mirrorCaps: 'false', guildId: 'g1' } as never), /can't be read: mirrorCaps must be true or false/);
   assert.equal(store.getRole('bad'), undefined);
   rmSync(path, { force: true });
 });

@@ -42,11 +42,22 @@ export function grantShapeProblem(inv: InviteTemplate): string | null {
   return ok ? null : 'invite grant scope is malformed';
 }
 
+const isMode = (v: unknown) => v === 'mint' || v === 'augment' || v === 'both';
+const MODE_RULE = 'must be "mint", "augment" or "both"';
+
+/** Why an invite's mode can't be read, or null. None (absent, null or '')
+ *  reads as "mint", as it always has. */
+export function inviteModeProblem(inv: InviteTemplate): string | null {
+  const m = (inv as { mode?: unknown }).mode;
+  return m === undefined || m === null || m === '' || isMode(m) ? null : `invite mode ${MODE_RULE}`;
+}
+
 /**
  * Why an invite can't be claimed as written, or null: a field a claim reads
  * holds a value outside its declared type, or the grant can't be applied
- * (grantShapeProblem). Every relay writer builds these fields from checked
- * values, so a hand edit is what reaches them. Read as found, `roles` as a
+ * (grantShapeProblem). Every relay writer but scripts/mint-invite.mjs, whose
+ * flags aren't checked (#62), builds these fields from checked values, so a
+ * hand edit is what reaches them. Read as found, `roles` as a
  * string throws mid-enroll, a numeric `guildId` or a `caps` that isn't a list
  * grants nothing and spends the invite, a misspelled `mode` mints, and a
  * non-numeric count never exhausts.
@@ -54,23 +65,29 @@ export function grantShapeProblem(inv: InviteTemplate): string | null {
  * consumed, the admin mint route refuses to store one, and loading warns,
  * naming an expiry that isn't a date too.
  * `null` reads as absent, as it always has, except in `maxUses`: a null count
- * has always exhausted the invite, so it is refused rather than opened.
+ * has always exhausted the invite, so it is refused rather than opened. So
+ * does '' in `mode`, `caps` and `subscriptions`, which their readers have
+ * always read as none; in `roles`, `uses` and `maxUses` it threw, grew as
+ * text or exhausted the invite, so it is refused.
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
-  const checks: Array<[string, (v: unknown) => boolean, string]> = [
+  // [field, rule, why, whether '' reads as none]
+  const checks: Array<[string, (v: unknown) => boolean, string, boolean?]> = [
     ['guildId', (v) => typeof v === 'string', 'must be a string'],
     ['mintedBy', (v) => typeof v === 'string', 'must be a string'],
     ['namePrefix', (v) => typeof v === 'string', 'must be a string'],
-    ['mode', (v) => v === 'mint' || v === 'augment' || v === 'both', 'must be "mint", "augment" or "both"'],
-    ['caps', strings, 'must be a list of capabilities'],
+    ['mode', isMode, MODE_RULE, true],
+    ['caps', strings, 'must be a list of capabilities', true],
     ['roles', strings, 'must be a list of access role names'],
-    ['subscriptions', strings, 'must be a list of channel ids'],
+    ['subscriptions', strings, 'must be a list of channel ids', true],
     ['uses', (v) => typeof v === 'number', 'must be a number'],
   ];
-  for (const [field, ok, why] of checks) {
-    if (f[field] !== undefined && f[field] !== null && !ok(f[field])) return `invite ${field} ${why}`;
+  for (const [field, ok, why, blankIsNone] of checks) {
+    const v = f[field];
+    if (v === undefined || v === null || (blankIsNone && v === '')) continue;
+    if (!ok(v)) return `invite ${field} ${why}`;
   }
   if (f.maxUses !== undefined && !(typeof f.maxUses === 'number' && f.maxUses > 0)) {
     return 'invite maxUses must be a number above 0';
@@ -85,7 +102,8 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
 /** When an invite expires, in ms since the epoch, or undefined for never.
  *  Only a string names an expiry: absent, null, '' and false read as none, as
  *  they always have, and any other value can't be read as a time, so it
- *  counts as long expired (NaN). `Date.parse` would read a number as a date
+ *  counts as long expired (NaN). That includes 0, which the relay used to
+ *  read as none. `Date.parse` would read a number as a date
  *  string: 2030 as 2030-01-01, 99999 as the year 99999. */
 function expiryOf(inv: InviteTemplate): number | undefined {
   const at = (inv as { expiresAt?: unknown }).expiresAt;

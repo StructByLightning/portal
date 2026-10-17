@@ -77,8 +77,8 @@ export class PermissionsStore {
   /** Catalog entries refused at load (no guildId / malformed): excluded from
    *  resolution but written back verbatim on persist — quarantine, not
    *  deletion. setRole of the same name replaces one, and removeRole removes
-   *  one. */
-  private quarantinedRoles: Record<string, unknown> = {};
+   *  one. Without a prototype, so a role named `__proto__` is kept as one. */
+  private quarantinedRoles: Record<string, unknown> = Object.create(null);
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
   private file?: WatchedFile;
@@ -282,6 +282,17 @@ export class PermissionsStore {
    *  inert until it's fixed. */
   isQuarantined(name: string): boolean {
     return Object.hasOwn(this.quarantinedRoles, name);
+  }
+
+  /** A quarantined entry as it is on disk (cloned), or undefined. */
+  quarantinedEntry(name: string): unknown {
+    return this.isQuarantined(name) ? structuredClone(this.quarantinedRoles[name]) : undefined;
+  }
+
+  /** The guild a quarantined entry names, when it names one as a string. */
+  quarantinedGuildId(name: string): string | undefined {
+    const e = this.isQuarantined(name) ? (this.quarantinedRoles[name] as { guildId?: unknown } | null) : undefined;
+    return typeof e?.guildId === 'string' && e.guildId ? e.guildId : undefined;
   }
 
   /** The full access-role catalog (read-only snapshot) — admin panel pickers. */
@@ -532,7 +543,7 @@ export class PermissionsStore {
     // fleet-wide. Loud, because a catalog entry silently granting nothing is
     // a debugging trap. Quarantined — not dropped — so the next persist()
     // doesn't destroy config the operator intends to repair.
-    this.quarantinedRoles = {};
+    this.quarantinedRoles = Object.create(null);
     this.roles = new Map(
       Object.entries(next.roles ?? {}).filter(([name, role]) => {
         if (!role || !role.guildId) {
@@ -622,11 +633,15 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
 };
 
 /** Why a catalog role can't be read as written, or null: its guild must be
- *  named by a string, its caps must be a list of strings, and its scope an
- *  object naming exactly one of `all` (true), `channels`, `mirrorRoles` and
- *  `mirrorRole`, holding that kind's type. That is the shape every relay
- *  writer makes: the admin API allows exactly one scope key, and a mirror
- *  grant materializes one. Readers don't share one order over a scope's keys
+ *  named by a string, its caps must be a list of strings, a `mirrorCaps` must
+ *  not be a string, and its scope must be an object naming exactly one of
+ *  `all` (true), `channels`, `mirrorRoles` and `mirrorRole`, holding that
+ *  kind's type. That is the shape every relay writer makes: the admin API
+ *  allows exactly one scope key and a boolean `mirrorCaps`, and a mirror grant
+ *  materializes one key. Every reader takes `mirrorCaps` by its truth, so a
+ *  string reads as on whatever it says, "false" included. A scope or caps that
+ *  name nothing make a role that grants nothing, which is a role still
+ *  (roleGrantsAccess). Readers don't share one order over a scope's keys
  *  (with `mirrorCaps`, resolveForRoles reads the mirror keys before `all`),
  *  so a scope with two keys reads one way in one place and another way in
  *  the next. Read as found, a scope that is null or not an object throws
@@ -638,6 +653,7 @@ export function roleShapeProblem(role: AccessRole): string | null {
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
   if (typeof r.guildId !== 'string') return 'guildId must be a string';
   if (!strings(r.caps)) return 'caps must be a list of capability names';
+  if (typeof r.mirrorCaps === 'string') return 'mirrorCaps must be true or false, not a string, which reads as on whatever it says';
   const sc = r.scope;
   if (!sc || typeof sc !== 'object' || Array.isArray(sc)) return 'scope must be an object';
   const kinds: Record<string, (v: unknown) => boolean> = {
@@ -647,7 +663,9 @@ export function roleShapeProblem(role: AccessRole): string | null {
     mirrorRole: (v) => typeof v === 'string',
   };
   const keys = Object.keys(sc);
-  if (keys.length !== 1 || !(keys[0]! in kinds)) return 'scope must name exactly one of all, channels, mirrorRoles and mirrorRole';
+  // Own keys only: a scope key named like an Object method (constructor,
+  // __proto__) is no kind.
+  if (keys.length !== 1 || !Object.hasOwn(kinds, keys[0]!)) return 'scope must name exactly one of all, channels, mirrorRoles and mirrorRole';
   return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
 }
 

@@ -1090,7 +1090,11 @@ export class AdminServer {
    *  may use any catalog role. Returns an error string, or null if allowed. */
   private roleAssignError(session: AdminSession, guildId: string, name: string): string | null {
     const role = this.deps.permissions.getRole(name);
-    if (!role) return `unknown role ${name}`;
+    if (!role) {
+      return this.deps.permissions.isQuarantined(name)
+        ? `role ${name} can't be read (it was set aside when the relay loaded it), so the relay's operator must fix it first`
+        : `unknown role ${name}`;
+    }
     if (session.isSuper) return null;
     if (role.guildId !== guildId) return `role ${name} is not bound to this guild`;
     return null;
@@ -1098,6 +1102,15 @@ export class AdminServer {
 
   private mintInvite(res: ServerResponse, session: AdminSession, guildId: string, body: any): void {
     if (!this.deps.invites) return sendJson(res, 400, err('DISABLED', 'invites not enabled'));
+    // A field the caller gave goes into the invite as sent, so a wrong type is
+    // refused by name rather than dropped: a count sent as "5" would otherwise
+    // be stored as unlimited, a misspelled mode as mint-only, roles that
+    // aren't a list as none, and an expiry that isn't a number of days as
+    // never. Absent, null and '' mean not given, as they always have.
+    const given = (v: unknown) => v !== undefined && v !== null && v !== '';
+    if (given(body?.roles) && !Array.isArray(body.roles)) {
+      return sendJson(res, 400, err('INVALID', 'roles must be a list of access role names'));
+    }
     const roles: string[] = Array.isArray(body?.roles) ? body.roles : [];
     // The grant is REBUILT from validated fields, never stored as sent: what an
     // invite confers is applied at enroll/claim time, so anything a caller
@@ -1118,15 +1131,16 @@ export class AdminServer {
       const e = this.roleAssignError(session, guildId, r);
       if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     }
-    // A field the caller gave goes into the invite as sent, so a wrong type is
-    // refused by name below rather than dropped: a count sent as "5" would
-    // otherwise be stored as unlimited, and a misspelled mode as mint-only.
-    // Absent, null and '' mean not given, as they always have.
-    const given = (v: unknown) => v !== undefined && v !== null && v !== '';
-    const expiresAt =
-      typeof body?.expiresInDays === 'number' && body.expiresInDays > 0
-        ? new Date(this.nowMs() + body.expiresInDays * 86_400_000).toISOString()
-        : undefined;
+    let expiresAt: string | undefined;
+    if (given(body?.expiresInDays)) {
+      const days = body.expiresInDays;
+      if (typeof days !== 'number' || !(days > 0)) {
+        return sendJson(res, 400, err('INVALID', 'expiresInDays must be a number of days above 0, or left out for an invite that never expires'));
+      }
+      const at = new Date(this.nowMs() + days * 86_400_000);
+      if (Number.isNaN(at.getTime())) return sendJson(res, 400, err('INVALID', 'expiresInDays is too far ahead to be a date'));
+      expiresAt = at.toISOString();
+    }
     const template: any = {
       code: this.deps.newInviteCode(),
       label: typeof body?.label === 'string' ? body.label : 'invite',
@@ -1186,8 +1200,13 @@ export class AdminServer {
 
   private revokeRole(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, role: string): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
-    // A guild-admin may only revoke roles bound to their guild (super: any).
-    const e = this.roleAssignError(session, guildId, role);
+    // A guild-admin may only revoke roles bound to their guild (super: any). A
+    // role set aside at load is still held by name, so it can be revoked too,
+    // by an admin of the guild its entry names.
+    const setAside = !this.deps.permissions.getRole(role) && this.deps.permissions.isQuarantined(role);
+    const e = setAside
+      ? (session.isSuper || this.deps.permissions.quarantinedGuildId(role) === guildId ? null : `role ${role} is not bound to this guild`)
+      : this.roleAssignError(session, guildId, role);
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     const roles = this.deps.permissions.removePersonaRole(personaId, role);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.revoke', target: personaId, guildId, ok: true, before: { role } });
@@ -1501,7 +1520,9 @@ export class AdminServer {
     // request says replace AND names the guild the existing role belongs to,
     // so a role of another guild (and every holder's access) can't be
     // rewritten by typing its name. Replacing never moves a role to another
-    // guild. The role is rebuilt from validated fields, never stored as sent.
+    // guild. A name set aside at load is in use too; replacing one whose entry
+    // names no guild as a string needs only replace. The role is rebuilt from
+    // validated fields, never stored as sent.
     if (method === 'POST' && path === '/admin/roles') {
       const body = await readJson(req);
       const name = body?.name;
@@ -1512,13 +1533,20 @@ export class AdminServer {
       if (typeof role.guildId !== 'string' || !role.guildId) {
         return sendJson(res, 400, err('INVALID', 'roles are guild-scoped: role.guildId required'));
       }
-      const existing = this.deps.permissions.getRole(name);
-      if (existing) {
+      const live = this.deps.permissions.getRole(name);
+      // A name set aside at load is taken too: its entry is on disk for the
+      // relay's operator to repair, and its holders hold it by name.
+      const setAside = !live && this.deps.permissions.isQuarantined(name);
+      const existing: unknown = live ?? (setAside ? this.deps.permissions.quarantinedEntry(name) : undefined);
+      if (live || setAside) {
+        const existingGuild = live ? live.guildId : this.deps.permissions.quarantinedGuildId(name);
         if (body.replace !== true) {
-          return sendJson(res, 409, err('EXISTS', `an access role named ${name} already exists`, { existing: { guildId: existing.guildId } }));
+          return sendJson(res, 409, err('EXISTS', `an access role named ${name} already exists${setAside ? ", set aside at load because it can't be read" : ''}`,
+            { existing: { guildId: existingGuild, ...(setAside ? { setAside: true } : {}) } }));
         }
-        if (body.expectedGuildId !== existing.guildId || role.guildId !== existing.guildId) {
-          return sendJson(res, 409, err('GUILD_MISMATCH', `access role ${name} belongs to another guild`, { existing: { guildId: existing.guildId } }));
+        // An entry naming no guild that can be read has none to keep.
+        if (existingGuild !== undefined && (body.expectedGuildId !== existingGuild || role.guildId !== existingGuild)) {
+          return sendJson(res, 409, err('GUILD_MISMATCH', `access role ${name} belongs to another guild`, { existing: { guildId: existingGuild } }));
         }
       } else if (!ROLE_NAME.test(name)) {
         return sendJson(res, 400, err('INVALID_NAME', 'a new access role name is 1–64 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit'));
@@ -1526,7 +1554,7 @@ export class AdminServer {
       const checked = this.checkRoleDef(role);
       if ('error' in checked) return sendJson(res, 400, checked);
       this.deps.permissions.setRole(name, checked);
-      this.audit.append({ actor: this.actorOf(session), action: 'role.set', target: name, ok: true, ...(existing ? { before: existing } : {}), after: checked });
+      this.audit.append({ actor: this.actorOf(session), action: 'role.set', target: name, ok: true, ...(live || setAside ? { before: existing } : {}), after: checked });
       return sendJson(res, 200, { ok: true, catalog: this.deps.permissions.allRoles() });
     }
     const del = /^\/admin\/roles\/([^/]+)$/.exec(path);

@@ -457,15 +457,43 @@ for (const [code, fields, why] of MALFORMED_FIELDS) {
   });
 }
 
-test('a misspelled mode is refused at enroll by name; a claim refuses it first as not claimable, as it always has', async () => {
+test('a misspelled mode is refused by name, at enroll and at a claim, since "mint-only" would be false for it', async () => {
   const t = makeRelay();
   try {
     t.relay.invites.mint({ code: 'mode-typo', mode: 'augmnet', guildId: GUILD, grant: MIRROR_GRANT } as any);
     const count = t.relay.identity.all().length;
     const enrolled = await outcome(() => t.relay.enroll({ invite: 'mode-typo', desiredName: 'n-typo' }));
-    assert.ok(/invite mode must be "mint", "augment" or "both"/.test(enrolled?.error ?? ''), JSON.stringify(enrolled));
-    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mode-typo'), /not claimable/);
+    const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'mode-typo'));
+    const why = /^invite mode must be "mint", "augment" or "both" — it must be re-minted$/;
+    assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ enrolled, claimed }));
     assert.equal(t.relay.identity.all().length, count, 'no persona created');
+    assert.equal(t.relay.invites.get('mode-typo').uses ?? 0, 0, 'no use spent');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a claim of a mint invite is still not claimable, with nothing more said about it', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'mint-only', mode: 'mint', guildId: GUILD, grant: MIRROR_GRANT, uses: 'x' } as any);
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mint-only'), /invite is not claimable \(mint-only\)$/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("an invite whose mode, caps and subscriptions are '' reads them as none, at enroll and at a claim", async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'blank-mint', mode: '', caps: '', subscriptions: '', guildId: GUILD, grant: MIRROR_GRANT } as any);
+    t.relay.invites.mint({ code: 'blank-both', mode: 'both', caps: '', subscriptions: '', guildId: GUILD, grant: MIRROR_GRANT } as any);
+    const enrolled = await outcome(() => t.relay.enroll({ invite: 'blank-mint', desiredName: 'n-blank' }));
+    assert.ok(enrolled?.personaId, JSON.stringify(enrolled));
+    // '' mode reads as mint, so a claim of it is as a mint invite's.
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'blank-mint'), /not claimable \(mint-only\)/);
+    const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'blank-both'));
+    assert.ok(!claimed?.threw, JSON.stringify(claimed));
   } finally {
     t.cleanup();
   }
@@ -558,6 +586,10 @@ test('an invite naming a role quarantined at load is refused as unreadable, for 
     assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ enrolled, claimed }));
     assert.equal(t.relay.identity.all().length, count, 'no persona created');
     assert.equal(t.relay.invites.get('names-broken').uses ?? 0, 0, 'no use spent');
+    // With a role that's gone as well, both are named, each with who fixes it.
+    t.relay.invites.mint({ code: 'names-both', mode: 'both', guildId: GUILD, roles: ['broken', 'gone'] } as any);
+    const both = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'names-both'));
+    assert.equal(both?.threw, "invite names access role(s) that can't be read: broken, which the relay's operator must fix, and that no longer exist: gone, so it must be re-minted");
   } finally {
     t.cleanup();
   }

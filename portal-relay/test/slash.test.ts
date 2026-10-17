@@ -4,7 +4,7 @@
 // (channel-access for remove/caps, guild-access for ban/resync/remove-role).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Capability } from '@animalabs/portal-protocol';
@@ -163,6 +163,30 @@ test('/add-role and /remove-role mutate the persona role list', () => {
 
     assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'guild-role' })), /doesn’t hold/);
     assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'nope' })), /No such access role/);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("roles set aside at load: /invite and add-role say they can't be read, and removing one keeps to the guild its entry names", () => {
+  const t = makeHandler();
+  try {
+    const path = (t.permissions as any).path as string;
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    file.roles['aside-here'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: GUILD };
+    file.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: 'g2' };
+    file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2'] };
+    writeFileSync(path, JSON.stringify(file));
+    (t.permissions as any).reload();
+    const unreadable = /Access role `aside-here` can't be read \(set aside when the relay loaded it\), so the relay's operator must fix it first\./;
+    assert.match(t.handler.handle(t.inv('invite', { role: 'aside-here' })), unreadable);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'ash-1', role: 'aside-here' })), unreadable);
+    const both = t.handler.handle(t.inv('invite', { role: 'nope', role2: 'aside-here' }));
+    assert.match(both, /No such access role: `nope`\./);
+    assert.match(both, unreadable);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-g2' })), /scoped to another guild/);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-here' })), /Removed `aside-here`/);
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2']);
   } finally {
     t.cleanup();
   }

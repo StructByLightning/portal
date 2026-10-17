@@ -2586,18 +2586,28 @@ test('persona rows: a guild-wide deny is flagged, and so are direct grants here 
   }
 });
 
-const MINT_REFUSED: Array<Record<string, unknown>> = [
-  { roles: ['r-g1'], maxUses: -1 },
-  { roles: ['r-g1'], maxUses: 0 },
-  { roles: ['r-g1'], subscriptions: [5] },
+const MINT_GRANT = { caps: ['VIEW_CHANNEL'], scope: { all: true } };
+// [the body, the field its refusal names]
+const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
+  [{ roles: ['r-g1'], maxUses: -1 }, 'maxUses'],
+  [{ roles: ['r-g1'], maxUses: 0 }, 'maxUses'],
+  [{ roles: ['r-g1'], subscriptions: [5] }, 'subscriptions'],
   // A field of the wrong type is refused by name, not dropped: dropped, "5" was stored as unlimited.
-  { roles: ['r-g1'], maxUses: '5' },
-  { roles: ['r-g1'], maxUses: true },
-  { roles: ['r-g1'], subscriptions: 'c1' },
-  { roles: ['r-g1'], mode: 'augmnet' },
+  [{ roles: ['r-g1'], maxUses: '5' }, 'maxUses'],
+  [{ roles: ['r-g1'], maxUses: true }, 'maxUses'],
+  [{ roles: ['r-g1'], subscriptions: 'c1' }, 'subscriptions'],
+  [{ roles: ['r-g1'], mode: 'augmnet' }, 'mode'],
+  // Dropped, roles that weren't a list left the grant alone, and an expiry that wasn't a number of days never expired.
+  [{ roles: 'r-g1', grant: MINT_GRANT }, 'roles'],
+  [{ roles: ['r-g1'], expiresInDays: '7' }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: 0 }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: -1 }, 'expiresInDays'],
+  [{ roles: ['r-g1'], expiresInDays: true }, 'expiresInDays'],
+  // Past a date's range, which threw a 500.
+  [{ roles: ['r-g1'], expiresInDays: 1e12 }, 'expiresInDays'],
 ];
-for (const body of MINT_REFUSED) {
-  test(`invites: a mint of ${JSON.stringify(body)}, which a claim would refuse, is refused and stores nothing`, async () => {
+for (const [body, field] of MINT_REFUSED) {
+  test(`invites: a mint of ${JSON.stringify(body)}, which a claim would refuse, is refused by name and stores nothing`, async () => {
     const ctx = setupDeps([]);
     const s = await signedIn(ctx);
     try {
@@ -2605,6 +2615,7 @@ for (const body of MINT_REFUSED) {
       const r = await s.call('POST', '/admin/g/G1/invites', body);
       assert.equal(r.status, 400, JSON.stringify(r.body));
       assert.equal(r.body.error.code, 'INVALID', JSON.stringify(r.body));
+      assert.ok(new RegExp(`\\b${field}\\b`).test(r.body.error.message), `names ${field}: ${JSON.stringify(r.body)}`);
       assert.deepEqual(storeBytes(ctx.dir), before, 'nothing stored, nothing audited');
     } finally {
       await s.close();
@@ -2619,6 +2630,84 @@ test('invites: a mint with a fractional count is stored, as it reads', async () 
     const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], maxUses: 2.5 });
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(ctx.invites.get(r.body.code)?.maxUses, 2.5, JSON.stringify(ctx.invites.get(r.body.code)));
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint with expiresInDays expires that many days on, and one with it null or empty never expires', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const week = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], expiresInDays: 7 });
+    assert.equal(week.status, 200, JSON.stringify(week.body));
+    const at = Date.parse(ctx.invites.get(week.body.code)?.expiresAt ?? '');
+    assert.ok(Math.abs(at - (Date.now() + 7 * 86_400_000)) < 60_000, `expires at ${new Date(at).toISOString()}`);
+    for (const expiresInDays of [null, '']) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], expiresInDays });
+      assert.equal(r.status, 200, `${JSON.stringify(expiresInDays)}: ${JSON.stringify(r.body)}`);
+      assert.equal(ctx.invites.get(r.body.code)?.expiresAt, undefined, JSON.stringify(expiresInDays));
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+/** Hand-edits permissions.json and reloads it, as an operator's edit and a restart would. */
+function editPermissions(ctx: ReturnType<typeof setupDeps>, edit: (file: any) => void): void {
+  const path = (ctx.permissions as any).path as string;
+  const file = JSON.parse(readFileSync(path, 'utf8'));
+  edit(file);
+  writeFileSync(path, JSON.stringify(file));
+  (ctx.permissions as any).reload();
+}
+
+test('role catalog: a name set aside at load is in use: refused unless replaced in its own guild, with the entry as the audit\'s before', async () => {
+  const ctx = setupDeps(['admin1']);
+  const twoKeys = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+  editPermissions(ctx, (f) => { f.roles['two-keys'] = twoKeys; f.roles['no-guild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true } }; });
+  const s = await signedIn(ctx, []);
+  const post = (body: unknown) => s.call('POST', '/admin/roles', body);
+  try {
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), true);
+    const taken = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G2' } });
+    assert.equal(taken.status, 409, JSON.stringify(taken.body));
+    assert.equal(taken.body.error.code, 'EXISTS');
+    assert.deepEqual(taken.body.error.existing, { guildId: 'G1', setAside: true });
+    const otherGuild = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G2' }, replace: true, expectedGuildId: 'G2' });
+    assert.equal(otherGuild.body.error?.code, 'GUILD_MISMATCH', JSON.stringify(otherGuild.body));
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), true, 'still set aside');
+    const repaired = await post({ name: 'two-keys', role: { caps: WRITE, scope: { all: true }, guildId: 'G1' }, replace: true, expectedGuildId: 'G1' });
+    assert.equal(repaired.status, 200, JSON.stringify(repaired.body));
+    assert.equal(ctx.permissions.isQuarantined('two-keys'), false);
+    const rec = ctx.deps.audit.read({ limit: 1 })[0];
+    assert.equal(rec.action, 'role.set');
+    assert.deepEqual(rec.before, twoKeys);
+    // An entry that names no guild has none to keep, so replace is enough.
+    const noGuild = await post({ name: 'no-guild', role: { caps: READ, scope: { all: true }, guildId: 'G1' }, replace: true });
+    assert.equal(noGuild.status, 200, JSON.stringify(noGuild.body));
+  } finally {
+    await s.close();
+  }
+});
+
+test('a role set aside at load can be revoked from a persona by an admin of the guild its entry names, and is assigned by nobody', async () => {
+  const ctx = setupDeps([]);
+  editPermissions(ctx, (f) => {
+    f.roles['aside-g1'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G1' };
+    f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+    f.personas.p1.roles = ['aside-g1', 'aside-g2'];
+  });
+  const s = await signedIn(ctx);
+  try {
+    const assign = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'aside-g1' });
+    assert.equal(assign.status, 403, JSON.stringify(assign.body));
+    assert.match(assign.body.error.message, /role aside-g1 can't be read .*the relay's operator must fix it first/);
+    const foreign = await s.call('DELETE', '/admin/g/G1/personas/p1/roles/aside-g2');
+    assert.equal(foreign.status, 403, JSON.stringify(foreign.body));
+    const own = await s.call('DELETE', '/admin/g/G1/personas/p1/roles/aside-g1');
+    assert.equal(own.status, 200, JSON.stringify(own.body));
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), ['aside-g2']);
   } finally {
     await s.close();
   }

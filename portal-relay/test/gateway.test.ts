@@ -383,7 +383,7 @@ test('register: an enroll hook that throws is answered as a refusal, with the er
     const closed = new Promise<number>((resolve) => sock.on('close', (code) => resolve(code)));
     sock.send(JSON.stringify({ op: 'register', d: { protocolVersion: 1, invite: 'good', desiredName: 'x' } }));
     const refused = (await frames.next((f) => f.op === 'invalid_session')) as Extract<ServerFrame, { op: 'invalid_session' }>;
-    assert.equal(refused.d.reason, 'registration failed on the relay, possibly after it made a persona, so registering again may make another');
+    assert.equal(refused.d.reason, "registration failed on the relay, possibly after it made a persona, so registering again may make another; the error is in the relay's session log, for its operator");
     assert.equal(refused.d.resumable, false);
     assert.equal(await closed, 4003);
     assert.ok(lines.some((l) => / register-error .*error="disk full"/.test(l)), lines.join('\n'));

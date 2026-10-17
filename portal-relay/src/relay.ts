@@ -26,7 +26,7 @@ import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore, inviteShapeProblem } from './invites.js';
+import { InviteStore, inviteModeProblem, inviteShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
 import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities, roleGrantsAccess } from './permissions.js';
@@ -876,10 +876,14 @@ export class Relay implements GatewayHooks {
     // disk, and only the relay's operator can repair it.
     const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
     const unreadable = missing.filter((r) => this.permissions.isQuarantined(r));
+    const gone = missing.filter((r) => !this.permissions.isQuarantined(r));
+    if (unreadable.length && gone.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')}, which the relay's operator must fix, and that no longer exist: ${gone.join(', ')}, so it must be re-minted`;
+    }
     if (unreadable.length) {
       return `invite names access role(s) that can't be read: ${unreadable.join(', ')} — the relay's operator must fix them`;
     }
-    if (missing.length) return `invite names access role(s) that no longer exist: ${missing.join(', ')} — it must be re-minted`;
+    if (gone.length) return `invite names access role(s) that no longer exist: ${gone.join(', ')} — it must be re-minted`;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
     if (!grant || !inv.guildId) return null;
     if (isMirrorScope(grant.scope)) {
@@ -1101,7 +1105,11 @@ export class Relay implements GatewayHooks {
     // the recheck's distinct messages) whether the minter still exists / is
     // still allowlisted / still holds rights. The recheck below is NOT dead
     // code — it is load-bearing for hand-edited mintedBy + mode:'both' invites.
+    // A mode outside the three gets the shape check's reason, since
+    // "mint-only" would be false for it.
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
+      const mode = inviteModeProblem(checked);
+      if (mode) throw rpcError('INVALID_PARAMS', `${mode} — it must be re-minted`);
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
     // Roles AND grant: an /invite carries roles plus a direct grant on the
