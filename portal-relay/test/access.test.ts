@@ -100,9 +100,13 @@ const PERSONAS: Record<string, unknown> = {
   'p-ghost': { roles: ['r-all'] }, // a permissions entry, but the relay doesn't know this persona
   'p-g3': { roles: ['r-g3'] },
   'p-custom': { policy: { default: [], guilds: { [G1]: { channels: { 'c-open': ['SEND_MESSAGES', 'ADD_REACTIONS'] } } } } },
+  // A legacy grant on a thread only: a thread uses its parent's access, so it gives nothing.
+  'p-thread': { policy: { default: [], guilds: { [G1]: { channels: { th: WRITE } } } } },
+  // Guild-wide Write, blocked in c-open ('Block guild-wide here').
+  'p-blocked': { policy: { default: [], guilds: { [G1]: { default: WRITE, channels: { 'c-open': [] } } } } },
   // p-none has no entry: the file default applies to it everywhere.
 };
-const IDENTITIES = ['p-roles', 'p-mirror', 'p-mcaps', 'p-direct', 'p-guildwide', 'p-deny', 'p-pdefault', 'p-legacy', 'p-banned', 'p-g3', 'p-custom', 'p-none'];
+const IDENTITIES = ['p-roles', 'p-mirror', 'p-mcaps', 'p-direct', 'p-guildwide', 'p-deny', 'p-pdefault', 'p-legacy', 'p-banned', 'p-g3', 'p-custom', 'p-thread', 'p-blocked', 'p-none'];
 const EVERYONE = [...IDENTITIES, 'p-ghost', 'p-nobody'];
 const FILE_DEFAULT: Capability[] = ['VIEW_CHANNEL', 'READ_HISTORY'];
 
@@ -430,6 +434,49 @@ test('parity: a grant change answers with what the relay enforces where it was m
     t.cleanup();
   }
 });
+
+test('parity: every capability gate on a thread id checks its channel — as the directory, sending and the panel do', () => {
+  const t = makeRelay();
+  try {
+    const allows = (pid: string, cid: string, cap: Capability) => {
+      try {
+        t.relay.requireCap(pid, cid, cap);
+        return true;
+      } catch (e) {
+        assert.equal((e as { code?: string }).code, 'FORBIDDEN');
+        return false;
+      }
+    };
+    const thMeta = t.relay.bot.channelMetaFromCache('th');
+    let differs = 0;
+    for (const pid of EVERYONE) {
+      const parent = t.capsFor(pid, 'c-open', G1);
+      // The directory's caps for the thread (what list_channels and identify send) are its parent's.
+      assert.deepEqual(t.relay.toPortalChannel(thMeta, pid).capabilities, parent, `${pid}: directory`);
+      for (const cap of ALL_CAPS) {
+        // list_pins, subscribe_channel, channel_missed, create_thread, delete_channel, voice_*, edits and reactions all go through requireCap.
+        assert.equal(allows(pid, 'th', cap), parent.includes(cap), `${pid} ${cap} on the thread`);
+      }
+      assert.equal(t.relay.canSubscribe(pid, 'th'), parent.includes('VIEW_CHANNEL'), `${pid}: canSubscribe`);
+      if (!sameSet(t.capsFor(pid, 'th', G1), parent)) differs++;
+    }
+    assert.ok(differs > 0, 'the fixture has personas whose thread id alone would say otherwise');
+    // A grant on the thread only gives nothing there (the panel lists it as doing nothing) …
+    assert.deepEqual(t.capsFor('p-thread', 'th', G1), WRITE, 'capsFor on the raw thread id would give Write');
+    assert.equal(allows('p-thread', 'th', 'READ_HISTORY'), false);
+    // … and a guild-wide level blocked in the channel is blocked in its threads too.
+    assert.deepEqual(t.capsFor('p-blocked', 'c-open', G1), []);
+    assert.deepEqual(t.capsFor('p-blocked', 'th', G1), WRITE, 'the raw thread id would give the guild-wide Write');
+    assert.equal(allows('p-blocked', 'th', 'READ_HISTORY'), false);
+    assert.equal(t.relay.canSubscribe('p-blocked', 'th'), false);
+    // A channel that isn't a thread is checked as itself.
+    assert.equal(allows('p-direct', 'c-readonly', 'READ_HISTORY'), t.capsFor('p-direct', 'c-readonly', G1).includes('READ_HISTORY'));
+  } finally {
+    t.cleanup();
+  }
+});
+
+const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
 /** portal-admin/lib.js, in an empty sandbox (it is the panel's pure code). */
 function panelLib(): any {

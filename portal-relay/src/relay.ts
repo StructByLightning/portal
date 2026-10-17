@@ -224,10 +224,7 @@ export class Relay implements GatewayHooks {
         botCaps: (guildId, channelId) =>
           computeCapabilities(new Set(ALL_CAPS), this.bot.channelForPerms(channelId), this.bot.meIn(guildId)),
         // Where the relay checks a channel's access: a thread's is its parent's.
-        permChannelId: (channelId) => {
-          const meta = this.bot.channelMetaFromCache(channelId);
-          return meta ? this.permChannelId(meta) : channelId;
-        },
+        permChannelId: (channelId) => this.permIdOf(channelId),
         listChannelLayout: (gid) => this.bot.listChannelLayout(gid),
         canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
         resync: (personaId) => this.resyncPersona(personaId),
@@ -2108,10 +2105,17 @@ export class Relay implements GatewayHooks {
   }
 
   /** GatewayHooks.canSubscribe — the identify/register-time twin of the
-   *  subscribe_channel VIEW_CHANNEL gate. */
+   *  subscribe_channel VIEW_CHANNEL gate (a thread: its parent's, as there). */
   canSubscribe(personaId: string, channelId: string): boolean {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
-    return this.capsFor(personaId, channelId, guildId).includes('VIEW_CHANNEL');
+    return this.capsFor(personaId, this.permIdOf(channelId), guildId).includes('VIEW_CHANNEL');
+  }
+
+  /** permChannelId for a raw id the persona sent: a cached thread's access
+   *  is its parent's; anything else is checked as itself. */
+  private permIdOf(channelId: string): string {
+    const meta = this.bot.channelMetaFromCache(channelId);
+    return meta ? this.permChannelId(meta) : channelId;
   }
 
   /** Whether a persona has any rights in a guild — gates addressing-role minting
@@ -2135,9 +2139,14 @@ export class Relay implements GatewayHooks {
     return computeCapabilities(allowed, channel, me);
   }
 
+  /** Refuse unless the persona holds `cap` where the relay checks
+   *  `channelId`: a thread is checked against its parent (permChannelId), as
+   *  sending, reading and delivery are — so a grant on the thread itself, or
+   *  a guild-wide level its parent blocks, gives nothing there, and every
+   *  RPC on a thread agrees with the directory and the admin panel. */
   private requireCap(personaId: string, channelId: string, cap: Capability): void {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
-    if (!this.capsFor(personaId, channelId, guildId).includes(cap)) {
+    if (!this.capsFor(personaId, this.permIdOf(channelId), guildId).includes(cap)) {
       throw rpcError('FORBIDDEN', `missing capability ${cap}`);
     }
   }
