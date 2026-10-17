@@ -133,6 +133,20 @@ test('voice_join: FORBIDDEN without VOICE_LISTEN, CONFLICT on a second channel i
   } finally { cleanup(); }
 });
 
+test("voice_join/voice_leave on a channel the relay can't see: NOT_FOUND naming it, before any capability check", async () => {
+  const { relay, voice, cleanup } = makeRelay({ withVoice: true });
+  try {
+    const known = relay.bot.channelForPerms;
+    relay.bot.channelForPerms = (id: string) => (id === 'gone-chan' ? undefined : known(id));
+    // Alice holds no capability there either; the missing channel is what she's told.
+    for (const m of ['voice_join', 'voice_leave']) {
+      await assert.rejects(() => relay.dispatchRpc(session(ALICE), m, { channelId: 'gone-chan' }),
+        (e: any) => e?.code === 'NOT_FOUND' && /no channel "gone-chan" is visible to you/.test(e.message));
+    }
+    assert.equal(voice.joined.size, 0);
+  } finally { cleanup(); }
+});
+
 test('delivery: subscribed + viewable only; partials ephemeral, finals sequenced; status gated the same way', () => {
   const { relay, voice, subscriptions, dispatched, cleanup } = makeRelay({ withVoice: true });
   try {

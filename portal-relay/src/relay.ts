@@ -267,6 +267,11 @@ export class Relay implements GatewayHooks {
     this.bot.on('slashCommand', (inv) => this.slash.handle(inv));
     this.bot.on('slashAutocomplete', (req) => this.slash.autocomplete(req));
     this.bot.on('ready', () => this.mirror.clear());
+    if (!this.config.elevenLabsKey) {
+      console.error('[portal-relay] voice off: ELEVENLABS_KEY is unset, so voice_join, voice_leave and voice_speak answer that voice isn\'t set up');
+    } else if (!this.config.voiceRegistryPath) {
+      console.error('[portal-relay] voice output off: PORTAL_VOICE_REGISTRY is unset, so voice_speak answers that speaking isn\'t set up');
+    }
     if (this.config.elevenLabsKey) {
       const wantSpeak = !!this.config.voiceRegistryPath;
       this.attachVoice(new VoiceBot(this.bot.rawClient, this.config.elevenLabsKey,
@@ -1284,9 +1289,25 @@ export class Relay implements GatewayHooks {
       case 'edit_message': {
         const p = params as RpcParams<'edit_message'>;
         const ref = await this.resolveRef(p.messageId);
-        if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
-        if (ref.personaId !== personaId) throw rpcError('FORBIDDEN', 'not your message');
-        if (!ref.webhookId) throw rpcError('NOT_FOUND', 'no webhook recorded for message');
+        if (!ref) throw unknownMessage(p.messageId, 'nothing was edited');
+        if (ref.personaId !== personaId) {
+          throw rpcError(
+            'FORBIDDEN',
+            ref.personaId
+              ? `Nothing was edited: message ${JSON.stringify(p.messageId)} was posted by someone else, ` +
+                'and edit_message changes only your own messages.'
+              : `Nothing was edited: the relay can't tell who posted message ${JSON.stringify(p.messageId)}, ` +
+                "and edit_message changes only messages it knows are yours, so calling again won't help. " +
+                'send_message posts a new message if the text must change.',
+          );
+        }
+        if (!ref.webhookId) {
+          throw rpcError(
+            'NOT_FOUND',
+            `Nothing was edited: the relay has no record of how message ${JSON.stringify(p.messageId)} was posted, ` +
+              "so it can't change it, and calling again won't help. send_message posts a new message if the text must change.",
+          );
+        }
         this.requireCap(personaId, ref.channelId, 'EDIT_OWN');
         await this.webhooks.ensureLoaded(ref.channelId); // adopt webhooks post-restart
         await this.webhooks.edit(ref.webhookId, ref.discordMsgId, p.content, ref.threadId);
@@ -1295,7 +1316,7 @@ export class Relay implements GatewayHooks {
       case 'delete_message': {
         const p = params as RpcParams<'delete_message'>;
         const ref = await this.resolveRef(p.messageId);
-        if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
+        if (!ref) throw unknownMessage(p.messageId, 'nothing was deleted');
         if (ref.personaId === personaId && ref.webhookId) {
           // Own webhook message → delete via the webhook.
           this.requireCap(personaId, ref.channelId, 'DELETE_OWN');
@@ -1316,27 +1337,26 @@ export class Relay implements GatewayHooks {
       case 'unreact': {
         const p = params as RpcParams<'unreact'>;
         const ref = await this.resolveRef(p.messageId);
-        if (ref) {
-          // Same gate as react (issue #27): with native=true this strips the
-          // shared bot's reaction — i.e. another persona's visible reaction —
-          // from any message the caller can name, viewable or not.
-          this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
-          this.gateway.dispatch(personaId, {
-            type: 'reaction_remove',
-            channelId: ref.channelId,
-            threadId: ref.threadId,
-            messageId: ref.relayId,
-            emoji: p.emoji,
-            actor: { kind: 'persona', id: personaId, name: this.displayName(personaId) },
-          });
-          // Optionally drop the shared bot's native reaction (best-effort — the
-          // structured pseudo-remove above is authoritative for agents/UI).
-          if (p.native) {
-            try {
-              await this.bot.removeReaction(ref.threadId ?? ref.channelId, ref.discordMsgId, p.emoji);
-            } catch (err) {
-              console.error('[portal-relay] native unreact failed:', (err as Error).message);
-            }
+        if (!ref) throw unknownMessage(p.messageId, 'no reaction was removed');
+        // Same gate as react (issue #27): with native=true this strips the
+        // shared bot's reaction — i.e. another persona's visible reaction —
+        // from any message the caller can name, viewable or not.
+        this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
+        this.gateway.dispatch(personaId, {
+          type: 'reaction_remove',
+          channelId: ref.channelId,
+          threadId: ref.threadId,
+          messageId: ref.relayId,
+          emoji: p.emoji,
+          actor: { kind: 'persona', id: personaId, name: this.displayName(personaId) },
+        });
+        // Optionally drop the shared bot's native reaction (best-effort — the
+        // structured pseudo-remove above is authoritative for agents/UI).
+        if (p.native) {
+          try {
+            await this.bot.removeReaction(ref.threadId ?? ref.channelId, ref.discordMsgId, p.emoji);
+          } catch (err) {
+            console.error('[portal-relay] native unreact failed:', (err as Error).message);
           }
         }
         return {};
@@ -1413,7 +1433,9 @@ export class Relay implements GatewayHooks {
       }
       case 'voice_join': {
         const p = params as RpcParams<'voice_join'>;
-        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        if (!this.voice) throw voiceNotSetUp();
+        // An id the bot can't see isn't a missing capability: say so first.
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
         // Joining implies wanting the transcripts: auto-subscribe this session,
         // same as it could do explicitly (capability already checked above —
@@ -1427,13 +1449,19 @@ export class Relay implements GatewayHooks {
         } catch (e) {
           if (!wasSubscribed) session.subscriptions.delete(p.channelId);
           if (e instanceof VoiceJoinError) throw rpcError(e.code, e.message);
-          throw rpcError('DISCORD_ERROR', `voice join failed: ${(e as Error).message}`);
+          console.error(`[portal-relay] voice_join ${p.channelId} failed: ${(e as Error).message}`);
+          throw rpcError(
+            'DISCORD_ERROR',
+            `voice_join failed, so you aren't listening in channel ${JSON.stringify(p.channelId)}. ` +
+              'Calling it again may work; if it keeps failing, ask whoever runs this host.',
+          );
         }
         return { listening: true };
       }
       case 'voice_leave': {
         const p = params as RpcParams<'voice_leave'>;
-        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        if (!this.voice) throw voiceNotSetUp();
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
         this.voice.leave(p.channelId);
         return {};
@@ -1441,14 +1469,22 @@ export class Relay implements GatewayHooks {
       case 'voice_speak': {
         const p = params as RpcParams<'voice_speak'>;
         if (!this.speaker) {
-          throw rpcError('UNAVAILABLE',
-            'voice output not configured (needs ELEVENLABS_KEY + PORTAL_VOICE_REGISTRY)');
+          throw rpcError(
+            'UNAVAILABLE',
+            "Speaking isn't set up on this Portal relay, so nothing was said, and calling again won't change that. " +
+              'If you need voice output, ask whoever runs this host.',
+          );
         }
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_SPEAK');
         const text = (p.text ?? '').trim();
-        if (!text) throw rpcError('INVALID_PARAMS', 'text is empty');
+        if (!text) throw rpcError('INVALID_PARAMS', 'Nothing was spoken: text is empty. Pass the words to say in text.');
         if (text.length > MAX_SPEAK_CHARS) {
-          throw rpcError('INVALID_PARAMS', `text exceeds ${MAX_SPEAK_CHARS} characters (one conversational turn per call)`);
+          throw rpcError(
+            'INVALID_PARAMS',
+            `Nothing was spoken: text is ${text.length} characters, over the ${MAX_SPEAK_CHARS}-character limit ` +
+              'for one voice_speak call. Split it into several calls, one conversational turn each.',
+          );
         }
         const clientId = p.requestId ?? `spk${Date.now().toString(36)}-${this.speakSeq++}`;
         const persona = this.identity.get(personaId);
@@ -1468,7 +1504,12 @@ export class Relay implements GatewayHooks {
           if (e instanceof VoiceSpeakError) {
             throw rpcError(e.code === 'NOT_JOINED' ? 'CONFLICT' : 'NOT_FOUND', e.message);
           }
-          throw rpcError('INTERNAL', `voice output failed: ${(e as Error).message}`);
+          console.error(`[portal-relay] voice_speak ${p.channelId} failed: ${(e as Error).message}`);
+          throw rpcError(
+            'INTERNAL',
+            `voice_speak failed, so nothing was said in channel ${JSON.stringify(p.channelId)}. ` +
+              'If it keeps failing, ask whoever runs this host.',
+          );
         }
         return { requestId: clientId };
       }
@@ -1680,7 +1721,7 @@ export class Relay implements GatewayHooks {
     native: boolean,
   ): Promise<Record<string, never>> {
     const ref = await this.resolveRef(relayMsgId);
-    if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
+    if (!ref) throw unknownMessage(relayMsgId, 'no reaction was added');
     this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
     // Structured pseudo-reaction for agents / a real UI.
     this.gateway.dispatch(personaId, {
@@ -2100,7 +2141,11 @@ export class Relay implements GatewayHooks {
 
   private requireGuild(personaId: string, guildId: string): void {
     if (!this.guildVisible(personaId, guildId)) {
-      throw rpcError('FORBIDDEN', 'no capabilities in guild');
+      throw rpcError(
+        'FORBIDDEN',
+        `Nothing was returned: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+          'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+      );
     }
   }
 
@@ -2146,8 +2191,19 @@ export class Relay implements GatewayHooks {
    *  RPC on a thread agrees with the directory and the admin panel. */
   private requireCap(personaId: string, channelId: string, cap: Capability): void {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
-    if (!this.capsFor(personaId, this.permIdOf(channelId), guildId).includes(cap)) {
-      throw rpcError('FORBIDDEN', `missing capability ${cap}`);
+    const checked = this.permIdOf(channelId);
+    if (!this.capsFor(personaId, checked, guildId).includes(cap)) {
+      // A thread is checked as its parent, so the refusal names the channel
+      // whose capabilities list_channels shows.
+      const where = checked === channelId
+        ? `in channel ${JSON.stringify(channelId)}`
+        : `in channel ${JSON.stringify(checked)}, which thread ${JSON.stringify(channelId)} takes its access from`;
+      throw rpcError(
+        'FORBIDDEN',
+        `Nothing ran: you don't have the ${cap} capability ${where}, ` +
+          "so calling again won't change that. list_channels, with a guildId from list_guilds, shows each channel's capabilities; " +
+          'if you need this one, ask whoever runs this host.',
+      );
     }
   }
 
@@ -2165,8 +2221,36 @@ function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirror
  *  or isn't one of that channel's. */
 function containerNotFound(channelId: string, threadId?: string): Error & { code: string } {
   return threadId
-    ? rpcError('NOT_FOUND', `thread ${threadId} is not a thread of channel ${channelId}`)
-    : rpcError('NOT_FOUND', 'channel not found');
+    ? rpcError(
+        'NOT_FOUND',
+        `Nothing ran: ${JSON.stringify(threadId)} isn't a thread of channel ${JSON.stringify(channelId)}. ` +
+          "Pass the thread's parent channel as channelId, with the thread's id as create_thread returns it " +
+          "and as a message's threadId shows it.",
+      )
+    : rpcError(
+        'NOT_FOUND',
+        `Nothing ran: no channel ${JSON.stringify(channelId)} is visible to you. ` +
+          'Check the id: list_channels, with a guildId from list_guilds, shows the channels you can use, with their ids.',
+      );
+}
+
+/** The refusal for a message id the relay can't find; `outcome` says what didn't happen. */
+function unknownMessage(messageId: string, outcome: string): Error & { code: string } {
+  return rpcError(
+    'NOT_FOUND',
+    `The relay can't find message ${JSON.stringify(messageId)}, so ${outcome}. ` +
+      'Check the id against what send_message, fetch_history or fetch_around gave; if it matches, ' +
+      "the message may have been deleted, or its channel may be out of the relay's reach.",
+  );
+}
+
+/** voice_join and voice_leave on a relay without voice transcription. */
+function voiceNotSetUp(): Error & { code: string } {
+  return rpcError(
+    'UNAVAILABLE',
+    "Voice isn't set up on this Portal relay, so nothing ran, and calling again won't change that. " +
+      'If you need voice, ask whoever runs this host.',
+  );
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {

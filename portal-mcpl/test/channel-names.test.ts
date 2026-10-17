@@ -249,16 +249,21 @@ test('a threadId that names no thread is refused before anything is sent or read
     ] as const) {
       await assert.rejects(
         agent.handleToolCall(tool, { channelId: '100000000000000003', threadId, ...extra }),
-        /threadId must name a thread .*Nothing was sent or read\./,
+        /^Error: Nothing ran: threadId .* isn't a thread id\. A thread is named by its id \(or portal:<id>\)/,
         `${tool} with threadId ${JSON.stringify(threadId)}`,
       );
     }
   }
-  // A name that isn't a known channel is refused by the resolver, naming threadId.
-  await assert.rejects(
-    agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId: '#no-such-thread', content: 'hi' }),
-    /^Error: threadId: /,
-  );
+  // Threads aren't addressable by label, so a name is refused with a thread's own remedy,
+  // even one that names a channel.
+  for (const threadId of ['#no-such-thread', '#lena_dev (Connectome)']) {
+    await assert.rejects(
+      agent.handleToolCall('send_message', { channelId: '100000000000000003', threadId, content: 'hi' }),
+      new RegExp(`^Error: Nothing ran: threadId ${JSON.stringify(threadId).replace(/[()]/g, '\\$&')} isn't a thread id\\. ` +
+        "A thread is named by its id \\(or portal:<id>\\), as create_thread returns it and as a message's threadId shows it; " +
+        'null or no threadId means no thread\\.$'),
+    );
+  }
   assert.deepEqual(sent, []);
   assert.deepEqual(fetched, []);
 });
@@ -267,11 +272,11 @@ test('an ambiguous or unknown name errors and NOTHING is sent', async () => {
   const { agent, sent } = agentWithCache();
   await assert.rejects(
     () => agent.handleToolCall('send_message', { channelId: '#general', content: 'hi' }),
-    /ambiguous.*#general \(Connectome\).*#general \(Anima Mundi\)/,
+    /^Error: Nothing ran: channelId "#general" is ambiguous: 2 channels match\. Call again with one of these: "#general \(Connectome\)", "#general \(Anima Mundi\)"\.$/,
   );
   await assert.rejects(
     () => agent.handleToolCall('send_message', { channelId: '#nope', content: 'hi' }),
-    /No addressable channel named #nope/,
+    /^Error: Nothing ran: channelId "#nope" names no channel you can address\. list_channels, with a guildId from list_guilds, shows each channel's label and id: pass a text or voice channel's label, or any channel's id\.$/,
   );
   assert.equal(sent.length, 0);
 });
@@ -286,4 +291,157 @@ test('list_channels returns the label every channelId argument accepts', async (
   assert.equal(res.channels[0].label, '#lena_dev (Connectome)');
   assert.equal(agent.labelFor('100000000000000003'), '#lena_dev (Connectome)');
   assert.equal(agent.labelFor('nope'), 'nope');
+});
+
+test("a retired tool points to the host's own channel tools without claiming their names", async () => {
+  const { agent } = agentWithCache();
+  for (const [tool, pointer] of [
+    ['subscribe_channel', /^Error: subscribe_channel is retired here: this host opens and closes channels itself, so nothing ran\. .*such as channel_open\.$/],
+    ['unsubscribe_channel', /such as channel_close\.$/],
+    ['list_subscriptions', /such as channel_list\.$/],
+    ['set_reaction_visibility', /^Error: set_reaction_visibility is retired here, so nothing ran: .*such as channel_open and channel_close\.$/],
+  ] as const) {
+    await assert.rejects(agent.handleToolCall(tool, { channelId: '100000000000000003', visible: true }), pointer, tool);
+    // A name the resolver can't place doesn't get ahead of the pointer: the tool won't run anyway.
+    await assert.rejects(agent.handleToolCall(tool, { channelId: '#nope', visible: true }), pointer, `${tool} with a bad name`);
+  }
+});
+
+test('an unknown tool is answered before its arguments are looked at', async () => {
+  const { agent, sent } = agentWithCache();
+  await assert.rejects(
+    agent.handleToolCall('send_mesage', { channelId: '#nope', content: 'hi' }),
+    /^Error: There's no Portal tool named "send_mesage", so nothing ran\. Call one of the tools listed for you\.$/,
+  );
+  // Retired tools aren't offered where they're retired.
+  await assert.rejects(
+    agent.handleToolCall('subscribe_channe', {}),
+    /^Error: There's no Portal tool named "subscribe_channe", so nothing ran\. Call one of the tools listed for you\.$/,
+  );
+  assert.deepEqual(sent, []);
+});
+
+test('an optional string argument of another type is refused by name, and nothing runs', async () => {
+  const { agent, sent, client } = agentWithCache();
+  const fetched: unknown[] = [];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async (p: unknown) => {
+    fetched.push(p);
+    return { messages: [] };
+  };
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi', replyToId: 42 }),
+    /^Error: Nothing ran: replyToId must be a string when given, got 42\.$/,
+  );
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', before: 7 }),
+    /^Error: Nothing ran: before must be a string when given, got 7\.$/,
+  );
+  // Absent and null still mean absent.
+  await agent.handleToolCall('fetch_history', { channelId: '100000000000000003', before: null });
+  assert.deepEqual(sent, []);
+  assert.equal(fetched.length, 1);
+});
+
+test('a send split into parts carries the resolved files on its first part only', async () => {
+  const { agent, client } = agentWithCache();
+  const parts: Array<Record<string, unknown>> = [];
+  (client as unknown as { sendMessage: unknown }).sendMessage = async (p: Record<string, unknown>) => {
+    parts.push(p);
+    return { messageId: `m${parts.length}` };
+  };
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    content: 'x'.repeat(2500),
+    files: [{ bytes: 'aGk=', name: 'a.json' }],
+  });
+  assert.equal(parts.length, 2);
+  // Resolved here: the content type is inferred from the name.
+  assert.deepEqual(parts[0].files, [{ bytes: 'aGk=', name: 'a.json', contentType: 'application/json' }]);
+  assert.equal('files' in parts[1], false);
+});
+
+test('an optional number or boolean argument of another type is refused by name, and nothing runs', async () => {
+  const { agent, client } = agentWithCache();
+  const calls: unknown[] = [];
+  (client as unknown as { fetchHistory: unknown }).fetchHistory = async (p: unknown) => {
+    calls.push(['fetchHistory', p]);
+    return { messages: [] };
+  };
+  (client as unknown as { react: unknown }).react = async (...a: unknown[]) => {
+    calls.push(['react', ...a]);
+    return {};
+  };
+  (client as unknown as { call: unknown }).call = async (m: string, p: unknown) => {
+    calls.push([m, p]);
+    return {};
+  };
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', limit: '5' }),
+    /^Error: Nothing ran: limit must be a number when given, got "5"\.$/,
+  );
+  // Read as found, the string 'false' made a visible reaction.
+  await assert.rejects(
+    agent.handleToolCall('react', { messageId: 'm1', emoji: 'x', visible: 'false' }),
+    /^Error: Nothing ran: visible must be true or false when given, got "false"\.$/,
+  );
+  // Read as found, a numeric uptoCreatedAt marked the whole channel read.
+  await assert.rejects(
+    agent.handleToolCall('mark_read', { channelId: '100000000000000003', uptoCreatedAt: 1760000000000 }),
+    /^Error: Nothing ran: uptoCreatedAt must be a string when given, got 1760000000000\.$/,
+  );
+  await assert.rejects(
+    agent.handleToolCall('fetch_history', { channelId: '100000000000000003', after: 5 }),
+    /^Error: Nothing ran: after must be a string when given, got 5\.$/,
+  );
+  assert.deepEqual(calls, []);
+  // Absent and null still mean absent.
+  await agent.handleToolCall('react', { messageId: 'm1', emoji: 'x', visible: null, native: true });
+  assert.deepEqual(calls, [['react', 'm1', 'x', false, true]]);
+  // voice_speak's requestId too, like every other optional string.
+  await agent.handleToolCall('voice_speak', { channelId: '100000000000000003', text: 'hi', requestId: null });
+  assert.deepEqual(calls.at(-1), ['voice_speak', { channelId: '100000000000000003', text: 'hi' }]);
+});
+
+test('a send split into parts replies and mentions on its first part only', async () => {
+  const { agent, client } = agentWithCache();
+  const parts: Array<Record<string, unknown>> = [];
+  (client as unknown as { sendMessage: unknown }).sendMessage = async (p: Record<string, unknown>) => {
+    parts.push(p);
+    return { messageId: `m${parts.length}` };
+  };
+  await agent.handleToolCall('send_message', {
+    channelId: '100000000000000003',
+    content: 'x'.repeat(2500),
+    replyToId: 'm9',
+    mentionPersonaIds: ['p1'],
+  });
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].replyToId, 'm9');
+  assert.deepEqual(parts[0].mentionPersonaIds, ['p1']);
+  assert.equal('replyToId' in parts[1], false);
+  assert.equal('mentionPersonaIds' in parts[1], false);
+});
+
+test('a send split into parts says which parts went out when a later part fails', async () => {
+  const { agent, client } = agentWithCache();
+  const activity: string[] = [];
+  (agent as unknown as { onPublicActivity: (kind: string) => void }).onPublicActivity = (kind) => activity.push(kind);
+  let calls = 0;
+  (client as unknown as { sendMessage: unknown }).sendMessage = async () => {
+    calls++;
+    if (calls === 1) return { messageId: 'm1' };
+    throw new Error('Nothing ran: you can\'t send in this channel now.');
+  };
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'x'.repeat(2500) }),
+    /^Error: Only part of the message was sent: the first 1 of 2 parts were posted \("m1"\), and part 2 may not have been\. Its call answered: "Nothing ran: you can't send in this channel now\." To send the rest, call send_message with only the text that didn't go out; fetch_around shows what did\.$/,
+  );
+  assert.deepEqual(activity, ['message'], 'the posted part counts as public activity');
+  // A failing first part is that part's own answer: nothing went out.
+  calls = 1;
+  await assert.rejects(
+    agent.handleToolCall('send_message', { channelId: '100000000000000003', content: 'hi' }),
+    /^Error: Nothing ran: you can't send in this channel now\.$/,
+  );
+  assert.deepEqual(activity, ['message'], 'a first part that fails posts nothing');
 });

@@ -121,6 +121,9 @@ export type ResolveResult =
   /** `matched` is present when a name resolved, absent when the input was
    *  already an id (nothing was looked up). */
   | { ok: true; id: string; matched?: ChannelCandidate }
+  /** `message` completes a sentence about the reference, such as
+   *  `channelId "#x" <message>`, so the caller can say which argument it was
+   *  and what didn't happen. */
   | { ok: false; reason: 'not-found' | 'ambiguous'; message: string };
 
 /** Ordinary message channels — also what the tie-break prefers over a
@@ -199,17 +202,16 @@ export function resolveChannelName(
         ok: false,
         reason: 'not-found',
         message:
-          `No channel #${ref.name} in a guild named "${ref.guild}". ` +
-          `That name exists elsewhere: ${near.map(channelLabel).join(', ')}`,
+          `names no channel in a guild named "${ref.guild}", but #${ref.name} exists elsewhere: ` +
+          `${near.map((c) => `"${channelLabel(c)}"`).join(', ')}. Call again with the one you meant.`,
       };
     }
     return {
       ok: false,
       reason: 'not-found',
       message:
-        `No addressable channel named #${ref.name}` +
-        (ref.guild ? ` in "${ref.guild}"` : '') +
-        `. Use list_channels to see what is addressable, or pass the channel id.`,
+        'names no channel you can address. list_channels, with a guildId from list_guilds, ' +
+        "shows each channel's label and id: pass a text or voice channel's label, or any channel's id.",
     };
   }
 
@@ -227,7 +229,9 @@ export function resolveChannelName(
   return {
     ok: false,
     reason: 'ambiguous',
-    message: `#${ref.name} is ambiguous — ${matches.length} channels match. Re-send with one of: ${options}`,
+    message:
+      `is ambiguous: ${matches.length} channels match. Call again with one of these: ${options}.` +
+      (labelsDistinguish ? '' : ' An option with an id works as that id alone.'),
   };
 }
 
@@ -235,7 +239,13 @@ export function resolveChannelName(
 export function resolveChannelRef(raw: string, candidates: () => ChannelCandidate[]): ResolveResult {
   const parsed = parseChannelRef(raw);
   if (!parsed) {
-    return { ok: false, reason: 'not-found', message: `Unusable channel reference: "${raw}"` };
+    return {
+      ok: false,
+      reason: 'not-found',
+      message:
+        'isn\'t a channel reference. Give the channel as list_channels labels it, "#name (Guild)", ' +
+        'or by its id (or portal:<id>).',
+    };
   }
   if (parsed.kind === 'id') return { ok: true, id: parsed.id };
   return resolveChannelName(parsed, candidates());
