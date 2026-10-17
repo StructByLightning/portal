@@ -34,6 +34,51 @@ npm run build && node dist/src/index.js
 The bot needs **Manage Webhooks** + **Manage Roles** (admin is simplest), and
 its role must sit above the pooled roles.
 
+## Preview the admin panel
+
+`scripts/admin-preview.mts` runs the real admin API (`src/admin/`) and the
+panel (`../portal-admin/`) on one origin, over an invented fixture world. There
+is no bot and no Discord app: OAuth is answered by a fake, so the panel's own
+`/admin/login` and `/admin/callback` run unchanged.
+
+```bash
+node --import tsx scripts/admin-preview.mts [--scale small|large] [--ttl ms] [--no-avatars] [--port 8833]
+# → preview http://127.0.0.1:8833/dev-login
+```
+
+It listens on 127.0.0.1 only. Sign in as a fixture user:
+
+| Open | Signs in as |
+|---|---|
+| `/dev-login?as=op` | a super-admin (`PORTAL_SUPERADMINS`) |
+| `/dev-login?as=gwen` | Manage Server in Guild One (served) and Guild Three (not served) |
+| `/dev-login?as=dee` | the configured delegate for Guild Two (`PORTAL_GUILD_ADMINS`) |
+| `/dev-login?as=otto` | someone who manages only Guild Three, so sign-in is refused (`not_admin`) |
+
+- `&deny=1` on `/dev-login` cancels at the fake Discord consent screen
+  (`/dev-authorize`), for the failed-sign-in path.
+- `/dev-restart` rebuilds the admin API over the same stores. Like a relay
+  restart, it ends every session.
+- `--ttl` sets the session lifetime in ms (default 30 minutes), to try expiry.
+- `--no-avatars` starts with no profile pictures and avatar uploads off.
+- `--scale large` adds a busy Guild One: 8 categories of 36 channels with
+  threads, 200 more personas, 60 more invites and 500 audit records.
+
+The small world has Guild One (channels in General, Research and Archive
+categories, an announcement channel, a thread, a forum and a channel the bot
+can't see), Guild Two, four access roles, six personas (Aria, Cass, Nyx,
+Juniper, Quill, Sol) with different kinds of access, and invites in every state.
+The stores live in a new temp directory each run (the path is printed) and are
+thrown away.
+
+Every name and id in the script is invented; keep it that way, since this repo
+is public. When a change adds a member to `AdminDeps`, give it a fake in this
+script, and in `scripts/admin-dev.mjs`, in the same change.
+
+CI (`.github/workflows/relay-ci.yml`) type-checks the relay and runs the admin,
+slash, permissions and invite tests, including `test/admin-spa.test.ts`, which
+loads the panel's scripts in `node:vm`.
+
 ## Status
 
 Implemented and type-checked: webhook send (threads, files, persona role

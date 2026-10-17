@@ -309,3 +309,65 @@ test('setRole rejects unbound roles', () => {
   );
   rmSync(path, { force: true });
 });
+
+test('unsetGuildDefault: removes the guild-wide setting, so channels fall back to the persona default', () => {
+  const path = tmpFile({
+    personas: {
+      nyx: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { default: [], channels: { c1: [...RW] } } } } },
+      sol: { policy: { default: ['VIEW_CHANNEL'], guilds: { g1: { default: ['READ_HISTORY'] } } } },
+    },
+  });
+  const store = new PermissionsStore(path);
+  const changes: string[] = [];
+  store.onChange((c) => changes.push(`${c.personaId}:${c.scope}:${c.guildId}`));
+  assert.deepEqual(sorted(store.resolve('nyx', 'g1', 'c2')), [], 'denied guild-wide');
+  assert.equal(store.unsetGuildDefault('nyx', 'g1'), true);
+  assert.deepEqual(sorted(store.resolve('nyx', 'g1', 'c2')), ['VIEW_CHANNEL'], 'the persona default again');
+  assert.deepEqual(sorted(store.resolve('nyx', 'g1', 'c1')), [...RW].sort(), 'direct grants untouched');
+  assert.deepEqual(store.getEntry('nyx')?.policy?.guilds?.g1, { channels: { c1: [...RW] } });
+  assert.equal(store.unsetGuildDefault('nyx', 'g1'), false, 'nothing left to unset');
+  assert.equal(store.unsetGuildDefault('nobody', 'g1'), false);
+  assert.deepEqual(changes, ['nyx:guild:g1'], 'one change, announced once');
+
+  // A guild entry left with nothing in it is removed, and the guilds map with it.
+  assert.equal(store.unsetGuildDefault('sol', 'g1'), true);
+  assert.deepEqual(store.getEntry('sol')?.policy, { default: ['VIEW_CHANNEL'] });
+  const onDisk = JSON.parse(readFileSync(path, 'utf8'));
+  assert.deepEqual(onDisk.personas.sol, { default: ['VIEW_CHANNEL'] }, 'persisted');
+  rmSync(path, { force: true });
+});
+
+test('clearChannel: an emptied channel map and guild entry are removed', () => {
+  const path = tmpFile({
+    personas: {
+      quill: { policy: { default: [], guilds: { g1: { channels: { c1: ['VIEW_CHANNEL'], c2: [] } }, g2: { default: ['VIEW_CHANNEL'] } } } },
+    },
+  });
+  const store = new PermissionsStore(path);
+  store.clearChannel('quill', 'g1', 'c1');
+  assert.deepEqual(store.getEntry('quill')?.policy?.guilds?.g1, { channels: { c2: [] } });
+  store.clearChannel('quill', 'g1', 'c2');
+  assert.deepEqual(store.getEntry('quill')?.policy?.guilds, { g2: { default: ['VIEW_CHANNEL'] } }, 'g1 is gone, g2 untouched');
+  store.setChannel('quill', 'g2', 'c9', ['VIEW_CHANNEL']);
+  store.clearChannel('quill', 'g2', 'c9');
+  assert.deepEqual(store.getEntry('quill')?.policy?.guilds, { g2: { default: ['VIEW_CHANNEL'] } }, 'a guild with a guild-wide setting stays');
+  rmSync(path, { force: true });
+});
+
+test('a persona on the file default keeps it elsewhere when one guild is changed; enrollment does not seed it', () => {
+  const path = tmpFile({ default: ['VIEW_CHANNEL'], personas: {} });
+  const store = new PermissionsStore(path);
+  store.setChannel('cass', 'g1', 'c1', [...RW]);
+  assert.deepEqual(sorted(store.resolve('cass', 'g2', 'cZ')), ['VIEW_CHANNEL'], 'a grant in g1');
+  store.setGuildDefault('juniper', 'g1', []);
+  assert.deepEqual(sorted(store.resolve('juniper', 'g2', 'cZ')), ['VIEW_CHANNEL'], 'a deny in g1');
+  assert.deepEqual(sorted(store.resolve('juniper', 'g1', 'c1')), []);
+  store.removePersonaRole('aria', 'nothing-held');
+  assert.deepEqual(sorted(store.resolve('aria', 'g2', 'cZ')), ['VIEW_CHANNEL'], 'a role change');
+  // Enrollment sets the whole entry from an invite: no copy of the file default.
+  store.setPersonaRoles('fresh', []);
+  assert.deepEqual(sorted(store.resolve('fresh', 'g2', 'cZ')), []);
+  store.setPersonaPolicy('fresh2', { default: [], guilds: { g1: { default: ['VIEW_CHANNEL'] } } });
+  assert.deepEqual(sorted(store.resolve('fresh2', 'g2', 'cZ')), []);
+  rmSync(path, { force: true });
+});

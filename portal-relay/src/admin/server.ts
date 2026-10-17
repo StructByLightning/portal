@@ -4,28 +4,94 @@
  * distinct, separately-hardened surface from the WS gateway (§7) — it can do far
  * more, so it never shares the gateway's auth path.
  *
- * P1 scope: OAuth login/callback, server-side sessions, super-admin + guild-admin
- * authorization, and read-only views (invites / roles / personas / channels /
- * audit). Mutations land in P2; the route table is shaped to receive them.
+ * OAuth login/callback, server-side sessions, super-admin + guild-admin
+ * authorization, guild-scoped reads and audited mutations.
+ *
+ * AUTHZ INVARIANTS — every change here keeps these true. Each has a test
+ * named after it in test/admin.test.ts ('invariant I1' …).
+ *
+ *   I1  Every /admin/g/:gid route passes canManageGuild(session, G, served)
+ *       first, in handle(), before the route reads anything.
+ *   I2  Every non-GET request with a session passes the CSRF gate in handle()
+ *       before any route runs or any body is read — POST /admin/logout too.
+ *   I3  Every channel written under G passed channelInGuild(G) and is
+ *       grantable (text, voice or forum; never a thread or a category), and
+ *       the guild key written is the route's G (grantTargetError,
+ *       checkInviteGrant, checkRoleDef).
+ *   I4  Every access role a non-super assigns, revokes, mints or claims is
+ *       bound to G (roleAssignError, hasForeignRole).
+ *   I5  GET /admin/g/:gid responses name only G's channels and access roles
+ *       (clipToGuild, rolesVisibleIn), and name personas only by their access
+ *       in G or by directory fields.
+ *   I8  Non-supers never write persona-wide state: the persona default, an
+ *       invite for every channel (scope {all}), another guild's roles, tokens,
+ *       avatars, the role catalog or the guild allow-list.
+ *
+ * (I6 and I7 are kept for later: invite codes shown only at mint or through an
+ * audited reveal, and admin rights computed on every request.)
+ *
+ * GET routes never change anything.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, extname } from 'node:path';
-import { randomBytes } from 'node:crypto';
-import type { AdminConfig, Scope } from '../config.js';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import type { AccessRole, AdminConfig, GuildPolicy, Scope } from '../config.js';
 import type { Capability } from '@animalabs/portal-protocol';
 import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
+import { LEVEL_CAPS } from '../slash.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog, AuditRecord } from './audit.js';
 import { canManageGuild } from './authz.js';
 import { clipToGuild, type ChannelLabel, type NameMaps, type RoleLabel } from './names.js';
-import { authorizeUrl, completeOAuth, type FetchLike } from './oauth.js';
-import { SessionStore, type AdminSession } from './sessions.js';
+import { authorizeUrl, completeOAuth, OAuthError, type FetchLike } from './oauth.js';
+import { SessionStore, STATE_TTL_MS, type AdminSession } from './sessions.js';
+import { LoginRateLimit, clientIp } from './login-limit.js';
+
+/** What /admin/me reports as apiVersion. The panel compares it with its own
+ *  PA.CLIENT_API and asks for a reload when the relay is newer. */
+export const ADMIN_API_VERSION = 2;
+
+/** Channel types a direct grant (or a role or invite channel list) can name:
+ *  a thread uses its parent's access and a category grants nothing. */
+const GRANTABLE_TYPES = new Set(['text', 'voice', 'forum']);
+
+/** New access-role names. Existing names that don't fit are kept (and can be
+ *  replaced under the same name). */
+const ROLE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const SESSION_COOKIE = 'portal_admin_session';
-const STATE_COOKIE = 'portal_admin_state';
+/** The sign-ins this browser has in flight: one cookie per OAuth state, named
+ *  after it (stateCookieName) and holding it. A request writes or deletes only
+ *  the cookies of the states it is about, never one rebuilt from what it read
+ *  earlier, so two tabs' sign-ins can't erase each other's. A new sign-in past
+ *  STATES_PER_BROWSER ends this browser's oldest. */
+const STATE_COOKIE_PREFIX = 'portal_admin_state_';
+const STATE_COOKIE_NAME = /^portal_admin_state_[0-9a-f]{16}$/;
+const STATES_PER_BROWSER = 3;
+/** At most this many state cookies are looked at in one request. */
+const STATE_COOKIES_READ = 32;
+/** The one state cookie of earlier versions (every state, joined with '.'):
+ *  cleared when a browser still sends it. */
+const LEGACY_STATE_COOKIE = 'portal_admin_state';
+/** An OAuth state as issued: 32 random bytes, base64url. */
+const STATE_FORMAT = /^[A-Za-z0-9_-]{43}$/;
+
+/** Why a sign-in came back without a session: the only words a callback
+ *  redirect ever adds to postLoginUrl (the panel has a sentence for each,
+ *  PA.lib.loginErrorText). */
+type LoginError = 'cancelled' | 'expired' | 'mismatch' | 'discord_error' | 'rate_limited' | 'not_admin';
+
+/** The ?error= values Discord's authorize step may send (RFC 6749 §4.1.2.1,
+ *  and OpenID's for prompt=none). Anything else is recorded as 'other'. */
+const DISCORD_ERRORS = new Set([
+  'invalid_request', 'unauthorized_client', 'access_denied', 'unsupported_response_type', 'invalid_scope',
+  'server_error', 'temporarily_unavailable', 'interaction_required', 'login_required', 'consent_required',
+]);
+
+const UNKNOWN_ACTOR = { id: 'unknown', name: 'unknown', kind: 'admin' as const };
 
 /** The slice of the relay the admin API needs. Built in relay.ts over the bot /
  *  gateway so this module stays decoupled and unit-testable. */
@@ -79,6 +145,12 @@ export class AdminServer {
   private server?: Server;
   private sessions: SessionStore;
   private audit: AuditLog;
+  /** Callbacks per client address (never global). */
+  private callbackLimit = new LoginRateLimit();
+  /** Sign-ins started (/admin/login) per client address, apart from the
+   *  callbacks: each start holds a state in memory until it is used. */
+  private loginLimit = new LoginRateLimit();
+  private limitTimer?: ReturnType<typeof setInterval>;
 
   constructor(
     private deps: AdminDeps,
@@ -91,6 +163,13 @@ export class AdminServer {
 
   async listen(): Promise<void> {
     this.sessions.start();
+    // Refusals counted after an address's last login.rate_limited record go
+    // into one more record once its minute is over.
+    this.limitTimer = setInterval(() => {
+      for (const { ip, count } of this.callbackLimit.sweep()) this.recordRateLimited(ip, count);
+      for (const { ip, count } of this.loginLimit.sweep()) this.recordRateLimited(ip, count, 'login');
+    }, 60_000);
+    this.limitTimer.unref?.();
     this.server = createServer((req, res) => {
       this.handle(req, res).catch((e) => {
         console.error('[portal-admin] request error:', (e as Error).message);
@@ -113,6 +192,8 @@ export class AdminServer {
 
   async close(): Promise<void> {
     this.sessions.stop();
+    if (this.limitTimer) clearInterval(this.limitTimer);
+    this.limitTimer = undefined;
     if (this.server) await new Promise<void>((r) => this.server!.close(() => r()));
     this.server = undefined;
   }
@@ -126,7 +207,7 @@ export class AdminServer {
 
     // Unauthenticated endpoints.
     if (method === 'GET' && path === '/admin/health') return sendJson(res, 200, { ok: true });
-    if (method === 'GET' && path === '/admin/login') return this.onLogin(res);
+    if (method === 'GET' && path === '/admin/login') return this.onLogin(req, res, url);
     if (method === 'GET' && path === '/admin/callback') return this.onCallback(req, res, url);
     // Uploaded avatars are public images (Discord fetches them) — unauthenticated.
     if (method === 'GET' && path.startsWith('/admin/avatars/')) return this.serveAvatar(res, path);
@@ -134,6 +215,12 @@ export class AdminServer {
     // Everything below requires a session.
     const session = this.sessions.get(getCookie(req, SESSION_COOKIE));
     if (!session) return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED', message: 'login required' } });
+
+    // I2: one CSRF gate for every change, before any route runs or reads a
+    // body — so no route can forget it, and a refused request changes nothing.
+    if (method !== 'GET' && method !== 'HEAD' && !this.csrfOk(req, session)) {
+      return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
+    }
 
     if (method === 'POST' && path === '/admin/logout') return this.onLogout(req, res, session);
     if (method === 'GET' && path === '/admin/me') return this.onMe(res, session);
@@ -175,7 +262,9 @@ export class AdminServer {
           ok: false,
           detail: { method, path },
         });
-        return sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'not an admin of this guild' } });
+        // `reason` tells this refusal apart from a route's own FORBIDDEN
+        // (a channel or role of another guild): the panel words them differently.
+        return sendJson(res, 403, err('FORBIDDEN', 'not an admin of this guild', { reason: 'NOT_GUILD_ADMIN' }));
       }
       return this.onGuildRoute(req, res, session, guildId, method, sub, url);
     }
@@ -183,11 +272,16 @@ export class AdminServer {
     sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such route' } });
   }
 
-  /** CSRF guard for mutations: the SPA echoes the session csrf in a header. */
+  /** The SPA echoes the session's CSRF token in X-CSRF-Token on every change.
+   *  Compared in constant time (after a length check, which timingSafeEqual
+   *  needs; the length of a fixed-size token is no secret). */
   private csrfOk(req: IncomingMessage, session: AdminSession): boolean {
     const h = req.headers['x-csrf-token'];
     const got = Array.isArray(h) ? h[0] : h;
-    return !!got && got === session.csrf;
+    if (typeof got !== 'string' || !got) return false;
+    const a = Buffer.from(got, 'utf8');
+    const b = Buffer.from(session.csrf, 'utf8');
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   // ── Guild-scoped routing (reads + mutations) ──
@@ -211,10 +305,7 @@ export class AdminServer {
     const readM = /^\/([^/]+)$/.exec(sub);
     if (method === 'GET' && readM) return this.onGuildRead(res, session, guildId, readM[1], url);
 
-    // All mutations below require a valid CSRF token.
-    if (method !== 'GET' && !this.csrfOk(req, session)) {
-      return sendJson(res, 403, { error: { code: 'CSRF', message: 'missing or invalid CSRF token' } });
-    }
+    // Mutations below: handle() has already checked the CSRF token (I2).
 
     // POST /admin/g/:gid/invites  (mint)
     if (method === 'POST' && sub === '/invites') {
@@ -235,14 +326,15 @@ export class AdminServer {
     if (method === 'DELETE' && roleDel) {
       return this.revokeRole(res, session, guildId, decodeURIComponent(roleDel[1]), decodeURIComponent(roleDel[2]));
     }
-    // PUT /admin/g/:gid/personas/:id/grants  (set ad-hoc caps, clipped to G)
+    // PUT /admin/g/:gid/personas/:id/grants  (set a direct grant or the
+    // guild-wide level in G: one target, one operation)
     const grantSet = /^\/personas\/([^/]+)\/grants$/.exec(sub);
     if (method === 'PUT' && grantSet) {
       return this.setGrant(res, session, guildId, decodeURIComponent(grantSet[1]), await readJson(req));
     }
-    // DELETE /admin/g/:gid/personas/:id/grants[?channelId=]  (clear)
+    // DELETE /admin/g/:gid/personas/:id/grants?channelId= | ?guildDefault=deny|unset
     if (method === 'DELETE' && grantSet) {
-      return this.clearGrant(res, session, guildId, decodeURIComponent(grantSet[1]), url.searchParams.get('channelId'));
+      return this.clearGrant(res, session, guildId, decodeURIComponent(grantSet[1]), url.searchParams);
     }
     // POST /admin/g/:gid/personas/:id/claim  (admin-initiated augment)
     const claim = /^\/personas\/([^/]+)\/claim$/.exec(sub);
@@ -257,36 +349,99 @@ export class AdminServer {
 
   // ── Auth flow ──
 
-  private onLogin(res: ServerResponse): void {
-    const state = this.sessions.issueState();
-    setCookie(res, STATE_COOKIE, state, {
-      httpOnly: true,
-      secure: this.deps.config.cookieSecure,
-      sameSite: 'Lax',
-      maxAge: 600,
-      path: '/admin',
-    });
+  /**
+   * Start a sign-in: a fresh state, kept server-side and in a cookie of its
+   * own in this browser, next to the (at most two) other live sign-ins it
+   * has in flight, so a second tab doesn't break the first. Only this
+   * browser's own state cookies are touched: the new one is set; ones the
+   * server no longer has, and past the cap the oldest, are deleted by name.
+   * ?reauth=1 only marks the login.ok record. Rate limited per client
+   * address, and the state is counted against that address
+   * (SessionStore.issueState), so no one can start enough sign-ins to push
+   * out everyone else's.
+   */
+  private onLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    const ip = clientIp(req);
+    const take = this.loginLimit.take(ip);
+    if (!take.ok) {
+      if (take.report) this.recordRateLimited(ip, take.report.count, 'login');
+      return this.loginFailed(res, 'rate_limited');
+    }
+    const state = this.sessions.issueState({ reauth: url.searchParams.get('reauth') === '1', client: ip });
+    this.setStateCookie(res, state);
+    const held = cookieStates(req);
+    const live = held
+      .filter((h) => h.state !== null && this.sessions.stateStatus(h.state) === 'live')
+      .sort((a, b) => (this.sessions.stateIssueOrder(a.state!) ?? 0) - (this.sessions.stateIssueOrder(b.state!) ?? 0));
+    const evict = live.slice(0, Math.max(0, live.length - (STATES_PER_BROWSER - 1)));
+    for (const h of held) if (!live.includes(h) || evict.includes(h)) clearCookie(res, h.name, '/admin');
+    if (getCookie(req, LEGACY_STATE_COOKIE) !== undefined) clearCookie(res, LEGACY_STATE_COOKIE, '/admin');
     redirect(res, authorizeUrl(this.deps.config.oauthClientId, this.deps.config.redirectUri, state));
   }
 
+  /**
+   * Discord sends the browser back here. Every outcome is a redirect to the
+   * panel: postLoginUrl, or postLoginUrl with a LoginError. Nothing in the
+   * redirect comes from the request.
+   *
+   * Login CSRF: a state is accepted only if this server issued it, it is
+   * live and unused, AND this browser holds its HttpOnly state cookie.
+   */
   private async onCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-    const code = url.searchParams.get('code') ?? undefined;
-    const state = url.searchParams.get('state') ?? undefined;
-    const cookieState = getCookie(req, STATE_COOKIE);
-
-    // Double-submit + single-use: query state must match the cookie AND be live.
-    if (!code || !state || state !== cookieState || !this.sessions.consumeState(state)) {
-      this.audit.append({
-        actor: { id: 'unknown', name: 'unknown', kind: 'admin' },
-        action: 'login.failed',
-        ok: false,
-        detail: { reason: 'state/code validation failed' },
-      });
-      clearCookie(res, STATE_COOKIE, '/admin');
-      return this.loginFailed(res, 'failed');
+    // Per client address, before anything else is looked at.
+    const ip = clientIp(req);
+    const take = this.callbackLimit.take(ip);
+    if (!take.ok) {
+      if (take.report) this.recordRateLimited(ip, take.report.count);
+      return this.loginFailed(res, 'rate_limited');
     }
-    clearCookie(res, STATE_COOKIE, '/admin');
 
+    const q = url.searchParams;
+    const state = q.get('state') || undefined;
+    const code = q.get('code') || undefined;
+
+    // 1. Discord says the sign-in didn't happen (Cancel on its consent
+    //    screen, or its own error). No state cookie is touched: other tabs'
+    //    sign-ins go on.
+    const discordError = q.get('error');
+    if (discordError !== null) {
+      if (discordError === 'access_denied') {
+        this.recordLoginFailed({ reason: 'cancelled' });
+        return this.loginFailed(res, 'cancelled');
+      }
+      this.recordLoginFailed({ reason: 'discord_error', discordError: DISCORD_ERRORS.has(discordError) ? discordError : 'other' });
+      return this.loginFailed(res, 'discord_error');
+    }
+
+    // 2. Back (or a reload) onto a callback already used, while signed in:
+    //    home, as is. The code is never looked at, so a code sent from
+    //    elsewhere can't replace a signed-in browser's session.
+    const mine = hasStateCookie(req, state);
+    const current = this.sessions.get(getCookie(req, SESSION_COOKIE));
+    if (current && (!state || !mine || this.sessions.stateStatus(state) === 'unknown')) {
+      return redirect(res, this.deps.config.postLoginUrl);
+    }
+
+    // 3. The state: started in this browser, by this server, recently. A
+    //    failure touches no cookie, so a junk callback can't end another
+    //    tab's sign-in.
+    if (!state || !mine) {
+      this.recordLoginFailed({ reason: 'mismatch' });
+      return this.loginFailed(res, 'mismatch');
+    }
+    if (!code) {
+      // Discord always sends a code or an error; keep the state for a retry.
+      this.recordLoginFailed({ reason: 'discord_error', step: 'callback' });
+      return this.loginFailed(res, 'discord_error');
+    }
+    // Unknown here: used already, never issued, or issued before a restart.
+    const used = this.sessions.consumeState(state);
+    if (!used.ok) {
+      this.recordLoginFailed({ reason: 'expired', stateStatus: used.why });
+      return this.loginFailed(res, 'expired');
+    }
+
+    // 4. Who is this, and what do they administer?
     let result;
     try {
       result = await completeOAuth(
@@ -299,15 +454,15 @@ export class AdminServer {
         this.fetchImpl,
       );
     } catch (e) {
-      this.audit.append({
-        actor: { id: 'unknown', name: 'unknown', kind: 'admin' },
-        action: 'login.failed',
-        ok: false,
-        detail: { reason: (e as Error).message },
-      });
-      return this.loginFailed(res, 'discord');
+      const why = e instanceof OAuthError
+        ? { step: e.step, failure: e.failure, ...(e.status !== undefined ? { status: e.status } : {}) }
+        : { step: 'unknown', failure: 'other' };
+      this.recordLoginFailed({ reason: 'discord_error', ...why });
+      return this.loginFailed(res, 'discord_error');
     }
+    const userName = result.user.global_name || result.user.username;
 
+    // 5. Eligibility.
     const isSuper = this.deps.config.superadmins.includes(result.user.id);
     // Per-guild operator allowlist (RFC-005 §5.3): grant guild-admin for guilds
     // that explicitly list this user, even when their live Discord perms don't
@@ -332,16 +487,23 @@ export class AdminServer {
     const adminGuilds = claimed;
     if (!isSuper && ![...adminGuilds].some((gid) => this.isServed(gid))) {
       this.audit.append({
-        actor: { id: result.user.id, name: result.user.global_name || result.user.username, kind: 'admin' },
+        actor: { id: result.user.id, name: userName, kind: 'admin' },
         action: 'login.denied',
         ok: false,
-        detail: { reason: 'administers no guild this relay serves' },
+        detail: { reason: 'no_manageable_guild' },
       });
       return this.loginFailed(res, 'not_admin');
     }
+
+    // 6. Signed in. The state is spent, and so is its cookie — only its own:
+    //    a sign-in another tab started while Discord was answering keeps its
+    //    cookie. A session this browser already had (the same admin signing
+    //    in again, or another one) ends here.
+    clearCookie(res, stateCookieName(state), '/admin');
+    if (current) this.sessions.destroy(current.id);
     const session = this.sessions.create({
       userId: result.user.id,
-      userName: result.user.global_name || result.user.username,
+      userName,
       adminGuilds,
       guildNames,
       isSuper,
@@ -357,9 +519,33 @@ export class AdminServer {
       actor: { id: session.userId, name: session.userName, kind: 'admin' },
       action: 'login.ok',
       ok: true,
-      detail: { isSuper, adminGuilds: [...adminGuilds] },
+      detail: { isSuper, adminGuilds: [...adminGuilds], ...(used.reauth ? { reauth: true } : {}) },
     });
     redirect(res, this.deps.config.postLoginUrl);
+  }
+
+  /** `state`'s own cookie. Max-Age is a sign-in's lifetime (600 s). */
+  private setStateCookie(res: ServerResponse, state: string): void {
+    setCookie(res, stateCookieName(state), state, {
+      httpOnly: true,
+      secure: this.deps.config.cookieSecure,
+      sameSite: 'Lax',
+      maxAge: Math.floor(STATE_TTL_MS / 1000),
+      path: '/admin',
+    });
+  }
+
+  /** A callback that came back without a session. `detail` holds only fixed
+   *  words and numbers (reason, step, failure, an HTTP status). */
+  private recordLoginFailed(detail: Record<string, string | number>): void {
+    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.failed', ok: false, detail });
+  }
+
+  /** At most one a minute per address and step (LoginRateLimit decides
+   *  when). A refused start of a sign-in says step 'login'; a refused
+   *  callback says nothing more. */
+  private recordRateLimited(ip: string, count: number, step?: 'login'): void {
+    this.audit.append({ actor: UNKNOWN_ACTOR, action: 'login.rate_limited', ok: false, detail: { ip, count, ...(step ? { step } : {}) } });
   }
 
   private onLogout(req: IncomingMessage, res: ServerResponse, session: AdminSession): void {
@@ -375,8 +561,20 @@ export class AdminServer {
       guilds: [...session.adminGuilds]
         .filter((id) => session.isSuper || this.isServed(id))
         .map((id) => ({ id, name: session.guildNames[id] ?? id })),
-      // CSRF token the SPA echoes in the X-CSRF-Token header on mutations (P2+).
+      // CSRF token the SPA echoes in the X-CSRF-Token header on mutations.
       csrf: session.csrf,
+      // The panel's model of the relay: levels and capabilities as the relay
+      // defines them (it keeps a copy for an older relay), which optional
+      // parts are switched on, and when this session ends.
+      apiVersion: ADMIN_API_VERSION,
+      levels: LEVEL_CAPS,
+      caps: ALL_CAPS,
+      features: {
+        invites: !!this.deps.invites,
+        avatarUploads: !!this.deps.config.avatarDir,
+        allowlistEditable: this.deps.allowlist.editable,
+      },
+      session: { expiresAt: session.expiresAt },
     });
   }
 
@@ -386,7 +584,16 @@ export class AdminServer {
     const page = parsePage(url);
     switch (resource) {
       case 'invites': {
-        const body = paginate(this.invitesFor(guildId, undefined, session.isSuper), page, 'invites');
+        const want = url.searchParams.get('status') ?? 'all';
+        if (want !== 'all' && want !== 'active' && want !== 'spent') {
+          return sendJson(res, 400, err('INVALID', 'status must be active, spent or all'));
+        }
+        const now = this.nowMs();
+        const rows = this.invitesFor(guildId, page.q, session.isSuper)
+          .reverse() // newest first: the store keeps them in the order they were made
+          .map((inv) => ({ ...inv, status: this.inviteStatus(inv.code, now) }))
+          .filter((inv) => want === 'all' || (want === 'active') === (inv.status === 'active'));
+        const body = paginate(rows, page, 'invites');
         const scopes = (body.invites as any[]).map((inv) => inv?.grant?.scope);
         return sendJson(res, 200, { ...body, names: await this.scopeNames(scopes, guildId) });
       }
@@ -439,18 +646,40 @@ export class AdminServer {
       id: p.id,
       displayName: p.displayName,
       roles: this.rolesVisibleIn(guildId, entry?.roles ?? [], session.isSuper),
+      ...(session.isSuper ? { otherGuildRoleCount: this.otherGuildRoleCount(guildId, entry?.roles ?? []) } : {}),
       guildPolicy,
+      // Removed from G with /ban: nothing it holds applies in G until an
+      // admin of G gives it access again.
+      banned: this.deps.permissions.isBanned(personaId, guildId),
       names: { channels: clipToGuild(labels, guildId) } satisfies NameMaps,
     });
   }
 
-  /** Invites scoped to a guild (those whose `guildId` matches), optional search. */
+  /** Invites scoped to a guild (those whose `guildId` matches), optional
+   *  search over code and label — in the store's order, oldest first. */
   private invitesFor(guildId: string, q?: string, isSuper = true): any[] {
     const all = this.deps.invites?.all() ?? [];
     return all
       .filter((inv) => inv.guildId === guildId)
       .filter((inv) => isSuper || !this.hasForeignRole(inv.roles ?? [], guildId))
       .filter((inv) => !q || matches(q, inv.code, inv.label));
+  }
+
+  /** Active, used up, or expired — as the relay judges an invite when it is
+   *  used (InviteStore.check: an unreadable expiry counts as expired, and
+   *  expiry is checked before uses). */
+  private inviteStatus(code: string, now: number): 'active' | 'used' | 'expired' {
+    const c = this.deps.invites?.check(code, now);
+    return c === 'expired' || c === 'unknown' || c === undefined ? 'expired' : c === 'exhausted' ? 'used' : 'active';
+  }
+
+  /** Access roles a persona holds that belong to another guild than G
+   *  (a super-admin's '+N roles in other guilds'). */
+  private otherGuildRoleCount(guildId: string, roles: string[]): number {
+    return roles.filter((r) => {
+      const g = this.deps.permissions.getRole(r)?.guildId;
+      return g !== undefined && g !== guildId;
+    }).length;
   }
 
   /** Personas with any possible access in the guild (trimmed for the table). */
@@ -462,12 +691,16 @@ export class AdminServer {
       if (!this.deps.permissions.couldAccessGuild(p.id, guildId, inGuild)) continue;
       if (q && !matches(q, p.id, p.displayName)) continue;
       const entry = this.deps.permissions.getEntry(p.id);
+      const directGrants = directGrantsIn(entry?.policy?.guilds?.[guildId]);
       out.push({
         id: p.id,
         displayName: p.displayName,
         avatarUrl: this.deps.identity.avatarUrl(p),
         roles: this.rolesVisibleIn(guildId, entry?.roles ?? [], isSuper),
-        hasOverride: !!entry?.policy?.guilds?.[guildId],
+        ...(isSuper ? { otherGuildRoleCount: this.otherGuildRoleCount(guildId, entry?.roles ?? []) } : {}),
+        // A grant that gives something here, in a channel or guild-wide.
+        hasOverride: directGrants === 'grants',
+        directGrants,
       });
     }
     return out;
@@ -498,7 +731,10 @@ export class AdminServer {
     let grant: { caps: Capability[]; scope: Scope } | undefined;
     if (!roles.length && body?.grant !== undefined) {
       const checked = this.checkInviteGrant(session, guildId, body.grant);
-      if (typeof checked === 'string') return sendJson(res, checked.startsWith('FORBIDDEN:') ? 403 : 400, err(checked.startsWith('FORBIDDEN:') ? 'FORBIDDEN' : 'INVALID', checked.replace(/^(FORBIDDEN|INVALID): /, '')));
+      if (typeof checked === 'string') {
+        const [, code, message] = /^([A-Z_]+): (.*)$/s.exec(checked) ?? [, 'INVALID', checked];
+        return sendJson(res, code === 'FORBIDDEN' ? 403 : 400, err(code!, message!));
+      }
       grant = checked;
     }
     if (!roles.length && !grant) return sendJson(res, 400, err('INVALID', 'invite needs roles or a grant'));
@@ -556,7 +792,7 @@ export class AdminServer {
     const liftedBan = role?.guildId && roleGrantsAccess(role) ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
-    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   private revokeRole(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, role: string): void {
@@ -569,37 +805,136 @@ export class AdminServer {
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
   }
 
+  /**
+   * Set a direct grant on one channel of G, or G's guild-wide level. The body
+   * names exactly one target — {channelId} or {guildDefault: true} — and one
+   * operation: {level: read|write|full} (slash's levels), {caps: [...]} (a
+   * non-empty set of known capabilities), or {deny: true} (an explicit
+   * deny, stored as []). Nothing that would store a grant that does nothing
+   * is accepted: empty caps, threads (they use their parent's access) and
+   * categories (they grant nothing) are refused with a code the panel words.
+   */
   private setGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, body: any): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
-    const caps: string[] = Array.isArray(body?.caps) ? body.caps : [];
-    const channelId: string | undefined = typeof body?.channelId === 'string' ? body.channelId : undefined;
-    // Strictly clipped to G: a per-channel grant must target a channel in G.
-    if (channelId && !this.deps.channelInGuild(guildId, channelId)) {
-      return sendJson(res, 403, err('FORBIDDEN', 'channel is not in this guild'));
+    const target = grantTarget(body);
+    if ('error' in target) return sendJson(res, 400, target);
+    const op = grantOperation(body);
+    if ('error' in op) return sendJson(res, 400, op);
+    const { channelId } = target;
+    if (channelId !== undefined) {
+      // The in-guild test runs first, so the type test below only ever
+      // describes a channel already proven to be G's (I3).
+      const bad = this.grantTargetError(guildId, channelId);
+      if (bad) return sendJson(res, bad.status, bad.body);
     }
+    const caps = op.caps;
+    const before = this.grantAt(personaId, guildId, channelId);
     // An admin granting access here ends a /ban here (an explicit deny doesn't).
     const liftedBan = caps.length > 0 && this.deps.permissions.liftBan(personaId, guildId);
-    if (channelId) this.deps.permissions.setChannel(personaId, guildId, channelId, caps as any);
-    else this.deps.permissions.setGuildDefault(personaId, guildId, caps as any);
+    // The guild key written is always the route's G (I3).
+    if (channelId !== undefined) this.deps.permissions.setChannel(personaId, guildId, channelId, caps);
+    else this.deps.permissions.setGuildDefault(personaId, guildId, caps);
     const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.grant.set', target: personaId, guildId, ok: true, after: { channelId, caps, ...(liftedBan ? { liftedBan } : {}) } });
-    sendJson(res, 200, { guildPolicy });
+    const where = channelId !== undefined ? { channelId } : { guildDefault: true };
+    this.audit.append({
+      actor: this.actorOf(session), action: 'persona.grant.set', target: personaId, guildId, ok: true,
+      before: { ...where, caps: before },
+      after: { ...where, caps, ...(op.level ? { level: op.level } : {}), ...(liftedBan ? { liftedBan } : {}) },
+    });
+    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
-  private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, channelId: string | null): void {
+  /**
+   * Remove a direct grant, or say what G's guild-wide setting becomes:
+   *   ?channelId=<id>        remove that channel's direct grant (404 if none)
+   *   ?guildDefault=deny     an explicit deny: blocks the persona default in G
+   *   ?guildDefault=unset    no guild-wide setting: channels fall back to the
+   *                          persona default (404 if none is set)
+   * Exactly one of them; a bare DELETE is refused (it used to mean deny).
+   *
+   * A persona removed from G with /ban has nothing in G, whatever is unset:
+   * unsetting would say "falls back to the persona default" and change
+   * nothing. So for a banned persona Unset is refused (409 BANNED) unless
+   * the request also says &liftBan=1 — the admin, asked, chose to lift it —
+   * and then it lifts the ban and unsets, recorded as liftedBan.
+   */
+  private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, params: URLSearchParams): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
-    // Only a grant that exists can be cleared — and only then audited. (An
-    // arbitrary id would otherwise land in the audit log, where the panel
-    // looks its name up on Discord.)
-    const held = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId]?.channels ?? {};
-    if (channelId && !Object.prototype.hasOwnProperty.call(held, channelId)) {
-      return sendJson(res, 404, err('NOT_FOUND', 'no grant on that channel for this persona in this guild'));
+    const channelId = params.get('channelId');
+    const gd = params.get('guildDefault');
+    if ((channelId === null) === (gd === null)) {
+      return sendJson(res, 400, err('TARGET_REQUIRED', 'give exactly one of ?channelId= or ?guildDefault=deny|unset'));
     }
-    if (channelId) this.deps.permissions.clearChannel(personaId, guildId, channelId);
-    else this.deps.permissions.setGuildDefault(personaId, guildId, [] as any);
+    if (gd !== null && gd !== 'deny' && gd !== 'unset') {
+      return sendJson(res, 400, err('INVALID', 'guildDefault must be deny or unset'));
+    }
+    const g = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId];
+    const where = channelId !== null ? { channelId } : { guildDefault: true };
+    const before = this.grantAt(personaId, guildId, channelId ?? undefined);
+    let liftedBan = false;
+    if (channelId !== null) {
+      // Only a grant that exists can be removed — and only then audited. (An
+      // arbitrary id would otherwise land in the audit log, where the panel
+      // looks its name up on Discord.)
+      if (!Object.prototype.hasOwnProperty.call(g?.channels ?? {}, channelId)) {
+        return sendJson(res, 404, err('NOT_FOUND', 'no grant on that channel for this persona in this guild'));
+      }
+      this.deps.permissions.clearChannel(personaId, guildId, channelId);
+    } else if (gd === 'unset') {
+      if (g?.default === undefined) {
+        return sendJson(res, 404, err('NOT_FOUND', 'this persona has no guild-wide setting in this guild'));
+      }
+      if (this.deps.permissions.isBanned(personaId, guildId)) {
+        if (params.get('liftBan') !== '1') {
+          return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild with /ban; unsetting lifts that — send liftBan=1 to do it'));
+        }
+        liftedBan = this.deps.permissions.liftBan(personaId, guildId);
+      }
+      this.deps.permissions.unsetGuildDefault(personaId, guildId);
+    } else {
+      this.deps.permissions.setGuildDefault(personaId, guildId, []);
+    }
     const guildPolicy = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId] ?? null;
-    this.audit.append({ actor: this.actorOf(session), action: 'persona.grant.clear', target: personaId, guildId, ok: true, before: { channelId } });
-    sendJson(res, 200, { guildPolicy });
+    this.audit.append({
+      actor: this.actorOf(session), action: 'persona.grant.clear', target: personaId, guildId, ok: true,
+      before: { ...where, caps: before },
+      // null: nothing set there any more; []: an explicit deny.
+      after: { ...where, caps: gd === 'deny' ? [] : null, ...(liftedBan ? { liftedBan } : {}) },
+    });
+    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
+  }
+
+  /** What a persona's own setting at one target of G is now: a channel's
+   *  direct grant, or (no channel) G's guild-wide level; null when unset. */
+  private grantAt(personaId: string, guildId: string, channelId: string | undefined): Capability[] | null {
+    const g = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId];
+    if (channelId === undefined) return g?.default ?? null;
+    return g?.channels && Object.prototype.hasOwnProperty.call(g.channels, channelId) ? g.channels[channelId] : null;
+  }
+
+  /**
+   * Why `channelId` can't hold access in G, or null. In-guild first (403, the
+   * same answer for a channel of another guild and one that doesn't exist),
+   * then its kind: a thread uses its parent's access (THREAD_TARGET, with
+   * the parent to give access on instead), a category grants nothing
+   * (CATEGORY_TARGET), and anything but text, voice or forum is NOT_GRANTABLE.
+   */
+  private grantTargetError(guildId: string, channelId: string): { status: number; body: ReturnType<typeof err> } | null {
+    if (!this.deps.channelInGuild(guildId, channelId)) {
+      return { status: 403, body: err('FORBIDDEN', 'channel is not in this guild') };
+    }
+    const ch = this.deps.listChannels(guildId).find((c) => c.id === channelId);
+    if (ch?.type === 'thread') {
+      return {
+        status: 400,
+        body: err('THREAD_TARGET', 'a thread uses its parent channel’s access — give access there', ch.parentId ? { parentId: ch.parentId } : {}),
+      };
+    }
+    if (ch?.type === 'category') return { status: 400, body: err('CATEGORY_TARGET', 'a category grants nothing — pick its channels') };
+    if (!ch || !GRANTABLE_TYPES.has(ch.type ?? '')) {
+      return { status: 400, body: err('NOT_GRANTABLE', 'access can only be given on a text, voice or forum channel') };
+    }
+    return null;
   }
 
   private claimForPersona(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, body: any): void {
@@ -620,7 +955,7 @@ export class AdminServer {
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
     this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
-    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper) });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   /** Global persona-token lifecycle (super-admin only; no guildId — it's not a
@@ -651,21 +986,37 @@ export class AdminServer {
     path: string,
   ): Promise<void> {
     if (!session.isSuper) return sendJson(res, 403, err('FORBIDDEN', 'role authoring is super-admin only'));
-    if (method !== 'GET' && !this.csrfOk(req, session)) {
-      return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
-    }
+    // POST /admin/roles {name, role, replace?, expectedGuildId?} — define an
+    // access role. A name already in use is refused (409 EXISTS) unless the
+    // request says replace AND names the guild the existing role belongs to,
+    // so a role of another guild (and every holder's access) can't be
+    // rewritten by typing its name. Replacing never moves a role to another
+    // guild. The role is rebuilt from validated fields, never stored as sent.
     if (method === 'POST' && path === '/admin/roles') {
       const body = await readJson(req);
       const name = body?.name;
       const role = body?.role;
-      if (typeof name !== 'string' || !name || !role || !Array.isArray(role.caps) || !role.scope) {
-        return sendJson(res, 400, err('INVALID', 'name + role{caps,scope} required'));
+      if (typeof name !== 'string' || !name || !role || typeof role !== 'object') {
+        return sendJson(res, 400, err('INVALID', 'name + role{caps,scope,guildId} required'));
       }
       if (typeof role.guildId !== 'string' || !role.guildId) {
         return sendJson(res, 400, err('INVALID', 'roles are guild-scoped: role.guildId required'));
       }
-      this.deps.permissions.setRole(name, role);
-      this.audit.append({ actor: this.actorOf(session), action: 'role.set', target: name, ok: true, after: role });
+      const existing = this.deps.permissions.getRole(name);
+      if (existing) {
+        if (body.replace !== true) {
+          return sendJson(res, 409, err('EXISTS', `an access role named ${name} already exists`, { existing: { guildId: existing.guildId } }));
+        }
+        if (body.expectedGuildId !== existing.guildId || role.guildId !== existing.guildId) {
+          return sendJson(res, 409, err('GUILD_MISMATCH', `access role ${name} belongs to another guild`, { existing: { guildId: existing.guildId } }));
+        }
+      } else if (!ROLE_NAME.test(name)) {
+        return sendJson(res, 400, err('INVALID_NAME', 'a new access role name is 1–64 of a-z, 0-9, dot, dash or underscore, starting with a letter or digit'));
+      }
+      const checked = this.checkRoleDef(role);
+      if ('error' in checked) return sendJson(res, 400, checked);
+      this.deps.permissions.setRole(name, checked);
+      this.audit.append({ actor: this.actorOf(session), action: 'role.set', target: name, ok: true, ...(existing ? { before: existing } : {}), after: checked });
       return sendJson(res, 200, { ok: true, catalog: this.deps.permissions.allRoles() });
     }
     const del = /^\/admin\/roles\/([^/]+)$/.exec(path);
@@ -711,9 +1062,6 @@ export class AdminServer {
         allowlist: this.deps.allowlist.list(),
         guilds: [...bot.map((g) => ({ ...g, present: true })), ...notJoined],
       });
-    }
-    if (method !== 'GET' && !this.csrfOk(req, session)) {
-      return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
     }
     if (method !== 'GET' && !this.deps.allowlist.editable) {
       return sendJson(
@@ -803,6 +1151,7 @@ export class AdminServer {
       names.guilds = this.guildNames([
         ...Object.keys(policyGuilds),
         ...roles.map((r) => (r as { guildId?: string }).guildId),
+        ...(entry?.bans ?? []),
       ]);
       return sendJson(res, 200, {
         id: p.id,
@@ -812,6 +1161,8 @@ export class AdminServer {
         roles,
         // Inline per-persona policy (ad-hoc grants), if any.
         policy: entry?.policy ?? null,
+        // Guilds it was removed from with /ban (nothing applies there).
+        bans: entry?.bans ?? [],
         // Guilds (named) where this persona can act, and how.
         guilds: this.guildsWithAccess(id).map((gid) => ({ id: gid, name: this.guildName(gid) })),
         names,
@@ -820,7 +1171,6 @@ export class AdminServer {
     // POST /admin/personas/:id/token — rotate/revoke (CSRF-checked).
     const tok = /^\/admin\/personas\/([^/]+)\/token$/.exec(path);
     if (method === 'POST' && tok) {
-      if (!this.csrfOk(req, session)) return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
       return this.personaToken(res, session, decodeURIComponent(tok[1]), await readJson(req));
     }
     // PUT /admin/personas/:id/avatar — set the persona's profile picture (global
@@ -828,7 +1178,6 @@ export class AdminServer {
     // relay has PORTAL_AVATAR_BASE_URL; empty clears it. Applies to new messages.
     const av = /^\/admin\/personas\/([^/]+)\/avatar$/.exec(path);
     if (method === 'PUT' && av) {
-      if (!this.csrfOk(req, session)) return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
       const id = decodeURIComponent(av[1]);
       const cur = this.deps.identity.get(id);
       if (!cur) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
@@ -847,7 +1196,6 @@ export class AdminServer {
     // and point the persona's avatar at it. Served back at /admin/avatars/<file>.
     const upl = /^\/admin\/personas\/([^/]+)\/avatar\/upload$/.exec(path);
     if (method === 'POST' && upl) {
-      if (!this.csrfOk(req, session)) return sendJson(res, 403, err('CSRF', 'missing or invalid CSRF token'));
       const dir = this.deps.config.avatarDir;
       if (!dir) return sendJson(res, 503, err('UNAVAILABLE', 'avatar uploads not configured (set PORTAL_AVATAR_DIR)'));
       const id = decodeURIComponent(upl[1]);
@@ -986,7 +1334,7 @@ export class AdminServer {
 
   /** Land a failed or refused login on the panel with a fixed reason code
    *  (the SPA maps codes to messages; nothing from the request is echoed). */
-  private loginFailed(res: ServerResponse, code: 'failed' | 'discord' | 'not_admin'): void {
+  private loginFailed(res: ServerResponse, code: LoginError): void {
     // The code goes in the query, before any #fragment (the SPA reads
     // location.search).
     const to = this.deps.config.postLoginUrl;
@@ -1051,10 +1399,11 @@ export class AdminServer {
 
   /**
    * Validate an invite grant for guild G and return a clean copy, or an error
-   * string ("FORBIDDEN: …" / "INVALID: …"). Caps must be known capability
-   * names; the scope must be exactly one of: channels of G, a Discord role of
-   * G to mirror, several roles of G to mirror — or, for super-admins only,
-   * `all` (every channel of G; see Relay.scopeToPolicy).
+   * string ("<CODE>: …", e.g. "FORBIDDEN: …", "INVALID: …", "THREAD_TARGET: …").
+   * Caps must be known capability names; the scope must be exactly one of:
+   * channels of G that can hold access (not threads or categories), a
+   * Discord role of G to mirror, several roles of G to mirror — or, for
+   * super-admins only, `all` (every channel of G; see Relay.scopeToPolicy).
    */
   private checkInviteGrant(session: AdminSession, guildId: string, raw: unknown): { caps: Capability[]; scope: Scope } | string {
     if (!raw || typeof raw !== 'object') return 'INVALID: grant must be an object';
@@ -1072,6 +1421,9 @@ export class AdminServer {
       if (!channels.length) return 'INVALID: grant.scope.channels is empty';
       for (const cid of channels) {
         if (typeof cid !== 'string' || !this.deps.channelInGuild(guildId, cid)) return `FORBIDDEN: channel ${String(cid)} is not in this guild`;
+        // I3: and a channel that can hold access (not a thread or category).
+        const bad = this.grantTargetError(guildId, cid);
+        if (bad) return `${bad.body.error.code}: ${bad.body.error.message}`;
       }
       return { caps: caps as Capability[], scope: { channels: channels as string[] } };
     }
@@ -1090,6 +1442,60 @@ export class AdminServer {
       return { caps: caps as Capability[], scope: { all: true } };
     }
     return 'INVALID: grant.scope must have exactly one of channels, mirrorRole, mirrorRoles, all';
+  }
+
+  /**
+   * An access role as the catalog may hold it, rebuilt from `raw`: known,
+   * non-empty caps; exactly one scope — channels of the role's guild that
+   * can hold access, Discord roles of that guild (not the relay's pooled
+   * addressing roles), or all: true; mirrorCaps only on a mirror, as a
+   * boolean. Or the error to answer with.
+   */
+  private checkRoleDef(raw: Record<string, unknown>): AccessRole | ReturnType<typeof err> {
+    const guildId = raw.guildId as string;
+    if (!Array.isArray(raw.caps)) return err('INVALID', 'role.caps must be a list of capabilities');
+    const caps = checkCaps(raw.caps);
+    if ('error' in caps) return caps;
+    const scope = (raw.scope && typeof raw.scope === 'object' ? raw.scope : {}) as Record<string, unknown>;
+    if (Object.keys(scope).length !== 1) return err('INVALID', 'role.scope must have exactly one of channels, mirrorRole, mirrorRoles, all');
+    const mirrorable = new Set(this.deps.listRoles(guildId).filter((r) => !r.pooled).map((r) => r.id));
+    const mirrorRole = (id: unknown) =>
+      typeof id === 'string' && mirrorable.has(id) ? null : err('INVALID', `${String(id)} is not a Discord role of that guild that can be mirrored`);
+    let out: AccessRole;
+    if (scope.all !== undefined) {
+      if (scope.all !== true) return err('INVALID', 'role.scope.all must be true');
+      out = { caps: caps.caps, scope: { all: true }, guildId };
+    } else if (scope.channels !== undefined) {
+      if (!Array.isArray(scope.channels) || !scope.channels.length) return err('INVALID', 'role.scope.channels must list at least one channel');
+      const channels = [...new Set(scope.channels)];
+      for (const cid of channels) {
+        if (typeof cid !== 'string' || !cid) return err('INVALID', 'role.scope.channels must list channel ids');
+        const bad = this.grantTargetError(guildId, cid);
+        if (bad) return bad.status === 403 ? err('INVALID', `channel ${cid} is not in that guild`) : bad.body;
+      }
+      out = { caps: caps.caps, scope: { channels: channels as string[] }, guildId };
+    } else if (scope.mirrorRole !== undefined) {
+      const bad = mirrorRole(scope.mirrorRole);
+      if (bad) return bad;
+      out = { caps: caps.caps, scope: { mirrorRole: scope.mirrorRole as string }, guildId };
+    } else if (scope.mirrorRoles !== undefined) {
+      if (!Array.isArray(scope.mirrorRoles) || !scope.mirrorRoles.length) return err('INVALID', 'role.scope.mirrorRoles must list at least one role');
+      const ids = [...new Set(scope.mirrorRoles)];
+      for (const id of ids) {
+        const bad = mirrorRole(id);
+        if (bad) return bad;
+      }
+      out = { caps: caps.caps, scope: { mirrorRoles: ids as string[] }, guildId };
+    } else {
+      return err('INVALID', 'role.scope must have exactly one of channels, mirrorRole, mirrorRoles, all');
+    }
+    if (raw.mirrorCaps !== undefined) {
+      if (typeof raw.mirrorCaps !== 'boolean') return err('INVALID', 'role.mirrorCaps must be true or false');
+      if (!('mirrorRole' in out.scope) && !('mirrorRoles' in out.scope)) {
+        if (raw.mirrorCaps) return err('INVALID', 'mirrorCaps applies only to a role that mirrors Discord roles');
+      } else out.mirrorCaps = raw.mirrorCaps;
+    }
+    return out;
   }
 
   /** Guild ids a persona can possibly act in (across the bot's known guilds). */
@@ -1188,8 +1594,58 @@ async function readBytes(req: IncomingMessage, max: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function err(code: string, message: string) {
-  return { error: { code, message } };
+function err(code: string, message: string, extra: Record<string, unknown> = {}) {
+  return { error: { code, message, ...extra } };
+}
+
+const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+
+/** A grant request's target: exactly one of {channelId} or {guildDefault: true}.
+ *  A body naming neither (a panel from before this check sent a bare caps
+ *  list for guild-wide) is refused loudly rather than read some other way. */
+function grantTarget(body: unknown): { channelId?: string } | ReturnType<typeof err> {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const hasChannel = b.channelId !== undefined;
+  const hasGuild = b.guildDefault !== undefined;
+  if (hasChannel === hasGuild) return err('TARGET_REQUIRED', 'give exactly one target: channelId, or guildDefault: true');
+  if (hasGuild) return b.guildDefault === true ? {} : err('INVALID', 'guildDefault must be true');
+  if (typeof b.channelId !== 'string' || !b.channelId) return err('INVALID', 'channelId must be a channel id');
+  return { channelId: b.channelId };
+}
+
+/** A grant request's operation: exactly one of {level}, {caps} or {deny: true}. */
+function grantOperation(body: unknown): { caps: Capability[]; level?: string } | ReturnType<typeof err> {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const given = (['level', 'caps', 'deny'] as const).filter((k) => b[k] !== undefined);
+  if (!given.length) return err('EMPTY_CAPS', 'pick a level, or use Remove');
+  if (given.length > 1) return err('INVALID', 'give exactly one of level, caps or deny');
+  if (given[0] === 'level') {
+    const level = b.level;
+    if (typeof level !== 'string' || !has(LEVEL_CAPS, level)) return err('INVALID', 'level must be read, write or full');
+    return { caps: [...LEVEL_CAPS[level]], level };
+  }
+  if (given[0] === 'deny') return b.deny === true ? { caps: [] } : err('INVALID', 'deny must be true');
+  if (!Array.isArray(b.caps)) return err('INVALID', 'caps must be a list of capabilities');
+  return checkCaps(b.caps);
+}
+
+/** A non-empty list of known capability names, without repeats. */
+function checkCaps(raw: unknown[]): { caps: Capability[] } | ReturnType<typeof err> {
+  if (!raw.length) return err('EMPTY_CAPS', 'pick a level, or use Remove');
+  const known = new Set<string>(ALL_CAPS);
+  for (const c of raw) if (typeof c !== 'string' || !known.has(c)) return err('UNKNOWN_CAP', `unknown capability ${String(c)}`);
+  return { caps: [...new Set(raw as Capability[])] };
+}
+
+/** What a guild's persona row says about its direct grants there:
+ *  'grants' — some channel grant or the guild-wide level gives something;
+ *  'denied' — guild-wide is an explicit deny and nothing gives anything;
+ *  'none'   — neither (no entry, or only empty channel grants). */
+function directGrantsIn(g: GuildPolicy | undefined): 'none' | 'grants' | 'denied' {
+  if (!g) return 'none';
+  const gives = (g.default?.length ?? 0) > 0 || Object.values(g.channels ?? {}).some((caps) => caps.length > 0);
+  if (gives) return 'grants';
+  return Array.isArray(g.default) ? 'denied' : 'none';
 }
 
 // ── HTTP helpers ──
@@ -1249,6 +1705,36 @@ function appendSetCookie(res: ServerResponse, cookie: string): void {
   const list = Array.isArray(prev) ? prev : prev ? [String(prev)] : [];
   list.push(cookie);
   res.setHeader('set-cookie', list);
+}
+
+/** The name of `state`'s cookie: the prefix and 16 hex digits of its SHA-256
+ *  (exported for tests). */
+export function stateCookieName(state: string): string {
+  return STATE_COOKIE_PREFIX + createHash('sha256').update(state).digest('hex').slice(0, 16);
+}
+
+/** Does this browser hold `state`'s cookie (it started this sign-in)? */
+function hasStateCookie(req: IncomingMessage, state: string | undefined): state is string {
+  return !!state && STATE_FORMAT.test(state) && getCookie(req, stateCookieName(state)) === state;
+}
+
+/** This browser's state cookies (at most STATE_COOKIES_READ): each one's name,
+ *  and its state — null when it doesn't hold a well-formed state under its
+ *  own name. */
+function cookieStates(req: IncomingMessage): Array<{ name: string; state: string | null }> {
+  const header = req.headers.cookie;
+  if (!header) return [];
+  const out: Array<{ name: string; state: string | null }> = [];
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    if (!STATE_COOKIE_NAME.test(name) || out.some((h) => h.name === name)) continue;
+    const v = part.slice(eq + 1).trim();
+    out.push({ name, state: STATE_FORMAT.test(v) && stateCookieName(v) === name ? v : null });
+    if (out.length >= STATE_COOKIES_READ) break;
+  }
+  return out;
 }
 
 function getCookie(req: IncomingMessage, name: string): string | undefined {
