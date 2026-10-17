@@ -2336,12 +2336,15 @@ async function openMintDrawer(prefill = {}) {
     });
     const another = el('button', { class: 'btn', text: 'Mint another' });
     another.addEventListener('click', () => { d.setBody(form); label.focus(); });
-    const done = el('button', { class: 'btn', text: 'Done', onclick: () => d.close() });
+    // As ✕: the form behind the card may hold an edit made while this was
+    // minting (it is not in this invite), and closing asks before it goes.
+    const done = el('button', { class: 'btn', text: 'Done', onclick: () => d.requestClose() });
     d.setBody(el('section', { class: 'result-card', 'aria-labelledby': headId }, [
       el('h3', { id: headId, text: 'Invite ready' }),
       el('p', { class: 'invite-code-wrap' }, [codeEl]),
       el('p', { class: 'invite-summary', text: lib.inviteSummary(inv, names, Date.now()) }),
       el('p', { class: 'muted', text: 'Hand this code to the enrolling agent.' }),
+      tracker.isDirty() ? el('p', { class: 'warn-line', text: 'The form was changed while this invite was being minted; that change isn’t in it. Mint another shows it.' }) : null,
       el('div', { class: 'inline' }, [copy, another, done]),
       cardStatus.node,
     ]));
@@ -2530,6 +2533,9 @@ async function openRoleDrawer() {
   ui.onSubmit(form, async () => {
     if (missing()) return; // Create is off until the form is complete
     status.clear(); // a line about the last try is not about this one
+    // What is sent is read now; the form stays editable while the relay is
+    // asked, and an edit made meanwhile is not part of this save.
+    const sent = tracker.mark();
     const roleName = name.value.trim();
     let scope;
     if (kind.value === 'all') scope = { all: true };
@@ -2587,7 +2593,16 @@ async function openRoleDrawer() {
       markStale();
       // Through the form's line, so an earlier 'Not created' toast goes too
       // (and, if this drawer was closed meanwhile, the toast still says it).
-      status.ok((existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.');
+      const done = (existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.';
+      tracker.saved(sent);
+      if (d.isCurrent() && tracker.isDirty()) {
+        // Changed while it was being saved: that change was not sent. The
+        // drawer stays with it, unsaved — closing asks, a sign-in keeps it,
+        // and Create sends it (asking first, as the role exists now).
+        status.ok(done + ' The form was changed while it was being saved; that change isn’t saved yet.');
+        return true;
+      }
+      status.ok(done);
       d.close(); // the list redraws with the role — never another drawer
       return true;
     }
@@ -2597,7 +2612,7 @@ async function openRoleDrawer() {
       // and the admin has moved on: nothing to say.
       if (d.isCurrent() || e.method !== 'GET') status.err(notDone(e, 'Not created', { roleName }));
     }
-  }, { busyLabel: 'Creating…' });
+  }, { busyLabel: 'Creating…', settled: update }); // edited while it was at work: Create as the form is now
   d.setBody(form);
 }
 

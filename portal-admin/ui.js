@@ -281,6 +281,9 @@
    * Submit `form` through `run` (Enter or the submit button), one at a time:
    * while a submission is pending, further submits are ignored and the submit
    * button is locked with busy(). `run` reports its own result and errors.
+   * opts.settled() runs once the button is back as it was: a form whose
+   * submit button is on only when it is complete says so again then (it can
+   * have been edited while the submission was at work).
    */
   function onSubmit(form, run, opts) {
     const o = opts || {};
@@ -294,6 +297,7 @@
       const p = button ? busy(button, work, o.busyLabel) : Promise.resolve().then(work);
       p.catch((err) => console.error('[portal-admin]', err)).then(() => {
         pending = false;
+        if (o.settled) o.settled();
       });
     });
     return form;
@@ -749,6 +753,12 @@
          *  lands after it was closed or replaced must not close another. */
         close(reason) {
           if (handle.isCurrent()) drawer.close(reason);
+        },
+        /** Close as ✕ does — asking 'Discard changes?' first when a tracked
+         *  form is dirty — only if this is still the drawer open. Resolves
+         *  true if it closed. A drawer's own Done uses this, not close(). */
+        requestClose() {
+          return handle.isCurrent() ? drawer.requestClose() : Promise.resolve(false);
         },
         setTitle(title, subtitle) {
           if (!handle.isCurrent()) return;

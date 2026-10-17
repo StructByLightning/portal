@@ -1436,7 +1436,7 @@ async function rolesTab(more: Record<string, any> = {}) {
   const g = '/admin/g/' + G1;
   const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'], ...more };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
-  const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void> } = { down: false };
+  const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void>; holdPost?: Promise<void> } = { down: false };
   const box = appSandbox({
     routes: {
       '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
@@ -1453,6 +1453,7 @@ async function rolesTab(more: Record<string, any> = {}) {
         return { catalog, discordRoles: [], canAuthor: true, names };
       }
       if (method === 'POST' && path === '/admin/roles') {
+        if (net.holdPost) await net.holdPost; // the save, answered late
         net.beforePost?.(body); // someone else, just before this request lands
         // As the relay does: a name in use only with replace, in its own guild.
         const cur = Object.hasOwn(catalog, body.name) ? catalog[body.name] : undefined;
@@ -2031,6 +2032,95 @@ test('role drawer: a role made before the naming rule can still be edited under 
   await settle();
   assert.deepEqual(bodies.at(-1), { name: 'Old Name', role: { caps: [...LEVEL_CAPS.write], scope: { all: true }, guildId: G1 }, replace: true, expectedGuildId: G1 });
   assert.deepEqual(catalog['Old Name'].caps, [...LEVEL_CAPS.write]);
+});
+
+/** The open role drawer's form, and a level picked on it as an admin would. */
+function roleForm(doc: FakeDocument) {
+  const form = doc.getElementById('drawer-body')!.querySelector('form')!;
+  const radio = (k: string) => form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === k)!;
+  const pick = (k: string) => {
+    for (const o of form.querySelectorAll('input')) if (o.type === 'radio') o.checked = false;
+    radio(k).checked = true;
+    radio(k).fire('change');
+  };
+  return { form, radio, pick };
+}
+
+test('role drawer: a level picked while Create is at work stays, unsaved — the drawer stays open, and closing asks', async () => {
+  const { define, confirm, catalog, net, doc, bodies } = await rolesTab();
+  let answer!: () => void;
+  net.holdPost = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  assert.equal(bodies.at(-1).role.caps.length, LEVEL_CAPS.read.length, 'Read was sent');
+  const { form, radio, pick } = roleForm(doc);
+  pick('full'); // while the relay saves Read
+  net.holdPost = undefined;
+  answer();
+  await settle();
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.read], 'the relay saved Read');
+  const drawer = doc.getElementById('drawer')!;
+  assert.ok(!drawer.classList.contains('hidden'), 'the drawer stays, with the change made meanwhile');
+  assert.equal(radio('full').checked, true);
+  assert.equal(form.querySelector('.status-line')!.textContent,
+    'Created access role g1-brand-new: Read in every channel of Guild One. The form was changed while it was being saved; that change isn’t saved yet.');
+  assert.equal(form.querySelector('button[type="submit"]')!.disabled, false, 'Create is on for it');
+
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Discard changes?', 'Full was never saved');
+  clickable(doc, 'Cancel', confirm()!).click();
+  await settle();
+
+  // Create sends it — as an edit of the role that exists now, after asking.
+  form.fire('submit');
+  await settle();
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'A role named g1-brand-new already exists — edit it instead?');
+  confirm()!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.full]);
+  assert.ok(drawer.classList.contains('hidden'), 'saved as it shows: the drawer closes');
+});
+
+test('role drawer: an edit made while the name is being looked up is not sent, and stays unsaved', async () => {
+  const { define, catalog, net, doc, bodies } = await rolesTab();
+  let answer!: () => void;
+  net.holdLookup = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  const { radio, pick } = roleForm(doc);
+  pick('write'); // before Create's request has even gone
+  net.holdLookup = undefined;
+  answer();
+  await settle();
+  assert.deepEqual(bodies.at(-1).role.caps, [...LEVEL_CAPS.read], 'what was pressed is what was sent');
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.read]);
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'), 'the drawer stays');
+  assert.equal(radio('write').checked, true, 'with Write, unsaved');
+  assert.equal(doc.getElementById('drawer-body')!.querySelector('.status-line')!.textContent.endsWith('that change isn’t saved yet.'), true);
+});
+
+test('role drawer: a name emptied while Create is at work leaves Create off after the answer', async () => {
+  const { define, net, doc } = await rolesTab();
+  let answer!: () => void;
+  net.holdPost = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  const { form } = roleForm(doc);
+  const input = form.querySelector('input[name="name"]')!;
+  input.value = '';
+  input.fire('input');
+  net.holdPost = undefined;
+  answer();
+  await settle();
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'));
+  assert.equal(form.querySelector('button[type="submit"]')!.disabled, true, 'not turned back on by the finished save');
+  assert.match(form.textContent, /Name the role to create it\./);
+});
+
+test('role drawer: created as it shows, the drawer closes without asking', async () => {
+  const { define, confirm, catalog, doc } = await rolesTab();
+  await define('g1-brand-new', 'write');
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.write]);
+  assert.equal(confirm(), null);
+  assert.ok(doc.getElementById('drawer')!.classList.contains('hidden'));
 });
 
 // ── Addresses: the router grammar (lib.js) ──
@@ -3218,6 +3308,56 @@ test('mint: a label changed while the invite is being minted stays unsaved; Mint
   box.doc.getElementById('drawer-close')!.click();
   await settle();
   assert.equal(box.doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?', '“y” was never minted');
+});
+
+test('mint: Done on the minted card asks first when the form was changed while it minted; untouched, it just closes', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: async (method, path, body) => {
+      if (method !== 'POST' || path !== `/admin/g/${GA}/invites`) return undefined;
+      if (gate) await gate;
+      return { code: 'inv_fixtureinvite0000000b', invite: { guildId: GA, ...body, uses: 0 } };
+    },
+  });
+  const drawer = box.doc.getElementById('drawer')!;
+  const body = box.doc.getElementById('drawer-body')!;
+  gate = new Promise<void>((r) => { answer = r; });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  form.fire('submit');
+  await settle();
+  const label = form.querySelector('input[name="label"]')!;
+  label.value = 'y'; // typed while it mints
+  label.fire('input');
+  gate = undefined;
+  answer();
+  await settle();
+  assert.ok(body.textContent.includes('Invite ready'));
+  assert.match(body.querySelector('p.warn-line')!.textContent, /changed while this invite was being minted; that change isn’t in it\. Mint another shows it\./);
+
+  clickable(box.doc, 'Done').click();
+  await settle();
+  const dialog = box.doc.querySelector('.modal')!;
+  assert.ok(dialog, 'Done asks, as ✕ does');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'Discard changes?');
+  clickable(box.doc, 'Cancel', dialog).click();
+  await settle();
+  assert.ok(!drawer.classList.contains('hidden'), 'Cancel keeps the drawer');
+  assert.ok(body.textContent.includes('Invite ready'), 'with the code still on screen');
+  clickable(box.doc, 'Mint another').click();
+  assert.equal(body.querySelector('input[name="label"]')!.value, 'y', 'and the edit behind it');
+
+  // Minted with nothing changed meanwhile: Done closes without a question.
+  body.querySelector('form')!.fire('submit');
+  await settle();
+  assert.ok(body.textContent.includes('Invite ready'));
+  assert.equal(body.querySelector('p.warn-line'), null, 'nothing to warn about');
+  clickable(box.doc, 'Done').click();
+  await settle();
+  assert.equal(box.doc.querySelector('.modal'), null, 'no question');
+  assert.ok(drawer.classList.contains('hidden'), 'closed');
 });
 
 test('persona drawer: text typed into a field while its save is at work stays, unsaved (picture URL, invite code)', async () => {
