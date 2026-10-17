@@ -425,6 +425,13 @@ const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
   ['uses-word', { uses: 'x', maxUses: 1 }, /invite uses must be a number/],
   ['prefix-number', { namePrefix: 7 }, /invite namePrefix must be a string/],
   ['subs-mixed', { subscriptions: [CHAN_A, 42] }, /invite subscriptions must be a list of channel ids/],
+  ['caps-mixed', { grant: undefined, caps: ['SEND_MESSAGES', 5] }, /invite caps must be a list of capabilities/],
+  ['roles-mixed', { roles: ['reader', 5] }, /invite roles must be a list of access role names/],
+  // A grant that isn't one: enroll read a falsy one as absent and fell back to the caps, a claim kept it and granted nothing.
+  ['grant-zero', { grant: 0 }, /invite grant must be an object/],
+  ['grant-blank', { grant: '' }, /invite grant must be an object/],
+  ['grant-false', { grant: false, caps: [...RW] }, /invite grant must be an object/],
+  ['grant-list', { grant: [] }, /invite grant must be an object/],
   // The legacy blanket grant: read as no grant when it has no length, which spent the invite for nothing.
   ['caps-number', { grant: undefined, caps: 5 }, /invite caps must be a list of capabilities/],
   ['caps-true', { grant: undefined, caps: true }, /invite caps must be a list of capabilities/],
@@ -525,10 +532,10 @@ for (const [fields, why] of MALFORMED_REGISTER) {
   });
 }
 
-test('an empty or false register name or avatar means none, as it always has; a false avatar is stored as none', async () => {
+test('an empty or false register name, avatar or subscriptions means none, as it always has; a false avatar is stored as none', async () => {
   const t = makeRelay();
   try {
-    for (const fields of [{ desiredName: '' }, { desiredName: false }, { desiredName: null }, { avatar: false }, { avatar: '' }, { subscriptions: null }]) {
+    for (const fields of [{ desiredName: '' }, { desiredName: false }, { desiredName: null }, { avatar: false }, { avatar: '' }, { subscriptions: null }, { subscriptions: '' }, { subscriptions: 0 }, { subscriptions: false }]) {
       const res = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'x', ...fields });
       assert.ok(!('error' in res), `${JSON.stringify(fields)}: ${JSON.stringify(res)}`);
       const p = t.relay.identity.get(res.personaId);
@@ -540,13 +547,33 @@ test('an empty or false register name or avatar means none, as it always has; a 
   }
 });
 
+// Enroll adds an invite's default subscriptions to the frame's after the
+// persona is made and the invite spent, so the frame's empty forms are read
+// there too.
+for (const subs of ['', 0, false, null]) {
+  test(`register subscriptions of ${JSON.stringify(subs)} beside an invite's default subscriptions: enroll carries the invite's`, async () => {
+    const t = makeRelay();
+    try {
+      t.relay.invites.mint({ code: 'subs-mint', subscriptions: [CHAN_A], guildId: GUILD, grant: MIRROR_GRANT } as any);
+      const d = { invite: 'subs-mint', desiredName: 'x', subscriptions: subs } as any;
+      const res = await outcome(() => t.relay.enroll(d));
+      assert.ok(res?.personaId, JSON.stringify(res));
+      assert.deepEqual(d.subscriptions, [CHAN_A]);
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
 const STORED_SCOPES: Array<[string, unknown]> = [
   ['both mirror keys naming different roles', { mirrorRole: DISCORD_ROLE, mirrorRoles: ['dr-other'] }],
   ['all: false beside a mirror role', { all: false, mirrorRole: DISCORD_ROLE }],
   ['both mirror keys naming one role', { mirrorRole: DISCORD_ROLE, mirrorRoles: [DISCORD_ROLE] }],
 ];
 for (const [what, scope] of STORED_SCOPES) {
-  test(`a stored mirror role hand-edited to ${what} is quarantined, and the next claim of its grant writes the grant's role in its place`, async () => {
+  test(`a stored mirror role hand-edited to ${what} is quarantined, and the next claim of its grant writes the grant's role in its place, logging what it replaced`, async (tc) => {
+    const warned: string[] = [];
+    tc.mock.method(console, 'warn', (...a: unknown[]) => { warned.push(a.map(String).join(' ')); });
     const t = makeRelay();
     try {
       const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'probe' });
@@ -564,6 +591,7 @@ for (const [what, scope] of STORED_SCOPES) {
       assert.deepEqual(seen.role, { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE }, guildId: GUILD }, JSON.stringify(seen));
       assert.deepEqual(seen.caps, [...RW].sort(), JSON.stringify(seen));
       assert.equal(t.relay.permissions.isQuarantined(name), false, 'replaced');
+      assert.ok(warned.some((l) => l.includes(`mirror grant ${name}: replacing the entry set aside at load, which was ${JSON.stringify({ caps: [...RW].sort(), scope, guildId: GUILD })}`)), warned.join('\n'));
     } finally {
       t.cleanup();
     }

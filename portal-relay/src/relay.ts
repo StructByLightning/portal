@@ -105,15 +105,15 @@ function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
 /** Why a register frame's own fields can't be used, or null. A name or an
  *  avatar that isn't a string would throw mid-enroll or be stored as sent, and
  *  subscriptions that aren't a list of channel ids would throw or be read a
- *  character at a time. An empty or false name or avatar means none: the
- *  default name, as it always has, and no avatar. Checked before anything is
- *  read or created. */
+ *  character at a time. An empty or false name, avatar or subscriptions means
+ *  none: the default name, as it always has, no avatar and no subscriptions.
+ *  Checked before anything is read or created. */
 function registerFieldProblem(d: RegisterData): string | null {
   const f = d as unknown as Record<string, unknown>;
   if (f.desiredName && typeof f.desiredName !== 'string') return 'register desiredName must be a string';
   if (f.avatar && typeof f.avatar !== 'string') return 'register avatar must be a string';
   const subs = f.subscriptions;
-  if (subs !== undefined && subs !== null && !(Array.isArray(subs) && subs.every((c) => typeof c === 'string'))) {
+  if (subs && !(Array.isArray(subs) && subs.every((c) => typeof c === 'string'))) {
     return 'register subscriptions must be a list of channel ids';
   }
   return null;
@@ -736,9 +736,11 @@ export class Relay implements GatewayHooks {
     this.applyInviteGrant(personaId, checked);
     this.invites.consume(d.invite);
 
-    // Carry the invite's default subscriptions through to this session.
+    // Carry the invite's default subscriptions through to this session. The
+    // frame's own are a list, or empty or false for none: registerFieldProblem
+    // lets those through.
     if (checked.subscriptions?.length) {
-      d.subscriptions = [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])];
+      d.subscriptions = [...new Set([...(d.subscriptions || []), ...checked.subscriptions])];
     }
 
     console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
@@ -851,6 +853,12 @@ export class Relay implements GatewayHooks {
         return null;
       }
       return name;
+    }
+    // A role set aside at load under this name is replaced: the name is a
+    // digest of the grant's guild, roles and caps, so this is the role it
+    // stands for. The log keeps what was there, for the relay's operator.
+    if (this.permissions.isQuarantined(name)) {
+      console.warn(`[portal-relay] mirror grant ${name}: replacing the entry set aside at load, which was ${JSON.stringify(this.permissions.quarantinedEntry(name))}`);
     }
     this.permissions.setRole(name, role);
     return name;

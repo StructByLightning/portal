@@ -259,14 +259,6 @@ export class SlashHandler {
     return this.deps.superadmins.includes(invoker.id);
   }
 
-  /**
-   * Guild containment for role grants (/add-role, /remove-role, /invite): a
-   * guild's admin may only hand out (or take away) roles SCOPED TO THAT
-   * GUILD; other guilds' roles are superadmin-only. Since 2026-07-31 roles
-   * are guild-scoped in RESOLUTION too (scope:{all} = that guild only), so
-   * this gate and the resolver agree. Autocomplete filters the same way, but
-   * the filter is a hint; THIS is the gate.
-   */
   /** Why named roles that aren't live can't be used here, or null: names
    *  the catalog has never had, and names set aside when the relay loaded
    *  them, which it can't read until its operator fixes them. */
@@ -283,6 +275,14 @@ export class SlashHandler {
     return parts.length ? parts.join(' ') : null;
   }
 
+  /**
+   * Guild containment for role grants (/add-role, /remove-role, /invite): a
+   * guild's admin may only hand out (or take away) roles SCOPED TO THAT
+   * GUILD; other guilds' roles are superadmin-only. Since 2026-07-31 roles
+   * are guild-scoped in RESOLUTION too (scope:{all} = that guild only), so
+   * this gate and the resolver agree. Autocomplete filters the same way, but
+   * the filter is a hint; THIS is the gate.
+   */
   private roleGrantableHere(role: AccessRole, inv: SlashInvocation): boolean {
     return this.isSuper(inv.invoker) || role.guildId === inv.guildId;
   }
@@ -387,12 +387,25 @@ export class SlashHandler {
     }
     // Same containment as granting: removing another guild's (or a global)
     // role changes the persona's access OUTSIDE this admin's authority.
-    // A role set aside at load is contained by the guild its entry names.
-    const role = this.deps.permissions.getRole(name);
-    const guildId = role ? role.guildId : this.deps.permissions.quarantinedGuildId(name);
-    if (guildId !== undefined && !this.isSuper(inv.invoker) && guildId !== inv.guildId) {
+    // A role set aside at load is contained by the guild its entry names, and
+    // one whose entry names no guild it can read is a superadmin's to remove,
+    // as in the admin panel. A name the catalog has never had keeps no guild.
+    const p = this.deps.permissions;
+    const role = p.getRole(name);
+    if (role && !this.roleGrantableHere(role, inv)) {
       this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
+    }
+    if (!role && p.isQuarantined(name) && !this.isSuper(inv.invoker)) {
+      const guildId = p.quarantinedGuildId(name);
+      if (guildId === undefined) {
+        this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-unreadable' });
+        return `\`${name}\` can't be read (set aside when the relay loaded it) and names no guild the relay can read, so only a portal superadmin can remove it.`;
+      }
+      if (guildId !== inv.guildId) {
+        this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
+        return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
+      }
     }
     const roles = this.visibleRoles(this.deps.permissions.removePersonaRole(persona.id, name), inv);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });

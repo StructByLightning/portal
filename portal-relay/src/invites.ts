@@ -89,6 +89,11 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
     if (v === undefined || v === null || (blankIsNone && v === '')) continue;
     if (!ok(v)) return `invite ${field} ${why}`;
   }
+  // A grant that is there must be one: enroll reads a falsy one as absent and
+  // falls back to the legacy caps, while a claim keeps it and grants nothing.
+  if (f.grant !== undefined && f.grant !== null && (typeof f.grant !== 'object' || Array.isArray(f.grant))) {
+    return 'invite grant must be an object, { caps, scope }';
+  }
   if (f.maxUses !== undefined && !(typeof f.maxUses === 'number' && f.maxUses > 0)) {
     return 'invite maxUses must be a number above 0';
   }

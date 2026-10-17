@@ -391,8 +391,12 @@ const MALFORMED_ROLES: Array<[string, unknown]> = [
   ['scope-constructor', { caps: ['SEND_MESSAGES'], scope: { constructor: true }, guildId: 'g1' }],
   ['scope-tostring', { caps: ['SEND_MESSAGES'], scope: { toString: true }, guildId: 'g1' }],
   ['scope-proto', { caps: ['SEND_MESSAGES'], scope: { ['__proto__']: true }, guildId: 'g1' }],
-  // Every reader takes a string mirrorCaps as on, "false" included.
+  // Every reader takes a string mirrorCaps as on, "false" included, and a list or an object too.
   ['mirrorcaps-string', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1' }, mirrorCaps: 'false', guildId: 'g1' }],
+  ['mirrorcaps-list', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1' }, mirrorCaps: [], guildId: 'g1' }],
+  ['mirrorcaps-object', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1' }, mirrorCaps: {}, guildId: 'g1' }],
+  // Each capability is named by a string.
+  ['caps-mixed', { caps: ['SEND_MESSAGES', 5], scope: { all: true }, guildId: 'g1' }],
 ];
 for (const [name, role] of MALFORMED_ROLES) {
   test(`role ${name}: quarantined at load, inert, warned about and kept on disk`, (t) => {
@@ -436,15 +440,15 @@ test('each kind of scope, and mirrorCaps of 0, load and resolve as they always h
   rmSync(path, { force: true });
 });
 
-test('mirrorCaps of true, false, null and 0 load as they always have', () => {
+test('mirrorCaps of true, false, null, 0 and 1 load as they always have', () => {
   const path = tmpFile({
-    roles: Object.fromEntries([['on', true], ['off', false], ['nulled', null], ['zero', 0]].map(([name, mc]) =>
+    roles: Object.fromEntries([['on', true], ['off', false], ['nulled', null], ['zero', 0], ['one', 1]].map(([name, mc]) =>
       [name, { caps: ['READ_HISTORY'], scope: { mirrorRole: 'r1' }, mirrorCaps: mc, guildId: 'g1' }])),
     personas: {},
   } as any);
   try {
     const store = new PermissionsStore(path);
-    for (const name of ['on', 'off', 'nulled', 'zero']) assert.notEqual(store.getRole(name), undefined, name);
+    for (const name of ['on', 'off', 'nulled', 'zero', 'one']) assert.notEqual(store.getRole(name), undefined, name);
   } finally {
     rmSync(path, { force: true });
   }

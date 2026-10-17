@@ -168,14 +168,16 @@ test('/add-role and /remove-role mutate the persona role list', () => {
   }
 });
 
-test("roles set aside at load: /invite and add-role say they can't be read, and removing one keeps to the guild its entry names", () => {
+test("roles set aside at load: /invite and add-role say they can't be read, and removing one keeps to the guild its entry names, or to a superadmin when it names none", () => {
   const t = makeHandler();
   try {
     const path = (t.permissions as any).path as string;
     const file = JSON.parse(readFileSync(path, 'utf8'));
     file.roles['aside-here'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: GUILD };
     file.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: [CHAN] }, guildId: 'g2' };
-    file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2'] };
+    // An entry naming its guild as a number, as a hand edit might: no guild the relay can read.
+    file.roles['aside-noguild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 5 };
+    file.personas['evander-1'] = { policy: { default: [] }, roles: ['aside-here', 'aside-g2', 'aside-noguild'] };
     writeFileSync(path, JSON.stringify(file));
     (t.permissions as any).reload();
     const unreadable = /Access role `aside-here` can't be read \(set aside when the relay loaded it\), so the relay's operator must fix it first\./;
@@ -186,7 +188,15 @@ test("roles set aside at load: /invite and add-role say they can't be read, and 
     assert.match(both, unreadable);
     assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-g2' })), /scoped to another guild/);
     assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-here' })), /Removed `aside-here`/);
+    // One whose entry names no guild the relay can read is a superadmin's to remove, as in the panel.
+    assert.equal(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-noguild' })),
+      "`aside-noguild` can't be read (set aside when the relay loaded it) and names no guild the relay can read, so only a portal superadmin can remove it.");
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2', 'aside-noguild']);
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-noguild' }, SUPER)), /Removed `aside-noguild`/);
     assert.deepEqual(t.permissions.getRoleNames('evander-1'), ['aside-g2']);
+    // A superadmin removes one naming another guild too.
+    assert.match(t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'aside-g2' }, SUPER)), /Removed `aside-g2`/);
+    assert.deepEqual(t.permissions.getRoleNames('evander-1'), []);
   } finally {
     t.cleanup();
   }

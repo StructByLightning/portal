@@ -2713,6 +2713,27 @@ test('a role set aside at load can be revoked from a persona by an admin of the 
   }
 });
 
+for (const asSuper of [false, true]) {
+  test(`a role set aside at load naming another guild, or none it can read, is revoked by ${asSuper ? 'a super-admin' : 'no guild admin'}`, async () => {
+    const ctx = setupDeps(asSuper ? ['admin1'] : []);
+    editPermissions(ctx, (f) => {
+      f.roles['aside-g2'] = { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'G2' };
+      f.roles['aside-noguild'] = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 5 };
+      f.personas.p1.roles = ['aside-g2', 'aside-noguild'];
+    });
+    const s = await signedIn(ctx);
+    try {
+      for (const role of ['aside-g2', 'aside-noguild']) {
+        const r = await s.call('DELETE', `/admin/g/G1/personas/p1/roles/${role}`);
+        assert.equal(r.status, asSuper ? 200 : 403, `${role}: ${JSON.stringify(r.body)}`);
+      }
+      assert.deepEqual(ctx.permissions.getRoleNames('p1'), asSuper ? [] : ['aside-g2', 'aside-noguild']);
+    } finally {
+      await s.close();
+    }
+  });
+}
+
 test('invites: a mint whose mode, count or subscriptions are null or empty mints as if they were left out', async () => {
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);

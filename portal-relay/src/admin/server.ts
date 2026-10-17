@@ -1520,8 +1520,9 @@ export class AdminServer {
     // request says replace AND names the guild the existing role belongs to,
     // so a role of another guild (and every holder's access) can't be
     // rewritten by typing its name. Replacing never moves a role to another
-    // guild. A name set aside at load is in use too; replacing one whose entry
-    // names no guild as a string needs only replace. The role is rebuilt from
+    // guild. A name set aside at load is in use too; an entry that names no
+    // guild the relay can read has none to keep, so replacing it needs only
+    // replace and binds it to the request's guild. The role is rebuilt from
     // validated fields, never stored as sent.
     if (method === 'POST' && path === '/admin/roles') {
       const body = await readJson(req);
