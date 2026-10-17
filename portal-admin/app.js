@@ -2273,12 +2273,14 @@ function accessSection(ctx, m) {
       const lines = [];
       const done = []; // what Undo puts back
       const left = [];
+      const saved = new Set(); // the channels the relay took
       let removedSince = false;
       for (const it of items) {
         const res = await send(it.value, caps, m.rowOf(it.value), lift);
         if (res.ok) {
           lines.push(res.text);
           done.push(res.undo);
+          saved.add(it.value);
           continue;
         }
         left.push(it);
@@ -2300,8 +2302,12 @@ function accessSection(ctx, m) {
       // Read again; focus is the form's to keep (onSubmit gives it to the
       // channel field once nothing is left to add).
       if (done.length || left.length) { try { await m.reload(); } catch { /* the lines say what was done */ } }
-      ta.set(left);
-      if (!left.length) tracker.reset();
+      // What is picked now, less what was added: one that failed stays to be
+      // tried again, and one picked while the Add was at work stays too —
+      // unsaved, so closing the drawer still asks.
+      const rest = ta.items().filter((it) => !saved.has(it.value));
+      ta.set(rest);
+      if (!rest.length) tracker.reset();
       syncCurrently();
       said(line, left.length ? 'err' : 'ok', statusParts(lines), { toastText: lines.join(' ') }, done, 'what Add just did');
     }

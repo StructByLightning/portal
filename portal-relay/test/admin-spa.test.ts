@@ -5771,3 +5771,73 @@ test('channel drawer: Esc on a direct grant holding a keyboard step cancels the 
   assert.ok(!drawerOpen(), 'the next closes the drawer');
   assert.equal(bodies.length, n, 'nothing was ever sent');
 });
+
+test('persona drawer: channels picked while an Add is being saved stay picked and unsaved — the drawer asks before they are dropped', async () => {
+  let release!: () => void;
+  let gate: Promise<void> | null = null;
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    handle: async (method) => {
+      if (method === 'PUT' && gate) await gate; // the relay takes its time with grants
+      return undefined;
+    },
+  });
+  const { addForm, typeChannel, pickOption, bodies, doc, ctx } = box;
+  const chips = () => addForm().querySelectorAll('.tag').map((t) => t.querySelector('span')!.textContent);
+  await typeChannel('lab');
+  pickOption('#lab-notes');
+  gate = new Promise<void>((r) => { release = r; });
+  addForm().fire('submit');
+  await settle();
+  // While #lab-notes is being saved: pick another channel.
+  await typeChannel('ide');
+  pickOption('ideas (forum)');
+  assert.deepEqual(chips(), ['#lab-notes', 'ideas (forum)'], 'picked meanwhile');
+  gate = null;
+  release();
+  await settle();
+  assert.deepEqual(bodies.filter((b) => b.channelId).map((b) => b.channelId), [CH.labNotes], 'only what the Add was sent with');
+  assert.deepEqual(chips(), ['ideas (forum)'], 'the saved pick goes; the one made meanwhile stays');
+  assert.equal(addForm().querySelector('button[type="submit"]')!.disabled, false, 'Add is on for it');
+  assert.match(addForm().querySelector('.currently')!.textContent, /ideas \(forum\)/);
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'unsaved: closing asks');
+  clickable(doc, '✕', doc.getElementById('drawer')!).click();
+  await settle();
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?');
+});
+
+test('channel drawer: personas picked while an Add is being saved stay picked and unsaved — the drawer asks before they are dropped', async () => {
+  let release!: () => void;
+  let gate: Promise<void> | null = null;
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    handle: async (method, path) => {
+      if (method === 'PUT' && gate) await gate;
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/nyx/grants') return echo(W7, [{ kind: 'direct', caps: W7 }], W7);
+      return undefined;
+    },
+  });
+  const { rowLink, drawerBody, bodies, calls, doc, ctx } = box;
+  rowLink(CH.research).click();
+  await settle();
+  const form = () => drawerBody.querySelector('form.add-form')!;
+  const chips = () => form().querySelectorAll('.tag').map((t) => t.querySelector('span')!.textContent);
+  const pickPersona = (label: string) => form().querySelectorAll('.ta-option').find((o) => o.querySelector('.ta-label')!.textContent === label)!.click();
+  await typeAhead(box, 'ny');
+  pickPersona('Nyx');
+  gate = new Promise<void>((r) => { release = r; });
+  form().fire('submit');
+  await settle();
+  await typeAhead(box, 'jun');
+  pickPersona('Juniper');
+  assert.deepEqual(chips(), ['Nyx', 'Juniper'], 'picked meanwhile');
+  gate = null;
+  release();
+  await settle();
+  assert.deepEqual(calls.filter((c) => c.startsWith('PUT ')), [`PUT /admin/g/${GA}/personas/nyx/grants`], 'only Nyx was sent');
+  assert.equal(bodies.filter((b) => b.channelId).length, 1);
+  assert.deepEqual(chips(), ['Juniper'], 'Nyx was added and goes; Juniper, picked meanwhile, stays');
+  assert.equal(form().querySelector('button[type="submit"]')!.disabled, false, 'Add is on for Juniper');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'unsaved: closing asks');
+  doc.press('Escape');
+  await settle();
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?');
+});

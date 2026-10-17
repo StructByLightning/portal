@@ -943,6 +943,7 @@ function drawDrawer(d, gid, cid, data, note) {
       const lines = [];
       const done = []; // what Undo puts back
       const left = [];
+      const saved = new Set(); // the personas the relay took
       let conflict = false;
       for (const it of items) {
         const lift = removedPick(it); // asked above
@@ -950,6 +951,7 @@ function drawDrawer(d, gid, cid, data, note) {
         if (res.ok) {
           lines.push(res.text);
           done.push(res.undo);
+          saved.add(it.value);
           continue;
         }
         left.push(it);
@@ -969,8 +971,12 @@ function drawDrawer(d, gid, cid, data, note) {
         }
       }
       if (conflict) await reloadRows(null);
-      ta.set(left);
-      if (!left.length) tracker.reset();
+      // What is picked now, less who was added: one that failed stays to be
+      // tried again, and one picked while the Add was at work stays too —
+      // unsaved, so closing the drawer still asks.
+      const rest = ta.items().filter((it) => !saved.has(it.value));
+      ta.set(rest);
+      if (!rest.length) tracker.reset();
       syncCurrently();
       said(addStatus, left.length ? 'err' : 'ok', parts(lines), { toastText: lines.join(' ') }, done, null);
     }, { busyLabel: 'Adding…' });
