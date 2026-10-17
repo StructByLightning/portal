@@ -304,9 +304,12 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   for nothing set; compared as sets — anything else there now is `409 CONFLICT {current}`
   and nothing is written) and `batchId` (`^[A-Za-z0-9_-]{1,32}$`, kept in the audit
   record's `detail`); DELETE takes them as a JSON body. Answers carry `effective`: for a
-  channel, what the persona can do there now and why (as a row below); guild-wide,
+  channel, what the persona can do there now and why (as a row below), with `names`
+  for the Discord roles its mirror sources follow; guild-wide,
   `{guildWide:true, channels, counts:{read,write,full,custom}, direct:{…}}` — how many
   of the guild's channels at each level, and how many of those through a direct grant.
+  A PUT that ended a `/ban` here says `liftedBan: true` (the persona changed in every
+  channel of the guild).
 - `GET /admin/g/:gid/invites?q=&status=active|spent|all` → newest first, each with
   `status` (`active` · `used` · `expired`); `POST …/invites`, `DELETE …/invites/:code`
 - `GET /admin/g/:gid/roles` → `{catalog, discordRoles, canAuthor}` (a guild-admin gets
@@ -333,8 +336,10 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
     reason: thread|category|missing|blocks-nothing}], roles:[{name, caps, scope, channels}],
     names}` (+ `otherGuildRoleCount` for super-admins)
   - `GET …/persona-directory?q=` → `{personas:[{id, displayName, avatarUrl,
-    hasAccessHere}]}` — at most 25, the people slash `/add` offers: an exact id first, then
-    names starting with `q`, then the rest.
+    hasAccessHere, removed?}]}` — at most 25, the people slash `/add` offers: an exact id
+    first, then names starting with `q`, then the rest. `removed: true` marks one removed
+    from the guild with `/ban` (giving it access there lifts that). `?ids=a,b` gives
+    exactly those personas instead, in that order (a form put back after Sign in again).
 - `POST /admin/roles {name, role, replace?, expectedGuildId?}` *(super-admin, global)* —
   a name in use is `409 EXISTS` unless `replace:true` names the guild it belongs to
   (else `409 GUILD_MISMATCH`; replacing never moves a role). New names match

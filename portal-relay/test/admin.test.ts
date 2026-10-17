@@ -2276,3 +2276,67 @@ test('grants: removing a thread’s grant answers with its parent’s access (wh
     await s.close();
   }
 });
+
+test('persona directory: one removed with /ban says so; ?ids= gives exactly those personas, in that order', async () => {
+  const ctx = setupDeps([]);
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  ctx.permissions.clearGuild('p2', 'G1');
+  const s = await signedIn(ctx);
+  try {
+    const found = await s.get('/admin/g/G1/persona-directory?q=persona');
+    assert.deepEqual(found.body.personas, [
+      { id: 'p1', displayName: 'Persona One', avatarUrl: '', hasAccessHere: true },
+      { id: 'p2', displayName: 'Persona Two', avatarUrl: '', hasAccessHere: false, removed: true },
+    ], 'giving p2 access here lifts its removal: the panel is told before it asks');
+    const ids = await s.get('/admin/g/G1/persona-directory?ids=' + encodeURIComponent('p2,nobody,p1,p2'));
+    assert.equal(ids.status, 200);
+    assert.deepEqual(ids.body.personas.map((p: { id: string }) => p.id), ['p2', 'p1'], 'in the order asked, unknown ids left out, each once');
+    assert.equal(ids.body.personas[0].removed, true);
+    assert.deepEqual((await s.get('/admin/g/G1/persona-directory?ids=')).body.personas, []);
+    for (let i = 1; i <= 30; i++) ctx.identity.upsert({ id: `many-${i}`, displayName: `Many ${i}`, avatar: '', token: hashToken(`m-${i}`) });
+    const many = await s.get('/admin/g/G1/persona-directory?ids=' + Array.from({ length: 30 }, (_, i) => `many-${i + 1}`).join(','));
+    assert.equal(many.body.personas.length, 25, 'at most 25');
+    // Another guild's /ban isn't this guild's business.
+    ctx.permissions.liftBan('p2', 'G1');
+    ctx.permissions.clearGuild('p2', 'G2');
+    const elsewhere = await s.get('/admin/g/G1/persona-directory?ids=p2');
+    assert.equal('removed' in elsewhere.body.personas[0], false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: a channel answer names the Discord roles its mirror sources follow; a grant that ended a /ban says so', async () => {
+  const ctx = setupDeps([]);
+  // role1 (@Mods, G1's) can see c2.
+  ctx.permissions.setMirrorLookup((gid, rid) => new Map(gid === 'G1' && rid === 'role1' ? [['c2', new Set<Capability>(['VIEW_CHANNEL', 'READ_HISTORY'])]] : []));
+  ctx.permissions.setRole('mirror-g1', { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { mirrorRole: 'role1' }, guildId: 'G1' });
+  ctx.permissions.addPersonaRoles('p1', ['mirror-g1']);
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  const s = await signedIn(ctx);
+  try {
+    const put = (pid: string, body: unknown) => s.call('PUT', `/admin/g/G1/personas/${pid}/grants`, body);
+    const set = await put('p1', { channelId: 'c2', level: 'write' });
+    assert.equal(set.status, 200);
+    assert.ok(set.body.effective.sources.some((x: { kind: string; mirror?: Array<{ id: string }> }) => x.kind === 'role' && x.mirror?.some((m) => m.id === 'role1')));
+    assert.deepEqual(set.body.names, { discordRoles: { role1: { name: 'Mods', guildId: 'G1' } } }, 'the role the panel shows as @Mods');
+    assert.equal('liftedBan' in set.body, false, 'nothing was lifted');
+    const del = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c2');
+    assert.deepEqual(del.body.names, { discordRoles: { role1: { name: 'Mods', guildId: 'G1' } } });
+    assert.deepEqual((await put('p1', { channelId: 'c1', level: 'read' })).body.names, { discordRoles: {} }, 'c1: no mirror there, nothing to name');
+    assert.equal('names' in (await put('p1', { guildDefault: true, level: 'read' })).body, false, 'guild-wide explains no channel');
+
+    // Removed with /ban: a deny keeps it; the grant that gives access ends it, and says so — once.
+    ctx.permissions.clearGuild('p2', 'G1');
+    const deny = await put('p2', { channelId: 'c1', deny: true });
+    assert.equal(deny.body.banned, true);
+    assert.equal('liftedBan' in deny.body, false);
+    const grant = await put('p2', { channelId: 'c2', level: 'read' });
+    assert.equal(grant.body.liftedBan, true);
+    assert.equal(grant.body.banned, false);
+    assert.equal(ctx.permissions.isBanned('p2', 'G1'), false);
+    assert.equal('liftedBan' in (await put('p2', { channelId: 'c2', level: 'write' })).body, false, 'only the grant that ended it');
+  } finally {
+    await s.close();
+  }
+});

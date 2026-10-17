@@ -943,27 +943,42 @@ export class AdminServer {
   /**
    * GET …/persona-directory?q= — personas to pick from (to add one to G):
    * the people slash /add autocomplete offers, at most 25, with only id,
-   * name, picture and whether it has access in G already. Matches id or name
-   * anywhere (any case): an exact id first, then names starting with q, then
-   * the rest, each alphabetically. No q: the first 25 alphabetically.
+   * name, picture, whether it has access in G already, and `removed: true`
+   * for one removed from G with /ban (giving it access here lifts that).
+   * Matches id or name anywhere (any case): an exact id first, then names
+   * starting with q, then the rest, each alphabetically. No q: the first 25
+   * alphabetically.
+   *
+   * ?ids=a,b — those personas instead (at most 25, in that order; unknown
+   * ids are left out): a form put back after "Sign in again" kept only ids.
    */
   private onPersonaDirectory(res: ServerResponse, guildId: string, url: URL): void {
     const t0 = performance.now();
-    const q = (url.searchParams.get('q') ?? '').trim().slice(0, 100).toLowerCase();
-    const alpha = (x: PersonaIdentity, y: PersonaIdentity) =>
-      cmp(x.displayName.toLowerCase(), y.displayName.toLowerCase()) || cmp(x.id, y.id);
-    const rank = (p: PersonaIdentity) => (p.id.toLowerCase() === q ? 0 : p.displayName.toLowerCase().startsWith(q) ? 1 : 2);
-    const found = this.deps.identity
-      .all()
-      .filter((p) => !q || p.id.toLowerCase().includes(q) || p.displayName.toLowerCase().includes(q))
-      .sort((x, y) => (q ? rank(x) - rank(y) : 0) || alpha(x, y))
-      .slice(0, DIRECTORY_ROWS);
+    const ids = url.searchParams.get('ids');
+    let found: PersonaIdentity[];
+    if (ids !== null) {
+      found = [...new Set(ids.split(','))]
+        .slice(0, DIRECTORY_ROWS)
+        .map((id) => (id ? this.deps.identity.get(id) : undefined))
+        .filter((p): p is PersonaIdentity => !!p);
+    } else {
+      const q = (url.searchParams.get('q') ?? '').trim().slice(0, 100).toLowerCase();
+      const alpha = (x: PersonaIdentity, y: PersonaIdentity) =>
+        cmp(x.displayName.toLowerCase(), y.displayName.toLowerCase()) || cmp(x.id, y.id);
+      const rank = (p: PersonaIdentity) => (p.id.toLowerCase() === q ? 0 : p.displayName.toLowerCase().startsWith(q) ? 1 : 2);
+      found = this.deps.identity
+        .all()
+        .filter((p) => !q || p.id.toLowerCase().includes(q) || p.displayName.toLowerCase().includes(q))
+        .sort((x, y) => (q ? rank(x) - rank(y) : 0) || alpha(x, y))
+        .slice(0, DIRECTORY_ROWS);
+    }
     sendJson(res, 200, {
       personas: found.map((p) => ({
         id: p.id,
         displayName: p.displayName,
         avatarUrl: this.deps.identity.avatarUrl(p),
         hasAccessHere: this.deps.canAccessGuild(p.id, guildId),
+        ...(this.deps.permissions.isBanned(p.id, guildId) ? { removed: true } : {}),
       })),
     }, timing(t0));
   }
@@ -1166,10 +1181,14 @@ export class AdminServer {
       after: { ...where, caps, ...(op.level ? { level: op.level } : {}), ...(liftedBan ? { liftedBan } : {}) },
       ...(meta.batchId ? { detail: { batchId: meta.batchId } } : {}),
     });
+    const effective = this.effectAfter(personaId, guildId, channelId);
     sendJson(res, 200, {
       guildPolicy,
       banned: this.deps.permissions.isBanned(personaId, guildId),
-      effective: this.effectAfter(personaId, guildId, channelId),
+      // This grant ended a /ban here: the persona's access changed in every channel of G.
+      ...(liftedBan ? { liftedBan: true } : {}),
+      effective,
+      ...this.answerNames(effective, guildId),
     });
   }
 
@@ -1239,11 +1258,21 @@ export class AdminServer {
       after: { ...where, caps: gd === 'deny' ? [] : null, ...(liftedBan ? { liftedBan } : {}) },
       ...(meta.batchId ? { detail: { batchId: meta.batchId } } : {}),
     });
+    const effective = this.effectAfter(personaId, guildId, channelId ?? undefined);
     sendJson(res, 200, {
       guildPolicy,
       banned: this.deps.permissions.isBanned(personaId, guildId),
-      effective: this.effectAfter(personaId, guildId, channelId ?? undefined),
+      effective,
+      ...this.answerNames(effective, guildId),
     });
+  }
+
+  /** The names a change's answer needs when it explains a channel: the
+   *  Discord roles its mirror sources follow (G's only), so the panel never
+   *  shows a role it hadn't seen as an id. */
+  private answerNames(effective: ReturnType<AdminServer['effectAfter']>, guildId: string): { names?: NameMaps } {
+    if (!('sources' in effective)) return {};
+    return { names: { discordRoles: this.roleLabels(mirrorIds(effective.sources), guildId) } };
   }
 
   /** What a persona's own setting at one target of G is now: a channel's

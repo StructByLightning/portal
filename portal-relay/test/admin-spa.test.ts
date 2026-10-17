@@ -3553,13 +3553,15 @@ test('ui.toast: an Undo toast runs its action once, then goes; it stays while fo
 
 /** The panel on the Channels tab over Guild One's fixture: #research's
  *  access read answers from `research` (mutable), and grant writes go to
- *  `handle`. Personas: aria, cass, quill, sol (with access), nyx (none). */
-async function channelsPanel(url: string, opts: { handle?: FakeHandler; research?: any[]; local?: Record<string, string>; session?: Record<string, string>; routes?: Record<string, unknown>; botCaps?: string[] } = {}) {
+ *  `handle`. Personas: aria, cass, quill, sol (with access), nyx (none).
+ *  `directory`: what the persona directory holds (default: Nyx, Juniper);
+ *  `roleNames`: the Discord roles the access read names (default: @Mods). */
+async function channelsPanel(url: string, opts: { handle?: FakeHandler; research?: any[]; local?: Record<string, string>; session?: Record<string, string>; routes?: Record<string, unknown>; botCaps?: string[]; directory?: any[]; roleNames?: Record<string, unknown> } = {}) {
   const g = '/admin/g/' + GA;
   const state = { research: opts.research ?? RESEARCH_ROWS() };
   const access = () => ({
     channel: G1_LAYOUT.find((c) => c.id === CH.research), botCaps: opts.botCaps ?? [...ALL_CAPS], botBase: 'full',
-    rows: state.research, names: { channels: { [CH.research]: { id: CH.research, name: 'research', type: 'text' }, [CH.catResearch]: { id: CH.catResearch, name: 'Research', type: 'category' } }, discordRoles: { [MODS]: { name: 'Mods', guildId: GA } } },
+    rows: state.research, names: { channels: { [CH.research]: { id: CH.research, name: 'research', type: 'text' }, [CH.catResearch]: { id: CH.catResearch, name: 'Research', type: 'category' } }, discordRoles: opts.roleNames ?? { [MODS]: { name: 'Mods', guildId: GA } } },
   });
   const box = await panelAt(url, {
     local: opts.local,
@@ -3575,8 +3577,11 @@ async function channelsPanel(url: string, opts: { handle?: FakeHandler; research
     handle: (method, path, body, headers) => {
       if (method === 'GET' && path === g + '/channels/' + CH.research + '/access') return access();
       if (method === 'GET' && path.startsWith(g + '/persona-directory')) {
-        const q = new URL(path, 'http://panel.invalid').searchParams.get('q') ?? '';
-        const all = [{ id: 'nyx', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false }, { id: 'juniper', displayName: 'Juniper', avatarUrl: '', hasAccessHere: true }];
+        const sp = new URL(path, 'http://panel.invalid').searchParams;
+        const q = sp.get('q') ?? '';
+        const all = opts.directory ?? [{ id: 'nyx', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false }, { id: 'juniper', displayName: 'Juniper', avatarUrl: '', hasAccessHere: true }];
+        const ids = sp.get('ids');
+        if (ids !== null) return { personas: ids.split(',').map((id) => all.find((p) => p.id === id)).filter(Boolean) };
         return { personas: all.filter((p) => p.displayName.toLowerCase().includes(q.toLowerCase())) };
       }
       return opts.handle?.(method, path, body, headers);
@@ -3938,4 +3943,167 @@ test('Channels tab: a change made elsewhere in the panel (a persona’s drawer) 
   box.tabs.channels.click();
   await settle();
   assert.equal(asked(), 2, 'asked again');
+});
+
+// ── The channel drawer: names, drafts and /ban, as the relay answers them ──
+
+/** Type `q` into the drawer's persona type-ahead and wait for its options. */
+async function typeAhead(box: Awaited<ReturnType<typeof channelsPanel>>, q: string) {
+  const input = box.drawerBody.querySelector('.ta-input')!;
+  input.focus();
+  input.value = q;
+  input.fire('input');
+  box.advance(150);
+  await settle();
+  return input;
+}
+
+test('channel drawer: a mirror role a change brings in, which the first read didn’t name, is named from the answer — never shown as an id', async () => {
+  const mirror = roleSrc('g1-mods-mirror', F7, { how: 'mirror', mirror: [{ id: MODS }], mirrorCaps: true });
+  const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    research: [accessRow('cass', 'Cass', R7, [{ kind: 'guildWide', caps: R7 }])],
+    roleNames: {}, // nobody listed follows @Mods: the read names no Discord role
+    directory: [{ id: 'quill', displayName: 'Quill', avatarUrl: '', hasAccessHere: true }],
+    handle: (method, path) => (method === 'PUT' && path === '/admin/g/' + GA + '/personas/quill/grants'
+      ? { ...echo(F7, [{ kind: 'direct', caps: W7 }, mirror], W7), names: { discordRoles: { [MODS]: { name: 'Mods', guildId: GA } } } }
+      : undefined),
+  });
+  const input = await typeAhead(box, 'qu');
+  input.fire('keydown', { key: 'Enter' });
+  box.drawerBody.querySelector('.add-form')!.fire('submit');
+  await settle();
+  const why = box.tr('quill').children[2];
+  assert.equal(why.textContent, 'direct grantrole g1-mods-mirror · mirrors @Mods');
+  assert.match(why.querySelector('.src-role')!.getAttribute('title')!, /as far as @Mods may act here/);
+  assert.ok(!box.drawerBody.textContent.includes(MODS), 'no raw role id anywhere in the drawer');
+});
+
+test('channel drawer: an Add kept across Sign in again comes back with names from the directory, not ids', async () => {
+  const at = '#/g/' + GA + '/channels/c/' + CH.research;
+  const box = await channelsPanel('/' + at, { handle: (method, path) => (method === 'PUT' && path.endsWith('/personas/juniper/grants') ? refuse(401, 'UNAUTHENTICATED') : undefined) });
+  const input = await typeAhead(box, 'ju');
+  input.fire('keydown', { key: 'Enter' });
+  box.drawerBody.querySelector('.add-form')!.fire('submit');
+  await settle();
+  clickable(box.doc, 'Sign in again', box.doc.querySelector('.modal')!).click();
+  const kept = JSON.parse(box.sessionStore.getItem('pa.draft')!);
+  assert.deepEqual(kept.fields.personas, ['juniper'], 'the draft keeps only the id');
+
+  const back = await channelsPanel('/' + at, { session: { 'pa.draft': JSON.stringify(kept) } });
+  assert.ok(back.calls.includes(`GET /admin/g/${GA}/persona-directory?ids=juniper`), 'the name is asked for');
+  const f = back.drawerBody.querySelector('.add-form')!;
+  const tag = f.querySelector('.ta-chips')!.querySelector('.tag')!;
+  assert.equal(tag.querySelector('span')!.textContent, 'Juniper');
+  assert.equal(tag.getAttribute('title'), 'juniper', 'the id only in the tooltip');
+  assert.equal(f.querySelector('.currently')!.textContent, 'Currently:Juniper: no access');
+  assert.deepEqual(f.querySelector('.ta-chips')!.querySelectorAll('input').map((i) => i.value), ['juniper']);
+  assert.ok(!back.calls.some((c) => c.startsWith('PUT ')), 'nothing was submitted');
+});
+
+test('channel drawer: adding a persona removed with /ban says so before, asks, and says it lifted the removal; Undo leaves it lifted; the list counts afresh', async () => {
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    directory: [{ id: 'nyx', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false, removed: true }],
+    handle: (method, path) => {
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/nyx/grants') return { ...echo(W7, [{ kind: 'direct', caps: W7 }], W7), liftedBan: true };
+      if (method === 'DELETE' && path === '/admin/g/' + GA + '/personas/nyx/grants?channelId=' + CH.research) return echo([], [], null);
+      return undefined;
+    },
+  });
+  const { doc, drawerBody, bodies, calls, tr } = box;
+  box.rowLink(CH.research).click();
+  await settle();
+  const input = await typeAhead(box, 'ny');
+  assert.equal(drawerBody.querySelector('.ta-option')!.querySelector('.ta-hint')!.textContent, 'nyx · removed from Guild One with /ban');
+  input.fire('keydown', { key: 'Enter' });
+  assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: removed from Guild One with /ban — adding it lifts that');
+
+  const form = drawerBody.querySelector('.add-form')!;
+  const n = bodies.length;
+  form.fire('submit');
+  await settle();
+  const modal = doc.querySelector('.modal')!;
+  assert.equal(modal.querySelector('h2')!.textContent, 'Lift Nyx’s removal from Guild One?');
+  assert.ok(modal.textContent.includes('Nyx was removed from Guild One with /ban, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.'));
+  assert.ok(modal.textContent.includes('Undo takes the grant away again, but the removal stays lifted.'));
+  clickable(doc, 'Cancel', modal).click();
+  await settle();
+  assert.equal(bodies.length, n, 'Cancel sends nothing');
+
+  form.fire('submit');
+  await settle();
+  clickable(doc, 'Add and lift', doc.querySelector('.modal')!).click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
+  assert.equal(form.querySelector('.status-line')!.textContent, 'Nyx → Write in #research. Effective now: Write. That lifted its removal from Guild One.');
+
+  const undo = doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Nyx →'))!.querySelector('.toast-action')!;
+  undo.click();
+  await settle();
+  assert.equal(calls.at(-1), `DELETE /admin/g/${GA}/personas/nyx/grants?channelId=${CH.research}`);
+  assert.equal((tr('nyx').nextSibling as FakeElement).textContent,
+    'Undone: no direct grant for Nyx in #research. Effective now: no access. Its removal from Guild One stays lifted: /ban in Discord removes it again.');
+
+  // The lift changed Nyx in every channel of the guild: closed, the list asks again.
+  const asked = () => calls.filter((c) => c.endsWith('/access/summary')).length;
+  const before = asked();
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(asked(), before + 1);
+});
+
+test('channel drawer: a removed persona’s row asks before a level lifts the removal; an answer without liftedBan still says so when the row isn’t removed any more', async () => {
+  const removedRow = accessRow('juniper', 'Juniper', [], [{ kind: 'removed' }, { kind: 'block', caps: [] }], []);
+  const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    research: [removedRow],
+    handle: (method, path) => (method === 'PUT' && path === '/admin/g/' + GA + '/personas/juniper/grants' ? echo(W7, [{ kind: 'direct', caps: W7 }], W7) : undefined),
+  });
+  const n = box.bodies.length;
+  box.pick('juniper', 'write');
+  await settle();
+  const modal = box.doc.querySelector('.modal')!;
+  assert.equal(modal.querySelector('h2')!.textContent, 'Lift Juniper’s removal from Guild One?');
+  clickable(box.doc, 'Cancel', modal).click();
+  await settle();
+  assert.equal(box.bodies.length, n, 'nothing sent');
+  assert.equal(box.tr('juniper').querySelector('select')!.value, 'block', 'back to what is set');
+  box.pick('juniper', 'write');
+  await settle();
+  clickable(box.doc, 'Give access and lift', box.doc.querySelector('.modal')!).click();
+  await settle();
+  assert.equal((box.tr('juniper').nextSibling as FakeElement).textContent, 'Juniper → Write in #research. Effective now: Write. That lifted its removal from Guild One.');
+});
+
+test('channel drawer: a channel that isn’t there says so in words — the id only in the tooltip', async () => {
+  const gone = '100000000000001099';
+  const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + gone);
+  const note = box.drawerBody.querySelector('.empty-note')!;
+  assert.equal(note.textContent, 'This is a deleted channel, or a channel the relay can’t see.');
+  assert.equal(note.getAttribute('title'), 'Channel id ' + gone);
+  assert.ok(!box.drawerBody.textContent.includes(gone));
+});
+
+test('lib: a persona removed with /ban, the lift in words, and the Custom option without doubled words', () => {
+  const { lib } = libOnly();
+  const banned = accessRow('p', 'P', [], [{ kind: 'removed' }]);
+  assert.equal(lib.isRemoved(banned), true);
+  assert.equal(lib.isRemoved(RESEARCH_ROWS()[0]), false);
+  assert.equal(lib.isRemoved(null), false);
+  assert.equal(lib.currentlyText('Quill', null, plain(lib.changeKind(null, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One with /ban — adding it lifts that');
+  assert.equal(lib.currentlyText('Quill', banned, plain(lib.changeKind(banned, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One with /ban — adding it lifts that');
+  assert.equal(lib.liftText('Quill', W7, '#research', 'Guild One'),
+    'Quill was removed from Guild One with /ban, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.');
+  assert.equal(lib.customOptionText(['READ_HISTORY', 'SEND_MESSAGES']), 'Custom — can’t see the channel');
+  assert.equal(lib.customOptionText(['VIEW_CHANNEL', 'SEND_MESSAGES']), 'Custom');
+  assert.equal(lib.customOptionText([...F7, 'MENTION_EVERYONE']), 'Full +1 (custom)');
+});
+
+test('ui.directGrantControl: a stored set that holds no level reads Custom once, with the warning when it can’t see', () => {
+  const { ctx } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const { directGrantControl } = ctx.PA.ui;
+  const text = (value: string[]) => directGrantControl({ value, canBlock: false, label: 'x', apply: async () => true })
+    .select.options.find((o: FakeElement) => o.value === 'custom')!.textContent;
+  assert.equal(text(['READ_HISTORY', 'SEND_MESSAGES']), 'Custom — can’t see the channel');
+  assert.equal(text(['VIEW_CHANNEL', 'SEND_MESSAGES']), 'Custom');
+  assert.equal(text([...W7, 'MENTION_EVERYONE']), 'Write +1 (custom)');
 });

@@ -955,7 +955,7 @@
       const opt = (v, text, title) => el('option', { value: v, text, title: title || null });
       select.appendChild(opt('', '—', 'No direct grant here'));
       for (const k of lib.LEVELS) select.appendChild(opt(k, lib.LEVEL_NAME[k], lib.LEVEL_HELP[k]));
-      select.appendChild(opt('custom', cur === 'custom' ? lib.levelLabel(value) + ' (custom)' : 'Custom…', cur === 'custom' ? lib.capsTitle(value) : 'Pick the capabilities one by one.'));
+      select.appendChild(opt('custom', cur === 'custom' ? lib.customOptionText(value) : 'Custom…', cur === 'custom' ? lib.capsTitle(value) : 'Pick the capabilities one by one.'));
       if (canBlock || cur === 'block') select.appendChild(opt('block', 'Block guild-wide here', 'Blocks guild-wide and persona-default access in this channel. Roles still apply.'));
       select.value = cur;
       edit.classList.toggle('hidden', cur !== 'custom');

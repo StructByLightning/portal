@@ -15,9 +15,11 @@
  *   channelLayout, filterLayout,       the Channels list in Discord's order, its
  *   countsText, botListNote            counts and warnings in words
  *   sourceChips, pillText,             a channel drawer row: why, and what it can do
- *   directValue, canBlock
+ *   directValue, canBlock,
+ *   customOptionText
  *   predictDirect, changeKind,         what a direct-grant change would do (only
- *   lowerText, currentlyText           to ask first: the relay says what it did)
+ *   lowerText, currentlyText,          to ask first: the relay says what it did)
+ *   isRemoved, liftText                a persona removed with /ban, and the lift
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
  *   roleNameTaken                      defining a role under a name in use
@@ -614,10 +616,20 @@
     return 'This lowers ' + name + ' from ' + from + ' to ' + to + ' in ' + where + '. Roles still apply.';
   }
 
+  /** Was the persona removed from this guild with /ban? From its
+   *  explanation in a channel (a row of …/channels/:cid/access, or a
+   *  change's answer). */
+  function isRemoved(row) {
+    return !!row && ((row.sources) || []).some((s) => s.kind === 'removed');
+  }
+
   /** The Add form's 'Currently:' line for a persona picked to add:
    *  'Aria: Write via role g1-chatters — no direct grant needed' · 'Nyx: no
-   *  access' · 'Cass: Write via the guild-wide level — this lowers it to Read'. */
-  function currentlyText(name, row, change) {
+   *  access' · 'Cass: Write via the guild-wide level — this lowers it to Read'
+   *  · 'Quill: removed from Guild One with /ban — adding it lifts that'
+   *  (`removedFrom`: the guild's name, for a persona removed there). */
+  function currentlyText(name, row, change, removedFrom) {
+    if (removedFrom) return name + ': removed from ' + removedFrom + ' with /ban — adding it lifts that';
     const eff = (row && Array.isArray(row.effective)) ? row.effective : [];
     let s = name + ': ';
     if (!eff.length) s += 'no access';
@@ -628,6 +640,24 @@
     if (change && eff.length && change.kind === 'same') s += ' — no direct grant needed';
     else if (change && change.kind === 'lower') s += ' — this lowers it to ' + (change.after.length ? summaryParts(change.after).text : 'no access');
     return s;
+  }
+
+  /** Before a change that gives a persona removed with /ban access again:
+   *  'Quill was removed from Guild One with /ban, so nothing it holds applies
+   *  there. Giving it Write in #research lifts that: anything it still holds
+   *  in Guild One applies again.' */
+  function liftText(name, caps, where, guild) {
+    return name + ' was removed from ' + guild + ' with /ban, so nothing it holds applies there. Giving it ' +
+      levelLabel(caps) + ' in ' + where + ' lifts that: anything it still holds in ' + guild + ' applies again.';
+  }
+
+  /** What the direct-grant control's Custom option reads when a custom set
+   *  is stored: 'Write +1 (custom)' · 'Custom' · 'Custom — can’t see the
+   *  channel' (a set without View). */
+  function customOptionText(caps) {
+    const l = levelLabel(caps);
+    if (l !== LEVEL_NAME.custom) return l + ' (custom)';
+    return new Set(caps || []).has('VIEW_CHANNEL') ? l : l + ' — can’t see the channel';
   }
 
   // ── Names ─────────────────────────────────────────────────────────────────
@@ -1190,7 +1220,7 @@
     botLimitText, effectNowText, remainingText, guildEffectText,
     countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
     channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
-    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, currentlyText,
+    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, liftText, customOptionText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,

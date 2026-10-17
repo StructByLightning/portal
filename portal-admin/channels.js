@@ -33,6 +33,8 @@ const RETRY_MS = 3_000;
 const MAX_RETRIES = 3;
 /** Personas one Add can take. */
 const MAX_ADD = 10;
+/** The last line of a confirm that lifts a removal with /ban. */
+const UNDO_KEEPS_LIFT = 'Undo takes the grant away again, but the removal stays lifted.';
 
 const el = (tag, attrs, children) => PA.ui.el(tag, attrs, children);
 const clear = (n) => PA.ui.clear(n);
@@ -433,7 +435,7 @@ async function loadInto(d, gid, cid, note) {
     if (!d.isCurrent() || e.handled) return;
     if (e.status === 404) {
       d.setTitle('Channel');
-      d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'No channel with id ' + cid + ' in this guild: it was deleted, or the relay can’t see it.' }));
+      d.setBody(el('p', { class: 'empty-note', role: 'status', title: 'Channel id ' + cid, text: 'This is a deleted channel, or a channel the relay can’t see.' }));
       return;
     }
     d.setBody(e.status === 401 ? env.sessionEndedNote() : env.loadError(env.couldntLoad('this channel', e), () => loadInto(d, gid, cid, note)));
@@ -553,6 +555,18 @@ function drawDrawer(d, gid, cid, data, note) {
     if (!statusRow.classList.contains('hidden')) tbody.insertBefore(statusRow, at ? at.nextSibling : tbody.firstChild);
   }
 
+  /** Take the names a change's answer brings (the Discord roles its
+   *  explanation mirrors): a source this drawer's first read didn't name is
+   *  shown by name, never as an id. */
+  function learnNames(r) {
+    const n = r && r.names;
+    if (!n || typeof n !== 'object') return;
+    names = Object.assign({}, names, {
+      channels: Object.assign({}, names.channels, n.channels),
+      discordRoles: Object.assign({}, names.discordRoles, n.discordRoles),
+    });
+  }
+
   /** A persona's row from a change's answer (the relay's explanation of the
    *  channel for it), or null when the answer has none. */
   function rowFrom(pid, base, ex) {
@@ -628,16 +642,17 @@ function drawDrawer(d, gid, cid, data, note) {
     }
   }
 
-  /** What a change did, in the copy guide's words, from the relay's answer. */
-  function resultText(name, next, before, ex, wasRemoved) {
+  /** What a change did, in the copy guide's words, from the relay's answer.
+   *  `liftedBan`: the change ended the persona's removal from the guild. */
+  function resultText(name, next, before, ex, liftedBan) {
+    const lifted = liftedBan ? ' That lifted its removal from ' + guild + '.' : '';
     // An answer without the channel explained (it was deleted meanwhile, or
     // an older relay): say what was done; the rows are read again.
     if (!ex || !Array.isArray(ex.effective)) {
       return next == null ? 'Removed ' + name + '’s direct grant in ' + where + '.'
-        : name + ' → ' + (next.length ? lib.capsSummary(next) : 'blocked') + ' in ' + where + '.';
+        : name + ' → ' + (next.length ? lib.capsSummary(next) : 'blocked') + ' in ' + where + '.' + lifted;
     }
     const nowText = lib.effectNowText(ex, where);
-    const lifted = wasRemoved && ex && !(ex.sources || []).some((s) => s.kind === 'removed') ? ' That lifted its removal from ' + guild + '.' : '';
     if (next == null) return 'Removed ' + name + '’s direct grant in ' + where + ' — ' + lib.remainingText(ex, where) + '.';
     if (!next.length) return 'Blocked guild-wide access for ' + name + ' in ' + where + '. Effective now: ' + nowText + '.';
     // Nothing it can do changed (a role or guild-wide gave it already) — but
@@ -647,21 +662,28 @@ function drawDrawer(d, gid, cid, data, note) {
   }
 
   /** Send one change and take the relay's answer for the row. Resolves
-   *  { ok, text, undo } — undo: what restores it ({ pid, prev, next }). */
+   *  { ok, text, undo } — undo: what restores it ({ pid, prev, next, lifted }).
+   *  `base`: what is known of a persona without a row here (the Add pick:
+   *  name, picture, whether the directory said it was removed with /ban). */
   async function send(pid, name, next, base, refocus) {
     const row = rowOf(pid);
     const expect = row ? row.direct : null;
     const before = row ? row.effective : [];
-    const wasRemoved = !!row && (row.sources || []).some((s) => s.kind === 'removed');
+    const wasRemoved = lib.isRemoved(row) || !!(base && base.removed);
     try {
       const r = await enqueue(() => writeGrant(gid, pid, cid, next, expect), paused(pid));
+      learnNames(r);
       const ex = r && r.effective;
       const fresh = rowFrom(pid, row || base, ex);
       if (fresh) put(fresh, refocus);
       else await reloadRows(refocus ? pid : null);
-      patchSummary(gid, cid, rows, wasRemoved && !!fresh && !(fresh.sources || []).some((s) => s.kind === 'removed'));
+      // The relay says when a grant ended a /ban (an older one doesn't: then
+      // a row that was removed and isn't any more says it).
+      const lifted = !!(r && r.liftedBan) || (wasRemoved && !!fresh && !lib.isRemoved(fresh));
+      // Lifted, the persona changed in every channel of the guild: the list asks again.
+      patchSummary(gid, cid, rows, lifted);
       env.markStale();
-      return { ok: true, text: resultText(name, next, before, ex, wasRemoved), undo: { pid, name, prev: expect, next: next == null ? null : next.slice() } };
+      return { ok: true, text: resultText(name, next, before, ex, lifted), undo: { pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } };
     } catch (e) {
       return { ok: false, error: e };
     }
@@ -686,14 +708,17 @@ function drawDrawer(d, gid, cid, data, note) {
       const row = rowOf(u.pid);
       try {
         const r = await enqueue(() => writeGrant(gid, u.pid, cid, u.prev, u.next), paused(u.pid));
+        learnNames(r);
         const fresh = rowFrom(u.pid, row || { displayName: u.name }, r && r.effective);
         if (fresh) put(fresh, false);
         else if (d.isCurrent()) await reloadRows(null);
         patchSummary(gid, cid, rows, false);
         env.markStale();
         const nowText = fresh ? lib.effectNowText(r.effective, where) : '';
+        // Undo takes the grant back; a removal it lifted stays lifted.
         lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + u.name + ' in ' + where : u.name + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + where) +
-          '.' + (nowText ? ' Effective now: ' + nowText + '.' : ''));
+          '.' + (nowText ? ' Effective now: ' + nowText + '.' : '') +
+          (u.lifted ? ' Its removal from ' + guild + ' stays lifted: /ban in Discord removes it again.' : ''));
       } catch (e) {
         bad = true;
         if (e.code === 'CONFLICT') conflict = true;
@@ -714,7 +739,16 @@ function drawDrawer(d, gid, cid, data, note) {
     const row = rowOf(pid);
     const name = (row && row.displayName) || pid;
     const ck = lib.changeKind(row, botCaps, next);
-    if (lib.needsLowerConfirm(ck, next)) {
+    if (lib.isRemoved(row) && next && next.length) {
+      // Giving access to a persona removed with /ban lifts the removal in the
+      // whole guild: asked first, as the confirm says.
+      const go = await ui.confirmDialog({
+        title: 'Lift ' + name + '’s removal from ' + guild + '?',
+        body: [lib.liftText(name, next, where, guild), UNDO_KEEPS_LIFT],
+        confirmLabel: 'Give access and lift',
+      });
+      if (!go) return false;
+    } else if (lib.needsLowerConfirm(ck, next)) {
       const go = await ui.confirmDialog(next.length ? {
         title: 'Lower ' + name + '’s access in ' + where + '?',
         body: [lib.lowerText(name, ck, where), 'You can undo it for a few seconds afterwards, or set it again any time.'],
@@ -746,6 +780,17 @@ function drawDrawer(d, gid, cid, data, note) {
   let syncCurrently = () => {};
   if (grantable) {
     const addStatus = ui.statusLine(null);
+    /** A persona of the directory as a pick: named, with where it stands
+     *  here, and whether it was removed from the guild with /ban. */
+    const itemOf = (p) => {
+      const row = rowOf(p.id);
+      const removed = !!p.removed || lib.isRemoved(row);
+      const here = row && row.effective && row.effective.length ? lib.levelLabel(row.effective) + ' here'
+        : removed ? 'removed from ' + guild + ' with /ban'
+          : p.hasAccessHere ? 'no access here' : 'no access in ' + guild;
+      return { value: p.id, label: p.displayName || p.id, title: p.id, hint: p.id + ' · ' + here, avatarUrl: p.avatarUrl, removed };
+    };
+    const removedPick = (it) => !!it.removed || lib.isRemoved(rowOf(it.value));
     const ta = ui.typeahead({
       label: 'Personas',
       placeholder: 'Type a persona’s name…',
@@ -754,11 +799,7 @@ function drawDrawer(d, gid, cid, data, note) {
       empty: 'No persona matches.',
       source: async (q) => {
         const r = await env.api('GET', env.gpath(gid) + '/persona-directory' + env.qs({ q }));
-        return (r.personas || []).map((p) => {
-          const row = rowOf(p.id);
-          const here = row && row.effective && row.effective.length ? lib.levelLabel(row.effective) + ' here' : p.hasAccessHere ? 'no access here' : 'no access in ' + guild;
-          return { value: p.id, label: p.displayName || p.id, title: p.id, hint: p.id + ' · ' + here, avatarUrl: p.avatarUrl };
-        });
+        return (r.personas || []).map(itemOf);
       },
     });
     ta.input.id = ui.uid('field');
@@ -783,7 +824,7 @@ function drawDrawer(d, gid, cid, data, note) {
       for (const it of items) {
         const row = rowOf(it.value);
         const ck = caps.length ? lib.changeKind(row, botCaps, caps) : null;
-        currentlyList.appendChild(el('li', { text: lib.currentlyText(it.label, row, ck) }));
+        currentlyList.appendChild(el('li', { text: lib.currentlyText(it.label, row, ck, removedPick(it) ? guild : null) }));
       }
       currently.classList.toggle('hidden', !items.length);
       const missing = !items.length ? 'Pick a persona to add.' : !caps.length ? 'Pick a level.' : '';
@@ -800,11 +841,18 @@ function drawDrawer(d, gid, cid, data, note) {
       const asks = items
         .map((it) => ({ it, ck: lib.changeKind(rowOf(it.value), botCaps, caps) }))
         .filter((c) => lib.needsLowerConfirm(c.ck, caps));
-      if (asks.length) {
+      // Adding a persona removed with /ban lifts its removal from the guild.
+      const lifts = items.filter(removedPick);
+      if (asks.length || lifts.length) {
+        const title = !lifts.length
+          ? (asks.length === 1 ? 'Lower ' + asks[0].it.label + '’s access in ' + where + '?' : 'Lower access for ' + asks.length + ' personas in ' + where + '?')
+          : asks.length ? 'Lower access and lift removals from ' + guild + '?'
+            : lifts.length === 1 ? 'Lift ' + lifts[0].label + '’s removal from ' + guild + '?' : 'Lift the removal of ' + lifts.length + ' personas from ' + guild + '?';
         const go = await ui.confirmDialog({
-          title: asks.length === 1 ? 'Lower ' + asks[0].it.label + '’s access in ' + where + '?' : 'Lower access for ' + asks.length + ' personas in ' + where + '?',
-          body: asks.map((c) => lib.lowerText(c.it.label, c.ck, where)),
-          confirmLabel: 'Add at ' + lib.levelLabel(caps),
+          title,
+          body: asks.map((c) => lib.lowerText(c.it.label, c.ck, where))
+            .concat(lifts.map((it) => lib.liftText(it.label, caps, where, guild)), lifts.length ? [UNDO_KEEPS_LIFT] : []),
+          confirmLabel: lifts.length ? 'Add and lift' : 'Add at ' + lib.levelLabel(caps),
         });
         if (!go) return;
       }
@@ -814,7 +862,7 @@ function drawDrawer(d, gid, cid, data, note) {
       const left = [];
       let conflict = false;
       for (const it of items) {
-        const res = await send(it.value, it.label, caps, { displayName: it.label, avatarUrl: it.avatarUrl }, false);
+        const res = await send(it.value, it.label, caps, { displayName: it.label, avatarUrl: it.avatarUrl, removed: !!it.removed }, false);
         if (res.ok) {
           lines.push(res.text);
           undos.push(res.undo);
@@ -839,12 +887,31 @@ function drawDrawer(d, gid, cid, data, note) {
       addStatus[left.length ? 'err' : 'ok'](parts(lines), opts);
     }, { busyLabel: 'Adding…' });
 
+    /** Put picks kept as ids back as the directory names them (and says
+     *  whether each was removed with /ban); one it doesn't know any more is
+     *  left out. Picks made meanwhile stay, after them. */
+    async function restorePicks(ids) {
+      let found = null;
+      try {
+        const r = await env.api('GET', env.gpath(gid) + '/persona-directory' + env.qs({ ids: ids.join(',') }));
+        found = new Map((r.personas || []).map((p) => [p.id, p]));
+      } catch { /* below: what this drawer knows */ }
+      if (!d.isCurrent()) return;
+      const back = ids
+        .map((id) => (found ? (found.has(id) ? itemOf(found.get(id)) : null)
+          : { value: id, label: (rowOf(id) || {}).displayName || id, title: id }))
+        .filter(Boolean);
+      const taken = new Set(back.map((it) => it.value));
+      ta.set(back.concat(ta.items().filter((it) => !taken.has(it.value))));
+      syncCurrently();
+    }
+
     // Kept across "Sign in again": whom to add and at what level.
     env.keepForm(d, 'chanAdd', {
       serialize: () => ({ personas: ta.values(), caps: level.value() }),
       restore(fl) {
-        if (fl.personas) ta.set(fl.personas.map((id) => ({ value: id, label: (rowOf(id) || {}).displayName || id, title: id })));
         if (fl.caps) level.set(fl.caps);
+        if (fl.personas && fl.personas.length) restorePicks(fl.personas.slice(0, MAX_ADD));
         syncCurrently();
       },
       isDirty: () => tracker.isDirty(),
