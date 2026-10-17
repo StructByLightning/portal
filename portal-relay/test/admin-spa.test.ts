@@ -6223,3 +6223,52 @@ test('persona drawer on a relay older than the panel: named from that relay’s 
   const none = await personaPanel('/#/g/' + GA + '/personas/p/nobody-0', { me: me2, handle: API2_RELAY });
   assert.equal(none.body.textContent, 'No persona with id “nobody-0”.', 'that relay’s persona read says so itself');
 });
+
+test('persona drawer: a Custom… edit kept across a redraw applies over the grant it started from — one changed meanwhile is refused, then re-based', async () => {
+  const same = (a: unknown, b: unknown) => JSON.stringify(Array.isArray(a) ? [...a].sort() : a) === JSON.stringify(Array.isArray(b) ? [...b].sort() : b);
+  let refused = 0;
+  let world: any = null;
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    // As the relay: a change carries what it expects to replace there.
+    refusePut: (body) => {
+      if (!body.channelId || !Object.prototype.hasOwnProperty.call(body, 'expect')) return undefined;
+      const row = world.rows.find((r: any) => r.channelId === body.channelId);
+      const cur = row ? row.direct : null;
+      if (!same(cur, body.expect)) { refused++; return refuse(409, 'CONFLICT', 'changed', { current: cur }); }
+      return undefined;
+    },
+  });
+  world = box.world;
+  const { tr, setDirectIn, bodies } = box;
+  setDirectIn(CH.research, 'custom');
+  customIn(tr(CH.research)).tick('MENTION_EVERYONE');
+  // Another admin lowers #research to Read; then this admin changes another
+  // row, which reads the persona again and draws #research with Read.
+  setDirect(world, CH.research, [...LEVEL_CAPS.read]);
+  setDirectIn(CH.general, 'read');
+  await settle();
+  assert.ok(customIn(tr(CH.research)).open(), 'the edit is still open after the redraw');
+  customIn(tr(CH.research)).button('Apply').click();
+  await settle();
+  assert.equal(refused, 1, 'Apply was sent over the grant the edit started from, and refused');
+  assert.ok(same(bodies.at(-1).expect, W8), 'expect is the starting grant (Write), not the redrawn one: ' + JSON.stringify(bodies.at(-1).expect));
+  assert.ok(same(world.rows.find((r: any) => r.channelId === CH.research).direct, LEVEL_CAPS.read), 'the other admin’s Read stands');
+  const c = customIn(tr(CH.research));
+  assert.ok(c.open(), 'the edit stays open with its ticks');
+  assert.equal(c.box('MENTION_EVERYONE')!.checked, true, 'tick kept');
+  // Apply again, knowingly: now over the grant as it is.
+  c.button('Apply').click();
+  await settle();
+  assert.equal(refused, 1, 'not refused again');
+  assert.ok(same(bodies.at(-1).expect, LEVEL_CAPS.read), 're-based: expect is Read now');
+  assert.ok(!customIn(tr(CH.research)).open(), 'closed once applied');
+});
+
+test('lib drafts: a kept Custom… edit carries the grant it started from (or null)', () => {
+  const { lib } = libOnly();
+  const mk = (fields: unknown) => lib.makeDraft({ userId: 'u', route: '#/g/100000000000000001/personas/p/aria', form: 'dgCustom', fields, at: 1 });
+  assert.deepEqual(mk({ personaId: 'aria', channelId: '100000000000000002', caps: ['VIEW_CHANNEL'], base: ['VIEW_CHANNEL', 'READ_HISTORY'] }).fields.base, ['VIEW_CHANNEL', 'READ_HISTORY'], 'kept');
+  assert.equal(mk({ personaId: 'aria', channelId: '100000000000000002', caps: ['VIEW_CHANNEL'], base: null }).fields.base, null, 'null kept');
+  assert.equal('base' in mk({ personaId: 'aria', channelId: '100000000000000002', caps: ['VIEW_CHANNEL'], base: 'x' }).fields, false, 'junk dropped');
+});
+

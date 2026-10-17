@@ -1967,7 +1967,7 @@ function accessSection(ctx, m) {
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + displayName + ' in ' + w,
       key: 'dg:' + cid,
-      apply: (next) => changeDirect(cid, next),
+      apply: (next, meta) => changeDirect(cid, next, meta),
       busy: pendingCids.has(cid),
       removeOnly: !grantable,
       editing: grantable ? edits.get(cid) || null : null,
@@ -2101,6 +2101,15 @@ function accessSection(ctx, m) {
   }
 
   /** A row's Custom… editor opened, was ticked (`e`), or closed (null). */
+  /** After a conflict: an open Custom… edit in this row now starts over the
+   *  grant as the relay has it (its ticks kept), and the row is drawn again. */
+  function rebaseEdit(cid) {
+    const e = edits.get(cid);
+    if (!e) return;
+    const row = m.rowOf(cid);
+    edits.set(cid, Object.assign({}, e, { base: row && row.direct != null ? row.direct.slice() : null }));
+    drawTable();
+  }
   function noteEdit(cid, e) {
     edits.delete(cid); // re-set: the last touched is last
     if (e) edits.set(cid, e);
@@ -2114,12 +2123,16 @@ function accessSection(ctx, m) {
     serialize() {
       const changed = liveEdits().filter(([, e]) => editChanged(e));
       const last = changed[changed.length - 1];
-      return last ? { personaId: id, channelId: last[0], caps: last[1].caps.slice() } : {};
+      return last ? { personaId: id, channelId: last[0], caps: last[1].caps.slice(), base: last[1].base == null ? null : last[1].base.slice() } : {};
     },
     belongs: (f) => f.personaId === id && typeof f.channelId === 'string' && !!m.rowOf(f.channelId) && grantableAt(f.channelId),
     restore(f) {
       const row = m.rowOf(f.channelId);
-      edits.set(f.channelId, { caps: (f.caps || []).slice(), start: ui.customStart(row ? row.direct : null) });
+      const cur = row && row.direct !== undefined ? row.direct : null;
+      // Started over `base` before the sign-in (a draft from an older panel:
+      // over the grant as it is now).
+      const base = Object.prototype.hasOwnProperty.call(f, 'base') ? f.base : cur;
+      edits.set(f.channelId, { caps: (f.caps || []).slice(), start: ui.customStart(cur), base: base == null ? null : base.slice() });
       drawTable();
     },
     isDirty: editsDirty,
@@ -2142,8 +2155,11 @@ function accessSection(ctx, m) {
    *  from the guild (without it the relay refuses: 409 BANNED). Resolves
    *  { ok, text, undo } (undo null where nothing could put it back: a
    *  channel the panel can't give access on) or { ok: false, error }. */
-  async function send(cid, next, row, lift) {
-    const expect = row && row.direct !== undefined ? row.direct : null;
+  async function send(cid, next, row, lift, meta) {
+    // `meta.expect`: a Custom… edit's own starting grant (see directGrantControl).
+    const expect = meta && Object.prototype.hasOwnProperty.call(meta, 'expect')
+      ? meta.expect
+      : row && row.direct !== undefined ? row.direct : null;
     const before = row && Array.isArray(row.effective) ? row.effective : [];
     const w = where(cid);
     try {
@@ -2200,10 +2216,10 @@ function accessSection(ctx, m) {
   /** A row's direct-grant control picked `next`: ask first when it lowers
    *  guild-wide or default access, or lifts a removal; then send it.
    *  Resolves true when saved. */
-  function changeDirect(cid, next) {
+  function changeDirect(cid, next, meta) {
     pendingCids.set(cid, next);
     let saved = false;
-    return m.track(changeDirectNow(cid, next)).then((ok) => { saved = !!ok; return ok; }).finally(() => {
+    return m.track(changeDirectNow(cid, next, meta)).then((ok) => { saved = !!ok; return ok; }).finally(() => {
       pendingCids.delete(cid);
       const c = controls.get(cid); // drawn busy by a redraw meanwhile, and not since
       if (c && c.drawnBusy) {
@@ -2218,7 +2234,7 @@ function accessSection(ctx, m) {
     });
   }
 
-  async function changeDirectNow(cid, next) {
+  async function changeDirectNow(cid, next, meta) {
     const row = m.rowOf(cid);
     const w = where(cid);
     const lift = (!!m.access.removed || lib.isRemoved(row)) && !!next && next.length > 0;
@@ -2244,7 +2260,7 @@ function accessSection(ctx, m) {
         if (!go) return false;
       }
     }
-    const res = await send(cid, next, row, lift);
+    const res = await send(cid, next, row, lift, meta);
     // Settled: the redraw below draws this row's control as usable again.
     pendingCids.delete(cid);
     // Saved: a Custom… edit it applied is done (the redraw draws it closed).
@@ -2257,6 +2273,9 @@ function accessSection(ctx, m) {
     const e = res.error;
     if (e.code === 'CONFLICT') {
       const ok = await refresh('dg:' + cid);
+      // A Custom… edit stays open with its ticks, now over the grant as it is:
+      // the admin sees the change, and Apply again replaces it knowingly.
+      if (ok) rebaseEdit(cid);
       status.err(lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { reloaded: ok }));
       return false;
     }

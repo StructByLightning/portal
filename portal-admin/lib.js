@@ -1446,7 +1446,7 @@
     // A Custom… editor open in a row of either drawer, not applied: whose
     // direct grant, in which channel, and the boxes ticked. It comes back
     // open, never applied.
-    dgCustom: { personaId: isPersonaId, channelId: isSnowflake, caps: FIELD.caps },
+    dgCustom: { personaId: isPersonaId, channelId: isSnowflake, caps: FIELD.caps, base: (v) => v === null || FIELD.caps(v) },
     // Defining an access role.
     role: {
       name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,

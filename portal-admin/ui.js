@@ -1091,15 +1091,21 @@
     function openEditor(was) {
       closeEditor();
       const start = was && Array.isArray(was.start) ? was.start.slice() : customStart(value);
+      // The grant this edit was started over: Apply sends it as `expect`, so
+      // a grant someone changed meanwhile is refused, not overwritten — even
+      // when the row has been drawn again since with the newer grant.
+      const has = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+      const base = has(was, 'base') ? (was.base == null ? null : was.base.slice()) : value == null ? null : value.slice();
       const editor = capsEditor({ value: was && Array.isArray(was.caps) ? was.caps : start });
       const keyed = (n, k) => {
         if (opts.key) n.setAttribute('data-key', opts.key + ':' + k);
         return n;
       };
       for (const cb of editor.node.querySelectorAll('input')) keyed(cb, cb.value);
+      const baseCopy = () => (base == null ? null : base.slice());
       const report = () => {
-        editing = { caps: editor.value(), start: start.slice() };
-        if (opts.onEditing) opts.onEditing({ caps: editing.caps.slice(), start: start.slice() });
+        editing = { caps: editor.value(), start: start.slice(), base: baseCopy() };
+        if (opts.onEditing) opts.onEditing({ caps: editing.caps.slice(), start: start.slice(), base: baseCopy() });
       };
       editor.onChange(report);
       const apply = keyed(el('button', { class: 'btn btn-sm btn-primary', text: 'Apply' }), 'apply');
@@ -1111,7 +1117,7 @@
           why.textContent = 'Tick at least one capability, or pick —.';
           return;
         }
-        run(caps);
+        run(caps, { expect: baseCopy() });
       });
       cancel.addEventListener('click', () => {
         closeEditor();
@@ -1123,10 +1129,10 @@
       ]));
       editorBox.classList.remove('hidden');
       // Reopened as it was, the owner has it already; opened now, it is told.
-      if (was) editing = { caps: editor.value(), start: start.slice() };
+      if (was) editing = { caps: editor.value(), start: start.slice(), base: baseCopy() };
       else report();
     }
-    async function run(next) {
+    async function run(next, meta) {
       if (busyNow) return;
       busyNow = true;
       const hadFocus = node.contains(document.activeElement);
@@ -1138,7 +1144,7 @@
       edit.disabled = true;
       node.setAttribute('aria-busy', 'true');
       let ok = false;
-      try { ok = await opts.apply(next); } catch (e) { console.error('[portal-admin]', e); ok = false; }
+      try { ok = await opts.apply(next, meta); } catch (e) { console.error('[portal-admin]', e); ok = false; }
       busyButtons.delete(select);
       if (busyFocus === select) busyFocus = null;
       busyNow = false;
@@ -1210,7 +1216,7 @@
       select,
       value: () => (value == null ? null : value.slice()),
       /** The open Custom… editor ({ caps, start }), or null. */
-      editing: () => (editing ? { caps: editing.caps.slice(), start: editing.start.slice() } : null),
+      editing: () => (editing ? { caps: editing.caps.slice(), start: editing.start.slice(), base: editing.base == null ? null : editing.base.slice() } : null),
       /** What is set is now `v`. An open Custom… editor closes, unless
        *  `keepEditing` (a change that wasn't made leaves the admin's ticks). */
       set(v, cb, keepEditing) {

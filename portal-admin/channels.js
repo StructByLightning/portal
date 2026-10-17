@@ -602,6 +602,15 @@ function drawDrawer(d, gid, cid, data, note) {
   const liveEdits = () => Array.from(edits.entries()).filter(([pid]) => !!rowOf(pid));
   const editsDirty = () => liveEdits().some(([, e]) => editChanged(e));
   d.trackDirty(editsDirty);
+  /** After a conflict: an open Custom… edit in this row now starts over the
+   *  grant as the relay has it (its ticks kept), and the rows are drawn again. */
+  function rebaseEdit(pid) {
+    const e = edits.get(pid);
+    if (!e) return;
+    const row = rowOf(pid);
+    edits.set(pid, Object.assign({}, e, { base: row && row.direct != null ? row.direct.slice() : null }));
+    drawRows();
+  }
   function noteEdit(pid, e) {
     edits.delete(pid); // re-set: the last touched is last
     if (e) edits.set(pid, e);
@@ -633,7 +642,7 @@ function drawDrawer(d, gid, cid, data, note) {
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + name + ' in ' + where,
       key: 'dg:' + pid,
-      apply: (next) => change(pid, next),
+      apply: (next, meta) => change(pid, next, meta),
       removeOnly: !grantable,
       editing: grantable ? edits.get(pid) || null : null,
       // Only the row's control as drawn now speaks for it.
@@ -792,9 +801,10 @@ function drawDrawer(d, gid, cid, data, note) {
    *  removed from the guild). `refocus`: the change came from the row's own
    *  control. `lift`: the admin was asked, and chose to lift its removal
    *  from the guild. */
-  async function send(pid, name, next, base, refocus, lift) {
+  async function send(pid, name, next, base, refocus, lift, meta) {
     const row = rowOf(pid);
-    const expect = row ? row.direct : null;
+    // `meta.expect`: a Custom… edit's own starting grant (see directGrantControl).
+    const expect = meta && Object.prototype.hasOwnProperty.call(meta, 'expect') ? meta.expect : row ? row.direct : null;
     const before = row ? row.effective : [];
     const wasRemoved = lib.isRemoved(row) || !!(base && base.removed);
     try {
@@ -886,7 +896,7 @@ function drawDrawer(d, gid, cid, data, note) {
 
   /** A row's direct-grant control picked `next`: ask first when it lowers
    *  guild-wide or default access, then send it. Resolves true when saved. */
-  async function change(pid, next) {
+  async function change(pid, next, meta) {
     const row = rowOf(pid);
     const name = (row && row.displayName) || pid;
     const ck = lib.changeKind(row, botCaps, next);
@@ -912,7 +922,7 @@ function drawDrawer(d, gid, cid, data, note) {
       });
       if (!go) return false;
     }
-    const res = await send(pid, name, next, row, true, lift);
+    const res = await send(pid, name, next, row, true, lift, meta);
     if (res.ok) {
       said(whoStatus, 'ok', res.text, null, [res.undo], pid);
       return true;
@@ -920,6 +930,9 @@ function drawDrawer(d, gid, cid, data, note) {
     const e = res.error;
     if (e.code === 'CONFLICT') {
       const ok = await reloadRows(pid);
+      // A Custom… edit stays open with its ticks, now over the grant as it is:
+      // the admin sees the change, and Apply again replaces it knowingly.
+      if (ok) rebaseEdit(pid);
       report('err', lib.errorText(e, 'Not saved', { reloaded: ok }), null, pid);
       return false;
     }
@@ -1093,14 +1106,18 @@ function drawDrawer(d, gid, cid, data, note) {
       serialize() {
         const changed = liveEdits().filter(([, e]) => editChanged(e));
         const last = changed[changed.length - 1];
-        return last ? { personaId: last[0], channelId: cid, caps: last[1].caps.slice() } : {};
+        return last ? { personaId: last[0], channelId: cid, caps: last[1].caps.slice(), base: last[1].base == null ? null : last[1].base.slice() } : {};
       },
       // It comes back open — never applied — in this channel's drawer, on a
       // row that is still here.
       belongs: (f) => f.channelId === cid && typeof f.personaId === 'string' && !!rowOf(f.personaId),
       restore(f) {
         const row = rowOf(f.personaId);
-        edits.set(f.personaId, { caps: (f.caps || []).slice(), start: ui.customStart(row ? row.direct : null) });
+        const cur = row ? row.direct : null;
+        // Started over `base` before the sign-in (a draft from an older
+        // panel: over the grant as it is now).
+        const base = Object.prototype.hasOwnProperty.call(f, 'base') ? f.base : cur;
+        edits.set(f.personaId, { caps: (f.caps || []).slice(), start: ui.customStart(cur), base: base == null ? null : base.slice() });
         restoredPid = f.personaId;
         drawRows();
       },
