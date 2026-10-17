@@ -271,10 +271,17 @@ function showLogin(errMsg) {
   }
 }
 
+/** The address of what the page shows: the address bar's, except while
+ *  "Discard changes?" is up after Back or a link — the bar already shows the
+ *  destination then, but the page is still the drawer. */
+function shownHash() {
+  return state.shownHash || location.hash;
+}
+
 /** Before going to sign in: keep this address to come back to (unless it is
  *  only home, and an earlier one is waiting). */
 function keepReturnTo() {
-  const r = lib.parseRoute(location.hash);
+  const r = lib.parseRoute(shownHash());
   const h = r && r.area !== 'home' ? lib.formatRoute(r) : null;
   if (h && lib.isSafeReturnTo(h)) session.set('pa.returnTo', h);
 }
@@ -288,10 +295,11 @@ function saveDraft() {
   session.del('pa.draft');
   const f = ui.drawer.isOpen() ? ui.drawer.activeForm() : null;
   if (!f || (f.isDirty && !f.isDirty())) return;
-  if (!state.drawerRoute || state.drawerRoute !== location.hash) return;
+  const here = shownHash();
+  if (!state.drawerRoute || state.drawerRoute !== here) return;
   let fields;
   try { fields = f.serialize(); } catch { return; }
-  const d = lib.makeDraft({ userId: userId(), route: location.hash, form: f.key, fields, at: Date.now() });
+  const d = lib.makeDraft({ userId: userId(), route: here, form: f.key, fields, at: Date.now() });
   if (d) session.set('pa.draft', JSON.stringify(d));
 }
 
@@ -752,7 +760,11 @@ async function applyRoute(opts = {}) {
     const at = state.routeAt;
     // One question at a time: Esc may have asked already (ui.drawer shares it).
     const asked = ui.drawer.id();
-    const discard = await ui.drawer.confirmDiscard();
+    // Until it's answered, the page is still the drawer: a sign-in from here
+    // (a save answered 401 meanwhile) keeps the drawer's place and form.
+    state.shownHash = prevHash;
+    let discard;
+    try { discard = await ui.drawer.confirmDiscard(); } finally { state.shownHash = null; }
     discardAsked = false;
     if (ui.drawer.isOpen() && ui.drawer.id() !== asked) return; // another drawer since
     if (!discard && ui.drawer.isOpen()) return stepBackTo(prevHash, at);
@@ -2386,6 +2398,8 @@ async function renderRoles(view, stale) {
   const meta = await guildMeta();
   if (stale()) return;
   let data = null; // fetched once per visit; the filter runs locally
+  let epoch = 0; // bumped when the catalog changes: an older reply isn't cached
+  const invalidate = () => { data = null; epoch++; };
   const actions = [];
   if (meta.canAuthor) {
     // A link: defining a role has an address (#/g/{gid}/roles/new).
@@ -2395,8 +2409,13 @@ async function renderRoles(view, stale) {
     placeholder: 'Filter access roles…',
     actions,
     load: async () => {
-      if (!data) data = await api('GET', G() + '/roles' + qs({ names: '1' }));
-      const { catalog, discordRoles, canAuthor, names: rawNames } = data;
+      let d = data;
+      if (!d) {
+        const at = epoch;
+        d = await api('GET', G() + '/roles' + qs({ names: '1' }));
+        if (at === epoch && !data) data = d; // a reply from before a change draws nothing and isn't kept
+      }
+      const { catalog, discordRoles, canAuthor, names: rawNames } = d;
       const names = withChannelList(rawNames, meta.channels, discordRoles);
       names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
       const here = (n) => (catalog[n] && catalog[n].guildId === state.guildId ? 0 : 1);
@@ -2418,7 +2437,7 @@ async function renderRoles(view, stale) {
         if (canAuthor) {
           cells.push(el('td', {}, [r.guildId ? el('span', { text: guildText(r.guildId, names) }) : el('span', { class: 'muted', text: '—' })]));
           const del = el('button', { class: 'btn btn-sm btn-danger', text: 'Delete', 'aria-label': 'Delete access role ' + n });
-          del.addEventListener('click', () => deleteRole(n, del, list, () => { data = null; }));
+          del.addEventListener('click', () => deleteRole(n, del, list, invalidate));
           cells.push(el('td', {}, [del]));
         }
         return el('tr', {}, cells);
@@ -2434,7 +2453,7 @@ async function renderRoles(view, stale) {
     },
   });
   // A role created in the drawer: refetch on the redraw that closing it triggers.
-  list.invalidate = () => { data = null; };
+  list.invalidate = invalidate;
 }
 
 async function openRoleDrawer() {

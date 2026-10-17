@@ -1435,7 +1435,8 @@ const G2_LOBBY = '100000000000002011'; // #lobby in Guild Two
  *  relay keeps (POST /admin/roles replaces a name, as the relay does). With
  *  ?names=1 it names what a super-admin's catalog references, as the relay
  *  does: every role's guild it knows, and their channels. */
-async function rolesTab(more: Record<string, any> = {}) {
+async function rolesTab(more: Record<string, any> = {}, opts: { holdFirstList?: Promise<void> } = {}) {
+  let lists = 0; // the tab's list loads (with names), in order
   const g = '/admin/g/' + G1;
   const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'], ...more };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
@@ -1449,6 +1450,11 @@ async function rolesTab(more: Record<string, any> = {}) {
       if (net.down) throw new Error('offline');
       if (method === 'GET' && path.startsWith(g + '/roles')) {
         if (!new URL(path, 'http://panel.invalid').searchParams.has('names')) return { catalog, discordRoles: [], canAuthor: true };
+        if (opts.holdFirstList && lists++ === 0) {
+          const snapshot = structuredClone(catalog); // what the catalog was when it was asked
+          await opts.holdFirstList; // the tab's first load, answered late
+          return { catalog: snapshot, discordRoles: [], canAuthor: true, names: { channels: {}, discordRoles: {}, guilds: {} } };
+        }
         if (net.holdLookup) await net.holdLookup; // the drawer's look, answered late
         const guilds: Record<string, string> = {};
         for (const r of Object.values(catalog)) if (known[r.guildId]) guilds[r.guildId] = known[r.guildId];
@@ -3584,5 +3590,67 @@ test('persona drawer: a crop started while a picture URL save is at work stays u
   box.doc.getElementById('drawer-close')!.click();
   await settle();
   assert.ok(box.doc.querySelector('.modal'), 'closing asks first');
+});
+
+test('access roles: a list reply from before a role was created is not kept, so a search still shows the new role', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => { release = r; });
+  const t = await rolesTab({}, { holdFirstList: hold });
+  await t.define('g1-brand-new', 'write'); // closing the drawer loads the list afresh
+  await settle();
+  release(); // the first load, from before the role existed, lands last
+  await settle();
+  const search = t.doc.getElementById('list-search')!;
+  search.value = 'g1';
+  search.fire('input');
+  t.advance(300);
+  await settle();
+  assert.ok(t.rows().some((r) => r[0] === 'g1-brand-new'), JSON.stringify(t.rows()));
+});
+
+test('session: a 401 while “Discard changes?” is up keeps the drawer’s place and form for after the sign-in', async () => {
+  const g = '#/g/' + GA;
+  let release!: () => void;
+  let gate: Promise<void> | null = null;
+  const box = await panelAt('/' + g + '/invites', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: async (method) => {
+      if (method === 'POST' && gate) { await gate; return refuse(401, 'UNAUTHENTICATED', 'login required'); }
+      return undefined;
+    },
+  });
+  clickable(box.doc, '+ Mint invite').click();
+  await settle();
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  gate = new Promise<void>((r) => { release = r; });
+  form.fire('submit');
+  await settle();
+  // An edit while it's at work keeps the form dirty; then Back asks.
+  const label = box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!;
+  label.value = 'xy';
+  label.fire('input');
+  box.nav.back();
+  await settle();
+  const heads = box.doc.querySelectorAll('.modal').map((m) => m.querySelector('h2')?.textContent);
+  assert.ok(heads.includes('Discard changes?'), 'Back asks: ' + JSON.stringify(heads) + ' at ' + box.here());
+  release(); // the save comes back 401 while the question is up
+  await settle();
+  const ended = box.doc.querySelectorAll('.modal').find((m) => /Your session ended/.test(m.querySelector('h2')?.textContent || ''));
+  assert.ok(ended, 'the session-ended dialog: ' + JSON.stringify(box.doc.querySelectorAll('.modal').map((m) => m.querySelector('h2')?.textContent)));
+  clickable(box.doc, 'Sign in again', ended!).click();
+  assert.equal(box.sessionStore.getItem('pa.returnTo'), g + '/invites/new', 'the drawer’s place, not where Back was going');
+  const draft = JSON.parse(box.sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.route, g + '/invites/new');
+  assert.equal(draft.fields.label, 'xy');
+});
+
+test('lib.isSafeReturnTo: any address the router accepts can be come back to (a long, non-ASCII persona id)', () => {
+  const { lib } = libOnly();
+  const id = '名'.repeat(60) + '-1a2b3c';
+  const hash = lib.formatRoute({ area: 'g', gid: '100000000000000001', view: 'personas', drawer: { kind: 'persona', id }, query: {} });
+  assert.ok(hash.length > 512, String(hash.length));
+  assert.ok(lib.parseRoute(hash), 'the router takes it');
+  assert.equal(lib.isSafeReturnTo(hash), true);
+  assert.equal(lib.isSafeReturnTo('#/' + 'a'.repeat(3000)), false, 'still bounded');
 });
 

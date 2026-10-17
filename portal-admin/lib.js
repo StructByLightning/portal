@@ -667,7 +667,9 @@
    *  a panel address in a narrow character set; it is only ever parsed into a
    *  route, never assigned to location. */
   function isSafeReturnTo(s) {
-    return typeof s === 'string' && /^#\/[A-Za-z0-9/%._~?=&,:-]{0,512}$/.test(s) && parseRoute(s) !== null;
+    // The same length limit as parseRoute (2048 in all), so any address the
+    // panel routes to can be come back to after a sign-in.
+    return typeof s === 'string' && /^#\/[A-Za-z0-9/%._~?=&,:-]{0,2046}$/.test(s) && parseRoute(s) !== null;
   }
 
   // ── Drafts ────────────────────────────────────────────────────────────────
