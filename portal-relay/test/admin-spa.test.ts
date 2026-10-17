@@ -2624,6 +2624,38 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
   }
 });
 
+test('session: a kept form that mirrors @everyone comes back with @everyone shown and picked', async () => {
+  const g = '#/g/' + GA;
+  const discordRoles = [
+    { id: GA, guildId: GA, name: '@everyone', pooled: false },
+    { id: MODS, guildId: GA, name: 'Mods', pooled: false },
+  ];
+  const routes = { [`/admin/g/${GA}/roles`]: { catalog: G1_CATALOG, discordRoles, canAuthor: true } };
+  const at = (route: string, form: string, fields: object) => ({
+    'pa.draft': JSON.stringify({ v: 1, userId: ME_OP.user.id, route, form, fields, at: Date.now() }),
+  });
+  const everyone = (body: FakeElement) => body.querySelectorAll('label').find((l) => l.textContent === 'Show @everyone')!.querySelector('input')!;
+
+  // Define access role, one Discord role.
+  let box = await panelAt('/' + g + '/roles/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/roles/new', 'role', { name: 'g1-all', where: 'mirrorRole', mirrorRole: GA, caps: [...LEVEL_CAPS.read] }) });
+  let body = box.doc.getElementById('drawer-body')!;
+  assert.equal(body.querySelector('select[name="mirrorRole"]')!.value, GA, 'the kept role is picked');
+  assert.equal(everyone(body).checked, true, 'and @everyone is shown');
+  assert.ok(body.textContent.includes('Restored your unsaved change'));
+
+  // Several Discord roles.
+  box = await panelAt('/' + g + '/roles/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/roles/new', 'role', { name: 'g1-some', where: 'mirrorRoles', mirrorRoles: [GA, MODS], caps: [...LEVEL_CAPS.read] }) });
+  body = box.doc.getElementById('drawer-body')!;
+  const ticked = body.querySelector('.check-list[aria-label="Discord roles"]')!.querySelectorAll('input').filter((i) => i.checked).map((i) => i.value);
+  assert.deepEqual(ticked.sort(), [GA, MODS].sort(), 'neither is dropped');
+
+  // Mint invite, mirror.
+  box = await panelAt('/' + g + '/invites/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/invites/new', 'mint', { kind: 'mirror', mirrorRole: GA, caps: [...LEVEL_CAPS.read] }) });
+  body = box.doc.getElementById('drawer-body')!;
+  assert.equal(body.querySelector('select[name="mirrorRole"]')!.value, GA);
+  assert.equal(everyone(body).checked, true);
+});
+
 // ── The all-persona drawer names its guild in its address ──
 
 test('app routes: from All personas a drawer’s address names the guild, so a reload keeps its “Access in” section', async () => {

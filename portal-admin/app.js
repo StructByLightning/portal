@@ -1971,17 +1971,32 @@ function discordRoleChoices(discordRoles, withEveryone) {
     .map((r) => ({ value: r.id, text: roleText(r.id, { discordRoles: { [r.id]: r } }) }));
 }
 
-/** A 'Show @everyone' toggle for a Discord-role picker, or null when the guild
- *  has no @everyone role to show. */
+/** A 'Show @everyone' toggle for a Discord-role picker (node null when the
+ *  guild has no @everyone role to show). show() turns it on, as a click would. */
 function everyoneToggle(discordRoles, onToggle) {
   const has = (discordRoles || []).some((r) => !r.pooled && (r.id === state.guildId || r.name === '@everyone'));
-  if (!has) return { node: null, on: () => false };
+  if (!has) return { node: null, on: () => false, show() {} };
   const box = el('input', { type: 'checkbox', 'data-no-dirty': true });
   box.addEventListener('change', () => onToggle(box.checked));
-  return { node: el('label', { class: 'check-inline' }, [box, el('span', { text: 'Show @everyone' })]), on: () => box.checked };
+  return {
+    node: el('label', { class: 'check-inline' }, [box, el('span', { text: 'Show @everyone' })]),
+    on: () => box.checked,
+    show() {
+      if (box.checked) return;
+      box.checked = true;
+      onToggle(true);
+    },
+  };
 }
 
-/** One Discord role to mirror: a select that starts at 'Pick a Discord role…'. */
+/** Is `id` a Discord role the pickers offer only behind 'Show @everyone'? */
+function behindEveryone(discordRoles, id) {
+  return !discordRoleChoices(discordRoles, false).some((o) => o.value === id) &&
+    discordRoleChoices(discordRoles, true).some((o) => o.value === id);
+}
+
+/** One Discord role to mirror: a select that starts at 'Pick a Discord role…'.
+ *  restore(id) puts back a kept choice — @everyone too, showing it first. */
 function mirrorRolePicker(discordRoles) {
   const select = el('select', { name: 'mirrorRole' });
   function fill(withEveryone) {
@@ -1997,14 +2012,29 @@ function mirrorRolePicker(discordRoles) {
   select.addEventListener('change', changed);
   const toggle = everyoneToggle(discordRoles, (on) => { fill(on); changed(); });
   fill(false);
-  return { select, toggle: toggle.node, value: () => select.value, onChange: (fn) => listeners.push(fn) };
+  return {
+    select, toggle: toggle.node, value: () => select.value, onChange: (fn) => listeners.push(fn),
+    restore(id) {
+      if (!id) return;
+      if (behindEveryone(discordRoles, id)) toggle.show();
+      if (Array.from(select.options).some((o) => o.value === id)) select.value = id;
+    },
+  };
 }
 
-/** Several Discord roles to mirror: a checkbox list. */
+/** Several Discord roles to mirror: a checkbox list. restore(ids) puts back
+ *  kept choices — @everyone too, showing it first. */
 function mirrorRoleList(discordRoles) {
   const list = ui.checkList({ label: 'Discord roles', empty: 'This guild has no Discord roles to mirror.', options: discordRoleChoices(discordRoles, false) });
   const toggle = everyoneToggle(discordRoles, (on) => list.setOptions(discordRoleChoices(discordRoles, on)));
-  return { list, toggle: toggle.node };
+  return {
+    list, toggle: toggle.node,
+    restore(ids) {
+      if (!ids) return;
+      if (ids.some((id) => behindEveryone(discordRoles, id))) toggle.show();
+      list.setValues(ids);
+    },
+  };
 }
 
 /**
@@ -2134,7 +2164,7 @@ async function openMintDrawer(prefill = {}) {
       if (f.kind) kind.set(f.kind);
       if (f.roles) roleList.setValues(f.roles.filter((r) => mine.includes(r)));
       if (f.channels) chanList.setValues(f.channels);
-      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
+      mirror.restore(f.mirrorRole);
       if (f.caps) level.set(f.caps);
       if (f.uses) uses.value = f.uses;
       if (f.usesOther != null) usesOther.value = f.usesOther;
@@ -2381,8 +2411,8 @@ async function openRoleDrawer() {
       if (f.where) kind.value = f.where;
       syncKind();
       if (f.channels) chanList.setValues(f.channels);
-      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
-      if (f.mirrorRoles) mirrors.list.setValues(f.mirrorRoles);
+      mirror.restore(f.mirrorRole);
+      mirrors.restore(f.mirrorRoles);
       if (f.caps) level.set(f.caps);
       update();
     },
