@@ -580,6 +580,66 @@ test('ui.onSubmit: a second submit while the first is pending sends nothing', as
   assert.equal(calls, 2, 'once settled, the form submits again');
 });
 
+test('ui.setDisabled: work that leaves nothing to send keeps its button off, and focus goes on to the form’s first field', async () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, busy, onSubmit, setDisabled } = ctx.PA.ui;
+  // Not held by busy(): it sets the button.
+  const b = el('button', { text: 'Add' });
+  setDisabled(b, true);
+  assert.equal(b.disabled, true);
+  setDisabled(b, false);
+  assert.equal(b.disabled, false);
+  // Held: what it returns to when the work is done, not its state before the click.
+  let release!: () => void;
+  const p = busy(b, new Promise<void>((r) => (release = r)));
+  setDisabled(b, true);
+  assert.equal(b.getAttribute('aria-busy'), 'true', 'still at work');
+  release();
+  await p;
+  assert.equal(b.disabled, true, 'off: nothing is left to send');
+  assert.equal(b.getAttribute('aria-busy'), null);
+  assert.equal(b.textContent, 'Add');
+  // Asked once: the next work without it puts back the state before the click.
+  setDisabled(b, false);
+  await busy(b, Promise.resolve());
+  assert.equal(b.disabled, false);
+
+  // Through onSubmit, pressed with focus on the button: the work clears the
+  // field and turns the button off; focus goes to the field, not <body>.
+  const input = el('input', { type: 'text', name: 'persona' });
+  const button = el('button', { type: 'submit', text: 'Add' });
+  const form = el('form', {}, [input, button]);
+  doc.body.appendChild(form);
+  let sent = 0;
+  onSubmit(form, async () => {
+    sent++;
+    input.value = '';
+    setDisabled(button, true);
+  });
+  input.value = 'Nyx';
+  button.focus();
+  form.fire('submit');
+  await tick();
+  await tick();
+  assert.equal(sent, 1);
+  assert.equal(button.disabled, true);
+  assert.equal(doc.activeElement, input);
+  form.fire('submit'); // Enter in the empty field
+  await tick();
+  assert.equal(sent, 1, 'off, it sends nothing');
+  // Left on (something still to send): focus comes back to the button.
+  setDisabled(button, false);
+  button.focus();
+  const again = form.fire('submit');
+  assert.equal(again.defaultPrevented, true);
+  await tick();
+  await tick();
+  assert.equal(sent, 2);
+  assert.equal(button.disabled, true, 'the work turned it off again');
+  assert.equal(doc.activeElement, input);
+});
+
 test('ui.toast: errors are alerts that stay until dismissed; the rest fade after 6 s', () => {
   const { ctx, doc, advance } = sandbox();
   load(ctx, ['ui.js']);
@@ -3369,6 +3429,17 @@ test('lib.changeKind: what a direct grant would change — asked about only when
   assert.equal(lib.currentlyText('Aria', chatter, plain(lib.changeKind(chatter, all, W7))), 'Aria: Write via role g1-chatters — no direct grant needed');
   assert.equal(lib.currentlyText('Cass', cassWrite, lower), 'Cass: Write via the guild-wide level — this lowers it to Read');
   assert.equal(lib.currentlyText('Aria', aria, plain(lib.changeKind(aria, all, F7))), 'Aria: Write via role g1-chatters and the direct grant here');
+  // The same level, with a direct grant of its own here: Add changes nothing
+  // there, or only that grant — never 'no direct grant needed' beside it.
+  assert.equal(lib.currentlyText('Aria', aria, plain(lib.changeKind(aria, all, W7))), 'Aria: Write via role g1-chatters and the direct grant here — the direct grant is already Write');
+  const ariaRead = accessRow('aria', 'Aria', W7, [roleSrc('g1-chatters', W7), { kind: 'direct', caps: R7 }], R7);
+  assert.equal(lib.currentlyText('Aria', ariaRead, plain(lib.changeKind(ariaRead, all, W7))), 'Aria: Write via role g1-chatters and the direct grant here — this changes its direct grant here to Write, not what it can do here');
+  const ariaBlock = accessRow('aria', 'Aria', W7, [roleSrc('g1-chatters', W7), { kind: 'block' }, { kind: 'guildWide', caps: R7, shadowedBy: 'block' }], []);
+  assert.equal(lib.currentlyText('Aria', ariaBlock, plain(lib.changeKind(ariaBlock, all, W7))), 'Aria: Write via role g1-chatters — this changes its direct grant here to Write, not what it can do here');
+  assert.equal(lib.currentlyText('Aria', aria, plain(lib.changeKind(aria, all, [...W7].reverse()))), 'Aria: Write via role g1-chatters and the direct grant here — the direct grant is already Write', 'in any order');
+  assert.equal(lib.sameCapSet(W7, [...W7].reverse()), true);
+  assert.equal(lib.sameCapSet(W7, R7), false);
+  assert.equal(lib.sameCapSet([], null), true);
 });
 
 test('lib drafts: the channel drawer’s Add form keeps whom (at most 10) and the level', () => {
@@ -3708,13 +3779,24 @@ test('channel drawer: who can act here, at what level and why; add a persona at 
   assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: no access');
   const level = drawerBody.querySelector('.add-form')!.querySelectorAll('input').find((i) => i.type === 'radio' && i.checked)!;
   assert.equal(level.value, 'write', 'Write is preselected');
-  drawerBody.querySelector('.add-form')!.fire('submit');
+  const addForm = drawerBody.querySelector('.add-form')!;
+  const addBtn = addForm.querySelector('button[type="submit"]')!;
+  assert.equal(addBtn.disabled, false);
+  addBtn.focus(); // Tab to Add, then Enter
+  addForm.fire('submit');
   await settle();
   assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
-  const addLine = drawerBody.querySelector('.add-form')!.querySelector('.status-line')!;
+  const addLine = addForm.querySelector('.status-line')!;
   assert.equal(addLine.textContent, 'Nyx → Write in #research. Effective now: Write.');
   assert.deepEqual(drawerBody.querySelectorAll('tr[data-pid]').map((t) => t.dataset.pid), ['aria', 'cass', 'nyx', 'quill', 'sol'], 'the row appears, in name order');
   assert.equal(drawerBody.querySelector('.ta-chips')!.querySelectorAll('.tag').length, 0, 'the picks are done');
+  // Nothing is picked now: Add is off, as its hint says, and focus is in the
+  // persona field to pick the next one — not on <body>.
+  assert.equal(addBtn.disabled, true, 'Add is off until a persona is picked again');
+  assert.equal(addBtn.textContent, 'Add');
+  assert.equal(addBtn.getAttribute('aria-busy'), null);
+  assert.equal(addBtn.nextSibling!.textContent, 'Pick a persona to add.');
+  assert.equal(doc.activeElement, input);
 
   // Aria's direct grant to '—': the line under her row says what is left.
   pick('aria', '');
@@ -4018,7 +4100,9 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: removed from Guild One with /ban — adding it lifts that');
 
   const form = drawerBody.querySelector('.add-form')!;
+  const addBtn = form.querySelector('button[type="submit"]')!;
   const n = bodies.length;
+  addBtn.focus();
   form.fire('submit');
   await settle();
   const modal = doc.querySelector('.modal')!;
@@ -4028,6 +4112,8 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   clickable(doc, 'Cancel', modal).click();
   await settle();
   assert.equal(bodies.length, n, 'Cancel sends nothing');
+  assert.equal(addBtn.disabled, false, 'Nyx is still picked');
+  assert.equal(doc.activeElement, addBtn, 'focus back on Add');
 
   form.fire('submit');
   await settle();
@@ -4035,6 +4121,8 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   await settle();
   assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
   assert.equal(form.querySelector('.status-line')!.textContent, 'Nyx → Write in #research. Effective now: Write. That lifted its removal from Guild One.');
+  assert.equal(addBtn.disabled, true, 'nothing picked now: Add is off');
+  assert.equal(doc.activeElement, input, 'focus in the persona field, not on <body>');
 
   const undo = doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Nyx →'))!.querySelector('.toast-action')!;
   undo.click();

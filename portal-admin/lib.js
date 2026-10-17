@@ -19,6 +19,7 @@
  *   customOptionText
  *   predictDirect, changeKind,         what a direct-grant change would do (only
  *   lowerText, currentlyText,          to ask first: the relay says what it did)
+ *   sameCapSet                         the same capabilities, in any order
  *   isRemoved, liftText                a persona removed with /ban, and the lift
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
@@ -580,11 +581,11 @@
 
   /**
    * What setting a persona's direct grant in a channel to `direct` would do:
-   *   { kind: 'add' | 'raise' | 'lower' | 'same', before, after, from }
+   *   { kind: 'add' | 'raise' | 'lower' | 'same', before, after, from, direct }
    * 'add' when it can't act there now, 'lower' when it would lose anything,
    * 'raise' when it would only gain. `from` is what decides its own access
    * there now (ownSource) — a lowering of guild-wide or a default access is
-   * asked about first (needsLowerConfirm).
+   * asked about first (needsLowerConfirm). `direct` is the setting asked for.
    */
   function changeKind(row, botCaps, direct) {
     const before = (row && Array.isArray(row.effective)) ? row.effective : [];
@@ -597,7 +598,7 @@
     if (!lost && !gained) kind = 'same';
     else if (!countedLevel(before) && countedLevel(after)) kind = 'add';
     else if (lost) kind = 'lower';
-    return { kind, before, after, from: ownSource(row) };
+    return { kind, before, after, from: ownSource(row), direct: direct == null ? null : direct };
   }
 
   const FROM_WORDS = { guildWide: 'guild-wide', personaDefault: 'persona default', relayDefault: 'relay default', direct: 'direct grant' };
@@ -627,7 +628,10 @@
    *  'Aria: Write via role g1-chatters — no direct grant needed' · 'Nyx: no
    *  access' · 'Cass: Write via the guild-wide level — this lowers it to Read'
    *  · 'Quill: removed from Guild One with /ban — adding it lifts that'
-   *  (`removedFrom`: the guild's name, for a persona removed there). */
+   *  (`removedFrom`: the guild's name, for a persona removed there). A change
+   *  that leaves what it can do as it is says what Add does to the persona's
+   *  own direct grant here: there is none to add ('no direct grant needed'),
+   *  it is already that level, or it changes it and nothing else. */
   function currentlyText(name, row, change, removedFrom) {
     if (removedFrom) return name + ': removed from ' + removedFrom + ' with /ban — adding it lifts that';
     const eff = (row && Array.isArray(row.effective)) ? row.effective : [];
@@ -637,9 +641,21 @@
       const via = viaParts(row, 'the direct grant here');
       s += summaryParts(eff).text + (via.length ? ' via ' + via.join(' and ') : '');
     }
-    if (change && eff.length && change.kind === 'same') s += ' — no direct grant needed';
-    else if (change && change.kind === 'lower') s += ' — this lowers it to ' + (change.after.length ? summaryParts(change.after).text : 'no access');
+    if (change && eff.length && change.kind === 'same') {
+      const own = row && Array.isArray(row.direct) ? row.direct : null;
+      const asked = Array.isArray(change.direct) ? change.direct : null;
+      if (!own || !asked) s += ' — no direct grant needed';
+      else if (sameCapSet(own, asked)) s += ' — the direct grant is already ' + levelLabel(asked);
+      else s += ' — this changes its direct grant here to ' + levelLabel(asked) + ', not what it can do here';
+    } else if (change && change.kind === 'lower') s += ' — this lowers it to ' + (change.after.length ? summaryParts(change.after).text : 'no access');
     return s;
+  }
+
+  /** The same capabilities, in any order. */
+  function sameCapSet(a, b) {
+    const x = new Set(a || []);
+    const y = new Set(b || []);
+    return x.size === y.size && Array.from(x).every((c) => y.has(c));
   }
 
   /** Before a change that gives a persona removed with /ban access again:
@@ -1220,7 +1236,7 @@
     botLimitText, effectNowText, remainingText, guildEffectText,
     countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
     channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
-    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, liftText, customOptionText,
+    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, customOptionText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,

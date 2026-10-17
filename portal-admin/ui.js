@@ -256,13 +256,29 @@
   // The button busy() took focus from, while its work runs: disabling it
   // dropped focus to <body>, so a dialog the work opens returns there.
   let busyFocus = null;
+  // On or off, as setDisabled() asked while busy() held the button: what it
+  // returns to when the work settles, instead of its state before the click.
+  const restDisabled = new WeakMap();
+
+  /**
+   * Turn `button` on or off. While busy() holds it, this is the state it
+   * returns to when the work is done (busy() would otherwise put back the one
+   * from before the click): a form whose work changes what can be sent —
+   * picks cleared after a save — sets its button through this.
+   */
+  function setDisabled(button, disabled) {
+    if (busyButtons.has(button)) restDisabled.set(button, !!disabled);
+    else button.disabled = !!disabled;
+  }
 
   /**
    * Lock `button` while `work` (a promise, or a function returning one) runs:
    * disabled, aria-busy, relabelled ('Saving…' unless `label` is given).
-   * Restores it when the work settles. Returns the work's promise.
+   * Restores it when the work settles (off, if the work turned it off with
+   * setDisabled()). Returns the work's promise. Focus the button had comes
+   * back to it — or, the button left off, to `offFocus()` when given.
    */
-  function busy(button, work, label) {
+  function busy(button, work, label, offFocus) {
     const prev = { text: button.textContent, disabled: button.disabled };
     // Disabling a focused button drops focus to <body>; hand it back after.
     const hadFocus = document.activeElement === button;
@@ -280,11 +296,14 @@
     const done = () => {
       busyButtons.delete(button);
       if (busyFocus === button) busyFocus = null;
-      button.disabled = prev.disabled;
+      button.disabled = restDisabled.has(button) ? restDisabled.get(button) : prev.disabled;
+      restDisabled.delete(button);
       button.removeAttribute('aria-busy');
       button.textContent = prev.text;
       const a = document.activeElement;
-      if (hadFocus && button.isConnected && !button.disabled && (!a || a === document.body || !a.isConnected)) button.focus();
+      if (!hadFocus || !button.isConnected || (a && a !== document.body && a.isConnected)) return;
+      if (!button.disabled) button.focus();
+      else if (offFocus) focusFirst([offFocus()]);
     };
     return p.then(
       (v) => {
@@ -306,6 +325,8 @@
    * Submit `form` through `run` (Enter or the submit button), one at a time:
    * while a submission is pending, further submits are ignored and the submit
    * button is locked with busy(). `run` reports its own result and errors.
+   * A `run` that leaves nothing to send turns the button off with
+   * setDisabled(); focus the button had then goes to the form's first field.
    */
   function onSubmit(form, run, opts) {
     const o = opts || {};
@@ -316,7 +337,8 @@
       if (pending || (button && (isBusy(button) || button.disabled))) return;
       pending = true;
       const work = () => run(e);
-      const p = button ? busy(button, work, o.busyLabel) : Promise.resolve().then(work);
+      const firstField = () => focusables(form).find((n) => n !== button) || null;
+      const p = button ? busy(button, work, o.busyLabel, firstField) : Promise.resolve().then(work);
       p.catch((err) => console.error('[portal-admin]', err)).then(() => {
         pending = false;
       });
@@ -1432,6 +1454,7 @@
     statusLine,
     busy,
     isBusy,
+    setDisabled,
     onSubmit,
     modal,
     modalOpen,

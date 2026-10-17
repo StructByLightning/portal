@@ -147,11 +147,7 @@ function writeGrant(gid, pid, cid, next, expect) {
   return env.api('PUT', P, body);
 }
 
-const sameSet = (a, b) => {
-  const x = new Set(a || []);
-  const y = new Set(b || []);
-  return x.size === y.size && [...x].every((c) => y.has(c));
-};
+const sameSet = (a, b) => PA.lib.sameCapSet(a, b);
 
 // ── The Channels tab ───────────────────────────────────────────────────────
 
@@ -828,7 +824,9 @@ function drawDrawer(d, gid, cid, data, note) {
       }
       currently.classList.toggle('hidden', !items.length);
       const missing = !items.length ? 'Pick a persona to add.' : !caps.length ? 'Pick a level.' : '';
-      addBtn.disabled = !!missing;
+      // Through setDisabled: after an Add clears the picks this runs inside
+      // the submit, and busy() would otherwise turn the button back on.
+      ui.setDisabled(addBtn, !!missing);
       why.textContent = missing;
     };
     ta.onChange(syncCurrently);
