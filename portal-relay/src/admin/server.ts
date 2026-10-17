@@ -1102,16 +1102,16 @@ export class AdminServer {
 
   private mintInvite(res: ServerResponse, session: AdminSession, guildId: string, body: any): void {
     if (!this.deps.invites) return sendJson(res, 400, err('DISABLED', 'invites not enabled'));
-    // A mode, count or subscriptions the caller gave goes into the invite as
-    // sent, for the invite's shape check to refuse a wrong type by name, and
-    // roles, a grant and expiresInDays are checked here, rather than any of
-    // them being dropped: a count sent as "5" would otherwise be stored as
-    // unlimited, a misspelled mode as mint-only, roles that aren't a list as
-    // none, and an expiry given as anything but a number of days as never.
-    // Absent, null, '' and false, and roles of 0, say that nothing was sent
-    // for the field, so it is left out, as if it weren't in the request. A
-    // grant is read only when no roles are given, and a label that isn't a
-    // string becomes 'invite'.
+    // Roles, a grant, a mode, a count, subscriptions or expiresInDays sent as
+    // null, '' or false, or roles sent as 0, count as not sent and are left
+    // out. Otherwise roles and expiresInDays are checked here, and a mode,
+    // count or subscriptions goes in as sent for the shape check below, which
+    // refuses a wrong type by name and reads a mode or subscriptions of 0 as
+    // none. Dropped instead, a count sent as "5" would be stored as unlimited,
+    // a misspelled mode as mint-only, roles that aren't a list as none, and an
+    // expiry given as anything but a number of days as never. A grant is read
+    // only when no roles are given, and a label that isn't a string becomes
+    // 'invite'.
     const given = (v: unknown) => v !== undefined && v !== null && v !== '' && v !== false;
     if (given(body?.roles) && body.roles !== 0 && !Array.isArray(body.roles)) {
       return sendJson(res, 400, err('INVALID', 'roles must be a list of access role names'));

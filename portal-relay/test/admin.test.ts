@@ -2593,7 +2593,7 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   [{ roles: ['r-g1'], maxUses: 0 }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: [5] }, 'subscriptions'],
   // A field given with the wrong type is refused by name, not dropped: dropped, "5" would be stored as unlimited.
-  // A field given as null, '' or false is not given, and mints as if left out (the tests below).
+  // Roles, a grant, a mode, a count, subscriptions or an expiry given as null, '' or false is not sent (the tests below).
   [{ roles: ['r-g1'], maxUses: '5' }, 'maxUses'],
   [{ roles: ['r-g1'], maxUses: true }, 'maxUses'],
   [{ roles: ['r-g1'], subscriptions: 'c1' }, 'subscriptions'],
