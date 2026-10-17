@@ -76,9 +76,9 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * list, and in `uses` and `maxUses` '' would grow as text or exhaust the
  * invite, so they are refused there. A `grant` that is there must be an
  * object, so '', 0 and false are refused there too. A `uses` or `maxUses`
- * that isn't finite, such as JSON's 1e400, is refused as well, and the next
- * save drops the invite: JSON would write it as null, which reads otherwise
- * (a null uses as 0).
+ * that isn't finite, such as JSON's 1e400, is refused as well, and the relay's
+ * next save drops the invite: JSON would write it as null, which reads
+ * otherwise (a null uses as 0).
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
@@ -112,6 +112,12 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const at = expiryOf(inv);
   if (at !== undefined && Number.isNaN(at)) return "invite expiresAt isn't a date, so it reads as expired and the next save drops it";
   return grantShapeProblem(inv);
+}
+
+/** The count field holding a number JSON can't write (it would write null), if one does. */
+function nonFiniteCount(inv: InviteTemplate): 'uses' | 'maxUses' | undefined {
+  const f = inv as unknown as Record<string, unknown>;
+  return (['uses', 'maxUses'] as const).find((k) => typeof f[k] === 'number' && !Number.isFinite(f[k]));
 }
 
 /** When an invite expires, in ms since the epoch, or undefined for never.
@@ -180,9 +186,12 @@ export class InviteStore {
 
   // ── Mutations (persist) — RFC-005 admin API ──
 
-  /** Add a new invite template. Throws on duplicate code. Returns it. */
+  /** Add a new invite template. Throws on duplicate code, and on a uses or
+   *  maxUses that isn't finite, which the save would drop. Returns it. */
   mint(template: InviteTemplate): InviteTemplate {
     if (this.byCode.has(template.code)) throw new Error(`duplicate invite code ${template.code}`);
+    const unwritable = nonFiniteCount(template);
+    if (unwritable) throw new Error(`invite ${unwritable} must be a finite number`);
     const inv = { uses: 0, ...template };
     this.byCode.set(inv.code, inv);
     this.persist();
@@ -215,7 +224,7 @@ export class InviteStore {
     const bad = [...byCode.values()]
       .map((i) => [i, inviteShapeProblem(i)] as const)
       .filter(([, why]) => why)
-      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why})`);
+      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why}${nonFiniteCount(i) ? ', and the next save drops it' : ''})`);
     if (bad.length) {
       console.error(`[portal-relay] invites: ${bad.length} invite(s) will be refused: ${bad.join('; ')}`);
     }
@@ -243,7 +252,7 @@ export class InviteStore {
   private prune(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [code, inv] of this.byCode) {
-      if ([inv.uses, inv.maxUses].some((v) => typeof v === 'number' && !Number.isFinite(v))) {
+      if (nonFiniteCount(inv)) {
         this.byCode.delete(code);
         continue;
       }

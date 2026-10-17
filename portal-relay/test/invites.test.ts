@@ -182,7 +182,7 @@ test('loading names each invite a claim would refuse, with the field; null reads
   rmSync(path, { force: true });
 });
 
-test('loading names a count or uses that JSON reads as infinite, which a save would write as null', (t) => {
+test('loading names a count or uses that JSON reads as infinite, and says the next save drops it', (t) => {
   const errors: string[] = [];
   t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
   const dir = mkdtempSync(join(tmpdir(), 'portal-invites-'));
@@ -196,13 +196,13 @@ test('loading names a count or uses that JSON reads as infinite, which a save wo
   ].join(',')}]}`);
   new InviteStore(path);
   const line = errors.find((l) => /will be refused/.test(l)) ?? '';
-  assert.ok(line.includes('count-infinite (invite maxUses must be a finite number above 0)'), line);
-  assert.ok(line.includes('uses-infinite (invite uses must be a finite number)'), line);
-  assert.ok(line.includes('uses-minus-infinite (invite uses must be a finite number)'), line);
+  assert.ok(line.includes('count-infinite (invite maxUses must be a finite number above 0, and the next save drops it)'), line);
+  assert.ok(line.includes('uses-infinite (invite uses must be a finite number, and the next save drops it)'), line);
+  assert.ok(line.includes('uses-minus-infinite (invite uses must be a finite number, and the next save drops it)'), line);
   rmSync(dir, { recursive: true, force: true });
 });
 
-test('a save drops an invite whose count or uses JSON read as infinite, which it would write as null', (t) => {
+test('a save drops an invite whose count or uses JSON read as infinite, since JSON would write it as null', (t) => {
   t.mock.method(console, 'error', () => {});
   const dir = mkdtempSync(join(tmpdir(), 'portal-invites-'));
   const path = join(dir, 'invites.json');
@@ -210,6 +210,7 @@ test('a save drops an invite whose count or uses JSON read as infinite, which it
   const invite = (code: string, field: string) => `{"code":"${code}","label":"${code}","guildId":"g1","roles":["r"],${field}}`;
   writeFileSync(path, `{"invites":[${[
     invite('count-infinite', '"maxUses":1e400'),
+    invite('count-minus-infinite', '"maxUses":-1e400'),
     invite('uses-infinite', '"maxUses":5,"uses":1e400'),
     invite('uses-minus-infinite', '"uses":-1e400'),
     invite('plain', '"maxUses":5,"uses":1'),
@@ -221,3 +222,17 @@ test('a save drops an invite whose count or uses JSON read as infinite, which it
   assert.deepEqual(new InviteStore(path).all().map((i) => i.code).sort(), ['fresh', 'plain']);
   rmSync(dir, { recursive: true, force: true });
 });
+
+// Its own save would drop such an invite, so mint refuses it rather than return a code the store no longer holds.
+for (const [field, value] of [['maxUses', Infinity], ['maxUses', -Infinity], ['uses', Infinity], ['uses', NaN]] as const) {
+  test(`mint refuses a ${field} of ${value}, which its save would drop, and stores nothing`, () => {
+    const path = tmpFile({ invites: [] });
+    const store = new InviteStore(path);
+    assert.throws(() => store.mint({ code: 'c', label: 'c', guildId: 'g1', roles: ['r'], [field]: value } as any), {
+      message: `invite ${field} must be a finite number`,
+    });
+    assert.deepEqual(store.all(), []);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).invites, []);
+    rmSync(path, { force: true });
+  });
+}
