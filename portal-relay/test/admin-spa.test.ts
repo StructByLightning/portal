@@ -1323,16 +1323,17 @@ async function rolesTab(more: Record<string, any> = {}) {
   const g = '/admin/g/' + G1;
   const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'], ...more };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
-  const net: { down: boolean; beforePost?: (body: any) => void } = { down: false };
+  const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void> } = { down: false };
   const box = appSandbox({
     routes: {
       '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
       [g + '/channels']: { channels: G1_CHANNELS },
     },
-    handle: (method, path, body) => {
+    handle: async (method, path, body) => {
       if (net.down) throw new Error('offline');
       if (method === 'GET' && path.startsWith(g + '/roles')) {
         if (!new URL(path, 'http://panel.invalid').searchParams.has('names')) return { catalog, discordRoles: [], canAuthor: true };
+        if (net.holdLookup) await net.holdLookup; // the drawer's look, answered late
         const guilds: Record<string, string> = {};
         for (const r of Object.values(catalog)) if (known[r.guildId]) guilds[r.guildId] = known[r.guildId];
         const names = { channels: { [G2_LOBBY]: { id: G2_LOBBY, name: 'lobby', type: 'text' } }, discordRoles: {}, guilds };
@@ -1786,6 +1787,46 @@ test('role drawer: a new name must be one the relay accepts', async () => {
   const submit = form.querySelector('button[type="submit"]')!;
   assert.equal(submit.disabled, true);
   assert.match(form.textContent, /Use lower-case letters, digits, dots, dashes or underscores in the name \(up to 64\) to create it\./);
+});
+
+test('role drawer: a look that answers after the drawer was discarded asks nothing and closes no other drawer', async () => {
+  const { define, confirm, button, net, doc, bodies, calls } = await rolesTab();
+  let answer!: () => void;
+  net.holdLookup = new Promise<void>((r) => { answer = r; });
+  await define('g1-readers', 'write'); // the name exists: the late answer would ask to edit it
+  assert.ok(calls.includes(`GET /admin/g/${G1}/roles?names=1`), 'the look is out');
+  // Discard that drawer while the relay thinks…
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  clickable(doc, 'Discard changes', confirm()!).click();
+  await settle();
+  // …and start on another one.
+  button('+ Define access role')!.click();
+  await settle();
+  const input = doc.getElementById('drawer-body')!.querySelector('input[name="name"]')!;
+  input.value = 'g1-new-one';
+  input.fire('input');
+  const posts = bodies.length;
+  net.holdLookup = undefined;
+  answer();
+  await settle();
+  assert.equal(confirm(), null, 'no question about the discarded form');
+  assert.equal(bodies.length, posts, 'nothing sent');
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'), 'the new drawer stays open');
+  assert.equal(doc.getElementById('drawer-body')!.querySelector('input[name="name"]')!.value, 'g1-new-one', 'with its unsaved edit');
+});
+
+test('ui.drawer: a handle closes only its own drawer', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, drawer } = ctx.PA.ui;
+  drawerDom(doc, el);
+  const first = drawer.open({ title: 'One' });
+  const second = drawer.open({ title: 'Two' });
+  first.close();
+  assert.equal(drawer.isOpen(), true, 'a replaced drawer’s handle leaves the open one alone');
+  second.close();
+  assert.equal(drawer.isOpen(), false);
 });
 
 test('role drawer: a role made before the naming rule can still be edited under its name', async () => {

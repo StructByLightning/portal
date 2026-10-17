@@ -711,8 +711,10 @@
   const drawer = {
     /**
      * Open the drawer at once: { title, subtitle, body, onClose }. Without a
-     * body it shows 'Loading…'. Returns a handle whose setBody/setTitle do
-     * nothing once this drawer has been closed or replaced.
+     * body it shows 'Loading…'. Returns a handle whose setBody/setTitle/close
+     * do nothing once this drawer has been closed or replaced. Anything that
+     * waits on the relay checks isCurrent() before it asks a question, since
+     * a question belongs to whichever drawer is open when it is asked.
      */
     open(opts) {
       bindDrawer();
@@ -725,6 +727,11 @@
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
+        /** Close this drawer — only if it is still the one open: a reply that
+         *  lands after it was closed or replaced must not close another. */
+        close(reason) {
+          if (handle.isCurrent()) drawer.close(reason);
+        },
         setTitle(title, subtitle) {
           if (!handle.isCurrent()) return;
           clear(d.title);

@@ -2227,7 +2227,7 @@ async function openMintDrawer(prefill = {}) {
     });
     const another = el('button', { class: 'btn', text: 'Mint another' });
     another.addEventListener('click', () => { d.setBody(form); label.focus(); });
-    const done = el('button', { class: 'btn', text: 'Done', onclick: () => ui.drawer.close() });
+    const done = el('button', { class: 'btn', text: 'Done', onclick: () => d.close() });
     d.setBody(el('section', { class: 'result-card', 'aria-labelledby': headId }, [
       el('h3', { id: headId, text: 'Invite ready' }),
       el('p', { class: 'invite-code-wrap' }, [codeEl]),
@@ -2331,7 +2331,7 @@ async function openRoleDrawer() {
   if (!d.isCurrent()) return;
   if (!meta.canAuthor) {
     // Only super-admins define access roles: a link here lands on the list.
-    ui.drawer.close();
+    d.close();
     ui.toast('Only super-admins can define access roles. Ask one to add the role you need.', { kind: 'info' });
     return;
   }
@@ -2446,9 +2446,12 @@ async function openRoleDrawer() {
      *  asking. The relay refuses a name in use (EXISTS) unless asked to
      *  replace it in the guild it belongs to; if it was made, deleted or
      *  moved between the look and the save, look again, once. Resolves true
-     *  when the role was saved. */
+     *  when the role was saved. A drawer discarded while the relay was asked
+     *  goes no further: no question (it would belong to whatever drawer is
+     *  open now) and nothing sent. */
     async function attempt(again) {
       const { existing, seen } = await lookup();
+      if (!d.isCurrent()) return false;
       const body = { name: roleName, role };
       if (existing) {
         const taken = lib.roleNameTaken(roleName, existing, role, gid, seen);
@@ -2473,13 +2476,18 @@ async function openRoleDrawer() {
       invalidateGuildMeta();
       if (state.list && state.list.invalidate) state.list.invalidate();
       markStale();
-      // Through the form's line, so an earlier 'Not created' toast goes too.
+      // Through the form's line, so an earlier 'Not created' toast goes too
+      // (and, if this drawer was closed meanwhile, the toast still says it).
       status.ok((existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.');
-      ui.drawer.close(); // the list redraws with the role
+      d.close(); // the list redraws with the role — never another drawer
       return true;
     }
 
-    try { await attempt(false); } catch (e) { status.err(notDone(e, 'Not created', { roleName })); }
+    try { await attempt(false); } catch (e) {
+      // A look that failed after the drawer was discarded changed nothing,
+      // and the admin has moved on: nothing to say.
+      if (d.isCurrent() || e.method !== 'GET') status.err(notDone(e, 'Not created', { roleName }));
+    }
   }, { busyLabel: 'Creating…' });
   d.setBody(form);
 }
