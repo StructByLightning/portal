@@ -44,7 +44,7 @@ import {
   type AccessDeps, type AccessSource, type Explained, type LevelCounts, type Subject,
 } from '../access.js';
 import type { IdentityStore } from '../identity.js';
-import type { InviteStore } from '../invites.js';
+import { inviteShapeProblem, type InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
 import type { AuditLog, AuditRecord } from './audit.js';
 import { canManageGuild } from './authz.js';
@@ -1134,6 +1134,11 @@ export class AdminServer {
       ...(expiresAt ? { expiresAt } : {}),
       ...(Array.isArray(body?.subscriptions) ? { subscriptions: body.subscriptions } : {}),
     };
+    // What a claim would refuse isn't stored: a count of 0 or below would be
+    // a dead invite reported as minted, and a non-string channel id would
+    // fail every enrollment through it.
+    const shape = inviteShapeProblem(template);
+    if (shape) return sendJson(res, 400, err('INVALID', shape));
     let inv;
     try {
       inv = this.deps.invites.mint(template);

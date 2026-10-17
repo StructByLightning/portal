@@ -411,3 +411,126 @@ test('a role whose scope names nothing grants nothing, so an admin claim of it l
   }
 });
 
+/** What a call did, for an assertion's message: its answer, or what it threw. */
+async function outcome(call: () => unknown): Promise<any> {
+  try { return await call(); } catch (e) { return { threw: (e as Error).message }; }
+}
+
+const MIRROR_GRANT = { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } };
+const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
+  ['roles-string', { roles: 'reader' }, /invite roles must be a list of access role names/],
+  ['guildId-number', { guildId: 7, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /invite guildId must be a string/],
+  ['maxUses-word', { maxUses: 'one' }, /invite maxUses must be a number above 0/],
+  ['maxUses-text', { maxUses: '5' }, /invite maxUses must be a number above 0/],
+  ['uses-word', { uses: 'x', maxUses: 1 }, /invite uses must be a number/],
+  ['prefix-number', { namePrefix: 7 }, /invite namePrefix must be a string/],
+  ['subs-mixed', { subscriptions: [CHAN_A, 42] }, /invite subscriptions must be a list of channel ids/],
+  // A machine mint's recheck reads the grant, so the shape comes first.
+  ['mint-scope-null', { mintedBy: EXISTING, grant: { caps: [...RW], scope: null } }, /invite grant scope must be exactly one/],
+];
+for (const [code, fields, why] of MALFORMED_FIELDS) {
+  test(`invite ${code}: enroll and claim refuse it by name, before anything is created or spent`, async () => {
+    const t = makeRelay();
+    try {
+      t.relay.invites.mint({ code, mode: 'both', guildId: GUILD, grant: MIRROR_GRANT, ...fields } as any);
+      const count = t.relay.identity.all().length;
+      const enrolled = await outcome(() => t.relay.enroll({ invite: code, desiredName: `n-${code}` }));
+      const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, code));
+      const seen = {
+        enrolled, claimed,
+        caps: enrolled?.personaId ? t.caps(enrolled.personaId, CHAN_A) : null,
+        personasAdded: t.relay.identity.all().length - count,
+        uses: t.relay.invites.get(code)?.uses,
+      };
+      assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify(seen));
+      assert.equal(seen.personasAdded, 0, 'no persona created');
+      assert.equal(seen.uses, fields.uses ?? 0, 'no use spent');
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+test('a misspelled mode is refused at enroll by name; a claim refuses it first as not claimable, as it always has', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'mode-typo', mode: 'augmnet', guildId: GUILD, grant: MIRROR_GRANT } as any);
+    const count = t.relay.identity.all().length;
+    const enrolled = await outcome(() => t.relay.enroll({ invite: 'mode-typo', desiredName: 'n-typo' }));
+    assert.ok(/invite mode must be "mint", "augment" or "both"/.test(enrolled?.error ?? ''), JSON.stringify(enrolled));
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'mode-typo'), /not claimable/);
+    assert.equal(t.relay.identity.all().length, count, 'no persona created');
+  } finally {
+    t.cleanup();
+  }
+});
+
+const MALFORMED_REGISTER: Array<[Record<string, unknown>, RegExp]> = [
+  [{ desiredName: 42 }, /register desiredName must be a string/],
+  [{ desiredName: { first: 'a' } }, /register desiredName must be a string/],
+  [{ desiredName: ['a'] }, /register desiredName must be a string/],
+  [{ avatar: 42 }, /register avatar must be a string/],
+  [{ avatar: { url: 'x' } }, /register avatar must be a string/],
+  [{ subscriptions: 42 }, /register subscriptions must be a list of channel ids/],
+  [{ subscriptions: CHAN_A }, /register subscriptions must be a list of channel ids/],
+  [{ subscriptions: [CHAN_A, 42] }, /register subscriptions must be a list of channel ids/],
+];
+for (const [fields, why] of MALFORMED_REGISTER) {
+  test(`register ${JSON.stringify(fields)}: refused by name before anything is created`, async () => {
+    const t = makeRelay();
+    try {
+      const count = t.relay.identity.all().length;
+      const enrolled = await outcome(() => t.relay.enroll({ invite: 'mirror-mint', desiredName: 'x', ...fields }));
+      const stored = enrolled?.personaId ? t.relay.identity.get(enrolled.personaId) : null;
+      assert.ok(why.test(enrolled?.error ?? ''), JSON.stringify({ enrolled, stored }));
+      assert.equal(t.relay.identity.all().length, count, 'no persona created');
+      assert.equal(t.relay.invites.get('mirror-mint').uses ?? 0, 0, 'no use spent');
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+test('an empty or false register name or avatar means none, as it always has; a false avatar is stored as none', async () => {
+  const t = makeRelay();
+  try {
+    for (const fields of [{ desiredName: '' }, { desiredName: false }, { desiredName: null }, { avatar: false }, { avatar: '' }, { subscriptions: null }]) {
+      const res = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'x', ...fields });
+      assert.ok(!('error' in res), `${JSON.stringify(fields)}: ${JSON.stringify(res)}`);
+      const p = t.relay.identity.get(res.personaId);
+      assert.equal(typeof p.displayName, 'string', JSON.stringify(fields));
+      assert.equal(typeof p.avatar, 'string', `${JSON.stringify(fields)}: stored avatar ${JSON.stringify(p.avatar)}`);
+    }
+  } finally {
+    t.cleanup();
+  }
+});
+
+const STORED_SCOPES: Array<[string, unknown, 'refused' | 'reused']> = [
+  // The resolver reads mirrorRoles before mirrorRole, and `all` before either.
+  ['both mirror keys naming different roles', { mirrorRole: DISCORD_ROLE, mirrorRoles: ['dr-other'] }, 'refused'],
+  ['all: false beside a mirror role', { all: false, mirrorRole: DISCORD_ROLE }, 'refused'],
+  ['both mirror keys naming one role', { mirrorRole: DISCORD_ROLE, mirrorRoles: [DISCORD_ROLE] }, 'reused'],
+];
+for (const [what, scope, expect] of STORED_SCOPES) {
+  test(`a stored mirror role with ${what} is ${expect}: reused only when the resolver reads it as the grant`, async () => {
+    const t = makeRelay();
+    try {
+      const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'probe' });
+      const name = t.relay.permissions.getRoleNames(first.personaId)[0];
+      t.relay.permissions.setRole(name, { caps: [...RW].sort(), scope, guildId: GUILD });
+      const count = t.relay.identity.all().length;
+      const enrolled = await outcome(() => t.relay.enroll({ invite: 'mirror-mint', desiredName: 'again' }));
+      const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'));
+      const seen = { enrolled, claimed, caps: enrolled?.personaId ? t.caps(enrolled.personaId, CHAN_A) : null };
+      if (expect === 'refused') {
+        assert.ok(/conflicts with an existing access role/.test(enrolled?.error ?? '') && /conflicts with an existing access role/.test(claimed?.threw ?? ''), JSON.stringify(seen));
+        assert.equal(t.relay.identity.all().length, count, 'no persona created');
+      } else {
+        assert.deepEqual(seen.caps, [...RW].sort(), JSON.stringify(seen));
+      }
+    } finally {
+      t.cleanup();
+    }
+  });
+}

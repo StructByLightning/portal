@@ -41,6 +41,55 @@ export function grantShapeProblem(inv: InviteTemplate): string | null {
   return ok ? null : 'invite grant scope is malformed';
 }
 
+/**
+ * Why an invite can't be claimed as written, or null: a field a claim reads
+ * holds a value outside its declared type, or the grant can't be applied
+ * (grantShapeProblem). Every relay writer builds these fields from checked
+ * values, so a hand edit is what reaches them. Read as found, `roles` as a
+ * string throws mid-enroll, a numeric `guildId` grants nothing and spends the
+ * invite, a misspelled `mode` mints, and a non-numeric count never exhausts.
+ * Enroll and claim refuse such an invite before anything is created or
+ * consumed, the admin mint route refuses to store one, and loading warns,
+ * naming an expiry that isn't a date too.
+ * `null` reads as absent, as it always has, except in `maxUses`: a null count
+ * has always exhausted the invite, so it is refused rather than opened.
+ */
+export function inviteShapeProblem(inv: InviteTemplate): string | null {
+  const f = inv as unknown as Record<string, unknown>;
+  const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+  const checks: Array<[string, (v: unknown) => boolean, string]> = [
+    ['guildId', (v) => typeof v === 'string', 'must be a string'],
+    ['mintedBy', (v) => typeof v === 'string', 'must be a string'],
+    ['namePrefix', (v) => typeof v === 'string', 'must be a string'],
+    ['mode', (v) => v === 'mint' || v === 'augment' || v === 'both', 'must be "mint", "augment" or "both"'],
+    ['roles', strings, 'must be a list of access role names'],
+    ['subscriptions', strings, 'must be a list of channel ids'],
+    ['uses', (v) => typeof v === 'number', 'must be a number'],
+  ];
+  for (const [field, ok, why] of checks) {
+    if (f[field] !== undefined && f[field] !== null && !ok(f[field])) return `invite ${field} ${why}`;
+  }
+  if (f.maxUses !== undefined && !(typeof f.maxUses === 'number' && f.maxUses > 0)) {
+    return 'invite maxUses must be a number above 0';
+  }
+  // check() already refuses such an expiry; this names it at load, since the
+  // next save drops it with the expired invites.
+  const at = expiryOf(inv);
+  if (at !== undefined && Number.isNaN(at)) return "invite expiresAt isn't a date, so it reads as expired and the next save drops it";
+  return grantShapeProblem(inv);
+}
+
+/** When an invite expires, in ms since the epoch, or undefined for never.
+ *  Only a string names an expiry: absent, null, '' and false read as none, as
+ *  they always have, and any other value can't be read as a time, so it
+ *  counts as long expired (NaN). `Date.parse` would read a number as a date
+ *  string: 2030 as 2030-01-01, 99999 as the year 99999. */
+function expiryOf(inv: InviteTemplate): number | undefined {
+  const at = (inv as { expiresAt?: unknown }).expiresAt;
+  if (at === undefined || at === null || at === '' || at === false) return undefined;
+  return typeof at === 'string' ? Date.parse(at) : NaN;
+}
+
 export type InviteRejection =
   | 'unknown'
   | 'expired'
@@ -67,14 +116,12 @@ export class InviteStore {
   check(code: string, nowMs: number): InviteTemplate | InviteRejection {
     const inv = this.byCode.get(code);
     if (!inv) return 'unknown';
-    if (inv.expiresAt) {
-      const at = Date.parse(inv.expiresAt);
-      // Fail CLOSED on an unparseable expiry: `NaN <= now` is false, so the
-      // naive comparison silently turned a malformed timestamp into a
-      // never-expiring invite — the most dangerous default a bearer-code
-      // store can have.
-      if (!Number.isFinite(at) || at <= nowMs) return 'expired';
-    }
+    const at = expiryOf(inv);
+    // Fail CLOSED on an unparseable expiry: `NaN <= now` is false, so the
+    // naive comparison silently turned a malformed timestamp into a
+    // never-expiring invite — the most dangerous default a bearer-code
+    // store can have.
+    if (at !== undefined && (!Number.isFinite(at) || at <= nowMs)) return 'expired';
     if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
     return inv;
   }
@@ -125,11 +172,12 @@ export class InviteStore {
       byCode.set(inv.code, inv);
     }
     this.byCode = byCode;
-    // An invite whose grant can't be applied (no guild, no caps, a malformed
-    // scope) is refused at enroll and claim. Flag it so it is re-minted
-    // rather than discovered by the agent that tries it.
+    // An invite a claim can't read as written (a field of the wrong type, a
+    // grant with no guild, no caps or a malformed scope) is refused at enroll
+    // and claim. Flag it so it is fixed rather than discovered by the agent
+    // that tries it.
     const bad = [...byCode.values()]
-      .map((i) => [i, grantShapeProblem(i)] as const)
+      .map((i) => [i, inviteShapeProblem(i)] as const)
       .filter(([, why]) => why)
       .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why})`);
     if (bad.length) {
@@ -155,8 +203,8 @@ export class InviteStore {
   private pruneExpired(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [code, inv] of this.byCode) {
-      if (!inv?.expiresAt) continue;
-      const at = Date.parse(inv.expiresAt);
+      const at = expiryOf(inv);
+      if (at === undefined) continue;
       if (!Number.isFinite(at) || at <= cutoff) this.byCode.delete(code);
     }
   }

@@ -371,3 +371,77 @@ test('a persona on the file default keeps it elsewhere when one guild is changed
   assert.deepEqual(sorted(store.resolve('fresh2', 'g2', 'cZ')), []);
   rmSync(path, { force: true });
 });
+
+const MALFORMED_ROLES: Array<[string, unknown]> = [
+  ['caps-number', { caps: 5, scope: { all: true }, guildId: 'g1' }],
+  ['scope-null', { caps: ['SEND_MESSAGES'], scope: null, guildId: 'g1' }],
+  ['scope-empty', { caps: ['SEND_MESSAGES'], scope: {}, guildId: 'g1' }],
+  ['all-string', { caps: ['SEND_MESSAGES'], scope: { all: 'yes' }, guildId: 'g1' }],
+  ['channels-string', { caps: ['SEND_MESSAGES'], scope: { channels: 'c1' }, guildId: 'g1' }],
+  ['mirror-number', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 7 }, guildId: 'g1' }],
+  // A second key no reader reaches first is checked too.
+  ['second-key', { caps: ['SEND_MESSAGES'], scope: { all: true, channels: 'c1' }, guildId: 'g1' }],
+];
+for (const [name, role] of MALFORMED_ROLES) {
+  test(`role ${name}: quarantined at load, inert, warned about and kept on disk`, (t) => {
+    const errors: string[] = [];
+    t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+    const good = { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' };
+    const path = tmpFile({ roles: { good, [name]: role }, personas: { p: { roles: ['good', name] } } } as any);
+    try {
+      const store = new PermissionsStore(path);
+      // Only role r1 sees c1, as a live mirror lookup would answer.
+      store.setMirrorLookup((_g, r) => (r === 'r1' ? chans('c1') : new Map()));
+      let caps: unknown;
+      try { caps = sorted(store.resolve('p', 'g1', 'c1')); } catch (e) { caps = `threw: ${(e as Error).message}`; }
+      assert.deepEqual(caps, ['VIEW_CHANNEL']);
+      assert.equal(store.getRole(name), undefined, 'not loaded');
+      assert.ok(errors.some((l) => l.includes(`role "${name}" can't be read`)), errors.join('\n'));
+      // A save keeps the entry as written, for the operator to repair.
+      store.setRole('another', { caps: ['VIEW_CHANNEL'], scope: { channels: ['c2'] }, guildId: 'g1' });
+      const onDisk = JSON.parse(readFileSync(path, 'utf8')) as { roles: Record<string, unknown> };
+      assert.deepEqual(onDisk.roles[name], role);
+    } finally {
+      rmSync(path, { force: true });
+    }
+  });
+}
+
+test('both mirror keys naming one role, and mirrorCaps of 0, load and resolve as they always have', () => {
+  const path = tmpFile({
+    roles: {
+      both: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1', mirrorRoles: ['r1'] }, guildId: 'g1' },
+      zero: { caps: ['READ_HISTORY'], scope: { mirrorRole: 'r1' }, mirrorCaps: 0, guildId: 'g1' },
+    },
+    personas: { q: { roles: ['both', 'zero'] } },
+  } as any);
+  const store = new PermissionsStore(path);
+  store.setMirrorLookup((_g, r) => (r === 'r1' ? chans('c1') : new Map()));
+  assert.deepEqual(sorted(store.resolve('q', 'g1', 'c1')), ['READ_HISTORY', 'VIEW_CHANNEL']);
+  rmSync(path, { force: true });
+});
+
+test('a mirror key behind `all` is read when mirrorCaps is set, so a malformed one is quarantined rather than thrown on', () => {
+  const path = tmpFile({
+    roles: {
+      good: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' },
+      masked: { caps: ['SEND_MESSAGES'], scope: { all: true, mirrorRoles: 5 }, mirrorCaps: true, guildId: 'g1' },
+    },
+    personas: { p: { roles: ['good', 'masked'] } },
+  } as any);
+  const store = new PermissionsStore(path);
+  store.setMirrorLookup(() => chans('c1'));
+  let caps: unknown;
+  try { caps = sorted(store.resolve('p', 'g1', 'c1')); } catch (e) { caps = `threw: ${(e as Error).message}`; }
+  assert.deepEqual(caps, ['VIEW_CHANNEL']);
+  assert.equal(store.getRole('masked'), undefined);
+  rmSync(path, { force: true });
+});
+
+test('setRole refuses a role a reader could not read, as loading quarantines one', () => {
+  const path = tmpFile({ personas: {} });
+  const store = new PermissionsStore(path);
+  assert.throws(() => store.setRole('bad', { caps: 5, scope: { all: true }, guildId: 'g1' } as never), /can't be read: caps must be a list/);
+  assert.equal(store.getRole('bad'), undefined);
+  rmSync(path, { force: true });
+});

@@ -2585,3 +2585,35 @@ test('persona rows: a guild-wide deny is flagged, and so are direct grants here 
     await s.close();
   }
 });
+
+const MINT_REFUSED: Array<Record<string, unknown>> = [
+  { roles: ['r-g1'], maxUses: -1 },
+  { roles: ['r-g1'], maxUses: 0 },
+  { roles: ['r-g1'], subscriptions: [5] },
+];
+for (const body of MINT_REFUSED) {
+  test(`invites: a mint of ${JSON.stringify(body)}, which a claim would refuse, is refused and stores nothing`, async () => {
+    const ctx = setupDeps([]);
+    const s = await signedIn(ctx);
+    try {
+      const before = storeBytes(ctx.dir);
+      const r = await s.call('POST', '/admin/g/G1/invites', body);
+      assert.equal(r.status, 400, JSON.stringify(r.body));
+      assert.equal(r.body.error.code, 'INVALID', JSON.stringify(r.body));
+      assert.deepEqual(storeBytes(ctx.dir), before, 'nothing stored, nothing audited');
+    } finally {
+      await s.close();
+    }
+  });
+}
+
+test('invites: a mint with a fractional count is stored, as it reads', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], maxUses: 2.5 });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+  } finally {
+    await s.close();
+  }
+});

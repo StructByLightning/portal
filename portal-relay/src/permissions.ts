@@ -454,6 +454,9 @@ export class PermissionsStore {
    *  references the role. */
   setRole(name: string, role: AccessRole): void {
     if (!role.guildId) throw new Error('roles are guild-scoped: guildId is required');
+    // The same rule loading quarantines by, so no role goes live that a reader can't read.
+    const shape = roleShapeProblem(role);
+    if (shape) throw new Error(`access role ${name} can't be read: ${shape}`);
     this.roles.set(name, role);
     this.persist();
     for (const [pid, e] of this.personas) {
@@ -527,6 +530,15 @@ export class PermissionsStore {
           this.quarantinedRoles[name] = role;
           return false;
         }
+        const shape = roleShapeProblem(role);
+        if (shape) {
+          console.error(
+            `[portal-relay] permissions: role "${name}" can't be read (${shape}); ` +
+              `treating it as INERT until it is fixed (entry preserved on save)`,
+          );
+          this.quarantinedRoles[name] = role;
+          return false;
+        }
         return true;
       }),
     );
@@ -596,11 +608,32 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   VOICE_SPEAK: F.Speak,
 };
 
-/** The portal caps a permission bitfield supports (per-channel, post-overwrite).
- *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly
- *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
- *  manage their own messages) — gated on SendMessages, mirroring
- *  {@link computeCapabilities}. */
+/** Why a catalog role can't be read as written, or null: its caps must be a
+ *  list of capability names, and its scope an object naming at least one of
+ *  all, channels, mirrorRoles and mirrorRole, each one it names holding its
+ *  type. Every key present is checked, not only the first a reader would
+ *  look at, because readers don't share one order: with `mirrorCaps`,
+ *  resolveForRoles reads the mirror keys before `all`. Read as found, such a
+ *  role throws for every persona holding it, or reads one way in one place and
+ *  another way in the next. */
+export function roleShapeProblem(role: AccessRole): string | null {
+  const r = role as unknown as Record<string, unknown>;
+  const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+  if (!strings(r.caps)) return 'caps must be a list of capability names';
+  const sc = r.scope;
+  if (!sc || typeof sc !== 'object' || Array.isArray(sc)) return 'scope must be an object';
+  const kinds: Record<string, (v: unknown) => boolean> = {
+    all: (v) => typeof v === 'boolean',
+    channels: strings,
+    mirrorRoles: strings,
+    mirrorRole: (v) => typeof v === 'string',
+  };
+  const named = Object.keys(kinds).filter((k) => k in sc);
+  if (!named.length) return 'scope names none of all, channels, mirrorRoles and mirrorRole';
+  const bad = named.find((k) => !kinds[k]!((sc as Record<string, unknown>)[k]));
+  return bad ? `scope ${bad} is malformed` : null;
+}
+
 /** Whether an access role can grant anything at all: some capability, over a
  *  scope that names something (every channel, at least one channel, or at
  *  least one Discord role to mirror). Only such a role ends a /ban. */
@@ -612,6 +645,11 @@ export function roleGrantsAccess(role: AccessRole | undefined): boolean {
   return named(sc.channels) || (typeof sc.mirrorRole === 'string' && sc.mirrorRole !== '') || named(sc.mirrorRoles);
 }
 
+/** The portal caps a permission bitfield supports (per-channel, post-overwrite).
+ *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly
+ *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
+ *  manage their own messages) — gated on SendMessages, mirroring
+ *  {@link computeCapabilities}. */
 export function capsFromPerms(perms: Readonly<PermissionsBitField>): Set<Capability> {
   const out = new Set<Capability>();
   for (const cap of ALL_CAPS) {
