@@ -149,7 +149,11 @@ async function api(method, path, body, opts = {}) {
     throw new ApiError(401, 'UNAUTHENTICATED', 'login required', null, method);
   }
   let data = null;
-  const text = await res.text();
+  // A body lost mid-read (even after a 2xx) is no answer: a change may have
+  // been made, so it reads as unconfirmed, never as "not made".
+  let text;
+  try { text = await res.text(); }
+  catch { throw new ApiError(0, 'NETWORK', 'network error', null, method); }
   if (text) { try { data = JSON.parse(text); } catch { /* non-JSON */ } }
   if (!res.ok) {
     const b = (data && data.error) || {};
@@ -1086,8 +1090,12 @@ function keepForm(d, key, hooks, status) {
  *  sent): that text stays, and stays unsaved. */
 function settleField(input, sentText, saved, tracker) {
   const typed = input.value;
+  // Something else in the form changed while this field was being saved
+  // (a crop picked meanwhile): the form keeps its old baseline, so that edit
+  // stays unsaved and closing still asks.
+  const others = tracker.dirtyBesides ? tracker.dirtyBesides(input) : false;
   input.value = saved;
-  tracker.reset();
+  if (!others) tracker.reset();
   if (typed !== sentText) input.value = typed;
 }
 

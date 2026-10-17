@@ -901,6 +901,8 @@ const refuse = (status: number, code: string, message = code, extra: Record<stri
 
 /** An answer that isn't the relay's: the proxy in front of it (Caddy) with
  *  an empty 502/503/504 when the relay went away mid-request or isn't there. */
+/** A 200 whose body never arrived (the connection dropped mid-read). */
+class BodyLost {}
 class ProxyAnswer {
   constructor(public status: number, public text = '') {}
 }
@@ -947,6 +949,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       // refuse(status, code, message, extra) answers as the relay refuses.
       if (body instanceof Refusal) return { status: body.status, ok: false, text: async () => JSON.stringify({ error: body.error }) };
       if (body instanceof ProxyAnswer) return { status: body.status, ok: false, text: async () => body.text };
+      if (body instanceof BodyLost) return { status: 200, ok: true, text: async () => { throw new TypeError('network error'); } };
       return { status: 200, ok: true, text: async () => JSON.stringify(body) };
     },
   });
@@ -3528,3 +3531,58 @@ test('session: a relay that came back newer is noticed when the tab checks the s
   await settle();
   assert.ok(other.doc.getElementById('update-banner'));
 });
+
+test('session: a change answered 200 whose body was lost mid-read says it may have been made', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method) => (down && method === 'POST' ? new BodyLost() : undefined),
+  });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  down = true;
+  form.fire('submit');
+  await settle();
+  assert.equal(form.querySelector('.status-line')!.textContent, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.');
+});
+
+test('persona drawer: a crop started while a picture URL save is at work stays unsaved, so closing asks', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/personas/p/aria', {
+    me: { ...ME_OP, features: { invites: true, avatarUploads: true, allowlistEditable: true } }, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatar: '', avatarUrl: '', roles: [], policy: null, guilds: [], names: {} } },
+    handle: async (method, path, body) => {
+      if (method === 'PUT' && path === '/admin/personas/aria/avatar') {
+        if (gate) await gate;
+        return { avatar: body.avatar, avatarUrl: body.avatar };
+      }
+      return undefined;
+    },
+  });
+  const ctx: any = box.ctx;
+  ctx.FileReader = class { result: any; onload: any; onerror: any; readAsDataURL() { this.result = 'data:image/png;base64,AAAA'; setImmediate(() => this.onload()); } };
+  ctx.Image = class { naturalWidth = 100; naturalHeight = 100; onload: any; onerror: any; set src(_v: string) { setImmediate(() => this.onload()); } get src() { return ''; } };
+  const input = box.doc.getElementById('drawer-body')!.querySelector('input[name="avatar"]')!;
+  const form = input.closest('form')!;
+  input.value = 'https://example.invalid/a.png';
+  input.fire('input');
+  gate = new Promise<void>((r) => { answer = r; });
+  form.fire('submit');
+  await settle();
+  const file = form.querySelector('input[type="file"]')!;
+  (file as any).files = [{ type: 'image/png', name: 'x.png' }];
+  file.fire('change');
+  await settle();
+  assert.ok(form.querySelector('.cropper-zoom'), 'a crop is pending');
+  gate = undefined;
+  answer();
+  await settle();
+  assert.equal(input.value, 'https://example.invalid/a.png', 'the URL as saved');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'the pending crop is still a change');
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.ok(box.doc.querySelector('.modal'), 'closing asks first');
+});
+

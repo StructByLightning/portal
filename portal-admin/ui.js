@@ -688,6 +688,20 @@
         resets++;
       },
       mark: () => ({ snap: snapshot(form), at: resets }),
+      /** Has anything but `control` changed since the baseline? (Lets a save
+       *  of one field settle without counting other edits made meanwhile as
+       *  saved.) A form whose controls came or went counts as changed. */
+      dirtyBesides(control) {
+        const ctrls = Array.from(form.elements || [])
+          .filter((c) => /^(INPUT|SELECT|TEXTAREA)$/.test(c.tagName))
+          .filter((c) => !/^(button|submit|reset|image)$/.test(c.type) && !c.hasAttribute('data-no-dirty'));
+        const now = JSON.parse(snapshot(form));
+        const was = JSON.parse(base);
+        if (now.length !== was.length) return true;
+        const i = ctrls.indexOf(control);
+        if (i >= 0) { now.splice(i, 1); was.splice(i, 1); }
+        return JSON.stringify(now) !== JSON.stringify(was);
+      },
       saved(m) {
         if (!m || m.at !== resets) return false;
         base = m.snap;
