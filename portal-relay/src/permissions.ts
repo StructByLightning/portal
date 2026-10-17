@@ -634,7 +634,8 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
 };
 
 /** Why a catalog role can't be read as written, or null. A role is set aside
- *  only where its readers would misread it or throw: its guild must be a
+ *  only where a reader would misread it, reading it otherwise than its writer
+ *  meant or than another reader does, or would throw: its guild must be a
  *  string (loading sets aside one with no guild, '' included, before asking
  *  here), its caps a list of strings or '', a `mirrorCaps` a boolean, a
  *  number, null or '', and its scope an object naming at most one of `all`,
@@ -647,9 +648,12 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
  *  reads as on whatever it says, "false" included, and so do a list and an
  *  object, which no writer means; '' reads as off, and a hand-written number
  *  reads by its truth, as one who writes 0 for off and 1 for on means it.
- *  A role that names nothing grants nothing in every reader, and main has it
- *  as a role still (roleGrantsAccess): a scope of {}, an `all` that is off, a
- *  list that names nothing, and caps that are an empty list or ''.
+ *  A role that names nothing grants nothing in every reader, and the relay
+ *  has always kept it as a role (roleGrantsAccess): a scope of {}, an `all`
+ *  that is off, a list that names nothing, and caps that are an empty list or
+ *  ''. A Discord role or channel id written as anything but a string names
+ *  one its writer meant, which no reader finds, since every reader looks ids
+ *  up as strings, so it is set aside where the load warning names it.
  *  couldAccessGuild takes `all` by its truth where every
  *  other reader wants true, so an `all` of 1 or "yes" reads two ways, and
  *  readers don't share one order over a scope's keys (with `mirrorCaps`,
@@ -658,7 +662,8 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
  *  found, a scope that is null or not an object throws whenever a persona
  *  holding the role is resolved, caps of a number throw where the role
  *  reaches, a caps string with something in it is read a character at a
- *  time, and channels as a string match channel ids as substrings. */
+ *  time, and channels as a string match channel ids as substrings in
+ *  scopeIncludes and throw in couldAccessGuild. */
 export function roleShapeProblem(role: AccessRole): string | null {
   const r = role as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
@@ -677,9 +682,10 @@ export function roleShapeProblem(role: AccessRole): string | null {
   };
   const keys = Object.keys(sc);
   if (keys.length === 0) return null;
+  if (keys.length > 1) return `scope names ${keys.join(', ')}, where it may name only one of all, channels, mirrorRoles and mirrorRole`;
   // Own keys only: a scope key named like an Object method (constructor,
   // __proto__) is no kind.
-  if (keys.length !== 1 || !Object.hasOwn(kinds, keys[0]!)) return 'scope may name only one of all, channels, mirrorRoles and mirrorRole';
+  if (!Object.hasOwn(kinds, keys[0]!)) return `scope names ${keys[0]}, which is none of all, channels, mirrorRoles and mirrorRole`;
   return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
 }
 

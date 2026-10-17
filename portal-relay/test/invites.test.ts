@@ -129,7 +129,7 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['mode-typo', { mode: 'augmnet' }, 'invite mode must be "mint", "augment" or "both"'],
     ['roles-string', { roles: 'r' }, 'invite roles must be a list of access role names'],
     ['roles-mixed', { roles: ['r', 7] }, 'invite roles must be a list of access role names'],
-    // '' in roles threw on main; in uses it grew as text; in a count it exhausted the invite.
+    // '' in roles threw before this check; in uses it grew as text; in a count it exhausted the invite.
     ['roles-blank', { roles: '' }, 'invite roles must be a list of access role names'],
     ['uses-blank', { uses: '' }, 'invite uses must be a number'],
     ['count-blank', { maxUses: '' }, 'invite maxUses must be a number above 0'],

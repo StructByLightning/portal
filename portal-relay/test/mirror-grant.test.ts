@@ -510,7 +510,7 @@ for (const blank of ['', false, 0]) {
   });
 }
 
-test('an invite whose grant is null reads it as absent, at enroll and at a claim, as on main', async () => {
+test('an invite whose grant is null reads it as absent, at enroll and at a claim, as it always has', async () => {
   const t = makeRelay();
   try {
     t.relay.invites.mint({ code: 'grant-null-mint', grant: null, caps: [...RW], guildId: GUILD } as any);

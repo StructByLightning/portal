@@ -464,7 +464,7 @@ test('mirrorCaps of true, false, null, \'\', 0 and 1 load and read by their trut
   }
 });
 
-test('a role that names nothing loads and grants nothing, as on main: a scope of {}, an `all` that is off, and caps of \'\'', () => {
+test('a role that names nothing loads and grants nothing, as it always has: a scope of {}, an `all` that is off, and caps of \'\'', () => {
   const nothing: Record<string, unknown> = {
     'scope-empty': { caps: ['SEND_MESSAGES'], scope: {}, guildId: 'g1' },
     'all-false': { caps: ['SEND_MESSAGES'], scope: { all: false }, guildId: 'g1' },
@@ -556,9 +556,9 @@ test('setRole refuses a role a reader could not read, as loading quarantines one
   const path = tmpFile({ personas: {} });
   const store = new PermissionsStore(path);
   assert.throws(() => store.setRole('bad', { caps: 5, scope: { all: true }, guildId: 'g1' } as never), /can't be read: caps must be a list/);
-  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope may name only one of/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope names all, channels, where it may name only one of all, channels, mirrorRoles and mirrorRole/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 7 } as never), /can't be read: guildId must be a string/);
-  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { constructor: true }, guildId: 'g1' } as never), /can't be read: scope may name only one of/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { constructor: true }, guildId: 'g1' } as never), /can't be read: scope names constructor, which is none of all, channels, mirrorRoles and mirrorRole/);
   assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1' }, mirrorCaps: 'false', guildId: 'g1' } as never), /can't be read: mirrorCaps must be true or false/);
   assert.equal(store.getRole('bad'), undefined);
   rmSync(path, { force: true });

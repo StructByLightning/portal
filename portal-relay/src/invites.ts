@@ -64,7 +64,7 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * hand edit is what reaches them. Read as found, `roles` as a
  * string throws mid-enroll, a numeric `guildId` or a `caps` that isn't a list
  * grants nothing and spends the invite, a misspelled `mode` mints, and a
- * count that doesn't read as a number, such as a word, never exhausts.
+ * count that compares as no number at all, such as a word, never exhausts.
  * Enroll and claim refuse such an invite before anything is created or
  * consumed, the admin mint route refuses to store one, and loading warns,
  * naming an expiry that isn't a date too.
