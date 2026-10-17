@@ -114,8 +114,8 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
 /** When an invite expires, in ms since the epoch, or undefined for never.
  *  Only a string names an expiry: absent, null, '' and false read as none,
  *  and any other value can't be read as a time, so it
- *  counts as long expired (NaN). That includes 0, which the relay used to
- *  read as none. `Date.parse` would read a number as a date
+ *  counts as long expired (NaN). That includes 0, which a truthiness test
+ *  would read as none. `Date.parse` would read a number as a date
  *  string: 2030 as 2030-01-01, 99999 as the year 99999. */
 function expiryOf(inv: InviteTemplate): number | undefined {
   const at = (inv as { expiresAt?: unknown }).expiresAt;

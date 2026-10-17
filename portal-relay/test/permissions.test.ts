@@ -490,13 +490,14 @@ test('a role that names nothing loads and grants nothing: a scope of {}, an `all
   }
 });
 
-test('the load warning says why a scope is set aside: two kinds, or a key that is no kind', (t) => {
+test('the load warning says why a scope is set aside: two or three kinds, or a key that is no kind', (t) => {
   const errors: string[] = [];
   t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
   const path = tmpFile({
     roles: {
       'two-kinds': { caps: ['SEND_MESSAGES'], scope: { all: true, mirrorRoles: ['r1'] }, guildId: 'g1' },
       'no-kind': { caps: ['SEND_MESSAGES'], scope: { constructor: true }, guildId: 'g1' },
+      'three-kinds': { caps: ['SEND_MESSAGES'], scope: { all: true, channels: ['c1'], mirrorRole: 'r1' }, guildId: 'g1' },
     },
     personas: {},
   } as any);
@@ -505,6 +506,7 @@ test('the load warning says why a scope is set aside: two kinds, or a key that i
     const said = (line: string) => assert.ok(errors.some((l) => l.includes(line)), `${line}\n${errors.join('\n')}`);
     said(`role "two-kinds" can't be read (scope names "all" and "mirrorRoles", but may name only one of all, channels, mirrorRoles and mirrorRole)`);
     said(`role "no-kind" can't be read (scope names "constructor", which is none of all, channels, mirrorRoles and mirrorRole)`);
+    said(`role "three-kinds" can't be read (scope names "all", "channels" and "mirrorRole", but may name only one of all, channels, mirrorRoles and mirrorRole)`);
   } finally {
     rmSync(path, { force: true });
   }

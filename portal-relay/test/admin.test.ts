@@ -2599,6 +2599,8 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   [{ roles: ['r-g1'], mode: 'augmnet' }, 'mode'],
   // Dropped, roles that weren't a list left the grant alone, and an expiry that wasn't a number of days never expired.
   [{ roles: 'r-g1', grant: MINT_GRANT }, 'roles'],
+  [{ roles: 0, grant: MINT_GRANT }, 'roles'],
+  [{ roles: false, grant: MINT_GRANT }, 'roles'],
   [{ roles: ['r-g1'], expiresInDays: '7' }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: 0 }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: -1 }, 'expiresInDays'],

@@ -649,12 +649,12 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
  *  object, which no writer means; '' reads as off, and a hand-written number
  *  reads by its truth, as one who writes 0 for off and 1 for on means it.
  *  A role whose scope is {} or one kind that names nothing (an `all` that is
- *  off, a list that names nothing, a `mirrorRole` of ''), or whose caps are
- *  an empty list or '', grants nothing in every reader and is kept as a role
- *  (roleGrantsAccess). A Discord role or channel id written as anything but a
- *  string names one its writer meant, which no reader finds, since every
- *  reader looks ids up as strings, so it is set aside, and the load warning
- *  names the role and its malformed key.
+ *  off, a list that is empty or holds only '', a `mirrorRole` of ''), or
+ *  whose caps are an empty list or '', grants nothing in every reader and is
+ *  kept as a role (roleGrantsAccess). A Discord role or channel id written as
+ *  anything but a string names one its writer meant, which no reader finds,
+ *  since every reader looks ids up as strings, so it is set aside, and the
+ *  load warning names the role and its malformed key.
  *  couldAccessGuild takes `all` by its truth where every
  *  other reader wants true, so an `all` of 1 or "yes" reads two ways, and
  *  readers don't share one order over a scope's keys (with `mirrorCaps`,
