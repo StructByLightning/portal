@@ -87,20 +87,15 @@ function mirrorRoleFor(
   };
 }
 
-/** Same guild, same caps, same scope, same mirrorCaps — order-insensitive.
- *  A scope's kind is told by which key it has, in the order scopeIncludes
- *  reads them (all, channels, mirrorRoles, mirrorRole), so a role counts as
- *  the same only when the resolver reads it as the same: a stored scope
- *  naming different Discord roles under both mirror keys resolves through
- *  `mirrorRoles`, and `{all: false, …}` grants nothing. */
+/** Same guild, same caps, same scope, same mirrorCaps — order-insensitive. */
 function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
   const norm = (r: AccessRole) => {
     const sc = r.scope as Record<string, unknown>;
     const scope =
-      'all' in sc ? `all:${sc.all === true}`
-      : 'channels' in sc ? `ch:${[...(sc.channels as string[])].sort().join(',')}`
-      : 'mirrorRoles' in sc ? `mr:${[...(sc.mirrorRoles as string[])].sort().join(',')}`
-      : 'mirrorRole' in sc ? `mr:${sc.mirrorRole}`
+      sc.all === true ? 'all'
+      : Array.isArray(sc.channels) ? `ch:${[...(sc.channels as string[])].sort().join(',')}`
+      : typeof sc.mirrorRole === 'string' ? `mr:${sc.mirrorRole}`
+      : Array.isArray(sc.mirrorRoles) ? `mr:${[...(sc.mirrorRoles as string[])].sort().join(',')}`
       : JSON.stringify(sc);
     return JSON.stringify([r.guildId, [...new Set(r.caps)].sort(), scope, !!r.mirrorCaps]);
   };
@@ -871,13 +866,19 @@ export class Relay implements GatewayHooks {
    * different access role of the same name.
    */
   private inviteGrantProblem(inv: InviteTemplate): string | null {
+    // The claimant can't change a stored invite, so the refusal says who can.
     const shape = inviteShapeProblem(inv);
-    if (shape) return shape;
+    if (shape) return `${shape} — it must be re-minted`;
     // A role name that resolves to nothing is refused, not stored: a name
     // left on a persona would come alive if a role of that name were created
     // later — possibly in another guild, by someone the invite's minter
-    // never meant to delegate to.
+    // never meant to delegate to. A role quarantined at load is still on
+    // disk, and only the relay's operator can repair it.
     const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
+    const unreadable = missing.filter((r) => this.permissions.isQuarantined(r));
+    if (unreadable.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')} — the relay's operator must fix them`;
+    }
     if (missing.length) return `invite names access role(s) that no longer exist: ${missing.join(', ')} — it must be re-minted`;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
     if (!grant || !inv.guildId) return null;
@@ -997,7 +998,8 @@ export class Relay implements GatewayHooks {
     }
     // Outstanding-mint cap: a minter may hold at most 20 live unclaimed codes.
     const now = Date.now();
-    // Live means what a claim would find: check()'s own expiry and use rules.
+    // Counted by check()'s own expiry and use rules: a code it finds neither
+    // expired nor used up.
     const invites = this.invites;
     const outstanding = invites.all().filter((inv) => inv.mintedBy === personaId && invites.check(inv.code, now) === inv).length;
     if (outstanding >= 20) {

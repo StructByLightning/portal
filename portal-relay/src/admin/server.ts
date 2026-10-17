@@ -1118,7 +1118,11 @@ export class AdminServer {
       const e = this.roleAssignError(session, guildId, r);
       if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     }
-    const mode = ['mint', 'augment', 'both'].includes(body?.mode) ? body.mode : undefined;
+    // A field the caller gave goes into the invite as sent, so a wrong type is
+    // refused by name below rather than dropped: a count sent as "5" would
+    // otherwise be stored as unlimited, and a misspelled mode as mint-only.
+    // Absent, null and '' mean not given, as they always have.
+    const given = (v: unknown) => v !== undefined && v !== null && v !== '';
     const expiresAt =
       typeof body?.expiresInDays === 'number' && body.expiresInDays > 0
         ? new Date(this.nowMs() + body.expiresInDays * 86_400_000).toISOString()
@@ -1129,10 +1133,10 @@ export class AdminServer {
       guildId,
       uses: 0,
       ...(roles.length ? { roles } : { grant: grant! }),
-      ...(mode ? { mode } : {}),
-      ...(typeof body?.maxUses === 'number' ? { maxUses: body.maxUses } : {}),
+      ...(given(body?.mode) ? { mode: body.mode } : {}),
+      ...(given(body?.maxUses) ? { maxUses: body.maxUses } : {}),
       ...(expiresAt ? { expiresAt } : {}),
-      ...(Array.isArray(body?.subscriptions) ? { subscriptions: body.subscriptions } : {}),
+      ...(given(body?.subscriptions) ? { subscriptions: body.subscriptions } : {}),
     };
     // What a claim would refuse isn't stored: a count of 0 or below would be
     // a dead invite reported as minted, and a non-string channel id would
@@ -1387,6 +1391,10 @@ export class AdminServer {
     if (!session.isSuper && this.hasForeignRole(inv.roles ?? [], guildId)) {
       return sendJson(res, 404, err('NOT_FOUND', 'no such invite in this guild'));
     }
+    // The claim refuses an invite it can't read, and the ban check below reads
+    // its roles first, so the refusal comes here, by name.
+    const shape = inviteShapeProblem(inv);
+    if (shape) return sendJson(res, 400, err('INVALID', `${shape} — it must be re-minted`));
     // An admin's claim lifts the persona's removal wherever the invite gives
     // access — only when the admin chose to ({liftBan: true}).
     if (body?.liftBan !== true && this.inviteLiftsBan(personaId, inv)) {
@@ -1852,6 +1860,9 @@ export class AdminServer {
    *  anyway (the relay won't apply a role that doesn't exist), so hiding it
    *  from a guild admin hides nothing live; a super-admin still sees it. */
   private hasForeignRole(roles: string[], guildId: string): boolean {
+    // Roles that aren't a list (a hand edit) can't be read, so they count as
+    // foreign too, rather than throwing for the guild's whole invite list.
+    if (!Array.isArray(roles)) return true;
     return roles.some((r) => this.deps.permissions.getRole(r)?.guildId !== guildId);
   }
 

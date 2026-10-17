@@ -18,12 +18,13 @@ import { WatchedFile } from './file-watch.js';
  * written, or null. A grant needs a guild (every scope resolves inside one),
  * at least one capability, and exactly one scope: a non-empty channel list,
  * one or more Discord roles to mirror, or `all: true`. Enroll and claim refuse
- * such an invite before anything is created or consumed; loading warns.
+ * such an invite before anything is created or consumed, saying it must be
+ * re-minted; loading warns.
  */
 export function grantShapeProblem(inv: InviteTemplate): string | null {
   const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true as const } } : undefined);
   if (!grant) return null;
-  if (!inv.guildId) return 'invite grants access but names no guild — it must be re-minted with a guild';
+  if (!inv.guildId) return 'invite grants access but names no guild';
   const caps = (grant as { caps?: unknown }).caps;
   if (!Array.isArray(caps) || caps.length === 0 || !caps.every((c) => typeof c === 'string' && c)) {
     return 'invite grant names no capabilities';
@@ -46,8 +47,9 @@ export function grantShapeProblem(inv: InviteTemplate): string | null {
  * holds a value outside its declared type, or the grant can't be applied
  * (grantShapeProblem). Every relay writer builds these fields from checked
  * values, so a hand edit is what reaches them. Read as found, `roles` as a
- * string throws mid-enroll, a numeric `guildId` grants nothing and spends the
- * invite, a misspelled `mode` mints, and a non-numeric count never exhausts.
+ * string throws mid-enroll, a numeric `guildId` or a `caps` that isn't a list
+ * grants nothing and spends the invite, a misspelled `mode` mints, and a
+ * non-numeric count never exhausts.
  * Enroll and claim refuse such an invite before anything is created or
  * consumed, the admin mint route refuses to store one, and loading warns,
  * naming an expiry that isn't a date too.
@@ -62,6 +64,7 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
     ['mintedBy', (v) => typeof v === 'string', 'must be a string'],
     ['namePrefix', (v) => typeof v === 'string', 'must be a string'],
     ['mode', (v) => v === 'mint' || v === 'augment' || v === 'both', 'must be "mint", "augment" or "both"'],
+    ['caps', strings, 'must be a list of capabilities'],
     ['roles', strings, 'must be a list of access role names'],
     ['subscriptions', strings, 'must be a list of channel ids'],
     ['uses', (v) => typeof v === 'number', 'must be a number'],
@@ -198,7 +201,9 @@ export class InviteStore {
    * TTL ≤ 60min) would otherwise accumulate forever and every persist() is a
    * full-file rewrite — O(total) bytes per mint. The 24h grace keeps a short
    * forensic tail on disk; the audit log holds provenance permanently. An
-   * unparseable expiresAt counts as long-expired (fail closed, matches check).
+   * expiresAt that isn't a date (expiryOf's NaN: a value that isn't a string,
+   * or a string Date.parse can't read) counts as long expired (fail closed,
+   * matches check).
    */
   private pruneExpired(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;

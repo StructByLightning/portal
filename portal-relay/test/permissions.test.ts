@@ -379,8 +379,14 @@ const MALFORMED_ROLES: Array<[string, unknown]> = [
   ['all-string', { caps: ['SEND_MESSAGES'], scope: { all: 'yes' }, guildId: 'g1' }],
   ['channels-string', { caps: ['SEND_MESSAGES'], scope: { channels: 'c1' }, guildId: 'g1' }],
   ['mirror-number', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 7 }, guildId: 'g1' }],
-  // A second key no reader reaches first is checked too.
+  ['mirrors-number', { caps: ['SEND_MESSAGES'], scope: { mirrorRoles: 5 }, guildId: 'g1' }],
+  ['all-false', { caps: ['SEND_MESSAGES'], scope: { all: false }, guildId: 'g1' }],
+  ['guild-number', { caps: ['SEND_MESSAGES'], scope: { all: true }, guildId: 123 }],
+  // A scope names exactly one kind, as every relay writer makes it, so every reader reads it alike.
   ['second-key', { caps: ['SEND_MESSAGES'], scope: { all: true, channels: 'c1' }, guildId: 'g1' }],
+  ['two-kinds', { caps: ['SEND_MESSAGES'], scope: { all: true, mirrorRoles: ['r1'] }, guildId: 'g1' }],
+  ['both-mirror-keys', { caps: ['SEND_MESSAGES'], scope: { mirrorRole: 'r1', mirrorRoles: ['r1'] }, guildId: 'g1' }],
+  ['unknown-kind', { caps: ['SEND_MESSAGES'], scope: { everywhere: true }, guildId: 'g1' }],
 ];
 for (const [name, role] of MALFORMED_ROLES) {
   test(`role ${name}: quarantined at load, inert, warned about and kept on disk`, (t) => {
@@ -407,18 +413,51 @@ for (const [name, role] of MALFORMED_ROLES) {
   });
 }
 
-test('both mirror keys naming one role, and mirrorCaps of 0, load and resolve as they always have', () => {
+test('each kind of scope, and mirrorCaps of 0, load and resolve as they always have', () => {
   const path = tmpFile({
     roles: {
-      both: { caps: ['VIEW_CHANNEL'], scope: { mirrorRole: 'r1', mirrorRoles: ['r1'] }, guildId: 'g1' },
+      everywhere: { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' },
+      listed: { caps: ['SEND_MESSAGES'], scope: { channels: ['c1'] }, guildId: 'g1' },
+      several: { caps: ['ADD_REACTIONS'], scope: { mirrorRoles: ['r1', 'r2'] }, guildId: 'g1' },
       zero: { caps: ['READ_HISTORY'], scope: { mirrorRole: 'r1' }, mirrorCaps: 0, guildId: 'g1' },
     },
-    personas: { q: { roles: ['both', 'zero'] } },
+    personas: { q: { roles: ['everywhere', 'listed', 'several', 'zero'] } },
   } as any);
   const store = new PermissionsStore(path);
   store.setMirrorLookup((_g, r) => (r === 'r1' ? chans('c1') : new Map()));
-  assert.deepEqual(sorted(store.resolve('q', 'g1', 'c1')), ['READ_HISTORY', 'VIEW_CHANNEL']);
+  assert.deepEqual(sorted(store.resolve('q', 'g1', 'c1')), ['ADD_REACTIONS', 'READ_HISTORY', 'SEND_MESSAGES', 'VIEW_CHANNEL']);
+  for (const name of ['everywhere', 'listed', 'several', 'zero']) assert.notEqual(store.getRole(name), undefined, name);
   rmSync(path, { force: true });
+});
+
+test('a role written under a quarantined name replaces it, so removing that role later leaves nothing on disk', () => {
+  const path = tmpFile({ roles: { r: { caps: 5, scope: { all: true }, guildId: 'g1' } }, personas: {} } as any);
+  try {
+    const store = new PermissionsStore(path);
+    assert.equal(store.isQuarantined('r'), true);
+    store.setRole('r', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'g1' });
+    assert.equal(store.isQuarantined('r'), false);
+    assert.ok(store.removeRole('r'));
+    const onDisk = JSON.parse(readFileSync(path, 'utf8')) as { roles?: Record<string, unknown> };
+    assert.equal(onDisk.roles?.r, undefined, JSON.stringify(onDisk.roles));
+  } finally {
+    rmSync(path, { force: true });
+  }
+});
+
+test('removeRole removes a quarantined entry, from the store and from disk', () => {
+  const path = tmpFile({ roles: { r: { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } }, personas: {} } as any);
+  try {
+    const store = new PermissionsStore(path);
+    assert.equal(store.isQuarantined('r'), true);
+    assert.equal(store.removeRole('r'), true);
+    assert.equal(store.isQuarantined('r'), false);
+    const onDisk = JSON.parse(readFileSync(path, 'utf8')) as { roles?: Record<string, unknown> };
+    assert.equal(onDisk.roles?.r, undefined, JSON.stringify(onDisk.roles));
+    assert.equal(store.removeRole('r'), false, 'nothing left to remove');
+  } finally {
+    rmSync(path, { force: true });
+  }
 });
 
 test('a mirror key behind `all` is read when mirrorCaps is set, so a malformed one is quarantined rather than thrown on', () => {
@@ -442,6 +481,8 @@ test('setRole refuses a role a reader could not read, as loading quarantines one
   const path = tmpFile({ personas: {} });
   const store = new PermissionsStore(path);
   assert.throws(() => store.setRole('bad', { caps: 5, scope: { all: true }, guildId: 'g1' } as never), /can't be read: caps must be a list/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true, channels: ['c1'] }, guildId: 'g1' } as never), /can't be read: scope must name exactly one/);
+  assert.throws(() => store.setRole('bad', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 7 } as never), /can't be read: guildId must be a string/);
   assert.equal(store.getRole('bad'), undefined);
   rmSync(path, { force: true });
 });

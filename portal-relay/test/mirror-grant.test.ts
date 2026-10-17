@@ -7,7 +7,7 @@
 // invisible until an operator noticed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
@@ -425,6 +425,10 @@ const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
   ['uses-word', { uses: 'x', maxUses: 1 }, /invite uses must be a number/],
   ['prefix-number', { namePrefix: 7 }, /invite namePrefix must be a string/],
   ['subs-mixed', { subscriptions: [CHAN_A, 42] }, /invite subscriptions must be a list of channel ids/],
+  // The legacy blanket grant: read as no grant when it has no length, which spent the invite for nothing.
+  ['caps-number', { grant: undefined, caps: 5 }, /invite caps must be a list of capabilities/],
+  ['caps-true', { grant: undefined, caps: true }, /invite caps must be a list of capabilities/],
+  ['caps-object', { grant: undefined, caps: { SEND_MESSAGES: true } }, /invite caps must be a list of capabilities/],
   // A machine mint's recheck reads the grant, so the shape comes first.
   ['mint-scope-null', { mintedBy: EXISTING, grant: { caps: [...RW], scope: null } }, /invite grant scope must be exactly one/],
 ];
@@ -443,6 +447,8 @@ for (const [code, fields, why] of MALFORMED_FIELDS) {
         uses: t.relay.invites.get(code)?.uses,
       };
       assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify(seen));
+      // The claimant can't change a stored invite, so each says who can.
+      assert.ok(/ — it must be re-minted$/.test(enrolled?.error ?? '') && / — it must be re-minted$/.test(claimed?.threw ?? ''), JSON.stringify(seen));
       assert.equal(seen.personasAdded, 0, 'no persona created');
       assert.equal(seen.uses, fields.uses ?? 0, 'no use spent');
     } finally {
@@ -506,31 +512,53 @@ test('an empty or false register name or avatar means none, as it always has; a 
   }
 });
 
-const STORED_SCOPES: Array<[string, unknown, 'refused' | 'reused']> = [
-  // The resolver reads mirrorRoles before mirrorRole, and `all` before either.
-  ['both mirror keys naming different roles', { mirrorRole: DISCORD_ROLE, mirrorRoles: ['dr-other'] }, 'refused'],
-  ['all: false beside a mirror role', { all: false, mirrorRole: DISCORD_ROLE }, 'refused'],
-  ['both mirror keys naming one role', { mirrorRole: DISCORD_ROLE, mirrorRoles: [DISCORD_ROLE] }, 'reused'],
+const STORED_SCOPES: Array<[string, unknown]> = [
+  ['both mirror keys naming different roles', { mirrorRole: DISCORD_ROLE, mirrorRoles: ['dr-other'] }],
+  ['all: false beside a mirror role', { all: false, mirrorRole: DISCORD_ROLE }],
+  ['both mirror keys naming one role', { mirrorRole: DISCORD_ROLE, mirrorRoles: [DISCORD_ROLE] }],
 ];
-for (const [what, scope, expect] of STORED_SCOPES) {
-  test(`a stored mirror role with ${what} is ${expect}: reused only when the resolver reads it as the grant`, async () => {
+for (const [what, scope] of STORED_SCOPES) {
+  test(`a stored mirror role hand-edited to ${what} is quarantined, and the next claim of its grant writes the grant's role in its place`, async () => {
     const t = makeRelay();
     try {
       const first = await t.relay.enroll({ invite: 'mirror-mint', desiredName: 'probe' });
       const name = t.relay.permissions.getRoleNames(first.personaId)[0];
-      t.relay.permissions.setRole(name, { caps: [...RW].sort(), scope, guildId: GUILD });
-      const count = t.relay.identity.all().length;
+      // The hand edit, then a reload, as the file watcher does.
+      const path = (t.relay.permissions as any).path as string;
+      const file = JSON.parse(readFileSync(path, 'utf8'));
+      file.roles[name] = { caps: [...RW].sort(), scope, guildId: GUILD };
+      writeFileSync(path, JSON.stringify(file));
+      (t.relay.permissions as any).reload();
+      assert.equal(t.relay.permissions.isQuarantined(name), true, 'quarantined at load');
       const enrolled = await outcome(() => t.relay.enroll({ invite: 'mirror-mint', desiredName: 'again' }));
-      const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'mirror-aug'));
-      const seen = { enrolled, claimed, caps: enrolled?.personaId ? t.caps(enrolled.personaId, CHAN_A) : null };
-      if (expect === 'refused') {
-        assert.ok(/conflicts with an existing access role/.test(enrolled?.error ?? '') && /conflicts with an existing access role/.test(claimed?.threw ?? ''), JSON.stringify(seen));
-        assert.equal(t.relay.identity.all().length, count, 'no persona created');
-      } else {
-        assert.deepEqual(seen.caps, [...RW].sort(), JSON.stringify(seen));
-      }
+      const seen = { enrolled, role: t.relay.permissions.getRole(name), caps: enrolled?.personaId ? t.caps(enrolled.personaId, CHAN_A) : null };
+      // The name is a digest of the grant's guild, roles and caps, so the role written is the one this grant made.
+      assert.deepEqual(seen.role, { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE }, guildId: GUILD }, JSON.stringify(seen));
+      assert.deepEqual(seen.caps, [...RW].sort(), JSON.stringify(seen));
+      assert.equal(t.relay.permissions.isQuarantined(name), false, 'replaced');
     } finally {
       t.cleanup();
     }
   });
 }
+
+test('an invite naming a role quarantined at load is refused as unreadable, for the operator to fix, before anything is created or spent', async () => {
+  const t = makeRelay();
+  try {
+    const path = (t.relay.permissions as any).path as string;
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    file.roles = { broken: { caps: ['VIEW_CHANNEL'], scope: { channels: CHAN_A }, guildId: GUILD } };
+    writeFileSync(path, JSON.stringify(file));
+    (t.relay.permissions as any).reload();
+    t.relay.invites.mint({ code: 'names-broken', mode: 'both', guildId: GUILD, roles: ['broken'] } as any);
+    const count = t.relay.identity.all().length;
+    const enrolled = await outcome(() => t.relay.enroll({ invite: 'names-broken', desiredName: 'n-broken' }));
+    const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'names-broken'));
+    const why = /^invite names access role\(s\) that can't be read: broken — the relay's operator must fix them$/;
+    assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ enrolled, claimed }));
+    assert.equal(t.relay.identity.all().length, count, 'no persona created');
+    assert.equal(t.relay.invites.get('names-broken').uses ?? 0, 0, 'no use spent');
+  } finally {
+    t.cleanup();
+  }
+});

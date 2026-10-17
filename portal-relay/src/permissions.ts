@@ -76,7 +76,8 @@ export class PermissionsStore {
   private roles = new Map<string, AccessRole>();
   /** Catalog entries refused at load (no guildId / malformed): excluded from
    *  resolution but written back verbatim on persist — quarantine, not
-   *  deletion. A live entry created under the same name wins on merge. */
+   *  deletion. setRole of the same name replaces one, and removeRole removes
+   *  one. */
   private quarantinedRoles: Record<string, unknown> = {};
   private fileDefault: Capability[] = [];
   private listeners: Array<(c: PermissionChange) => void> = [];
@@ -277,6 +278,12 @@ export class PermissionsStore {
     return this.roles.get(name);
   }
 
+  /** Whether `name` is a catalog entry quarantined at load: on disk, but
+   *  inert until it's fixed. */
+  isQuarantined(name: string): boolean {
+    return Object.hasOwn(this.quarantinedRoles, name);
+  }
+
   /** The full access-role catalog (read-only snapshot) — admin panel pickers. */
   allRoles(): Record<string, AccessRole> {
     return Object.fromEntries([...this.roles].map(([k, v]) => [k, structuredClone(v)]));
@@ -458,16 +465,22 @@ export class PermissionsStore {
     const shape = roleShapeProblem(role);
     if (shape) throw new Error(`access role ${name} can't be read: ${shape}`);
     this.roles.set(name, role);
+    // The role written replaces a quarantined entry of its name, so a later
+    // removal doesn't write that entry back.
+    delete this.quarantinedRoles[name];
     this.persist();
     for (const [pid, e] of this.personas) {
       if (e.roles?.includes(name)) this.emit({ personaId: pid, scope: 'reload' });
     }
   }
 
-  /** Remove a named access role from the catalog. Personas referencing it lose
-   *  those caps on their next action (live revocation, §5.8). */
+  /** Remove a named access role from the catalog, live or quarantined.
+   *  Personas referencing it lose those caps on their next action (live
+   *  revocation, §5.8). */
   removeRole(name: string): boolean {
-    if (!this.roles.delete(name)) return false;
+    const live = this.roles.delete(name);
+    const quarantined = this.isQuarantined(name) && delete this.quarantinedRoles[name];
+    if (!live && !quarantined) return false;
     this.persist();
     for (const [pid, e] of this.personas) {
       if (e.roles?.includes(name)) this.emit({ personaId: pid, scope: 'reload' });
@@ -608,30 +621,34 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   VOICE_SPEAK: F.Speak,
 };
 
-/** Why a catalog role can't be read as written, or null: its caps must be a
- *  list of capability names, and its scope an object naming at least one of
- *  all, channels, mirrorRoles and mirrorRole, each one it names holding its
- *  type. Every key present is checked, not only the first a reader would
- *  look at, because readers don't share one order: with `mirrorCaps`,
- *  resolveForRoles reads the mirror keys before `all`. Read as found, such a
- *  role throws for every persona holding it, or reads one way in one place and
- *  another way in the next. */
+/** Why a catalog role can't be read as written, or null: its guild must be
+ *  named by a string, its caps must be a list of strings, and its scope an
+ *  object naming exactly one of `all` (true), `channels`, `mirrorRoles` and
+ *  `mirrorRole`, holding that kind's type. That is the shape every relay
+ *  writer makes: the admin API allows exactly one scope key, and a mirror
+ *  grant materializes one. Readers don't share one order over a scope's keys
+ *  (with `mirrorCaps`, resolveForRoles reads the mirror keys before `all`),
+ *  so a scope with two keys reads one way in one place and another way in
+ *  the next. Read as found, a scope that is null or not an object throws
+ *  whenever a persona holding the role is resolved, caps of a number throw where the
+ *  role reaches, a caps string is read a character at a time, and channels
+ *  as a string match channel ids as substrings. */
 export function roleShapeProblem(role: AccessRole): string | null {
   const r = role as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
+  if (typeof r.guildId !== 'string') return 'guildId must be a string';
   if (!strings(r.caps)) return 'caps must be a list of capability names';
   const sc = r.scope;
   if (!sc || typeof sc !== 'object' || Array.isArray(sc)) return 'scope must be an object';
   const kinds: Record<string, (v: unknown) => boolean> = {
-    all: (v) => typeof v === 'boolean',
+    all: (v) => v === true,
     channels: strings,
     mirrorRoles: strings,
     mirrorRole: (v) => typeof v === 'string',
   };
-  const named = Object.keys(kinds).filter((k) => k in sc);
-  if (!named.length) return 'scope names none of all, channels, mirrorRoles and mirrorRole';
-  const bad = named.find((k) => !kinds[k]!((sc as Record<string, unknown>)[k]));
-  return bad ? `scope ${bad} is malformed` : null;
+  const keys = Object.keys(sc);
+  if (keys.length !== 1 || !(keys[0]! in kinds)) return 'scope must name exactly one of all, channels, mirrorRoles and mirrorRole';
+  return kinds[keys[0]!]!((sc as Record<string, unknown>)[keys[0]!]) ? null : `scope ${keys[0]} is malformed`;
 }
 
 /** Whether an access role can grant anything at all: some capability, over a

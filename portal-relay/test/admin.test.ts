@@ -2590,6 +2590,11 @@ const MINT_REFUSED: Array<Record<string, unknown>> = [
   { roles: ['r-g1'], maxUses: -1 },
   { roles: ['r-g1'], maxUses: 0 },
   { roles: ['r-g1'], subscriptions: [5] },
+  // A field of the wrong type is refused by name, not dropped: dropped, "5" was stored as unlimited.
+  { roles: ['r-g1'], maxUses: '5' },
+  { roles: ['r-g1'], maxUses: true },
+  { roles: ['r-g1'], subscriptions: 'c1' },
+  { roles: ['r-g1'], mode: 'augmnet' },
 ];
 for (const body of MINT_REFUSED) {
   test(`invites: a mint of ${JSON.stringify(body)}, which a claim would refuse, is refused and stores nothing`, async () => {
@@ -2613,7 +2618,51 @@ test('invites: a mint with a fractional count is stored, as it reads', async () 
   try {
     const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], maxUses: 2.5 });
     assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(ctx.invites.get(r.body.code)?.maxUses, 2.5, JSON.stringify(ctx.invites.get(r.body.code)));
   } finally {
     await s.close();
   }
 });
+
+test('invites: a mint whose mode, count or subscriptions are null or empty mints as if they were left out', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const extra of [{ maxUses: null }, { maxUses: '' }, { mode: null }, { mode: '' }, { subscriptions: null }, { subscriptions: '' }]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], ...extra });
+      assert.equal(r.status, 200, `${JSON.stringify(extra)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      const key = Object.keys(extra)[0]!;
+      assert.equal(inv?.[key], undefined, `${JSON.stringify(extra)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+for (const asSuper of [false, true]) {
+  test(`invites: a hand-edited invite whose roles aren't a list, as ${asSuper ? 'a super-admin' : 'a guild admin'}, is ${asSuper ? 'refused by name at a claim' : 'hidden'}, and the guild's invite list still answers`, async () => {
+    const ctx = setupDeps(asSuper ? ['admin1'] : []);
+    // A number: read as roles, it threw in the guild admin's list and in the claim's ban check.
+    ctx.invites.mint({ code: 'roles-text', guildId: 'G1', roles: 5, mode: 'both', uses: 0 } as any);
+    ctx.invites.mint({ code: 'plain', guildId: 'G1', roles: ['r-g1'], mode: 'both', uses: 0 } as any);
+    const s = await signedIn(ctx);
+    try {
+      const list = await s.get('/admin/g/G1/invites');
+      assert.equal(list.status, 200, JSON.stringify(list.body));
+      const codes = (list.body.invites as Array<{ code: string }>).map((i) => i.code);
+      assert.ok(codes.includes('plain') && codes.includes('roles-text') === asSuper, JSON.stringify(codes));
+      const before = storeBytes(ctx.dir);
+      const claim = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'roles-text' });
+      if (asSuper) {
+        assert.equal(claim.status, 400, JSON.stringify(claim.body));
+        assert.equal(claim.body.error.message, 'invite roles must be a list of access role names — it must be re-minted', JSON.stringify(claim.body));
+      } else {
+        assert.equal(claim.status, 404, JSON.stringify(claim.body));
+      }
+      assert.deepEqual(storeBytes(ctx.dir), before, 'nothing changed');
+    } finally {
+      await s.close();
+    }
+  });
+}
