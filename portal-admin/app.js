@@ -1906,11 +1906,17 @@ function accessSection(ctx, m) {
   /** Custom… editors open in rows, not applied (channel → { caps, start },
    *  the last touched last): drawn open again by every redraw until Apply
    *  or Cancel, and unsaved once ticked away from where they started — so
-   *  closing the drawer asks, and Sign in again keeps the last one. */
+   *  closing the drawer asks, and Sign in again keeps the last one. One whose
+   *  row a read no longer has is dropped (drawTable): nothing shows it. */
   const edits = new Map();
   const editTouched = [];
   const editChanged = (e) => !!e && !lib.sameCapSet(e.caps, e.start);
-  ctx.drawer.trackDirty(() => Array.from(edits.values()).some(editChanged));
+  /** The open edits on rows the drawer has now, as [channel, edit]. */
+  const liveEdits = () => Array.from(edits.entries()).filter(([cid]) => !!m.rowOf(cid) && grantableAt(cid));
+  const editsDirty = () => liveEdits().some(([, e]) => editChanged(e));
+  ctx.drawer.trackDirty(editsDirty);
+  /** Each shown run's Show/Hide, by the channels in it (drawTable). */
+  let runOf = new Map();
   let node = null;
   const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
   /** Can the panel give access on this channel (text, voice, forum)? One of
@@ -1994,7 +2000,13 @@ function accessSection(ctx, m) {
     const focusKey = a && tableBox.contains(a) && a.dataset ? a.dataset.key || null : null;
     clear(tableBox);
     controls = new Map();
+    runOf = new Map();
     const rows = ordered(m.access.rows || []);
+    // A Custom… edit whose row this read no longer has (Remove from the
+    // guild, or a change elsewhere) goes with it: nothing is left unsaved
+    // that the drawer doesn't show.
+    const here = new Set(rows.map((r) => r.channelId));
+    for (const cid of Array.from(edits.keys())) if (!here.has(cid) || !grantableAt(cid)) edits.delete(cid);
     empty.classList.toggle('hidden', rows.length > 0 || !!m.access.removed);
     if (!rows.length) return;
     const fold = lib.foldAccessRows(rows);
@@ -2010,17 +2022,27 @@ function accessSection(ctx, m) {
       }
     };
     for (const run of fold.runs) {
+      // A run with a Custom… edit open in it is shown, and stays shown: an
+      // open edit never folds out of sight (a row that came to read like
+      // others, or a kept edit restored), and Hide waits for Apply or Cancel.
+      if (run.rows.some((r) => edits.has(r.channelId))) expanded.add(run.key);
       const open = expanded.has(run.key);
       const n = lib.plural(run.rows.length, 'channel');
       const btn = el('button', {
         class: 'btn btn-sm', 'data-key': 'run:' + run.key, 'aria-expanded': String(open), text: open ? 'Hide' : 'Show',
         'aria-label': (open ? 'Hide the ' : 'Show the ') + n + ': ' + run.text,
       });
+      const shown = { btn, rows: run.rows, label: btn.getAttribute('aria-label') };
       btn.addEventListener('click', () => {
+        if (btn.getAttribute('aria-disabled') === 'true') return; // an edit is open in it
         if (expanded.has(run.key)) expanded.delete(run.key);
         else expanded.add(run.key);
         drawTable();
       });
+      if (open) {
+        for (const r of run.rows) runOf.set(r.channelId, shown);
+        syncRun(shown);
+      }
       tbody.appendChild(el('tr', { class: 'run-row' }, [el('td', { colspan: '4' }, [el('div', { class: 'run-line' }, [
         ui.levelPill(run.rows[0], 'these channels'), el('span', { class: 'run-text', text: run.text }), btn,
       ])])]));
@@ -2066,17 +2088,31 @@ function accessSection(ctx, m) {
     drawInactive();
   };
 
+  /** A shown run's Hide: unavailable (aria-disabled, so it keeps focus)
+   *  while a Custom… edit is open in one of its rows, and says why. */
+  function syncRun(shown) {
+    const held = shown.rows.some((r) => edits.has(r.channelId));
+    const why = 'Apply or cancel the Custom… edit in these channels to hide them.';
+    shown.btn.setAttribute('aria-label', held ? shown.label + ' — ' + why : shown.label);
+    for (const [k, v] of [['aria-disabled', 'true'], ['title', why]]) {
+      if (held) shown.btn.setAttribute(k, v);
+      else shown.btn.removeAttribute(k);
+    }
+  }
+
   /** A row's Custom… editor opened, was ticked (`e`), or closed (null). */
   function noteEdit(cid, e) {
     edits.delete(cid); // re-set: the last touched is last
     if (e) edits.set(cid, e);
+    const shown = runOf.get(cid);
+    if (shown) syncRun(shown);
     for (const fn of editTouched) fn();
   }
   /** Sign in again keeps the last-touched edit that changed something: whose
    *  grant, where, the boxes. It comes back open — never applied. */
   const customHooks = {
     serialize() {
-      const changed = Array.from(edits.entries()).filter(([, e]) => editChanged(e));
+      const changed = liveEdits().filter(([, e]) => editChanged(e));
       const last = changed[changed.length - 1];
       return last ? { personaId: id, channelId: last[0], caps: last[1].caps.slice() } : {};
     },
@@ -2086,7 +2122,7 @@ function accessSection(ctx, m) {
       edits.set(f.channelId, { caps: (f.caps || []).slice(), start: ui.customStart(row ? row.direct : null) });
       drawTable();
     },
-    isDirty: () => Array.from(edits.values()).some(editChanged),
+    isDirty: editsDirty,
   };
 
   /** Read the persona again after a change, then put focus on `key` (or the

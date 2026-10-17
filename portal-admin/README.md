@@ -77,7 +77,9 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     to the same persona retires the older one's Undo, and an Undo's outcome
     is said where its change was. A *Custom…* edit stays open — through a
     redraw after another row's change — until *Apply* or *Cancel*, and
-    counts as unsaved once a box is ticked. On a channel of a kind the panel
+    counts as unsaved once a box is ticked; a read that no longer lists its
+    row (the persona removed from the guild, or no longer able to act there)
+    drops it, with nothing left to ask about. On a channel of a kind the panel
     can't give access on, a direct grant set in Discord can only be removed;
   - the slash equivalent, and *Invite a new agent here*.
   Opening a thread's address shows its channel ("Threads use #research's
@@ -101,7 +103,9 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     Then where it can act, by category in Discord's order: what it can do,
     why, and its direct grant, changed in place with the channel drawer's
     control. Six or more rows that read alike fold into one line ("Write in
-    240 channels · via role g1-everyone" — *Show*). *Inactive grants* lists
+    240 channels · via role g1-everyone" — *Show*); a run with a *Custom…*
+    edit open in it is shown, and its *Hide* waits for *Apply* or *Cancel*.
+    *Inactive grants* lists
     the direct grants that do nothing (on a thread, a category or a deleted
     channel, or a block with nothing to block), each with *Remove*. Every
     change answers "Effective now: …" from the relay, offers **Undo** for 10

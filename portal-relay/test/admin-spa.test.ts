@@ -6043,6 +6043,100 @@ test('session: a Custom… edit not applied is kept across Sign in again — it 
   }
 });
 
+test('persona drawer: an open Custom… edit never folds out of sight — a run its row comes to read like is shown, and Hide waits for Apply or Cancel', async () => {
+  const direct = (cid: string, caps: string[]) => pRow(cid, caps, [{ kind: 'direct', caps }], caps);
+  const five = [CH.general, CH.random, CH.lounge, CH.research, CH.labNotes].map((cid) => direct(cid, W8));
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: [...five, direct(CH.ideas, R8)], roles: [] });
+  const { tr, setDirectIn, ctx, body, doc } = box;
+  const drawer = ctx.PA.ui.drawer;
+  assert.equal(body.querySelectorAll('.run-row').length, 0, 'five alike: no run yet');
+  setDirectIn(CH.general, 'custom');
+  customIn(tr(CH.general)).tick('MENTION_EVERYONE');
+  // #ideas comes to read like the other five: six alike fold into one line.
+  setDirectIn(CH.ideas, 'write');
+  await settle();
+  const run = body.querySelector('.run-row');
+  assert.ok(run, 'six alike: a run');
+  assert.match(run!.textContent, /Write in 6 channels · via direct grants/, 'the run’s line');
+  const btn = run!.querySelector('button')!;
+  assert.equal(btn.textContent, 'Hide', 'shown: the edit is open in it');
+  assert.equal(btn.getAttribute('aria-expanded'), 'true', 'expanded');
+  assert.equal(btn.getAttribute('aria-disabled'), 'true', 'Hide waits for the edit');
+  assert.equal(btn.getAttribute('title'), 'Apply or cancel the Custom… edit in these channels to hide them.', 'and says why');
+  assert.match(btn.getAttribute('aria-label')!, /Hide the 6 channels: .* — Apply or cancel the Custom… edit/, 'to a screen reader too');
+  const c = customIn(tr(CH.general));
+  assert.ok(c.open(), 'the edit is still on screen');
+  assert.equal(c.box('MENTION_EVERYONE')!.checked, true, 'with its tick');
+  assert.equal(doc.activeElement?.getAttribute('data-key'), 'dg:' + CH.ideas, 'focus stays on the row that was changed, not the heading');
+  btn.click();
+  await settle();
+  assert.ok(customIn(tr(CH.general)).open(), 'Hide does nothing while the edit is open');
+  assert.equal(drawer.isDirty(), true, 'still unsaved');
+  // Cancelled: Hide is back, and the run stays shown until it is used.
+  customIn(tr(CH.general)).button('Cancel').click();
+  assert.equal(drawer.isDirty(), false, 'cancelled: nothing unsaved');
+  assert.equal(btn.getAttribute('aria-disabled'), null, 'Hide is usable again');
+  assert.equal(btn.getAttribute('title'), null, 'no reason left to give');
+  assert.equal(btn.getAttribute('aria-label'), 'Hide the 6 channels: Write in 6 channels · via direct grants', 'its own label');
+  assert.ok(tr(CH.general), 'still shown');
+  btn.click();
+  await settle();
+  assert.equal(tr(CH.general), undefined, 'hidden once asked');
+
+  // A kept edit (Sign in again) on a row of a run that reads folded comes back shown, open.
+  const six = [...five, direct(CH.ideas, W8)];
+  const caps = ALL_CAPS.filter((x) => [...W8, 'MENTION_EVERYONE'].includes(x));
+  const draft = { v: 1, userId: ME_GWEN.user.id, route: '#/g/' + GA + '/personas/p/aria', form: 'dgCustom', fields: { personaId: 'aria', channelId: CH.random, caps }, at: Date.now() };
+  const back = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: six, roles: [], session: { 'pa.draft': JSON.stringify(draft) } });
+  const kept = customIn(back.tr(CH.random));
+  assert.ok(kept.open(), 'restored open, its run shown');
+  assert.equal(kept.box('MENTION_EVERYONE')!.checked, true, 'with the tick');
+  assert.equal(back.body.querySelector('.run-row')!.querySelector('button')!.getAttribute('aria-disabled'), 'true', 'Hide waits for it');
+});
+
+test('persona drawer: a Custom… edit goes with its row — after Remove from the guild nothing is left unsaved, and ✕ closes without asking', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria');
+  const { tr, setDirectIn, ctx, doc, body, confirm } = box;
+  setDirectIn(CH.research, 'custom');
+  customIn(tr(CH.research)).tick('MENTION_EVERYONE');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'a tick not applied is unsaved');
+  clickable(doc, 'Remove from Guild One…', body).click();
+  await settle();
+  confirm('Remove from Guild One');
+  await settle();
+  assert.equal(body.querySelectorAll('tr[data-cid]').length, 0, 'no rows left');
+  assert.equal(body.querySelector('.dg-editor'), null, 'no editor shown');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), false, 'so nothing unsaved');
+  assert.equal(ctx.PA.ui.drawer.activeForm()?.serialize().channelId, undefined, 'and nothing for Sign in again to keep');
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(doc.querySelector('.modal'), null, 'no “Discard changes?”');
+  assert.ok(!box.drawerOpen(), 'closed');
+});
+
+test('channel drawer: a Custom… edit goes with its row — a read of the channel that no longer lists the persona leaves nothing unsaved', async () => {
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    handle: (method, path) => (method === 'PUT' && path === '/admin/g/' + GA + '/personas/aria/grants' ? refuse(409, 'CONFLICT', 'changed', { current: R7 }) : undefined),
+  });
+  const { rowLink, tr, pick, ctx, doc, state, calls } = box;
+  rowLink(CH.research).click();
+  await settle();
+  pick('cass', 'custom');
+  customIn(tr('cass')).tick('MENTION_EVERYONE');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'a tick not applied is unsaved');
+  // Cass stops being listed here meanwhile; Aria's change is refused as changed, so the channel is read again.
+  state.research = state.research.filter((r: any) => r.personaId !== 'cass');
+  pick('aria', 'full');
+  await settle();
+  assert.ok(calls.filter((x) => x === `GET /admin/g/${GA}/channels/${CH.research}/access`).length >= 2, 'read again');
+  assert.equal(tr('cass'), undefined, 'Cass’s row is gone');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), false, 'and its edit with it: nothing unsaved');
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(doc.querySelector('.modal'), null, 'closing doesn’t ask');
+  assert.ok(!box.drawerOpen(), 'closed');
+});
+
 test('lib drafts: a Custom… edit keeps whose grant, which channel and the boxes — nothing else, nothing malformed', () => {
   const { lib } = libOnly();
   const fields = { personaId: 'aria', channelId: CH.research, caps: ['VIEW_CHANNEL', 'MENTION_EVERYONE'], code: 'inv_x', token: 't' };

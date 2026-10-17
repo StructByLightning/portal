@@ -591,12 +591,17 @@ function drawDrawer(d, gid, cid, data, note) {
   /** Custom… editors open in rows, not applied (persona id → { caps, start },
    *  the last touched last): drawn open again by every redraw until Apply or
    *  Cancel, and unsaved once ticked away from where they started — so
-   *  closing the drawer asks, and Sign in again keeps the last one. */
+   *  closing the drawer asks, and Sign in again keeps the last one. One whose
+   *  row a read of the channel no longer has is dropped (drawRows): nothing
+   *  shows it. */
   const edits = new Map();
   const editTouched = [];
   const ctrlOf = new Map(); // persona id → its row's control as drawn now
   const editChanged = (e) => !!e && !lib.sameCapSet(e.caps, e.start);
-  d.trackDirty(() => Array.from(edits.values()).some(editChanged));
+  /** The open edits on rows the drawer has now, as [persona id, edit]. */
+  const liveEdits = () => Array.from(edits.entries()).filter(([pid]) => !!rowOf(pid));
+  const editsDirty = () => liveEdits().some(([, e]) => editChanged(e));
+  d.trackDirty(editsDirty);
   function noteEdit(pid, e) {
     edits.delete(pid); // re-set: the last touched is last
     if (e) edits.set(pid, e);
@@ -658,6 +663,11 @@ function drawDrawer(d, gid, cid, data, note) {
     // back to the same one drawn again.
     const a = document.activeElement;
     const focusKey = a && tbody.contains(a) && a.dataset ? a.dataset.key || null : null;
+    // A Custom… edit whose row this read no longer has goes with it: nothing
+    // is left unsaved that the drawer doesn't show.
+    const here = new Set(rows.map((r) => r.personaId));
+    for (const pid of Array.from(edits.keys())) if (!here.has(pid)) edits.delete(pid);
+    for (const pid of Array.from(ctrlOf.keys())) if (!here.has(pid)) ctrlOf.delete(pid);
     clear(tbody);
     for (const r of rows) tbody.appendChild(rowTr(r));
     if (focusKey) {
@@ -1081,7 +1091,7 @@ function drawDrawer(d, gid, cid, data, note) {
     };
     const customHooks = {
       serialize() {
-        const changed = Array.from(edits.entries()).filter(([, e]) => editChanged(e));
+        const changed = liveEdits().filter(([, e]) => editChanged(e));
         const last = changed[changed.length - 1];
         return last ? { personaId: last[0], channelId: cid, caps: last[1].caps.slice() } : {};
       },
@@ -1094,7 +1104,7 @@ function drawDrawer(d, gid, cid, data, note) {
         restoredPid = f.personaId;
         drawRows();
       },
-      isDirty: () => Array.from(edits.values()).some(editChanged),
+      isDirty: editsDirty,
     };
     let restoredPid = null;
     const restoredAdd = env.keepForm(d, 'chanAdd', addHooks, addStatus);
