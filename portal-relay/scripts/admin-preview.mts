@@ -160,8 +160,10 @@ interface FixtureChannel {
   /** Discord announcement channel (the relay maps it to `text`). */
   announcement?: boolean;
   /** What the relay's bot may do here (none = it can't see the channel;
-   *  full = every capability, as a bot with broad permissions has). */
-  bot: Level | 'none';
+   *  full = every capability, as a bot with broad permissions has;
+   *  nothreads = all but starting threads, as where Create Public Threads
+   *  is denied). */
+  bot: Level | 'none' | 'nothreads';
   /** What members holding each Discord role may do here. */
   access: Partial<Record<'everyone' | 'mods' | 'researchers', Level>>;
 }
@@ -179,6 +181,8 @@ const C = {
   labNotes: '100000000000001023',
   ideas: '100000000000001024',
   oldLogs: '100000000000001031',
+  townHall: '100000000000001014',
+  showAndTell: '100000000000001015',
   lobby: '100000000000002011',
   desk: '100000000000002012',
   // Not in the fixture: a channel of Guild One since deleted.
@@ -191,6 +195,10 @@ const CHANNELS: FixtureChannel[] = [
   { id: C.general, name: 'general', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 0, bot: 'full', access: everywhere },
   { id: C.random, name: 'random', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 1, bot: 'full', access: everywhere },
   { id: C.lounge, name: 'lounge', type: 'voice', guildId: G1, categoryId: C.catGeneral, position: 2, bot: 'full', access: everywhere },
+  // A stage channel: the relay calls its kind 'unknown', and serves it all the same.
+  { id: C.townHall, name: 'town-hall', type: 'unknown', guildId: G1, categoryId: C.catGeneral, position: 3, bot: 'full', access: everywhere },
+  // The bot can send here, but not start threads.
+  { id: C.showAndTell, name: 'show-and-tell', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 4, bot: 'nothreads', access: everywhere },
   { id: C.catResearch, name: 'Research', type: 'category', guildId: G1, position: 2, bot: 'full', access: { mods: 'full', researchers: 'write' } },
   { id: C.research, name: 'research', type: 'text', guildId: G1, categoryId: C.catResearch, position: 0, bot: 'full', access: { mods: 'full', researchers: 'write' } },
   { id: C.designReview, name: 'design-review', type: 'thread', guildId: G1, parentId: C.research, position: 0, bot: 'full', access: { mods: 'full', researchers: 'write' } },
@@ -235,8 +243,9 @@ const PERSONAS = [
 
 const PERMISSIONS: Record<string, unknown> = {
   // Aria: talks in #general and #research through her access role, and holds
-  // her own direct grant in #research too.
-  [P.aria]: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE } } } } },
+  // her own direct grant in #research too — and one in the town-hall stage
+  // channel, as slash /add stores it when run in its chat.
+  [P.aria]: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE, [C.townHall]: WRITE } } } } },
   // Cass: reads all of Guild One guild-wide, but is blocked in #random.
   [P.cass]: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
   // Nyx: no entry at all — no access anywhere.
@@ -410,7 +419,9 @@ permissions.setMirrorLookup((gid, rid) => {
 // What the relay's bot can do in a channel — as computeCapabilities works it
 // out: a channel Discord's cache doesn't hold lets only the two capabilities
 // with no Discord permission behind them through.
-const BOT_CAPS: Record<Level | 'none', Capability[]> = { none: [], read: LEVEL_CAPS.read, write: LEVEL_CAPS.write, full: ALL_CAPS };
+const BOT_CAPS: Record<Level | 'none' | 'nothreads', Capability[]> = {
+  none: [], read: LEVEL_CAPS.read, write: LEVEL_CAPS.write, full: ALL_CAPS, nothreads: ALL_CAPS.filter((c) => c !== 'CREATE_THREADS'),
+};
 const botCaps = (_gid: string, cid: string): Capability[] => {
   const c = channelById.get(cid);
   return c ? [...BOT_CAPS[c.bot]] : ['EDIT_OWN', 'DELETE_OWN'];

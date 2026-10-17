@@ -311,12 +311,13 @@ async function render(view, stale) {
     const href = env.formatRoute(env.route('g', gid, 'channels', { kind: 'channel', id: r.id }));
     const badge = lib.channelBadge(r);
     const warn = lib.botListNote(r);
+    const badgeTitle = r.type === 'unknown' ? lib.OTHER_KIND_HELP : null;
     const counts = r.counts ? lib.countsText(r.counts) : '';
     const li = el('li', { class: 'chan-item' }, [el('a', { class: 'chan-row', href, 'data-key': 'channel:' + r.id }, [
       el('span', { class: 'chan-name', text: lib.channelTitle(r) }),
-      badge ? el('span', { class: 'badge', text: badge }) : null,
+      badge ? el('span', { class: 'badge', title: badgeTitle, text: badge }) : null,
       inHidden && r.categoryName ? el('span', { class: 'muted chan-cat', text: 'in ' + r.categoryName }) : null,
-      warn ? el('span', { class: 'chan-warn', title: 'The relay’s bot can’t do everything Write needs in this channel.' }, [
+      warn ? el('span', { class: 'chan-warn', title: lib.botListTitle(r) }, [
         el('span', { 'aria-hidden': 'true', text: '⚠ ' }), warn,
       ]) : null,
       counts ? el('span', { class: 'chan-counts', title: countsTitle(r.counts), text: counts }) : null,
@@ -513,7 +514,7 @@ function drawDrawer(d, gid, cid, data, note) {
 
   // ── Header: where it is, Discord, the bot's limits ──
   const cat = ch.categoryId && names.channels && names.channels[ch.categoryId] ? names.channels[ch.categoryId].name : null;
-  const kind = ch.announcement ? 'announcement' : ch.type || 'channel';
+  const kind = ch.announcement ? 'announcement' : ch.type === 'unknown' ? 'a kind of channel the panel can’t give access on' : ch.type || 'channel';
   const top = el('div', { class: 'chan-head' }, [
     el('p', { class: 'chan-sub muted' }, [
       el('span', { text: (cat ? 'in ' + cat + ' · ' : '') + kind }),
@@ -522,6 +523,9 @@ function drawDrawer(d, gid, cid, data, note) {
   ]);
   const noteLine = ui.statusLine(top);
   if (note) noteLine.info(note);
+  if (!grantable) {
+    top.appendChild(el('p', { class: 'hint muted', text: 'Access can’t be given on this kind of channel here. What access roles, guild-wide levels and defaults give applies, and a direct grant set in Discord can be removed.' }));
+  }
   const banner = el('p', { class: 'banner banner-warn hidden', role: 'note' });
   top.appendChild(banner);
   function syncBanner() {
@@ -560,11 +564,14 @@ function drawDrawer(d, gid, cid, data, note) {
     const eff = Array.isArray(row.effective) ? row.effective : [];
     const blocked = Array.isArray(row.direct) && !row.direct.length;
     const chips = lib.sourceChips(row, names, { isSuper: env.isSuper(), guild });
-    const control = grantable ? ui.directGrantControl({
+    // A channel the panel can't give access on: a direct grant stored there
+    // (slash /add run in its chat) can still be removed.
+    const control = grantable || row.direct !== null ? ui.directGrantControl({
       value: row.direct,
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + name + ' in ' + where,
       apply: (next) => change(row.personaId, next),
+      removeOnly: !grantable,
     }) : null;
     return el('tr', { 'data-pid': row.personaId, class: eff.length ? null : 'who-none' }, [
       el('td', { 'data-label': 'Persona' }, [el('span', { class: 'who-name' }, [
@@ -690,10 +697,11 @@ function drawDrawer(d, gid, cid, data, note) {
 
   /** Send one change and take the relay's answer for the row. Resolves
    *  { ok, text, undo } — undo: what restores it ({ key, pid, prev, next,
-   *  lifted }). `base`: what is known of a persona without a row here (the
-   *  Add pick: name, picture, whether the directory said it was removed from
-   *  the guild). `lift`: the admin was asked, and chose to lift its removal
-   *  from the guild. */
+   *  lifted }), or null where nothing could put it back (a channel the panel
+   *  can't give access on). `base`: what is known of a persona without a row
+   *  here (the Add pick: name, picture, whether the directory said it was
+   *  removed from the guild). `lift`: the admin was asked, and chose to lift
+   *  its removal from the guild. */
   async function send(pid, name, next, base, refocus, lift) {
     const row = rowOf(pid);
     const expect = row ? row.direct : null;
@@ -712,7 +720,8 @@ function drawDrawer(d, gid, cid, data, note) {
       // Lifted, the persona changed in every channel of the guild: the list asks again.
       patchSummary(gid, cid, rows, lifted);
       env.markStale();
-      return { ok: true, text: resultText(name, next, before, ex, lifted), undo: { key: pid, pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } };
+      const undo = grantable ? { key: pid, pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } : null;
+      return { ok: true, text: resultText(name, next, before, ex, lifted), undo };
     } catch (e) {
       return { ok: false, error: e };
     }

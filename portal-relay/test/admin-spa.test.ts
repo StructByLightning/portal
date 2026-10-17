@@ -3338,7 +3338,14 @@ test('lib: a channel’s counts and the bot’s limits, in words', () => {
   assert.deepEqual(plain(lib.countsFromRows([{ effective: W7 }, { effective: R7 }, { effective: R7 }, { effective: F7 }, { effective: [] }, { effective: ['EDIT_OWN'] }])),
     { read: 2, write: 1, full: 1, custom: 0 });
 
-  assert.equal(lib.botListNote({ botBase: 'read', botCantView: false }), 'relay can only read here');
+  // From what the bot lacks: 'can only read' only when it can't send.
+  assert.equal(lib.botListNote({ botBase: 'read', botCantView: false, botLacks: ['SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS'] }), 'relay can only read here');
+  assert.equal(lib.botListNote({ botBase: 'read', botCantView: false, botLacks: ['CREATE_THREADS'] }), 'relay is limited here', 'it can send: never “only read”');
+  assert.equal(lib.botListTitle({ botLacks: ['CREATE_THREADS'] }), 'The relay bot can’t start threads in this channel, so Write and Full do only what it can.');
+  assert.match(lib.botListTitle({ botLacks: ['SEND_MESSAGES', 'CREATE_THREADS'] }), /^The relay bot can only Read here/);
+  assert.equal(lib.botListNote({ botBase: 'write', botCantView: false, botLacks: [] }), null);
+  // An older relay says only the level: below Write is “limited”, it can't tell more.
+  assert.equal(lib.botListNote({ botBase: 'read', botCantView: false }), 'relay is limited here');
   assert.equal(lib.botListNote({ botBase: null, botCantView: false }), 'relay is limited here');
   assert.equal(lib.botListNote({ botBase: 'full', botCantView: false }), null);
   assert.equal(lib.botListNote({ botBase: 'write', botCantView: false }), null);
@@ -3373,12 +3380,13 @@ const PLACE: Record<string, { categoryId: string | null; position: number; annou
 };
 const G1_LAYOUT = G1_CHANNELS.map((c) => ({ ...c, categoryId: PLACE[c.id].categoryId, position: PLACE[c.id].position, announcement: !!PLACE[c.id].announcement, grantable: ['text', 'voice', 'forum'].includes(c.type) }));
 const G1_CHANNELS_VIEW = { channels: G1_LAYOUT, categories: G1_LAYOUT.filter((c) => c.type === 'category').map((c) => ({ id: c.id, name: c.name, position: c.position })) };
-const stat = (id: string, counts: Partial<ReturnType<typeof z7>>, botBase: string | null = 'full', botCantView = false) => ({ id, counts: { ...z7(), ...counts }, botBase, botCantView });
+const stat = (id: string, counts: Partial<ReturnType<typeof z7>>, botBase: string | null = 'full', botCantView = false, botLacks?: string[]) =>
+  ({ id, counts: { ...z7(), ...counts }, botBase, botCantView, ...(botLacks ? { botLacks } : {}) });
 const G1_SUMMARY = {
   channels: [
-    stat(CH.welcome, { read: 3 }, 'read'),
+    stat(CH.welcome, { read: 3 }, 'read', false, W7.filter((c) => !R7.includes(c))), // the bot can't send
     stat(CH.general, { write: 1, read: 2, full: 1 }),
-    stat(CH.random, { read: 1, full: 1 }),
+    stat(CH.random, { read: 1, full: 1 }, 'read', false, ['CREATE_THREADS']), // it can send, not start threads
     stat(CH.lounge, { read: 2, full: 1 }),
     stat(CH.research, { write: 1, read: 2, full: 1 }),
     stat(CH.labNotes, { read: 2, full: 1 }),
@@ -3786,6 +3794,10 @@ test('Channels tab: a first visit lands here — Discord’s order, counts in wo
   assert.ok(hiddenList.classList.contains('hidden'));
   assert.ok(hiddenList.textContent.includes('#old-logs'));
   assert.match(rowLink(CH.welcome).textContent, /announcement.*relay can only read here.*3 can read/);
+  // A bot that can send but not start threads is limited, not read-only — and the tooltip says what it can't do.
+  const randomWarn = rowLink(CH.random).querySelector('.chan-warn')!;
+  assert.equal(randomWarn.textContent, '⚠ relay is limited here');
+  assert.equal(randomWarn.getAttribute('title'), 'The relay bot can’t start threads in this channel, so Write and Full do only what it can.');
   assert.equal(rowLink(CH.research).querySelector('.chan-counts')!.textContent, '1 can write · 2 can read · 1 full');
   assert.equal(rowLink(CH.research).getAttribute('href'), '#/g/' + GA + '/channels/c/' + CH.research);
   assert.equal(rowLink(CH.lounge).querySelector('.badge')!.textContent, 'voice');
@@ -5516,4 +5528,37 @@ test('channel drawer: a newer change to the same persona retires the older Undo;
   await settle();
   assert.equal(undoFor('Nyx → Write').length, 0, 'retired: it would undo over this admin’s own newer change');
   assert.equal(undoFor('Nyx → Read').length, 1);
+});
+
+test('every channel kind the relay serves: listed with its kind, its access shown, a direct grant there only removable, never an Add target', async () => {
+  const { lib } = libOnly();
+  const STAGE = '100000000000001025';
+  const withStage = {
+    channels: [...G1_LAYOUT, { id: STAGE, name: 'town-hall', type: 'unknown', categoryId: CH.catResearch, position: 9, announcement: false, grantable: false }],
+    categories: G1_CHANNELS_VIEW.categories,
+  };
+  const l = lib.channelLayout(withStage, null);
+  const stage = l.groups.flatMap((g: any) => g.rows).find((r: any) => r.id === STAGE);
+  assert.ok(stage, 'listed: the relay serves it');
+  assert.equal(stage.grantable, false);
+  assert.equal(lib.channelTitle(stage), 'town-hall');
+  assert.equal(lib.channelBadge(stage), 'other kind');
+  assert.equal(l.count, 9, 'still no thread, no category');
+
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    rows: [...ARIA_ROWS(), pRow(STAGE, W8, [{ kind: 'direct', caps: W8 }], W8)],
+    routes: { [`/admin/g/${GA}/channels`]: withStage },
+  });
+  const { tr, typeChannel, options, setDirectIn, calls, P, doc } = box;
+  const sel = tr(STAGE).querySelector('select')!;
+  assert.deepEqual(sel.options.map((o) => o.textContent), ['—', 'Write'], 'what is set, or remove it — nothing else');
+  assert.equal(sel.value, 'keep');
+  assert.match(tr(STAGE).textContent, /other kind/);
+  await typeChannel('town');
+  assert.deepEqual(options(), [], 'not offered to add to');
+  setDirectIn(STAGE, '');
+  await settle();
+  assert.ok(calls.includes(`DELETE ${P}/grants?channelId=${STAGE}`));
+  const t = doc.getElementById('toasts')!.querySelectorAll('.toast').find((x) => x.textContent.startsWith('Removed Aria'))!;
+  assert.equal(t.querySelector('.toast-action'), null, 'no Undo: the panel can’t give access there');
 });

@@ -1821,6 +1821,14 @@ function accessSection(ctx, m) {
   const inactiveBox = el('div', { class: 'inactive hidden' });
   const expanded = new Set(); // the folded runs shown
   let node = null;
+  const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
+  /** Can the panel give access on this channel (text, voice, forum)? One of
+   *  another kind is a row all the same (the relay serves it), whose direct
+   *  grant can only be removed. */
+  const grantableAt = (cid) => {
+    const c = chanById.get(cid);
+    return !c || (typeof c.grantable === 'boolean' ? c.grantable : lib.isGrantableType(c.type));
+  };
 
   /** What the relay's bot can do in a channel, as far as the persona's row
    *  says: every capability but those it says the bot lacks. It is exact for
@@ -1856,15 +1864,21 @@ function accessSection(ctx, m) {
     const eff = Array.isArray(row.effective) ? row.effective : [];
     const blocked = Array.isArray(row.direct) && !row.direct.length;
     const chips = lib.sourceChips(row, m.names, { isSuper: isSuper(), guild });
-    const control = ui.directGrantControl({
+    const grantable = grantableAt(cid);
+    const control = grantable || row.direct !== null ? ui.directGrantControl({
       value: row.direct,
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + displayName + ' in ' + w,
       apply: (next) => changeDirect(cid, next),
-    });
-    control.select.setAttribute('data-key', 'dg:' + cid);
+      removeOnly: !grantable,
+    }) : null;
+    if (control) control.select.setAttribute('data-key', 'dg:' + cid);
+    const kind = chanById.get(cid);
     return el('tr', { 'data-cid': cid, class: eff.length ? null : 'who-none' }, [
-      el('td', { 'data-label': 'Channel' }, [href ? el('a', { class: 'link', href, title: cid, text: w }) : el('span', { title: cid, text: w })]),
+      el('td', { 'data-label': 'Channel' }, [
+        href ? el('a', { class: 'link', href, title: cid, text: w }) : el('span', { title: cid, text: w }),
+        kind && kind.type === 'unknown' ? el('span', { class: 'badge', title: lib.OTHER_KIND_HELP, text: lib.channelBadge(kind) }) : null,
+      ]),
       el('td', { 'data-label': 'Can do here' }, [el('span', { class: 'who-can' }, [
         ui.levelPill(row, w),
         blocked ? el('span', { class: 'badge badge-warn', title: 'Blocks guild-wide and persona-default access in this channel. Roles still apply.', text: 'Blocked here' }) : null,
@@ -1872,7 +1886,7 @@ function accessSection(ctx, m) {
       el('td', { 'data-label': 'Why' }, [chips.length
         ? el('span', { class: 'src-chips' }, chips.map((c) => el('span', { class: 'src-chip src-' + c.kind, title: c.title, text: c.text })))
         : el('span', { class: 'muted', text: '—' })]),
-      el('td', { 'data-label': 'Direct grant' }, [control.node]),
+      el('td', { 'data-label': 'Direct grant' }, [control ? control.node : el('span', { class: 'muted', text: '—' })]),
     ]);
   }
 
@@ -1967,7 +1981,8 @@ function accessSection(ctx, m) {
    *  block; null removed), with what this drawer showed there as `expect`.
    *  `lift`: the admin was asked, and chose to lift the persona's removal
    *  from the guild (without it the relay refuses: 409 BANNED). Resolves
-   *  { ok, text, undo } or { ok: false, error }. */
+   *  { ok, text, undo } (undo null where nothing could put it back: a
+   *  channel the panel can't give access on) or { ok: false, error }. */
   async function send(cid, next, row, lift) {
     const expect = row && row.direct !== undefined ? row.direct : null;
     const before = row && Array.isArray(row.effective) ? row.effective : [];
@@ -1979,7 +1994,7 @@ function accessSection(ctx, m) {
       return {
         ok: true,
         text: lib.grantResultText({ name: displayName, next, before, ex: r && r.effective, where: w, liftedFrom: lifted ? guild : null }),
-        undo: { key: cid, cid, where: w, prev: expect, next: next == null ? null : next.slice(), lifted },
+        undo: grantableAt(cid) ? { key: cid, cid, where: w, prev: expect, next: next == null ? null : next.slice(), lifted } : null,
       };
     } catch (e) {
       return { ok: false, error: e };
@@ -2111,9 +2126,10 @@ function accessSection(ctx, m) {
 
   const add = (() => {
     const line = ui.statusLine(null);
-    const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
-    const cats = layout.groups.filter((g) => g.id);
-    const all = layout.groups.flatMap((g) => g.rows.map((r) => r.id));
+    // Only channels the panel can give access on can be added to.
+    const inCat = (g) => g.rows.filter((r) => grantableAt(r.id)).map((r) => r.id);
+    const cats = layout.groups.filter((g) => g.id && inCat(g).length);
+    const all = layout.groups.flatMap((g) => inCat(g));
     const hereNow = (cid) => {
       const r = m.rowOf(cid);
       return r && Array.isArray(r.effective) && r.effective.length ? lib.levelLabel(r.effective) + ' now' : 'no access now';
@@ -2131,10 +2147,11 @@ function accessSection(ctx, m) {
         const out = [];
         for (const g of cats) {
           if (needle && String(g.name || '').toLowerCase().indexOf(needle) < 0) continue;
+          const ids = inCat(g);
           out.push({
-            value: 'cat:' + g.id, group: 'Categories', channels: g.rows.map((r) => r.id),
-            label: 'Category ' + g.name + ' (' + lib.plural(g.rows.length, 'channel') + ')',
-            title: 'Picks the ' + lib.plural(g.rows.length, 'channel') + ' in ' + g.name + ' now. Channels added to it later aren’t covered.',
+            value: 'cat:' + g.id, group: 'Categories', channels: ids,
+            label: 'Category ' + g.name + ' (' + lib.plural(ids.length, 'channel') + ')',
+            title: 'Picks the ' + lib.plural(ids.length, 'channel') + ' in ' + g.name + ' now. Channels added to it later aren’t covered.',
           });
         }
         let n = 0;
@@ -2261,7 +2278,7 @@ function accessSection(ctx, m) {
       /** Put picks kept as ids back (channels this guild still has). */
       restore(ids, caps) {
         if (caps && caps.length) level.set(caps);
-        ta.set(ids.filter((cid) => chanById.has(cid) && order.has(cid)).slice(0, MAX_ADD_CHANNELS).map(itemOf));
+        ta.set(ids.filter((cid) => chanById.has(cid) && order.has(cid) && grantableAt(cid)).slice(0, MAX_ADD_CHANNELS).map(itemOf));
         syncCurrently();
       },
       onTouch: (fn) => touched.push(fn),

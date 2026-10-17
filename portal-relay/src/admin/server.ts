@@ -40,7 +40,7 @@ import type { AccessRole, AdminConfig, GuildPolicy, PersonaIdentity, Scope } fro
 import type { Capability } from '@animalabs/portal-protocol';
 import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
 import {
-  LEVEL_CAPS, accessSummary, countedLevel, explainFor, isGrantable, levelOf, removeFromGuild, subjectOf, zeroCounts,
+  LEVEL_CAPS, accessSummary, countedLevel, explainFor, holdsAccess, isGrantable, levelOf, removeFromGuild, subjectOf, zeroCounts,
   type AccessDeps, type AccessSource, type Explained, type LevelCounts, type Subject,
 } from '../access.js';
 import type { IdentityStore } from '../identity.js';
@@ -810,7 +810,7 @@ export class AdminServer {
     const direct = zeroCounts();
     let channels = 0;
     for (const ch of this.deps.listChannels(guildId)) {
-      if (!isGrantable(ch.type)) continue;
+      if (!holdsAccess(ch.type)) continue;
       channels++;
       const ex = this.enforced(a, s, ch.id, new Set(this.deps.botCaps(guildId, ch.id)));
       const level = countedLevel(ex.effective);
@@ -822,10 +822,12 @@ export class AdminServer {
   }
 
   /**
-   * GET …/access/summary — for each channel of G that can hold access, how
-   * many personas can act there at each level (counted where they can see it,
-   * as /list counts), and the bot's own ceiling there; for each persona, in
-   * how many channels. Reused for SUMMARY_TTL_MS, dropped by any permissions
+   * GET …/access/summary — for each channel of G with access of its own
+   * (holdsAccess: any kind but a thread or a category, kinds the panel can't
+   * give access on included), how many personas can act there at each level
+   * (counted where they can see it, as /list counts), and the bot's own
+   * ceiling there and what of Write it lacks; for each persona, in how many
+   * channels. Reused for SUMMARY_TTL_MS, dropped by any permissions
    * change. Past ACCESS_CELL_CAP personas × channels the counts are left out.
    */
   private onAccessSummary(res: ServerResponse, guildId: string): void {
@@ -833,7 +835,7 @@ export class AdminServer {
     const now = this.nowMs();
     const hit = this.summaries.get(guildId);
     if (hit && now - hit.at < SUMMARY_TTL_MS && now >= hit.at) return sendJson(res, 200, hit.body, timing(t0));
-    const channelIds = this.deps.listChannels(guildId).filter((c) => isGrantable(c.type)).map((c) => c.id);
+    const channelIds = this.deps.listChannels(guildId).filter((c) => holdsAccess(c.type)).map((c) => c.id);
     const personaIds = this.candidates(guildId).map((p) => p.id);
     const body = {
       ...accessSummary(accessDepsOf(this.deps), guildId, channelIds, personaIds, this.accessCellCap),
@@ -894,8 +896,10 @@ export class AdminServer {
 
   /**
    * GET …/personas/:pid/access — one persona in G: its guild-wide setting
-   * and persona default (as caps here), what it can do in each channel that
-   * can hold access and why, the direct grants that do nothing (on a thread,
+   * and persona default (as caps here), what it can do in each channel with
+   * access of its own (holdsAccess — a kind the panel can't give access on
+   * too, where a direct grant stored there is a row) and why, the direct
+   * grants that do nothing (on a thread,
    * a category, a channel G no longer has, or a block with nothing to
    * block), and the access roles of G it holds, with in how many channels
    * each gives something.
@@ -913,7 +917,7 @@ export class AdminServer {
     const rows = [];
     const roleChannels = new Map<string, number>();
     for (const ch of list) {
-      if (!isGrantable(ch.type)) continue;
+      if (!holdsAccess(ch.type)) continue;
       const ex = this.enforced(a, s, ch.id, new Set(this.deps.botCaps(guildId, ch.id)));
       for (const src of ex.sources) if (src.kind === 'role') roleChannels.set(src.name, (roleChannels.get(src.name) ?? 0) + 1);
       if (!ex.effective.length && ex.direct === null) continue;
@@ -2150,7 +2154,7 @@ function blocksSomething(g: GuildPolicy | undefined, pol: { default?: Capability
 function inactiveReason(caps: Capability[], type: string | undefined, known: boolean, blocks: boolean): InactiveReason | null {
   if (type === 'thread' || type === 'category') return type;
   if (!known) return 'missing';
-  if (!caps.length && isGrantable(type) && !blocks) return 'blocks-nothing';
+  if (!caps.length && holdsAccess(type) && !blocks) return 'blocks-nothing';
   return null;
 }
 

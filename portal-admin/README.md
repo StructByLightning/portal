@@ -49,8 +49,13 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
   folds; the fold is remembered per admin and guild), each with how many
   personas can act there at each level ("3 can write · 2 can read · 1 full")
   and a warning where the relay's bot can't do everything Write needs
-  ("relay can only read here"). Channels the bot can't see are in a folded
-  group at the end; threads aren't listed (they use their channel's access).
+  ("relay can only read here" when it can't send, else "relay is limited
+  here"; the tooltip says what it can't do). Channels of a kind the panel
+  can't give access on (a stage or media channel: badge *other kind*) are
+  listed too — the relay serves them, and roles, guild-wide levels and
+  defaults reach them. Channels the bot can't see are in a folded group at
+  the end; threads aren't listed (they use their channel's access — the
+  relay checks every action on a thread against its channel).
   A filter and *All · With agents · Empty* narrow the rows. The counts come
   from the relay (`…/access/summary`), are asked for again when you come back
   to the window after a minute, and follow every change made in a drawer.
@@ -70,7 +75,8 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     would lower access that came from guild-wide or a default. A change made
     meanwhile elsewhere is refused and the rows are read again. A newer change
     to the same persona retires the older one's Undo, and an Undo's outcome
-    is said where its change was;
+    is said where its change was. On a channel of a kind the panel can't give
+    access on, a direct grant set in Discord can only be removed;
   - the slash equivalent, and *Invite a new agent here*.
   Opening a thread's address shows its channel ("Threads use #research's
   access."); a category's opens the list with that category unfolded.
@@ -370,9 +376,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   within what the relay's bot can do there, nothing after a `/ban`), and why. Each sends
   `Server-Timing: access;dur=<ms>`.
   - `GET …/access/summary` → `{channels:[{id, counts:{read,write,full,custom}, botBase,
-    botCantView}], personas:[{id, counts}], considered, computedAt, truncated?}` — per
-    channel that can hold access, how many personas can act there at each level (counted
-    where they can see it, as `/list` counts). Reused for 5 s, dropped by any permissions
+    botCantView, botLacks?}], personas:[{id, counts}], considered, computedAt, truncated?}` —
+    per channel with access of its own (any kind but a thread or a category, kinds the
+    panel can't give access on included), how many personas can act there at each level
+    (counted where they can see it, as `/list` counts); `botLacks`: what of Write the
+    relay's bot can't do there. Reused for 5 s, dropped by any permissions
     change; past 100k personas × channels the counts are left out (`truncated`).
   - `GET …/channels/:cid/access` → `{channel, botCaps, botBase, rows:[{personaId,
     displayName, avatarUrl, effective, level, base, extra, direct, sources, botLimited,
@@ -382,7 +390,8 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
     channels · mirror), `guildWide`, `personaDefault`, `relayDefault`, `removed` (`/ban`);
     one that doesn't count there carries `shadowedBy`.
   - `GET …/personas/:id/access` → `{persona, removed, guildWide (caps|'deny'|null),
-    personaDefault, relayDefault, rows:[{channelId, …}], inactive:[{channelId, caps,
+    personaDefault, relayDefault, rows:[{channelId, …}] (every channel with access of its
+    own, as the summary counts them), inactive:[{channelId, caps,
     reason: thread|category|missing|blocks-nothing}], roles:[{name, caps, scope, channels}],
     names}` (+ `otherGuildRoleCount` for super-admins)
   - `GET …/persona-directory?q=` → `{personas:[{id, displayName, avatarUrl,

@@ -59,6 +59,8 @@ const CHANNELS: Chan[] = [
   { id: 'c-nosend', guildId: G1, type: 'text', bot: [F.ViewChannel, F.ReadMessageHistory, F.AddReactions, F.MentionEveryone] },
   { id: 'c-voice', guildId: G1, type: 'voice', categoryId: 'cat', bot: ALL_BITS },
   { id: 'c-forum', guildId: G1, type: 'forum', bot: [F.ViewChannel, F.ReadMessageHistory, F.SendMessages, F.SendMessagesInThreads] },
+  // A kind the relay doesn't name (a stage or media channel): it serves it all the same.
+  { id: 'c-stage', guildId: G1, type: 'unknown', categoryId: 'cat', bot: ALL_BITS },
   { id: 'cat', guildId: G1, type: 'category', bot: ALL_BITS },
   { id: 'th', guildId: G1, type: 'thread', parentId: 'c-open', bot: ALL_BITS },
   { id: 'c2', guildId: G2, type: 'text', bot: ALL_BITS },
@@ -88,7 +90,8 @@ const PERSONAS: Record<string, unknown> = {
   'p-mcaps': { roles: ['r-mirrorcaps'] },
   'p-direct': { policy: { default: [], guilds: { [G1]: { channels: {
     'c-open': FULL, 'c-readonly': WRITE, 'c-hidden': READ, [UNCACHED]: WRITE, th: WRITE, cat: READ,
-    'c-nosend': [...WRITE, 'MENTION_EVERYONE'],
+    'c-nosend': [...WRITE, 'MENTION_EVERYONE'], 'c-stage': WRITE, // c-stage: what slash /add stores when run in its chat
+
   } } } } },
   'p-guildwide': { roles: ['r-chans'], policy: { default: [], guilds: { [G1]: { default: WRITE, channels: { 'c-open': [], 'c-voice': READ } } } } },
   'p-deny': { policy: { default: READ, guilds: { [G1]: { default: [], channels: { 'c-forum': WRITE } } } } },
@@ -253,7 +256,7 @@ test('parity: the summary counts what capsFor allows, channel by channel and per
   try {
     const a = accessDepsOf(t.deps);
     for (const gid of [G1, G2, G3]) {
-      const channelIds = CHANNELS.filter((c) => c.guildId === gid && ['text', 'voice', 'forum'].includes(c.type)).map((c) => c.id);
+      const channelIds = CHANNELS.filter((c) => c.guildId === gid && c.type !== 'thread' && c.type !== 'category').map((c) => c.id);
       const s = accessSummary(a, gid, channelIds, EVERYONE, 100_000);
       assert.equal(s.considered, EVERYONE.length);
       for (const [i, cid] of channelIds.entries()) {
@@ -340,8 +343,11 @@ test('parity: the access endpoints, over the relay’s own wiring, show capsFor'
       assert.match(r.headers.get('server-timing') ?? '', /^access;dur=\d+(\.\d+)?$/, path);
       return r.json();
     };
-    const grantable = CHANNELS.filter((c) => c.guildId === G1 && ['text', 'voice', 'forum'].includes(c.type));
-    for (const c of grantable) {
+    // Every channel with access of its own: c-stage, of a kind the panel
+    // can't give access on, too — the relay serves it with capsFor's caps.
+    const holding = CHANNELS.filter((c) => c.guildId === G1 && c.type !== 'thread' && c.type !== 'category');
+    assert.ok(holding.some((c) => c.type === 'unknown'));
+    for (const c of holding) {
       const body = await get(`/admin/g/${G1}/channels/${c.id}/access`);
       assert.deepEqual(body.botCaps, t.deps.botCaps(G1, c.id));
       for (const pid of IDENTITIES) {
@@ -354,11 +360,15 @@ test('parity: the access endpoints, over the relay’s own wiring, show capsFor'
     }
     for (const pid of IDENTITIES) {
       const body = await get(`/admin/g/${G1}/personas/${pid}/access`);
-      for (const c of grantable) {
+      for (const c of holding) {
         const row = body.rows.find((r: any) => r.channelId === c.id);
         const enforced = t.capsFor(pid, c.id, G1);
         if (enforced.length) assert.deepEqual(row?.effective, enforced, `${pid} in ${c.id}`);
         else if (row) assert.deepEqual(row.effective, [], `${pid} in ${c.id}`);
+        // A direct grant there is a row, never “inactive”, whatever the kind.
+        const own = (t.deps.permissions.getPolicy(pid)?.guilds?.[G1]?.channels ?? {})[c.id];
+        if (own && (own.length || t.capsFor(pid, c.id, G1).length)) assert.ok(row, `${pid}: its grant in ${c.id} is a row`);
+        if (own?.length) assert.ok(!body.inactive.some((x: any) => x.channelId === c.id), `${pid}: its grant in ${c.id} isn’t inactive`);
       }
     }
     const summary = await get(`/admin/g/${G1}/access/summary`);
@@ -370,7 +380,17 @@ test('parity: the access endpoints, over the relay’s own wiring, show capsFor'
       }
       assert.deepEqual(ch.counts, want, ch.id);
     }
-    assert.deepEqual(summary.channels.map((c: any) => c.id).sort(), grantable.map((c) => c.id).sort(), 'every channel that can hold access, nothing else');
+    assert.deepEqual(summary.channels.map((c: any) => c.id).sort(), holding.map((c) => c.id).sort(), 'every channel with access of its own, nothing else');
+    for (const pid of IDENTITIES) {
+      const want = zeroCounts();
+      for (const c of holding) {
+        const level = countedLevel(t.capsFor(pid, c.id, G1));
+        if (level) want[level]++;
+      }
+      const got = summary.personas.find((p: any) => p.id === pid);
+      if (got) assert.deepEqual(got.counts, want, pid);
+      else assert.deepEqual(want, zeroCounts(), `${pid}: left out only when it can act nowhere`);
+    }
   } finally {
     await server.close();
     t.cleanup();
@@ -428,7 +448,7 @@ test('parity: a grant change answers with what the relay enforces where it was m
         seen.add(meta.type);
       }
     }
-    assert.deepEqual([...seen].sort(), ['category', 'missing', 'text', 'thread']);
+    assert.deepEqual([...seen].sort(), ['category', 'missing', 'text', 'thread', 'unknown']);
   } finally {
     await server.close();
     t.cleanup();

@@ -987,7 +987,9 @@
    * Custom… opens the capabilities inline, with Apply and Cancel. 'Block
    * guild-wide here' ([]) is offered when opts.canBlock, or when it is what
    * is set.
-   *   opts: { value (caps | null), canBlock, label (the select's name), apply }
+   *   opts: { value (caps | null), canBlock, label (the select's name), apply,
+   *           removeOnly (a channel the panel can't give access on: what is
+   *           set, or — to remove it; nothing else) }
    * Returns { node, select, value(), set(value, canBlock) }.
    */
   function directGrantControl(opts) {
@@ -1005,6 +1007,14 @@
       clear(select);
       const cur = lib.directValue(value);
       const opt = (v, text, title) => el('option', { value: v, text, title: title || null });
+      if (opts.removeOnly) {
+        select.appendChild(opt('', '—', 'Remove the direct grant here'));
+        if (cur) select.appendChild(opt('keep', cur === 'block' ? 'Blocked guild-wide here' : cur === 'custom' ? lib.customOptionText(value) : lib.LEVEL_NAME[cur], lib.capsTitle(value || [])));
+        select.value = cur ? 'keep' : '';
+        select.disabled = !cur || busyNow;
+        edit.classList.add('hidden');
+        return;
+      }
       select.appendChild(opt('', '—', 'No direct grant here'));
       for (const k of lib.LEVELS) select.appendChild(opt(k, lib.LEVEL_NAME[k], lib.LEVEL_HELP[k]));
       select.appendChild(opt('custom', cur === 'custom' ? lib.customOptionText(value) : 'Custom…', cur === 'custom' ? lib.capsTitle(value) : 'Pick the capabilities one by one.'));
@@ -1071,6 +1081,7 @@
     }
     select.addEventListener('change', () => {
       const v = select.value;
+      if (v === 'keep') return;
       if (v === 'custom') {
         openEditor();
         return;

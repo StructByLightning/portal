@@ -67,8 +67,10 @@ It listens on 127.0.0.1 only. Sign in as a fixture user:
   hundreds of rows that read alike into one line.
 
 The small world has Guild One (channels in General, Research and Archive
-categories, an announcement channel, a thread, a forum and a channel the bot
-can't see), Guild Two, four access roles, six personas (Aria, Cass, Nyx,
+categories, an announcement channel, a thread, a forum, a stage channel the
+relay calls `unknown` (Aria holds a direct grant there, as slash `/add` would
+store it), a channel where the bot can send but not start threads, and a
+channel the bot can't see), Guild Two, four access roles, six personas (Aria, Cass, Nyx,
 Juniper, Quill, Sol) with different kinds of access, and invites in every state.
 The stores live in a new temp directory each run (the path is printed) and are
 thrown away.

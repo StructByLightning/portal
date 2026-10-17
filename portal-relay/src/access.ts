@@ -92,6 +92,18 @@ export function isGrantable(type: string | undefined): boolean {
   return type === 'text' || type === 'voice' || type === 'forum';
 }
 
+/** Channels whose access is their own, where the relay serves a persona with
+ *  what capsFor gives there: every kind but a thread (it uses its parent's
+ *  access) and a category (it grants nothing). That is the grantable kinds
+ *  and the ones the relay doesn't name ('unknown': a stage or media channel,
+ *  say) — access from roles, guild-wide levels and defaults reaches those
+ *  too, and so does a direct grant stored on one (slash /add run in its
+ *  chat), even though the panel can't set one there. Every access view
+ *  covers these channels, so none shows less than the relay enforces. */
+export function holdsAccess(type: string | undefined): boolean {
+  return type !== 'thread' && type !== 'category';
+}
+
 /** Distinct caps in ALL_CAPS order; names the relay doesn't know go last. */
 function ordered(caps: Iterable<Capability>): Capability[] {
   const set = new Set(caps);
@@ -364,7 +376,9 @@ export function countedLevel(effective: readonly Capability[]): keyof LevelCount
 }
 
 export interface AccessSummary {
-  channels: Array<{ id: string; counts?: LevelCounts; botBase: PresetName | null; botCantView: boolean }>;
+  /** botLacks: what of Write the bot can't do there (left out when it can
+   *  do all of it, or can't see the channel at all). */
+  channels: Array<{ id: string; counts?: LevelCounts; botBase: PresetName | null; botCantView: boolean; botLacks?: Capability[] }>;
   personas: Array<{ id: string; counts?: LevelCounts }>;
   /** How many personas were looked at. */
   considered: number;
@@ -386,11 +400,16 @@ export function accessSummary(
   cellCap: number,
 ): AccessSummary {
   const bots = channelIds.map((cid) => new Set(deps.botCaps(guildId, cid)));
-  const channels = channelIds.map((id, i) => ({
-    id,
-    botBase: levelOf([...bots[i]]).base,
-    botCantView: !bots[i].has('VIEW_CHANNEL'),
-  }));
+  const channels = channelIds.map((id, i) => {
+    const cantView = !bots[i].has('VIEW_CHANNEL');
+    const lacks = cantView ? [] : WRITE_CAPS.filter((c) => !bots[i].has(c));
+    return {
+      id,
+      botBase: levelOf([...bots[i]]).base,
+      botCantView: cantView,
+      ...(lacks.length ? { botLacks: lacks } : {}),
+    };
+  });
   if (personaIds.length * channelIds.length > cellCap) {
     return { channels, personas: personaIds.map((id) => ({ id })), considered: personaIds.length, truncated: true };
   }

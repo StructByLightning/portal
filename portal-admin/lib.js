@@ -9,11 +9,13 @@
  *   adoptModel                         take the relay's own copy from /admin/me
  *   levelOf, levelLabel, capsSummary   caps → 'Write', 'Write +1', 'Custom'
  *   capsTitle, capsWords               the same in words (tooltips)
- *   isGrantableType                    which channels can hold a direct grant
+ *   isGrantableType, holdsAccess       which channels can hold a direct grant; which
+ *                                      have access of their own (any kind but a thread or category)
  *   effectNowText, remainingText,      what the relay lets a persona do after a
  *   guildEffectText, botLimitText      change ('Read — the relay bot can’t send in #welcome')
  *   channelLayout, filterLayout,       the Channels list in Discord's order, its
- *   countsText, botListNote            counts and warnings in words
+ *   countsText, botListNote,           counts and warnings in words
+ *   botListTitle
  *   sourceChips, pillText,             a channel drawer row: why, and what it can do
  *   directValue, canBlock,
  *   customOptionText
@@ -211,6 +213,13 @@
     return type === 'text' || type === 'voice' || type === 'forum';
   }
 
+  /** Channels with access of their own (as access.ts holdsAccess): every kind
+   *  but a thread and a category — the grantable ones, and kinds the relay
+   *  doesn't name (a stage or media channel), which it serves all the same. */
+  function holdsAccess(type) {
+    return type !== 'thread' && type !== 'category';
+  }
+
   // ── What a change leaves a persona with ───────────────────────────────────
   // From the relay's answer to a grant change (`effective`): its own account
   // of what the persona can do there now, within what its bot can do.
@@ -339,12 +348,29 @@
   }
 
   /** The list's warning for a channel whose bot can't do everything Write
-   *  needs: 'relay can only read here'. Null when it can (or can't see the
-   *  channel at all: those are listed apart). */
+   *  needs, from what it lacks (the summary's botLacks): 'relay can only read
+   *  here' when it can't send, else 'relay is limited here'. Null when it
+   *  can (or can't see the channel at all: those are listed apart). An older
+   *  relay says only the bot's level: below Write is 'limited' — it can't
+   *  tell a bot that can't send from one that only can't start threads. */
   function botListNote(s) {
     if (!s || s.botCantView || s.botBase === undefined) return null;
+    if (Array.isArray(s.botLacks)) {
+      if (!s.botLacks.length) return null;
+      return s.botLacks.includes('SEND_MESSAGES') ? 'relay can only read here' : 'relay is limited here';
+    }
     if (s.botBase === 'write' || s.botBase === 'full') return null;
-    return s.botBase === 'read' ? 'relay can only read here' : 'relay is limited here';
+    return 'relay is limited here';
+  }
+
+  /** That warning's tooltip: what the bot can't do, as the channel drawer's
+   *  banner says it. */
+  function botListTitle(s) {
+    const lacks = s && Array.isArray(s.botLacks) ? s.botLacks : null;
+    if (!lacks || !lacks.length) return 'The relay’s bot can’t do everything Write needs in this channel.';
+    const t = lacks.includes('SEND_MESSAGES') ? 'The relay bot can only Read here — anything above Read does nothing until the bot gets Send Messages in this channel.'
+      : botLimitText(lacks, 'this channel') + ', so Write and Full do only what it can.';
+    return t.charAt(0).toUpperCase() + t.slice(1);
   }
 
   /** The channel drawer's banner when the relay's bot can't do everything
@@ -380,13 +406,16 @@
   /**
    * The Channels list, from GET …/channels ({channels, categories}) and
    * …/access/summary, in Discord's order: channels outside any category
-   * first, then each category by position. Only channels that can hold
-   * access are listed — never a thread (it uses its channel's access), a
-   * category or an unknown kind — and those the relay's bot can't see go to
-   * `hidden`, in the same order.
+   * first, then each category by position. Every channel with access of
+   * its own is listed (holdsAccess) — never a thread (it uses its channel's
+   * access) or a category — a kind the panel can't give access on included
+   * (`grantable` false: the relay serves it, and roles, guild-wide levels and
+   * defaults reach it); those the relay's bot can't see go to `hidden`, in
+   * the same order.
    *   → { groups: [{ id, name, rows }], hidden: [rows], truncated, count }
-   * A row: { id, name, type, announcement, categoryId, categoryName, counts
-   * (null when unknown), total, botBase, botCantView }.
+   * A row: { id, name, type, grantable, announcement, categoryId,
+   * categoryName, counts (null when unknown), total, botBase, botCantView,
+   * botLacks }.
    */
   function channelLayout(chans, summary) {
     const all = (chans && chans.channels) || [];
@@ -397,16 +426,17 @@
     const catName = {};
     for (const c of cats) catName[c.id] = c.name || c.id;
     const rows = all
-      .filter((c) => (typeof c.grantable === 'boolean' ? c.grantable : isGrantableType(c.type)))
+      .filter((c) => holdsAccess(c.type))
       .map((c) => {
         const s = stats[c.id];
         const counts = s && s.counts && !truncated ? s.counts : null;
         const cat = c.categoryId && Object.prototype.hasOwnProperty.call(catName, c.categoryId) ? c.categoryId : null;
         return {
           id: c.id, name: c.name || null, type: c.type, announcement: !!c.announcement, position: c.position || 0,
+          grantable: typeof c.grantable === 'boolean' ? c.grantable : isGrantableType(c.type),
           categoryId: cat, categoryName: cat ? catName[cat] : null,
           counts, total: counts ? countsTotal(counts) : null,
-          botBase: s ? s.botBase : undefined, botCantView: !!(s && s.botCantView),
+          botBase: s ? s.botBase : undefined, botCantView: !!(s && s.botCantView), botLacks: s ? s.botLacks : undefined,
         };
       });
     const rank = { '': -1 };
@@ -433,19 +463,25 @@
   }
 
   /** A channel as a list or a drawer title names it: '#research', or
-   *  'lounge' / 'ideas' for a voice or forum channel (whose kind is a badge
-   *  beside it). */
+   *  'lounge' / 'ideas' for a voice or forum channel, or one of a kind the
+   *  panel doesn't name (whose kind is a badge beside it). */
   function channelTitle(c) {
     const name = (c && c.name) || (c && c.id) || '';
-    return c && (c.type === 'voice' || c.type === 'forum') ? name : '#' + name;
+    return c && (c.type === 'voice' || c.type === 'forum' || c.type === 'unknown') ? name : '#' + name;
   }
 
-  /** The badge beside a channel's name: 'announcement' · 'voice' · 'forum'. */
+  /** The badge beside a channel's name: 'announcement' · 'voice' · 'forum' ·
+   *  'other kind' (a stage or media channel, say: the relay calls those
+   *  unknown, and the panel can't give access on one). */
   function channelBadge(c) {
     if (!c) return null;
     if (c.announcement) return 'announcement';
+    if (c.type === 'unknown') return 'other kind';
     return c.type === 'voice' || c.type === 'forum' ? c.type : null;
   }
+
+  /** The tooltip of that 'other kind' badge. */
+  const OTHER_KIND_HELP = 'A kind of channel the panel can’t give access on (a stage or media channel, say). Access from access roles, guild-wide levels and defaults still applies here, and a direct grant set in Discord can be removed.';
 
   const SOURCE_ORDER = { removed: 0, direct: 1, block: 2, role: 3, guildWide: 4, personaDefault: 5, relayDefault: 6 };
 
@@ -902,6 +938,7 @@
       case 'category': return l.name + ' (category)';
       case 'voice': return l.name + ' (voice)';
       case 'forum': return l.name + ' (forum)';
+      case 'unknown': return l.name + ' (other kind)';
       case 'thread': return l.name + (l.parentName ? ' (thread in #' + l.parentName + ')' : ' (thread)');
       default: return '#' + l.name;
     }
@@ -1472,10 +1509,10 @@
 
   PA.lib = {
     LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS, adoptModel,
-    sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType,
+    sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType, holdsAccess,
     botLimitText, effectNowText, remainingText, guildEffectText,
-    countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
-    channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
+    countedLevel, countsTotal, countsText, countsFromRows, botListNote, botListTitle, botBannerText, agoText,
+    channelLayout, filterLayout, channelTitle, channelBadge, OTHER_KIND_HELP, sourceChips, pillText, directValue,
     ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, removeAgainText, customOptionText,
     UNDO_KEEPS_LIFT, removedSinceText, undoRefusedText, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
