@@ -525,6 +525,20 @@ function drawDrawer(d, gid, cid, data, note) {
   const where = lib.chanText(cid, names);
   const guild = env.guildName(gid);
   const rowOf = (pid) => rows.find((r) => r.personaId === pid) || null;
+  // Reads of the channel overlap with each other and with changes (only
+  // writes are queued). Each read, and each change's answer drawn into a row,
+  // takes the next number: a read that answers after a later read was drawn
+  // is dropped, and a row put in by a change made after a read was sent
+  // stays over that read's older one.
+  let seq = 0;
+  let drawnRead = 0;
+  const putAt = new Map(); // persona id → the number of the change drawn into its row
+  /** Where `row` goes in `list`: name order, as the relay sends them. */
+  const slotOf = (list, row) => {
+    const key = (r) => (r.displayName || r.personaId).toLowerCase();
+    const j = list.findIndex((r) => key(r) > key(row) || (key(r) === key(row) && r.personaId > row.personaId));
+    return j < 0 ? list.length : j;
+  };
   d.setTitle(lib.channelTitle(ch));
 
   // ── Header: where it is, Discord, the bot's limits ──
@@ -644,16 +658,12 @@ function drawDrawer(d, gid, cid, data, note) {
    *  went when it was turned off — the new row's control gets it. */
   function put(row, refocus) {
     if (!row) return;
+    putAt.set(row.personaId, ++seq);
     const i = rows.findIndex((r) => r.personaId === row.personaId);
     const oldTr = Array.from(tbody.children).find((n) => n.dataset && n.dataset.pid === row.personaId) || null;
     const tr = rowTr(row);
     if (i >= 0) rows[i] = row;
-    else {
-      const key = (r) => (r.displayName || r.personaId).toLowerCase();
-      let j = rows.findIndex((r) => key(r) > key(row) || (key(r) === key(row) && r.personaId > row.personaId));
-      if (j < 0) j = rows.length;
-      rows.splice(j, 0, row);
-    }
+    else rows.splice(slotOf(rows, row), 0, row);
     const a = document.activeElement;
     const lost = !a || a === document.body || !a.isConnected || (oldTr && oldTr.contains(a));
     if (oldTr) replaceNode(tbody, tr, oldTr);
@@ -674,14 +684,26 @@ function drawDrawer(d, gid, cid, data, note) {
   }
 
   /** Read the channel again (after "someone else changed this"): the rows,
-   *  the bot's limits, the names. Resolves whether it could. */
+   *  the bot's limits, the names. Resolves whether it could (true too when
+   *  a read sent after it is drawn already, and this older answer dropped). */
   async function reloadRows(pid) {
+    const mine = ++seq;
     try {
       const fresh = await env.api('GET', env.gpath(gid) + '/channels/' + encodeURIComponent(cid) + '/access');
       if (!d.isCurrent() || fresh.inert) return false;
-      rows = (fresh.rows || []).slice();
+      if (mine < drawnRead) return true;
+      drawnRead = mine;
+      // A row a change put in after this read was sent is newer than the read's.
+      const next = (fresh.rows || []).slice();
+      for (const r of rows) {
+        if ((putAt.get(r.personaId) || 0) < mine) continue;
+        const i = next.findIndex((x) => x.personaId === r.personaId);
+        if (i >= 0) next[i] = r;
+        else next.splice(slotOf(next, r), 0, r);
+      }
+      rows = next;
       botCaps = fresh.botCaps || [];
-      names = fresh.names || names;
+      learnNames(fresh);
       if (patchSummary(gid, cid, rows, false)) env.markStale();
       const a = document.activeElement;
       const lost = !a || a === document.body || !a.isConnected;

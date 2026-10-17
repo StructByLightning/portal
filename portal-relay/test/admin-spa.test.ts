@@ -3763,7 +3763,7 @@ test('ui.toast: an Undo toast runs its action once, then goes; it stays while fo
  *  `handle`. Personas: aria, cass, quill, sol (with access), nyx (none).
  *  `directory`: what the persona directory holds (default: Nyx, Juniper);
  *  `roleNames`: the Discord roles the access read names (default: @Mods). */
-async function channelsPanel(url: string, opts: { handle?: FakeHandler; research?: any[]; local?: Record<string, string>; session?: Record<string, string>; routes?: Record<string, unknown>; botCaps?: string[]; directory?: any[]; roleNames?: Record<string, unknown> } = {}) {
+async function channelsPanel(url: string, opts: { handle?: FakeHandler; research?: any[]; local?: Record<string, string>; session?: Record<string, string>; routes?: Record<string, unknown>; botCaps?: string[]; directory?: any[]; roleNames?: Record<string, unknown>; readGate?: () => Promise<void> | null } = {}) {
   const g = '/admin/g/' + GA;
   const state = { research: opts.research ?? RESEARCH_ROWS() };
   const access = () => ({
@@ -3781,8 +3781,15 @@ async function channelsPanel(url: string, opts: { handle?: FakeHandler; research
       [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
       ...opts.routes,
     },
-    handle: (method, path, body, headers) => {
-      if (method === 'GET' && path === g + '/channels/' + CH.research + '/access') return access();
+    handle: async (method, path, body, headers) => {
+      if (method === 'GET' && path === g + '/channels/' + CH.research + '/access') {
+        // readGate: the read is answered as the channel is now, but only once the gate opens.
+        const held = opts.readGate?.();
+        if (!held) return access();
+        const now = JSON.parse(JSON.stringify(access()));
+        await held;
+        return now;
+      }
       if (method === 'GET' && path.startsWith(g + '/persona-directory')) {
         const sp = new URL(path, 'http://panel.invalid').searchParams;
         const q = sp.get('q') ?? '';
@@ -5840,4 +5847,78 @@ test('channel drawer: personas picked while an Add is being saved stay picked an
   doc.press('Escape');
   await settle();
   assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?');
+});
+
+test('persona drawer: a read that answers after a newer one was drawn is dropped — two row changes, their reads crossing', async () => {
+  let release!: () => void;
+  let holdNext = false;
+  const ref: { world?: { rows: any[]; roles: any[] } } = {};
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    handle: async (method, path) => {
+      if (method !== 'GET' || path !== '/admin/g/' + GA + '/personas/aria/access' || !holdNext) return undefined;
+      holdNext = false;
+      // Answered as the persona is now, but only once released.
+      const now = accessBody({ rows: JSON.parse(JSON.stringify(ref.world!.rows)), roles: ref.world!.roles });
+      await new Promise<void>((r) => { release = r; });
+      return now;
+    },
+  });
+  ref.world = box.world;
+  const { setDirectIn, tr } = box;
+  holdNext = true;
+  setDirectIn(CH.general, 'read'); // saved; the read after it is slow
+  await settle();
+  setDirectIn(CH.research, 'full'); // saved; the read after it answers at once
+  await settle();
+  assert.equal(tr(CH.research).querySelector('select')!.value, 'full', 'the newer read is drawn');
+  release(); // the older read answers last: from before #research changed
+  await settle();
+  assert.equal(tr(CH.research).querySelector('select')!.value, 'full', 'not drawn over by the older read');
+  assert.match(tr(CH.research).textContent, /Full/, 'what it can do there is the newer read’s');
+  assert.equal(tr(CH.general).querySelector('select')!.value, 'read');
+  assert.match(box.body.querySelector('.persona-summary')!.textContent, /Full in 1/, 'the counts are the newer read’s: ' + box.body.querySelector('.persona-summary')!.textContent);
+});
+
+test('channel drawer: a read of the channel is not drawn over a newer read, nor over a row a later change put in', async () => {
+  let gate: Promise<void> | null = null;
+  let release!: () => void;
+  const hold = () => { gate = new Promise<void>((r) => { release = r; }); };
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    readGate: () => gate,
+    handle: (method, path) => {
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/aria/grants') return refuse(409, 'CONFLICT', 'changed', { current: R7 });
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/sol/grants') return refuse(409, 'CONFLICT', 'changed', { current: null });
+      if (method === 'PUT' && path === '/admin/g/' + GA + '/personas/cass/grants') return echo(W7, [{ kind: 'direct', caps: W7 }, { kind: 'guildWide', caps: R7, shadowedBy: 'direct' }], W7);
+      return undefined;
+    },
+  });
+  const { rowLink, tr, pick, state } = box;
+  rowLink(CH.research).click();
+  await settle();
+  // A change: Aria's is refused as changed meanwhile, so the channel is read
+  // again (slowly); Cass's, made meanwhile, puts the relay's answer in its row.
+  hold();
+  pick('aria', 'full');
+  await settle();
+  gate = null;
+  pick('cass', 'write');
+  await settle();
+  assert.equal(tr('cass').querySelector('select')!.value, 'write', 'Cass’s row is the answer to its change');
+  release(); // the read sent before Cass's change answers now: Cass at Read
+  await settle();
+  assert.equal(tr('cass').querySelector('select')!.value, 'write', 'the change made after the read was sent stays');
+  assert.match(tr('cass').textContent, /Write/);
+
+  // Two reads: the first (slow) one answers after the second was drawn.
+  hold();
+  pick('aria', 'full');
+  await settle();
+  gate = null;
+  state.research = state.research.map((r: any) => (r.personaId === 'sol' ? accessRow('sol', 'Sol', F7, [roleSrc('g1-mods', F7)]) : r));
+  pick('sol', 'write'); // refused as changed meanwhile: read again, at once — Sol is Full now
+  await settle();
+  assert.match(tr('sol').textContent, /Full/, 'the newer read is drawn');
+  release();
+  await settle();
+  assert.match(tr('sol').textContent, /Full/, 'not drawn over by the older read');
 });

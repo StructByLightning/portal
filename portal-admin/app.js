@@ -1703,6 +1703,12 @@ function personaModel(ctx, access, meta) {
   const busyFns = [];
   let pending = 0;
   let idleWaiters = [];
+  // Reads overlap (only writes are queued): each is numbered as it is sent,
+  // and one that answers after a later one was drawn is dropped. Every
+  // change reads again after it is saved, so the newest read is always one
+  // sent after the newest change.
+  let reads = 0;
+  let drawnRead = 0;
   const m = {
     access,
     meta,
@@ -1740,10 +1746,15 @@ function personaModel(ctx, access, meta) {
       m.names = namesOf(a);
       for (const fn of draws) fn(a);
     },
-    /** Read the persona's access again; resolves true once redrawn. */
+    /** Read the persona's access again; resolves true once the drawer shows
+     *  it, or a read sent after it (this one's answer, older, is dropped). */
     async reload() {
+      const mine = ++reads;
       const a = await api('GET', m.path + '/access');
-      if (ctx.drawer.isCurrent()) m.set(a);
+      if (ctx.drawer.isCurrent() && mine > drawnRead) {
+        drawnRead = mine;
+        m.set(a);
+      }
       return true;
     },
     rowOf: (cid) => (m.access.rows || []).find((r) => r.channelId === cid) || null,
