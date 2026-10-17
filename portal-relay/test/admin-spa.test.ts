@@ -899,6 +899,13 @@ class Refusal {
 /** The relay's refusal: {error: {code, message, …extra}} with an HTTP status. */
 const refuse = (status: number, code: string, message = code, extra: Record<string, unknown> = {}) => new Refusal(status, { code, message, ...extra });
 
+/** An answer that isn't the relay's: the proxy in front of it (Caddy) with
+ *  an empty 502/503/504 when the relay went away mid-request or isn't there. */
+class ProxyAnswer {
+  constructor(public status: number, public text = '') {}
+}
+const proxy = (status: number, text = '') => new ProxyAnswer(status, text);
+
 /** A sandbox with index.html's shell, signed in as a one-guild admin. Every
  *  request lands in `calls` as 'METHOD /path?query', and every JSON body sent
  *  in `bodies`. `routes` adds or replaces GET answers by path. */
@@ -939,6 +946,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
       // refuse(status, code, message, extra) answers as the relay refuses.
       if (body instanceof Refusal) return { status: body.status, ok: false, text: async () => JSON.stringify({ error: body.error }) };
+      if (body instanceof ProxyAnswer) return { status: body.status, ok: false, text: async () => body.text };
       return { status: 200, ok: true, text: async () => JSON.stringify(body) };
     },
   });
@@ -1696,7 +1704,26 @@ test('lib.errorText: the relay’s refusal codes in the copy guide’s words', (
     assert.equal(t({ code: 'NETWORK', status: 0, method }, 'Not minted'),
       'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.',
       'a change whose answer was lost may have been made: ' + method);
+    // Behind Caddy the lost answer is the proxy's 502/504 (503 with the relay
+    // down), with no relay error body: just as unconfirmed.
+    for (const status of [500, 502, 503, 504]) {
+      assert.equal(t({ status, message: 'HTTP ' + status, method }, 'Not minted'),
+        'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.',
+        `the proxy's ${status} to a change: ${method}`);
+    }
+    // The relay's own INTERNAL error can come after the change was stored.
+    assert.equal(t({ code: 'INTERNAL', status: 500, message: 'internal error', method }, 'Not minted'),
+      'The relay ran into an error, so this change may or may not have been made. Reload the page and check before you try again.',
+      'an internal error on a change: ' + method);
   }
+  for (const status of [502, 503, 504]) {
+    assert.equal(t({ status, message: 'HTTP ' + status, method: 'GET' }), 'Couldn’t reach the relay. Nothing was changed. Try again.', `the proxy's ${status} to a read`);
+  }
+  assert.equal(t({ code: 'INTERNAL', status: 500, message: 'internal error', method: 'GET' }, 'Not created'), 'Not created: internal error.', 'a read changed nothing');
+  // A refusal the relay answered with its own code is a refusal, 5xx or not.
+  assert.equal(t({ code: 'UNAVAILABLE', status: 503, message: 'avatar uploads not configured (set PORTAL_AVATAR_DIR)', method: 'POST' }, 'Not uploaded'),
+    'Not uploaded: avatar uploads not configured (set PORTAL_AVATAR_DIR).');
+  assert.equal(t({ code: 'INVALID', status: 400, message: 'bad', method: 'POST' }), 'Not saved: bad.');
   assert.equal(t({ code: 'FORBIDDEN', status: 403, reason: 'NOT_GUILD_ADMIN', message: 'not an admin of this guild' }),
     'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
   assert.equal(t({ code: 'FORBIDDEN', status: 403, message: 'channel is not in this guild' }), 'Not saved: channel is not in this guild.', 'a route’s own refusal says what it is');
@@ -3130,6 +3157,37 @@ test('session: a change whose answer never came says it may have been made, not 
   const line = form.querySelector('.status-line')!;
   assert.equal(line.textContent, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.');
   assert.ok(!/Nothing was changed|Try again\./.test(line.textContent), 'never “try again” as if nothing happened');
+});
+
+test('session: behind the proxy, a change whose answer was lost (an empty 502/504) says it may have been made', async () => {
+  const g = '#/g/' + GA;
+  for (const status of [502, 503, 504]) {
+    let down = false;
+    const box = await panelAt('/' + g + '/invites/new', {
+      me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+      // The relay took the mint and went away before answering: Caddy answers.
+      handle: (method) => (down && method === 'POST' ? proxy(status) : undefined),
+    });
+    const form = fillMint(box.doc, 'x', 'g1-readers');
+    down = true;
+    form.fire('submit');
+    await settle();
+    assert.ok(box.calls.includes(`POST /admin/g/${GA}/invites`), 'the mint was sent');
+    const line = form.querySelector('.status-line')!.textContent;
+    assert.equal(line, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.', String(status));
+    assert.ok(!/Not minted|HTTP/.test(line), `never “Not minted: HTTP ${status}”`);
+  }
+});
+
+test('session: behind the proxy, a read answered by an empty 502 says the relay couldn’t be reached', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/invites', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method, path) => (method === 'GET' && path.startsWith(`/admin/g/${GA}/invites`) ? proxy(502, '<html>Bad Gateway</html>') : undefined),
+  });
+  const view = box.doc.getElementById('view')!;
+  assert.match(view.textContent, /Couldn’t reach the relay to load this list\. Try again\./);
+  assert.ok(!/HTTP 502|Bad Gateway/.test(view.textContent));
 });
 
 test('mint: a label changed while the invite is being minted stays unsaved; Mint another shows it', async () => {

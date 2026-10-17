@@ -202,7 +202,7 @@ function notDone(e, prefix = 'Not saved', ctx) {
 
 /** A failed read, as a line: 'Couldn’t load <what>: <reason>.' */
 function couldntLoad(what, e) {
-  if (e && e.code === 'NETWORK') return 'Couldn’t reach the relay to load ' + what + '. Try again.';
+  if (lib.noAnswer(e)) return 'Couldn’t reach the relay to load ' + what + '. Try again.';
   if (e && e.status === 403 && e.code === 'FORBIDDEN') return NOT_GUILD_ADMIN;
   const why = String((e && e.message) || 'something went wrong').trim().replace(/[.\s]+$/, '');
   return 'Couldn’t load ' + what + ': ' + why + '.';
