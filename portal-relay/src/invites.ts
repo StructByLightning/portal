@@ -186,12 +186,12 @@ export class InviteStore {
 
   // ── Mutations (persist) — RFC-005 admin API ──
 
-  /** Add a new invite template. Throws on duplicate code, and on a uses or
-   *  maxUses that isn't finite, which the save would drop. Returns it. */
+  /** Add a new invite template. Throws on duplicate code. Returns it. A
+   *  template the save can't keep (an expiry that isn't a date or passed more
+   *  than 24h ago, a uses or maxUses that isn't finite) is dropped by this
+   *  mint's own save (prune), so its code is unknown at once. */
   mint(template: InviteTemplate): InviteTemplate {
     if (this.byCode.has(template.code)) throw new Error(`duplicate invite code ${template.code}`);
-    const unwritable = nonFiniteCount(template);
-    if (unwritable) throw new Error(`invite ${unwritable} must be a finite number`);
     const inv = { uses: 0, ...template };
     this.byCode.set(inv.code, inv);
     this.persist();
@@ -224,7 +224,7 @@ export class InviteStore {
     const bad = [...byCode.values()]
       .map((i) => [i, inviteShapeProblem(i)] as const)
       .filter(([, why]) => why)
-      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why}${nonFiniteCount(i) ? ', and the next save drops it' : ''})`);
+      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why}${nonFiniteCount(i) ? ", and the relay's next save drops it" : ''})`);
     if (bad.length) {
       console.error(`[portal-relay] invites: ${bad.length} invite(s) will be refused: ${bad.join('; ')}`);
     }
@@ -246,8 +246,8 @@ export class InviteStore {
    * expiresAt that isn't a date (expiryOf's NaN: a value that isn't a string,
    * or a string Date.parse can't read) counts as long expired (fail closed,
    * matches check). An invite whose uses or maxUses is a number that isn't
-   * finite goes too: JSON would write it as null, which reads otherwise (a
-   * null uses as 0), so the refusal it gets as loaded would lapse.
+   * finite goes too, since JSON can't write either as read: it would write
+   * null, and a null uses reads as 0, which would end the invite's refusal.
    */
   private prune(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;

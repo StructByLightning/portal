@@ -467,7 +467,8 @@ for (const [code, fields, why] of MALFORMED_FIELDS) {
 }
 
 // JSON reads 1e400 as Infinity, which a save would write as null. Loaded from a hand edit, such an invite is refused
-// by name until the relay's next save drops it; a mint would refuse it, so the invite is written to the file and reloaded.
+// by name until the relay's next save drops it; a mint's own save would drop it, so the invite is written to the file
+// and reloaded.
 for (const [code, field, why] of [
   ['count-infinite', '"maxUses":1e400', /^invite maxUses must be a finite number above 0 — whoever minted it must mint a new one$/],
   ['uses-infinite', '"uses":1e400', /^invite uses must be a finite number — whoever minted it must mint a new one$/],
@@ -483,7 +484,9 @@ for (const [code, field, why] of [
       const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, code));
       assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ enrolled, claimed }));
       assert.equal(t.relay.identity.all().length - count, 0, 'no persona created');
-      assert.equal(t.relay.invites.get(code)?.uses, code === 'uses-infinite' ? Infinity : undefined, 'no use spent');
+      // A use saves, and the save drops this invite, so one still held shows no use was spent.
+      assert.ok(t.relay.invites.get(code), 'nothing saved, so no use spent');
+      assert.equal(t.relay.invites.get(code)?.uses, code === 'uses-infinite' ? Infinity : undefined, 'its uses as loaded');
     } finally {
       t.cleanup();
     }
