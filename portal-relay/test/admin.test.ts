@@ -2624,6 +2624,22 @@ for (const [body, field] of MINT_REFUSED) {
   });
 }
 
+test('invites: a mint whose maxUses JSON reads as infinite, 1e400, is refused by name and stores nothing', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const before = storeBytes(ctx.dir);
+    // Sent as text, since JSON.stringify would send Infinity as null, which the route leaves out.
+    const r = await s.call('POST', '/admin/g/G1/invites', undefined, { raw: Buffer.from('{"roles":["r-g1"],"maxUses":1e400}'), type: 'application/json' });
+    assert.equal(r.status, 400, JSON.stringify(r.body));
+    assert.equal(r.body.error.code, 'INVALID', JSON.stringify(r.body));
+    assert.match(r.body.error.message, /invite maxUses must be a finite number above 0/, JSON.stringify(r.body));
+    assert.deepEqual(storeBytes(ctx.dir), before, 'nothing stored, nothing audited');
+  } finally {
+    await s.close();
+  }
+});
+
 test('invites: a mint with a fractional count is stored, as it reads', async () => {
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);

@@ -134,20 +134,20 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['roles-blank', { roles: '' }, 'invite roles must be a list of access role names'],
     ['roles-zero', { roles: 0 }, 'invite roles must be a list of access role names'],
     ['roles-false', { roles: false }, 'invite roles must be a list of access role names'],
-    ['uses-blank', { uses: '' }, 'invite uses must be a number'],
-    ['count-blank', { maxUses: '' }, 'invite maxUses must be a number above 0'],
+    ['uses-blank', { uses: '' }, 'invite uses must be a finite number'],
+    ['count-blank', { maxUses: '' }, 'invite maxUses must be a finite number above 0'],
     ['subs-mixed', { subscriptions: ['c1', 5] }, 'invite subscriptions must be a list of channel ids'],
     ['caps-mixed', { caps: ['SEND_MESSAGES', 5] }, 'invite caps must be a list of capabilities'],
     ['grant-zero', { grant: 0 }, 'invite grant must be an object, { caps, scope }'],
     ['grant-blank', { grant: '' }, 'invite grant must be an object, { caps, scope }'],
     ['caps-number', { roles: undefined, caps: 5 }, 'invite caps must be a list of capabilities'],
     ['caps-text', { roles: undefined, caps: 'VIEW_CHANNEL' }, 'invite caps must be a list of capabilities'],
-    ['uses-word', { uses: 'x' }, 'invite uses must be a number'],
-    ['count-word', { maxUses: 'one' }, 'invite maxUses must be a number above 0'],
-    ['count-text', { maxUses: '5' }, 'invite maxUses must be a number above 0'],
-    ['count-zero', { maxUses: 0 }, 'invite maxUses must be a number above 0'],
-    ['count-negative', { maxUses: -1 }, 'invite maxUses must be a number above 0'],
-    ['count-null', { maxUses: null }, 'invite maxUses must be a number above 0'],
+    ['uses-word', { uses: 'x' }, 'invite uses must be a finite number'],
+    ['count-word', { maxUses: 'one' }, 'invite maxUses must be a finite number above 0'],
+    ['count-text', { maxUses: '5' }, 'invite maxUses must be a finite number above 0'],
+    ['count-zero', { maxUses: 0 }, 'invite maxUses must be a finite number above 0'],
+    ['count-negative', { maxUses: -1 }, 'invite maxUses must be a finite number above 0'],
+    ['count-null', { maxUses: null }, 'invite maxUses must be a finite number above 0'],
     ['expiry-number', { expiresAt: 2030 }, "invite expiresAt isn't a date, so it reads as expired and the next save drops it"],
     ['expiry-word', { expiresAt: 'tomorrow' }, "invite expiresAt isn't a date, so it reads as expired and the next save drops it"],
   ];
@@ -180,4 +180,24 @@ test('loading names each invite a claim would refuse, with the field; null reads
   for (const [code, , why] of refused) assert.ok(line.includes(`${code} (${why})`), `${code}: ${line}`);
   for (const [code] of kept) assert.ok(!line.includes(`${code} (`), `${code}: ${line}`);
   rmSync(path, { force: true });
+});
+
+test('loading names a count or uses that JSON reads as infinite, which a save would write as null', (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, 'error', (...a: unknown[]) => { errors.push(a.map(String).join(' ')); });
+  const dir = mkdtempSync(join(tmpdir(), 'portal-invites-'));
+  const path = join(dir, 'invites.json');
+  // Written as text, since JSON.stringify would write Infinity as null.
+  const invite = (code: string, field: string) => `{"code":"${code}","label":"${code}","guildId":"g1","roles":["r"],${field}}`;
+  writeFileSync(path, `{"invites":[${[
+    invite('count-infinite', '"maxUses":1e400'),
+    invite('uses-infinite', '"uses":1e400'),
+    invite('uses-minus-infinite', '"uses":-1e400'),
+  ].join(',')}]}`);
+  new InviteStore(path);
+  const line = errors.find((l) => /will be refused/.test(l)) ?? '';
+  assert.ok(line.includes('count-infinite (invite maxUses must be a finite number above 0)'), line);
+  assert.ok(line.includes('uses-infinite (invite uses must be a finite number)'), line);
+  assert.ok(line.includes('uses-minus-infinite (invite uses must be a finite number)'), line);
+  rmSync(dir, { recursive: true, force: true });
 });

@@ -75,7 +75,9 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * `roles`, '', 0 and false would throw where enroll and a claim read the
  * list, and in `uses` and `maxUses` '' would grow as text or exhaust the
  * invite, so they are refused there. A `grant` that is there must be an
- * object, so '', 0 and false are refused there too.
+ * object, so '', 0 and false are refused there too. A `uses` or `maxUses`
+ * that isn't finite, such as JSON's 1e400, is refused as well: a save writes
+ * it as null, so it would read one way until a reload and another after.
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
@@ -89,7 +91,7 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
     ['caps', strings, 'must be a list of capabilities', true],
     ['roles', strings, 'must be a list of access role names'],
     ['subscriptions', strings, 'must be a list of channel ids', true],
-    ['uses', (v) => typeof v === 'number' || v === false, 'must be a number'],
+    ['uses', (v) => (typeof v === 'number' && Number.isFinite(v)) || v === false, 'must be a finite number'],
   ];
   for (const [field, ok, why, blankIsNone] of checks) {
     const v = f[field];
@@ -101,8 +103,8 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
   if (f.grant !== undefined && f.grant !== null && (typeof f.grant !== 'object' || Array.isArray(f.grant))) {
     return 'invite grant must be an object, { caps, scope }';
   }
-  if (f.maxUses !== undefined && !(typeof f.maxUses === 'number' && f.maxUses > 0)) {
-    return 'invite maxUses must be a number above 0';
+  if (f.maxUses !== undefined && !(typeof f.maxUses === 'number' && Number.isFinite(f.maxUses) && f.maxUses > 0)) {
+    return 'invite maxUses must be a finite number above 0';
   }
   // check() already refuses such an expiry; this names it at load, since the
   // next save drops it with the expired invites.

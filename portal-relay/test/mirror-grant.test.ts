@@ -422,9 +422,9 @@ const MIRROR_GRANT = { caps: [...RW], scope: { mirrorRole: DISCORD_ROLE } };
 const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
   ['roles-string', { roles: 'reader' }, /invite roles must be a list of access role names/],
   ['guildId-number', { guildId: 7, grant: { caps: [...RW], scope: { channels: [CHAN_A] } } }, /invite guildId must be a string/],
-  ['maxUses-word', { maxUses: 'one' }, /invite maxUses must be a number above 0/],
-  ['maxUses-text', { maxUses: '5' }, /invite maxUses must be a number above 0/],
-  ['uses-word', { uses: 'x', maxUses: 1 }, /invite uses must be a number/],
+  ['maxUses-word', { maxUses: 'one' }, /invite maxUses must be a finite number above 0/],
+  ['maxUses-text', { maxUses: '5' }, /invite maxUses must be a finite number above 0/],
+  ['uses-word', { uses: 'x', maxUses: 1 }, /invite uses must be a finite number/],
   ['prefix-number', { namePrefix: 7 }, /invite namePrefix must be a string/],
   ['subs-mixed', { subscriptions: [CHAN_A, 42] }, /invite subscriptions must be a list of channel ids/],
   ['caps-mixed', { grant: undefined, caps: ['SEND_MESSAGES', 5] }, /invite caps must be a list of capabilities/],
@@ -440,6 +440,9 @@ const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
   ['caps-object', { grant: undefined, caps: { SEND_MESSAGES: true } }, /invite caps must be a list of capabilities/],
   // A machine mint's recheck reads the grant, so the shape comes first.
   ['mint-scope-null', { mintedBy: EXISTING, grant: { caps: [...RW], scope: null } }, /invite grant scope must be exactly one/],
+  // JSON reads 1e400 as Infinity, and a save writes it as null, so it reads one way until a reload and another after.
+  ['maxUses-infinite', { maxUses: Infinity }, /invite maxUses must be a finite number above 0/],
+  ['uses-infinite', { uses: Infinity }, /invite uses must be a finite number/],
 ];
 for (const [code, fields, why] of MALFORMED_FIELDS) {
   test(`invite ${code}: enroll and claim refuse it by name, before anything is created or spent`, async () => {
