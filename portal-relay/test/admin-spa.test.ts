@@ -6031,7 +6031,7 @@ test('session: a Custom… edit not applied is kept across Sign in again — it 
   const draft = JSON.parse(box.sessionStore.getItem('pa.draft')!);
   assert.equal(draft.form, 'dgCustom');
   const caps = ALL_CAPS.filter((x) => [...W8, 'MENTION_EVERYONE'].includes(x));
-  assert.deepEqual(draft.fields, { personaId: 'aria', channelId: CH.research, caps });
+  assert.deepEqual(draft.fields, { personaId: 'aria', channelId: CH.research, caps, base: W8 }, 'whose, where, the ticks, and the grant the edit started over');
   for (const [who, kept] of [['sol', false], ['aria', true]] as const) {
     const back = await personaPanel('/' + g + '/personas/p/aria', { session: { 'pa.draft': JSON.stringify({ ...draft, fields: { ...draft.fields, personaId: who } }) } });
     const c = customIn(back.tr(CH.research));
