@@ -640,16 +640,16 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
  *  admin API allows exactly one scope key and a boolean `mirrorCaps`, and a
  *  mirror grant materializes one key. Every reader takes `mirrorCaps` by its
  *  truth, so a string reads as on whatever it says, "false" included, and so
- *  do a list and an object, which no writer means; a number reads as a
- *  writer means by 0 or 1. A scope or caps that name nothing make a role
- *  that grants nothing, which is a role still (roleGrantsAccess). Readers
- *  don't share one order over a scope's keys (with `mirrorCaps`,
- *  resolveForRoles reads the mirror keys before `all`), so a scope with two
- *  keys reads one way in one place and another way in the next. Read as
- *  found, a scope that is null or not an object throws whenever a persona
- *  holding the role is resolved, caps of a number throw where the role
- *  reaches, a caps string is read a character at a time, and channels as a
- *  string match channel ids as substrings. */
+ *  do a list and an object, which no writer means; a number reads by its
+ *  truth, as a writer who means 0 for off and anything else for on means it.
+ *  A scope or caps that name nothing make a role that grants nothing, which
+ *  is a role still (roleGrantsAccess). Readers don't share one order over a
+ *  scope's keys (with `mirrorCaps`, resolveForRoles reads the mirror keys
+ *  before `all`), so a scope with two keys reads one way in one place and
+ *  another way in the next. Read as found, a scope that is null or not an
+ *  object throws whenever a persona holding the role is resolved, caps of a
+ *  number throw where the role reaches, a caps string is read a character at
+ *  a time, and channels as a string match channel ids as substrings. */
 export function roleShapeProblem(role: AccessRole): string | null {
   const r = role as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');

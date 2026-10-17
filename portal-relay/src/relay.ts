@@ -105,8 +105,9 @@ function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
 /** Why a register frame's own fields can't be used, or null. A name or an
  *  avatar that isn't a string would throw mid-enroll or be stored as sent, and
  *  subscriptions that aren't a list of channel ids would throw or be read a
- *  character at a time. An empty or false name, avatar or subscriptions means
- *  none: the default name, as it always has, no avatar and no subscriptions.
+ *  character at a time. An empty or false name, avatar or subscriptions ('',
+ *  0, false or null) means none: the default name, as it always has, no avatar
+ *  and no subscriptions.
  *  Checked before anything is read or created. */
 function registerFieldProblem(d: RegisterData): string | null {
   const f = d as unknown as Record<string, unknown>;
@@ -737,7 +738,7 @@ export class Relay implements GatewayHooks {
     this.invites.consume(d.invite);
 
     // Carry the invite's default subscriptions through to this session. The
-    // frame's own are a list, or empty or false for none: registerFieldProblem
+    // frame's own are a list, or '', 0, false or null for none: registerFieldProblem
     // lets those through.
     if (checked.subscriptions?.length) {
       d.subscriptions = [...new Set([...(d.subscriptions || []), ...checked.subscriptions])];
@@ -855,8 +856,9 @@ export class Relay implements GatewayHooks {
       return name;
     }
     // A role set aside at load under this name is replaced: the name is a
-    // digest of the grant's guild, roles and caps, so this is the role it
-    // stands for. The log keeps what was there, for the relay's operator.
+    // digest of the grant's guild, roles and caps, so the entry was this
+    // grant's role unless a hand edit changed it. The log keeps what was
+    // there, for the relay's operator.
     if (this.permissions.isQuarantined(name)) {
       console.warn(`[portal-relay] mirror grant ${name}: replacing the entry set aside at load, which was ${JSON.stringify(this.permissions.quarantinedEntry(name))}`);
     }
@@ -876,7 +878,7 @@ export class Relay implements GatewayHooks {
   private inviteGrantProblem(inv: InviteTemplate): string | null {
     // The claimant can't change a stored invite, so the refusal says who can.
     const shape = inviteShapeProblem(inv);
-    if (shape) return `${shape} — it must be re-minted`;
+    if (shape) return `${shape} — whoever minted it must mint a new one`;
     // A role name that resolves to nothing is refused, not stored: a name
     // left on a persona would come alive if a role of that name were created
     // later — possibly in another guild, by someone the invite's minter
@@ -886,12 +888,12 @@ export class Relay implements GatewayHooks {
     const unreadable = missing.filter((r) => this.permissions.isQuarantined(r));
     const gone = missing.filter((r) => !this.permissions.isQuarantined(r));
     if (unreadable.length && gone.length) {
-      return `invite names access role(s) that can't be read: ${unreadable.join(', ')}, which the relay's operator must fix, and that no longer exist: ${gone.join(', ')}, so it must be re-minted`;
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')}, which the relay's operator must fix, and that no longer exist: ${gone.join(', ')}, so whoever minted it must mint a new one`;
     }
     if (unreadable.length) {
       return `invite names access role(s) that can't be read: ${unreadable.join(', ')} — the relay's operator must fix them`;
     }
-    if (gone.length) return `invite names access role(s) that no longer exist: ${gone.join(', ')} — it must be re-minted`;
+    if (gone.length) return `invite names access role(s) that no longer exist: ${gone.join(', ')} — whoever minted it must mint a new one`;
     const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
     if (!grant || !inv.guildId) return null;
     if (isMirrorScope(grant.scope)) {
@@ -1117,7 +1119,7 @@ export class Relay implements GatewayHooks {
     // "mint-only" would be false for it.
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
       const mode = inviteModeProblem(checked);
-      if (mode) throw rpcError('INVALID_PARAMS', `${mode} — it must be re-minted`);
+      if (mode) throw rpcError('INVALID_PARAMS', `${mode} — whoever minted it must mint a new one`);
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
     // Roles AND grant: an /invite carries roles plus a direct grant on the

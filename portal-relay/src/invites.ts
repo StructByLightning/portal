@@ -18,8 +18,8 @@ import { WatchedFile } from './file-watch.js';
  * written, or null. A grant needs a guild (every scope resolves inside one),
  * at least one capability, and exactly one scope: a non-empty channel list,
  * one or more Discord roles to mirror, or `all: true`. Enroll and claim refuse
- * such an invite before anything is created or consumed, saying it must be
- * re-minted; loading warns.
+ * such an invite before anything is created or consumed, saying whoever
+ * minted it must mint a new one; loading warns.
  */
 export function grantShapeProblem(inv: InviteTemplate): string | null {
   const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true as const } } : undefined);
@@ -45,11 +45,15 @@ export function grantShapeProblem(inv: InviteTemplate): string | null {
 const isMode = (v: unknown) => v === 'mint' || v === 'augment' || v === 'both';
 const MODE_RULE = 'must be "mint", "augment" or "both"';
 
-/** Why an invite's mode can't be read, or null. None (absent, null or '')
- *  reads as "mint", as it always has. */
+/** '', false and 0: what the readers of an invite's `mode`, `caps` and
+ *  `subscriptions` have always read as none. */
+const blank = (v: unknown) => v === '' || v === false || v === 0;
+
+/** Why an invite's mode can't be read, or null. None (absent, null, '', false
+ *  or 0) reads as "mint", as it always has. */
 export function inviteModeProblem(inv: InviteTemplate): string | null {
   const m = (inv as { mode?: unknown }).mode;
-  return m === undefined || m === null || m === '' || isMode(m) ? null : `invite mode ${MODE_RULE}`;
+  return m === undefined || m === null || blank(m) || isMode(m) ? null : `invite mode ${MODE_RULE}`;
 }
 
 /**
@@ -66,14 +70,15 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * naming an expiry that isn't a date too.
  * `null` reads as absent, as it always has, except in `maxUses`: a null count
  * has always exhausted the invite, so it is refused rather than opened. So
- * does '' in `mode`, `caps` and `subscriptions`, which their readers have
- * always read as none; in `roles`, `uses` and `maxUses` it threw, grew as
- * text or exhausted the invite, so it is refused.
+ * do '', false and 0 in `mode`, `caps` and `subscriptions`, which their
+ * readers have always read as none; in `roles`, `uses` and `maxUses` '' threw,
+ * grew as text or exhausted the invite, so it is refused. A `grant` that is
+ * there must be an object, so '', 0 and false are refused there too.
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
   const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string');
-  // [field, rule, why, whether '' reads as none]
+  // [field, rule, why, whether '', false and 0 read as none]
   const checks: Array<[string, (v: unknown) => boolean, string, boolean?]> = [
     ['guildId', (v) => typeof v === 'string', 'must be a string'],
     ['mintedBy', (v) => typeof v === 'string', 'must be a string'],
@@ -86,7 +91,7 @@ export function inviteShapeProblem(inv: InviteTemplate): string | null {
   ];
   for (const [field, ok, why, blankIsNone] of checks) {
     const v = f[field];
-    if (v === undefined || v === null || (blankIsNone && v === '')) continue;
+    if (v === undefined || v === null || (blankIsNone && blank(v))) continue;
     if (!ok(v)) return `invite ${field} ${why}`;
   }
   // A grant that is there must be one: enroll reads a falsy one as absent and

@@ -357,7 +357,7 @@ export class Gateway {
       res = await this.hooks.enroll(d);
     } catch (err) {
       this.sessionLog('register-error', session, `error="${logSafe((err as Error)?.message ?? String(err), 160)}"`);
-      res = { error: "registration failed on the relay, possibly after it made a persona, so registering again may make another; the error is in the relay's session log, for its operator" };
+      res = { error: "registration failed on the relay, possibly after it made a persona and spent the invite, so registering again may make another or find the invite used; the error is in the relay's session log, for its operator" };
     }
     // Enrollment hooks may await external work. A closed or closing socket
     // can't carry the result, and another identify/register may have won

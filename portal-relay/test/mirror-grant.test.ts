@@ -368,9 +368,11 @@ test('an invite naming an access role that no longer exists is refused, so the n
     t.relay.permissions.removeRole('h-staff');
     const count = t.relay.identity.all().length;
     const res = await t.relay.enroll({ invite: 'dangling', desiredName: 'dangler' });
-    assert.ok('error' in res && /no longer exist/.test(res.error), JSON.stringify(res));
+    // ...and says who can mend it: the role is gone, so only a new invite can
+    const remedy = /no longer exist: h-staff — whoever minted it must mint a new one/;
+    assert.ok('error' in res && remedy.test(res.error), JSON.stringify(res));
     assert.equal(t.relay.identity.all().length, count);
-    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'dangling', { byAdmin: true }), /no longer exist/);
+    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'dangling', { byAdmin: true }), remedy);
     assert.ok(!t.relay.permissions.getRoleNames(EXISTING).includes('h-staff'));
     assert.equal(t.relay.invites.get('dangling').uses ?? 0, 0);
   } finally {
@@ -455,7 +457,7 @@ for (const [code, fields, why] of MALFORMED_FIELDS) {
       };
       assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify(seen));
       // The claimant can't change a stored invite, so each says who can.
-      assert.ok(/ — it must be re-minted$/.test(enrolled?.error ?? '') && / — it must be re-minted$/.test(claimed?.threw ?? ''), JSON.stringify(seen));
+      assert.ok(/ — whoever minted it must mint a new one$/.test(enrolled?.error ?? '') && / — whoever minted it must mint a new one$/.test(claimed?.threw ?? ''), JSON.stringify(seen));
       assert.equal(seen.personasAdded, 0, 'no persona created');
       assert.equal(seen.uses, fields.uses ?? 0, 'no use spent');
     } finally {
@@ -471,7 +473,7 @@ test('a misspelled mode is refused by name, at enroll and at a claim, since "min
     const count = t.relay.identity.all().length;
     const enrolled = await outcome(() => t.relay.enroll({ invite: 'mode-typo', desiredName: 'n-typo' }));
     const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'mode-typo'));
-    const why = /^invite mode must be "mint", "augment" or "both" — it must be re-minted$/;
+    const why = /^invite mode must be "mint", "augment" or "both" — whoever minted it must mint a new one$/;
     assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ enrolled, claimed }));
     assert.equal(t.relay.identity.all().length, count, 'no persona created');
     assert.equal(t.relay.invites.get('mode-typo').uses ?? 0, 0, 'no use spent');
@@ -490,16 +492,32 @@ test('a claim of a mint invite is still not claimable, with nothing more said ab
   }
 });
 
-test("an invite whose mode, caps and subscriptions are '' reads them as none, at enroll and at a claim", async () => {
+for (const blank of ['', false, 0]) {
+  test(`an invite whose mode, caps and subscriptions are ${JSON.stringify(blank)} reads them as none, at enroll and at a claim`, async () => {
+    const t = makeRelay();
+    try {
+      t.relay.invites.mint({ code: 'blank-mint', mode: blank, caps: blank, subscriptions: blank, guildId: GUILD, grant: MIRROR_GRANT } as any);
+      t.relay.invites.mint({ code: 'blank-both', mode: 'both', caps: blank, subscriptions: blank, guildId: GUILD, grant: MIRROR_GRANT } as any);
+      const enrolled = await outcome(() => t.relay.enroll({ invite: 'blank-mint', desiredName: 'n-blank' }));
+      assert.ok(enrolled?.personaId, JSON.stringify(enrolled));
+      // A blank mode reads as mint, so a claim of it is as a mint invite's.
+      assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'blank-mint'), /not claimable \(mint-only\)/);
+      const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'blank-both'));
+      assert.ok(!claimed?.threw, JSON.stringify(claimed));
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
+test('an invite whose grant is null reads it as absent, at enroll and at a claim, as on main', async () => {
   const t = makeRelay();
   try {
-    t.relay.invites.mint({ code: 'blank-mint', mode: '', caps: '', subscriptions: '', guildId: GUILD, grant: MIRROR_GRANT } as any);
-    t.relay.invites.mint({ code: 'blank-both', mode: 'both', caps: '', subscriptions: '', guildId: GUILD, grant: MIRROR_GRANT } as any);
-    const enrolled = await outcome(() => t.relay.enroll({ invite: 'blank-mint', desiredName: 'n-blank' }));
+    t.relay.invites.mint({ code: 'grant-null-mint', grant: null, caps: [...RW], guildId: GUILD } as any);
+    t.relay.invites.mint({ code: 'grant-null-both', mode: 'both', grant: null, caps: [...RW], guildId: GUILD } as any);
+    const enrolled = await outcome(() => t.relay.enroll({ invite: 'grant-null-mint', desiredName: 'n-null' }));
     assert.ok(enrolled?.personaId, JSON.stringify(enrolled));
-    // '' mode reads as mint, so a claim of it is as a mint invite's.
-    assert.throws(() => t.relay.applyInviteAugment(EXISTING, 'blank-mint'), /not claimable \(mint-only\)/);
-    const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'blank-both'));
+    const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'grant-null-both'));
     assert.ok(!claimed?.threw, JSON.stringify(claimed));
   } finally {
     t.cleanup();
@@ -617,7 +635,7 @@ test('an invite naming a role quarantined at load is refused as unreadable, for 
     // With a role that's gone as well, both are named, each with who fixes it.
     t.relay.invites.mint({ code: 'names-both', mode: 'both', guildId: GUILD, roles: ['broken', 'gone'] } as any);
     const both = await outcome(() => t.relay.applyInviteAugment(EXISTING, 'names-both'));
-    assert.equal(both?.threw, "invite names access role(s) that can't be read: broken, which the relay's operator must fix, and that no longer exist: gone, so it must be re-minted");
+    assert.equal(both?.threw, "invite names access role(s) that can't be read: broken, which the relay's operator must fix, and that no longer exist: gone, so whoever minted it must mint a new one");
   } finally {
     t.cleanup();
   }

@@ -138,8 +138,11 @@ test('loading names each invite a claim would refuse, with the field; null reads
     ['plain', {}],
     ['nulls', { mintedBy: null, namePrefix: null, mode: null, subscriptions: null, uses: null, expiresAt: null }],
     ['expiry-empty', { expiresAt: '' }],
-    // Their readers have always read '' as none.
+    // Their readers have always read '', false and 0 as none.
     ['blanks', { mode: '', caps: '', subscriptions: '' }],
+    ['falses', { mode: false, caps: false, subscriptions: false }],
+    ['zeros', { mode: 0, caps: 0, subscriptions: 0 }],
+    ['grant-null', { grant: null }],
     ['expiry-false', { expiresAt: false }],
     ['expiry-date', { expiresAt: '2099-01-01T00:00:00.000Z' }],
     ['roles-null', { roles: null, grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } }],

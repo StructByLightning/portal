@@ -2766,7 +2766,7 @@ for (const asSuper of [false, true]) {
       const claim = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'roles-text' });
       if (asSuper) {
         assert.equal(claim.status, 400, JSON.stringify(claim.body));
-        assert.equal(claim.body.error.message, 'invite roles must be a list of access role names — it must be re-minted', JSON.stringify(claim.body));
+        assert.equal(claim.body.error.message, 'invite roles must be a list of access role names — whoever minted it must mint a new one', JSON.stringify(claim.body));
       } else {
         assert.equal(claim.status, 404, JSON.stringify(claim.body));
       }

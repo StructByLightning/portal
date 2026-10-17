@@ -1413,7 +1413,7 @@ export class AdminServer {
     // The claim refuses an invite it can't read, and the ban check below reads
     // its roles first, so the refusal comes here, by name.
     const shape = inviteShapeProblem(inv);
-    if (shape) return sendJson(res, 400, err('INVALID', `${shape} — it must be re-minted`));
+    if (shape) return sendJson(res, 400, err('INVALID', `${shape} — whoever minted it must mint a new one`));
     // An admin's claim lifts the persona's removal wherever the invite gives
     // access — only when the admin chose to ({liftBan: true}).
     if (body?.liftBan !== true && this.inviteLiftsBan(personaId, inv)) {
@@ -1520,9 +1520,9 @@ export class AdminServer {
     // request says replace AND names the guild the existing role belongs to,
     // so a role of another guild (and every holder's access) can't be
     // rewritten by typing its name. Replacing never moves a role to another
-    // guild. A name set aside at load is in use too; an entry that names no
-    // guild the relay can read has none to keep, so replacing it needs only
-    // replace and binds it to the request's guild. The role is rebuilt from
+    // guild. A name set aside at load is in use too; an entry whose guild
+    // isn't a string has none to keep, so replacing it needs only replace and
+    // binds it to the request's guild. The role is rebuilt from
     // validated fields, never stored as sent.
     if (method === 'POST' && path === '/admin/roles') {
       const body = await readJson(req);
