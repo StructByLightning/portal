@@ -165,11 +165,19 @@
   /** In a sentence: 'Write', 'Write + mention everyone', 'Custom (view, send)',
    *  'Custom (send) — can’t see the channel', 'None'. */
   function capsSummary(caps) {
+    const s = summaryParts(caps);
+    return s.blind ? s.text + ' — can’t see the channel' : s.text;
+  }
+
+  /** capsSummary in its two parts — the level in words, and whether it
+   *  can't see the channel (a set without View) — so that a longer sentence
+   *  can end on the warning: 'still Custom (send) via role x — can’t see
+   *  the channel'. */
+  function summaryParts(caps) {
     const l = levelOf(caps);
-    if (l.level !== 'custom') return LEVEL_NAME[l.level];
-    if (l.base) return LEVEL_NAME[l.base] + ' + ' + capsWords(l.extra);
-    const set = new Set(caps);
-    return 'Custom (' + capsWords(caps) + ')' + (set.has('VIEW_CHANNEL') ? '' : ' — can’t see the channel');
+    if (l.level !== 'custom') return { text: LEVEL_NAME[l.level], blind: false };
+    if (l.base) return { text: LEVEL_NAME[l.base] + ' + ' + capsWords(l.extra), blind: false };
+    return { text: 'Custom (' + capsWords(caps) + ')', blind: !new Set(caps).has('VIEW_CHANNEL') };
   }
 
   /** A tooltip: what the level means, with any extras named in words. */
@@ -202,28 +210,47 @@
     return 'the relay bot can’t ' + orList(sortCaps(l).map((c) => CAP_WORDS[c] || String(c).toLowerCase().replace(/_/g, ' '))) + ' in ' + where;
   }
 
+  /** How an access sentence ends: ' — can’t see the channel' (a set
+   *  without View), ' — the relay bot can’t send in #welcome', both, or ''.
+   *  When the bot can't see the channel, that alone says why. */
+  function limitsText(ex, parts, where) {
+    const lacks = ex.botLimited && Array.isArray(ex.botLacks) ? ex.botLacks : [];
+    const out = [];
+    if (parts.blind && !lacks.includes('VIEW_CHANNEL')) out.push('can’t see the channel');
+    if (lacks.length) out.push(botLimitText(lacks, where));
+    return out.length ? ' — ' + out.join('; ') : '';
+  }
+
   /** What a persona can do in a channel now, for 'Effective now: …':
    *  'Write' · 'Read — the relay bot can’t send in #welcome' · 'no access'. */
   function effectNowText(ex, where) {
     if (!ex || !Array.isArray(ex.effective)) return '';
-    const level = ex.effective.length ? capsSummary(ex.effective) : 'no access';
-    return ex.botLimited && ex.botLacks && ex.botLacks.length ? level + ' — ' + botLimitText(ex.botLacks, where) : level;
+    const parts = summaryParts(ex.effective);
+    return (ex.effective.length ? parts.text : 'no access') + limitsText(ex, parts, where);
   }
 
-  /** After a direct grant is removed: 'still Write via role g1-chatters' ·
-   *  'no remaining access in #research'. */
-  function remainingText(ex, where) {
+  /**
+   * After a direct grant is removed, what the relay's answer says is left:
+   * 'still Write via role g1-chatters' · 'no remaining access in #research'.
+   * `where` names the channel the grant was on; `accessWhere` the channel
+   * whose access applies there, when that is another one (a thread's is its
+   * parent's, and the answer is then the parent's: ex.parentId). A channel
+   * that is gone (ex.missing) leaves nothing to say: ''.
+   */
+  function remainingText(ex, where, accessWhere) {
     if (!ex || !Array.isArray(ex.effective)) return '';
     if (!ex.effective.length) return 'no remaining access in ' + where;
+    const at = accessWhere || where;
     const live = (ex.sources || []).filter((s) => !s.shadowedBy);
     const roles = live.filter((s) => s.kind === 'role').map((s) => s.name);
     const via = [];
     if (roles.length) via.push((roles.length === 1 ? 'role ' : 'roles ') + roles.join(', '));
+    if (live.some((s) => s.kind === 'direct' && s.caps && s.caps.length)) via.push('the direct grant in ' + at);
     if (live.some((s) => s.kind === 'guildWide' && s.caps && s.caps.length)) via.push('the guild-wide level');
     if (live.some((s) => s.kind === 'personaDefault')) via.push('the persona default');
     if (live.some((s) => s.kind === 'relayDefault')) via.push('the relay default');
-    const bot = ex.botLimited && ex.botLacks && ex.botLacks.length ? ' — ' + botLimitText(ex.botLacks, where) : '';
-    return 'still ' + capsSummary(ex.effective) + (via.length ? ' via ' + via.join(' and ') : '') + bot;
+    const parts = summaryParts(ex.effective);
+    return 'still ' + parts.text + (via.length ? ' via ' + via.join(' and ') : '') + limitsText(ex, parts, at);
   }
 
   /** A guild-wide change's answer, for 'Effective now: …': 'Read in 14

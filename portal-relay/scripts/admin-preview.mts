@@ -181,6 +181,8 @@ const C = {
   oldLogs: '100000000000001031',
   lobby: '100000000000002011',
   desk: '100000000000002012',
+  // Not in the fixture: a channel of Guild One since deleted.
+  gone: '100000000000001099',
 };
 const everywhere = { everyone: 'write', mods: 'full', researchers: 'write' } as const;
 const CHANNELS: FixtureChannel[] = [
@@ -238,8 +240,9 @@ const PERMISSIONS: Record<string, unknown> = {
   // Cass: reads all of Guild One guild-wide, but is blocked in #random.
   [P.cass]: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
   // Nyx: no entry at all — no access anywhere.
-  // Juniper: grants on a thread id and a category id, which grant nothing.
-  [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ } } } } },
+  // Juniper: grants on a thread id, a category id and a deleted channel,
+  // which grant nothing.
+  [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ, [C.gone]: WRITE } } } } },
   // Quill: mirrors @Mods with their per-channel permissions.
   [P.quill]: { roles: ['g1-mods-mirror'] },
   // Sol: a persona default (every guild) plus Guild Two's desk role.
@@ -522,6 +525,11 @@ const deps: AdminDeps = {
     return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
   },
   botCaps,
+  // As Relay.permChannelId: a thread's access is its parent's.
+  permChannelId: (cid) => {
+    const c = channelById.get(cid);
+    return c?.type === 'thread' && c.parentId ? c.parentId : cid;
+  },
   listChannelLayout: (gid) =>
     joinedGuilds().some((g) => g.id === gid)
       ? CHANNELS.filter((c) => c.guildId === gid && c.type !== 'thread')

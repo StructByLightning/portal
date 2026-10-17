@@ -223,6 +223,11 @@ export class Relay implements GatewayHooks {
         capsFor: (personaId, channelId, guildId) => this.capsFor(personaId, channelId, guildId),
         botCaps: (guildId, channelId) =>
           computeCapabilities(new Set(ALL_CAPS), this.bot.channelForPerms(channelId), this.bot.meIn(guildId)),
+        // Where the relay checks a channel's access: a thread's is its parent's.
+        permChannelId: (channelId) => {
+          const meta = this.bot.channelMetaFromCache(channelId);
+          return meta ? this.permChannelId(meta) : channelId;
+        },
         listChannelLayout: (gid) => this.bot.listChannelLayout(gid),
         canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
         resync: (personaId) => this.resyncPersona(personaId),

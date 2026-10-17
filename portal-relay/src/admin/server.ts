@@ -146,6 +146,9 @@ export interface AdminDeps {
   /** What the relay's bot can do in a channel of G: computeCapabilities over
    *  every capability, for the bot's member in G — capsFor's Discord half. */
   botCaps(guildId: string, channelId: string): Capability[];
+  /** The channel whose access the relay checks for `channelId`
+   *  (Relay.permChannelId): a thread's parent, anything else itself. */
+  permChannelId(channelId: string): string;
   /** Where each channel of G sits in Discord's sidebar (threads left out). */
   listChannelLayout(guildId: string): Array<{ id: string; categoryId: string | null; position: number; announcement: boolean }>;
   /** Whether a persona could have any capability in G (the relay's own test,
@@ -751,11 +754,28 @@ export class AdminServer {
 
   /** What a grant change's answer says the persona can do now: in the
    *  channel, or (guild-wide) how many of G's channels at each level, and
-   *  how many of those through a direct grant. */
-  private effectAfter(personaId: string, guildId: string, channelId: string | undefined): Explained | { guildWide: true; channels: number; counts: LevelCounts; direct: LevelCounts } {
+   *  how many of those through a direct grant.
+   *
+   *  In a channel it is read where the relay checks it: a thread's actions
+   *  are checked against its parent (permChannelId), so a thread answers
+   *  with its parent's explanation and says so (parentId). A channel that
+   *  isn't one of G's channels in Discord's cache now (deleted, say) answers
+   *  {missing: true}: there is no channel to explain, and capsFor's answer
+   *  without one (the policy-only edit/delete own) would read as access in
+   *  a channel that isn't there. */
+  private effectAfter(
+    personaId: string,
+    guildId: string,
+    channelId: string | undefined,
+  ): (Explained & { parentId?: string }) | { missing: true } | { guildWide: true; channels: number; counts: LevelCounts; direct: LevelCounts } {
     const a = accessDepsOf(this.deps);
     const s = subjectOf(a, personaId, guildId);
-    if (channelId !== undefined) return this.enforced(a, s, channelId, new Set(this.deps.botCaps(guildId, channelId)));
+    if (channelId !== undefined) {
+      const at = this.deps.permChannelId(channelId);
+      if (!this.deps.listChannels(guildId).some((c) => c.id === at)) return { missing: true };
+      const ex = this.enforced(a, s, at, new Set(this.deps.botCaps(guildId, at)));
+      return at === channelId ? ex : { ...ex, parentId: at };
+    }
     const counts = zeroCounts();
     const direct = zeroCounts();
     let channels = 0;

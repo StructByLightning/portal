@@ -1729,7 +1729,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
       const where = chanText(cid, names);
       const note = inertNote(cid);
       const rm = el('button', { class: 'btn btn-sm btn-danger', text: 'Remove', 'aria-label': 'Remove ' + displayName + '’s direct grant in ' + where });
-      rm.addEventListener('click', () => ui.busy(rm, () => removeGrant(cid), 'Removing…'));
+      rm.addEventListener('click', () => ui.busy(rm, () => removeGrant(cid, rm), 'Removing…'));
       rows.push(el('tr', {}, [
         el('td', {}, [chanNode(cid, names), note ? el('div', { class: 'cell-note', text: note }) : null]),
         levelCell(chans[cid] || [], 'Blocked', 'An empty direct grant: it blocks the guild-wide level and the persona default in this channel. Access roles still apply.'),
@@ -1751,8 +1751,10 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
   }
 
   /** The relay refused a change because the setting changed since this
-   *  drawer loaded it: load it again, then say so in the line. */
-  async function conflicted(e, prefix, ctxErr) {
+   *  drawer loaded it: load it again, then say so in the line. `from` is the
+   *  table's button that made the change: drawn again, it is gone, so focus
+   *  goes to Where, as after a change that went through. */
+  async function conflicted(e, prefix, ctxErr, from) {
     let reloaded = false;
     try {
       const d = await api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id));
@@ -1762,13 +1764,15 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
       reloaded = true;
       markStale();
     } catch { /* the line says to reload the page instead */ }
+    const a = document.activeElement;
+    if (from && !from.isConnected && (!a || a === document.body || !a.isConnected)) target.focus();
     status.err(lib.errorText(e, prefix, Object.assign({}, ctxErr, { reloaded })));
   }
 
   /** ' Effective now: …' for the guild, from a guild-wide change's answer. */
   const guildEffect = (r) => (r && r.effective && r.effective.counts ? ' Effective now: ' + lib.guildEffectText(r.effective, guild) + '.' : '');
 
-  async function removeGrant(cid) {
+  async function removeGrant(cid, button) {
     const where = chanText(cid, names);
     try {
       const r = await api('DELETE', P() + '?channelId=' + encodeURIComponent(cid), { expect: loaded(cid) });
@@ -1776,11 +1780,13 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
       draw(r.guildPolicy);
       target.focus(); // the row whose button had focus is gone
       if (target.value === cid) preload();
-      const left = r.effective ? lib.remainingText(r.effective, where) : '';
+      // A thread's answer is its parent's access (what the relay checks there).
+      const ex = r.effective;
+      const left = ex ? lib.remainingText(ex, where, ex.parentId ? chanText(ex.parentId, names) : where) : '';
       status.ok('Removed ' + displayName + '’s direct grant in ' + where + (left ? ' — ' + left : '') + '.');
       markStale(); onChange();
     } catch (e) {
-      if (e.code === 'CONFLICT') return conflicted(e, 'Not removed', { channelId: cid, names });
+      if (e.code === 'CONFLICT') return conflicted(e, 'Not removed', { channelId: cid, names }, button);
       status.err(notDone(e, 'Not removed'));
     }
   }
@@ -1808,7 +1814,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
         status.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.' + guildEffect(r));
         markStale(); onChange();
       } catch (e) {
-        if (e.code === 'CONFLICT') return conflicted(e, 'Not denied');
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not denied', undefined, button);
         status.err(notDone(e, 'Not denied'));
       }
     }, 'Denying…');
@@ -1849,7 +1855,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
           : 'Unset ' + displayName + '’s guild-wide level in ' + guild + ': channels without their own grant fall back to the persona default.') + guildEffect(r));
         markStale(); onChange();
       } catch (e) {
-        if (e.code === 'CONFLICT') return conflicted(e, 'Not unset');
+        if (e.code === 'CONFLICT') return conflicted(e, 'Not unset', undefined, button);
         status.err(notDone(e, 'Not unset'));
       }
     }, 'Unsetting…');

@@ -278,6 +278,14 @@ function setupDeps(
       return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
     },
     botCaps,
+    // As Relay.permChannelId: a thread's access is its parent's.
+    permChannelId: (cid) => {
+      for (const cs of Object.values(channelTable)) {
+        const c = cs.find((x) => x.id === cid);
+        if (c) return c.type === 'thread' && c.parentId ? c.parentId : cid;
+      }
+      return cid;
+    },
     listChannelLayout: (gid) =>
       (channelTable[gid] ?? []).filter((c) => c.type !== 'thread').map((c, i) => ({ id: c.id, categoryId: categoryOf[c.id] ?? null, position: i, announcement: false })),
     canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, (cid) => (channels[gid] ?? []).includes(cid)),
@@ -2236,6 +2244,34 @@ test('grants: the answer says what the persona can do now — in the channel, or
     const removed = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c2');
     assert.deepEqual(removed.body.effective.effective, READ);
     assert.deepEqual(removed.body.effective.sources, [{ kind: 'guildWide', caps: READ }]);
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: removing a thread’s grant answers with its parent’s access (where the relay checks it); a channel that is gone answers missing', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    // Only an old entry, or slash before it refused threads, holds these: the
+    // panel's PUT refuses both.
+    ctx.permissions.setChannel('p1', 'G1', 'th-c1', WRITE);
+    ctx.permissions.setChannel('p1', 'G1', 'c-gone', WRITE);
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write' })).status, 200);
+    const th = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=th-c1');
+    assert.equal(th.status, 200);
+    assert.equal(th.body.effective.parentId, 'c1', 'the thread uses c1’s access');
+    assert.deepEqual(th.body.effective.effective, ctx.deps.capsFor('p1', 'c1', 'G1'));
+    assert.deepEqual(th.body.effective.effective, WRITE, 'Write in c1 still reaches the thread');
+    assert.deepEqual(th.body.effective.sources, [{ kind: 'direct', caps: WRITE }, { kind: 'guildWide', caps: ['VIEW_CHANNEL'], shadowedBy: 'direct' }], 'c1’s sources');
+    // Removing c1's own grant: no parentId, and the guild-wide level is what is left.
+    const c1 = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1');
+    assert.equal('parentId' in c1.body.effective, false);
+    assert.deepEqual(c1.body.effective.effective, ['VIEW_CHANNEL']);
+    const gone = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c-gone');
+    assert.equal(gone.status, 200);
+    assert.deepEqual(gone.body.effective, { missing: true }, 'nothing to explain in a channel that isn’t there');
+    assert.equal(ctx.permissions.getEntry('p1')?.policy?.guilds?.G1?.channels?.['c-gone'], undefined, 'and it was removed');
   } finally {
     await s.close();
   }

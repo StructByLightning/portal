@@ -82,6 +82,7 @@ async function world(): Promise<World> {
     newInviteCode: () => 'unused',
     capsFor: () => [],
     botCaps: () => [],
+    permChannelId: (cid) => cid,
     listChannelLayout: () => [],
     canAccessGuild: () => false,
     resync: () => 0,

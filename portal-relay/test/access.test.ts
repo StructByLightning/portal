@@ -368,3 +368,61 @@ test('parity: the access endpoints, over the relay’s own wiring, show capsFor'
     t.cleanup();
   }
 });
+
+test('parity: a grant change answers with what the relay enforces where it was made — a thread with its channel’s, a channel that is gone with nothing', async () => {
+  const t = makeRelay();
+  const fakeDiscord = (async (url: string | URL) => {
+    const u = String(url);
+    const body = u.endsWith('/oauth2/token') ? { access_token: 'x', token_type: 'Bearer' } : u.endsWith('/users/@me') ? { id: 'op', username: 'op' } : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  const server = new AdminServer(t.deps, fakeDiscord);
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const login = await fetch(`${base}/admin/login`, { redirect: 'manual' });
+    const state = /portal_admin_state=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')![1];
+    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const cookie = `portal_admin_session=${/portal_admin_session=([^;]+)/.exec(cb.headers.get('set-cookie') ?? '')![1]}`;
+    const { csrf } = await (await fetch(`${base}/admin/me`, { headers: { cookie } })).json();
+    const remove = async (pid: string, cid: string) => {
+      const r = await fetch(`${base}/admin/g/${G1}/personas/${pid}/grants?channelId=${encodeURIComponent(cid)}`, { method: 'DELETE', headers: { cookie, 'x-csrf-token': csrf } });
+      assert.equal(r.status, 200, `${pid} ${cid}`);
+      return (await r.json()).effective;
+    };
+    // p-direct holds a direct grant on every kind of channel: a thread (its
+    // grant first, while the parent's own grant still gives Full), the
+    // channel Discord's cache doesn't hold, a category, and text channels.
+    const pid = 'p-direct';
+    const held = Object.keys(t.deps.permissions.getPolicy(pid)!.guilds![G1].channels!);
+    const order = ['th', UNCACHED, 'cat', ...held.filter((c) => !['th', UNCACHED, 'cat'].includes(c))];
+    assert.deepEqual([...order].sort(), [...held].sort());
+    const seen = new Set<string>();
+    for (const cid of order) {
+      const effective = await remove(pid, cid);
+      const meta: ChannelMeta | null = t.relay.bot.channelMetaFromCache(cid);
+      if (!meta) {
+        assert.deepEqual(effective, { missing: true }, `${cid}: no channel, nothing to explain`);
+        seen.add('missing');
+        continue;
+      }
+      // The relay's own answer for what the persona can do there: its
+      // channel directory entry, read where the relay checks access.
+      const relaySays = t.relay.toPortalChannel(meta, pid).capabilities;
+      assert.deepEqual(effective.effective, relaySays, cid);
+      if (meta.isThread) {
+        assert.equal(effective.parentId, meta.parentId, `${cid}: its parent’s access`);
+        assert.deepEqual(effective.effective, FULL, `${cid}: the parent’s direct Full still reaches it`);
+        assert.notDeepEqual(t.capsFor(pid, cid, G1), relaySays, 'the thread id on its own would say otherwise');
+        seen.add('thread');
+      } else {
+        assert.equal('parentId' in effective, false, cid);
+        seen.add(meta.type);
+      }
+    }
+    assert.deepEqual([...seen].sort(), ['category', 'missing', 'text', 'thread']);
+  } finally {
+    await server.close();
+    t.cleanup();
+  }
+});

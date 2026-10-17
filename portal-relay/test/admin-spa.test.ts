@@ -1217,6 +1217,8 @@ async function ariaDrawer(opts: {
   refuseDelete?: (path: string, body: any) => unknown;
   /** The relay's `effective` for a change's answer. */
   effective?: (method: string, path: string, body: any) => unknown;
+  /** The persona read's channel labels (the relay's names map). */
+  names?: Record<string, unknown>;
 } = {}) {
   const g = '/admin/g/' + G1;
   const policy: { channels: Record<string, string[]>; default?: string[] } = opts.policy ?? { channels: { [CH.research]: [...LEVEL_CAPS.write] } };
@@ -1225,7 +1227,7 @@ async function ariaDrawer(opts: {
       [g + '/roles']: { catalog: G1_CATALOG, discordRoles: [], canAuthor: false },
       [g + '/channels']: { channels: G1_CHANNELS },
       [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: ['g1-chatters'] }], total: 1, limit: 50, offset: 0 },
-      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters', 'g2-desk'], guildPolicy: policy, names: { channels: {} } },
+      [g + '/personas/aria']: { id: 'aria', displayName: 'Aria', roles: ['g1-chatters', 'g2-desk'], guildPolicy: policy, names: { channels: opts.names ?? {} } },
     },
     handle: (method, path, body) => {
       // As the relay does: one target, one operation.
@@ -3008,6 +3010,54 @@ test('grant editor: a change says “Effective now”, from the relay’s answer
   assert.equal(line(), 'Removed Aria’s direct grant in #research — still Write via role g1-chatters.');
 });
 
+test('lib: what a removal leaves — a thread’s is its parent’s, a channel that is gone leaves nothing to say, and a set without View ends on the warning', () => {
+  const { lib } = libOnly();
+  const R = [...LEVEL_CAPS.read];
+  const W = [...LEVEL_CAPS.write];
+  const thread = 'design-review (thread in #research)';
+  // The relay answers a thread with its parent's explanation (parentId).
+  assert.equal(lib.remainingText({ effective: W, botLacks: [], sources: [{ kind: 'direct', caps: W }], parentId: 'p' }, thread, '#research'), 'still Write via the direct grant in #research');
+  assert.equal(lib.remainingText({ effective: [], botLacks: [], sources: [], parentId: 'p' }, thread, '#research'), 'no remaining access in ' + thread);
+  assert.equal(lib.remainingText({
+    effective: R, botLimited: true, botLacks: W.filter((c) => !R.includes(c)), sources: [{ kind: 'guildWide', caps: W }], parentId: 'p',
+  }, thread, '#research'), 'still Read via the guild-wide level — the relay bot can’t send in #research', 'the bot’s limit is where it is checked');
+  // A block on the parent gives nothing: it isn't named.
+  assert.equal(lib.remainingText({ effective: W, botLacks: [], sources: [{ kind: 'block' }, { kind: 'role', name: 'g1-chatters', caps: W, how: 'channels' }] }, thread, '#research'), 'still Write via role g1-chatters');
+  // A channel that is gone: nothing to say about what is left there.
+  assert.equal(lib.remainingText({ missing: true }, 'channel the relay can’t see'), '');
+  // Without View: the warning comes last, after where it comes from.
+  const role = { kind: 'role', name: 'g1-posters', caps: ['SEND_MESSAGES', 'ADD_REACTIONS'], how: 'all' };
+  assert.equal(lib.remainingText({ effective: ['SEND_MESSAGES', 'ADD_REACTIONS'], botLacks: [], sources: [role] }, '#general'), 'still Custom (send, react) via role g1-posters — can’t see the channel');
+  // When it is the relay's bot that can't see the channel, that is the reason, said once.
+  assert.equal(lib.remainingText({
+    effective: ['EDIT_OWN', 'DELETE_OWN'], botLimited: true, botLacks: ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES'], sources: [{ kind: 'guildWide', caps: W }],
+  }, '#old-logs'), 'still Custom (edit own messages, delete own messages) via the guild-wide level — the relay bot can’t see #old-logs');
+  assert.equal(lib.effectNowText({ effective: ['EDIT_OWN', 'DELETE_OWN'], botLimited: true, botLacks: ['VIEW_CHANNEL'] }, '#old-logs'), 'Custom (edit own messages, delete own messages) — the relay bot can’t see #old-logs');
+  assert.equal(lib.effectNowText({ effective: ['SEND_MESSAGES'], botLimited: true, botLacks: ['MANAGE_MESSAGES'] }, '#general'), 'Custom (send) — can’t see the channel; the relay bot can’t manage messages in #general');
+  assert.equal(lib.capsSummary(['SEND_MESSAGES']), 'Custom (send) — can’t see the channel', 'on its own, unchanged');
+  assert.equal(lib.effectNowText({ missing: true }, '#gone'), '');
+});
+
+test('grant editor: removing a thread’s grant says what the thread is left with — its channel’s access; a gone channel’s says only that it was removed', async () => {
+  const W = [...LEVEL_CAPS.write];
+  const GONE = '100000000000001099';
+  const { drawer, form } = await ariaDrawer({
+    policy: { channels: { [CH.designReview]: W, [CH.research]: W, [GONE]: W } },
+    names: { [GONE]: { id: GONE, name: null, unavailable: true } },
+    effective: (_m, path) => (path.includes(GONE)
+      ? { missing: true }
+      : { effective: W, level: 'write', botLimited: false, botLacks: [], direct: W, sources: [{ kind: 'direct', caps: W }], parentId: CH.research }),
+  });
+  const line = () => form.querySelector('.status-line')!.textContent;
+  const remove = (where: string) => drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent?.startsWith(where))!.querySelector('button')!.click();
+  remove('design-review');
+  await settle();
+  assert.equal(line(), 'Removed Aria’s direct grant in design-review (thread in #research) — still Write via the direct grant in #research.');
+  remove('channel the relay can’t see');
+  await settle();
+  assert.equal(line(), 'Removed Aria’s direct grant in channel the relay can’t see.');
+});
+
 test('grant editor: changed meanwhile — “someone else changed this”, the setting is loaded again, nothing is lost silently', async () => {
   const W = [...LEVEL_CAPS.write];
   const F = [...LEVEL_CAPS.full];
@@ -3037,10 +3087,47 @@ test('grant editor: changed meanwhile — “someone else changed this”, the s
   const row = drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
   assert.equal(row.children[1].textContent, 'Full');
 
-  // A removal refused the same way.
+  // A removal refused the same way. The table is drawn again, so the
+  // focused Remove is gone: focus goes to Where, as after a removal.
   const again = await ariaDrawer({ refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: null }) });
   const r = again.drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === '#research')!;
-  r.querySelector('button')!.click();
+  const rm = r.querySelector('button')!;
+  rm.focus();
+  rm.click();
   await settle();
   assert.equal(again.form.querySelector('.status-line')!.textContent, 'Not removed: someone else changed this a moment ago. Reloaded — check and try again.');
+  assert.equal(rm.isConnected, false, 'its row was drawn again');
+  assert.equal(again.doc.activeElement, again.target, 'focus is on Where, not lost to <body>');
+});
+
+test('grant editor: a guild-wide change refused as changed meanwhile leaves focus on Where, not <body>', async () => {
+  for (const [label, confirm] of [['Deny guild-wide', 'Deny guild-wide'], ['Unset', 'Unset guild-wide']]) {
+    const box = await ariaDrawer({
+      policy: { channels: {}, default: [...LEVEL_CAPS.read] },
+      refuseDelete: () => refuse(409, 'CONFLICT', 'changed', { current: [...LEVEL_CAPS.write] }),
+    });
+    const row = box.drawer.querySelectorAll('tr').find((tr) => tr.children[0]?.textContent === 'Every channel (guild-wide)')!;
+    const button = row.querySelectorAll('button').find((b) => b.textContent === label)!;
+    button.focus();
+    button.click();
+    await settle();
+    box.doc.querySelector('.modal')!.querySelectorAll('button').find((b) => b.textContent === confirm)!.click();
+    await settle();
+    assert.match(box.form.querySelector('.status-line')!.textContent, /^Not (denied|unset): someone else changed this a moment ago\. Reloaded/, label);
+    assert.equal(button.isConnected, false, label);
+    assert.equal(box.doc.activeElement, box.target, label);
+  }
+});
+
+test('grant editor: Save refused as changed meanwhile keeps focus where it was', async () => {
+  const box = await ariaDrawer({ refusePut: () => refuse(409, 'CONFLICT', 'changed', { current: [...LEVEL_CAPS.full] }) });
+  box.choose(CH.research);
+  box.radio('write').checked = false;
+  box.radio('read').checked = true;
+  box.radio('read').fire('change');
+  box.save.focus();
+  box.form.fire('submit');
+  await settle();
+  assert.match(box.form.querySelector('.status-line')!.textContent, /^Not saved: someone else changed this/);
+  assert.equal(box.doc.activeElement, box.save, 'Save is still there, and keeps focus');
 });
