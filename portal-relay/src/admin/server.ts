@@ -1107,11 +1107,12 @@ export class AdminServer {
     // roles and expiresInDays are checked here, rather than any of them being
     // dropped: a count sent as "5" would otherwise be stored as unlimited, a
     // misspelled mode as mint-only, roles that aren't a list as none, and an
-    // expiry that isn't a number of days as never. Absent, null and '' mean
-    // not given. A grant is read only when no roles are given, and a label
+    // expiry that isn't a number of days as never. Absent, null, '' and false
+    // mean not given, and so does a roles of 0: each says none, so the field
+    // is left out. A grant is read only when no roles are given, and a label
     // that isn't a string becomes 'invite'.
-    const given = (v: unknown) => v !== undefined && v !== null && v !== '';
-    if (given(body?.roles) && !Array.isArray(body.roles)) {
+    const given = (v: unknown) => v !== undefined && v !== null && v !== '' && v !== false;
+    if (given(body?.roles) && body.roles !== 0 && !Array.isArray(body.roles)) {
       return sendJson(res, 400, err('INVALID', 'roles must be a list of access role names'));
     }
     const roles: string[] = Array.isArray(body?.roles) ? body.roles : [];

@@ -2600,8 +2600,6 @@ const MINT_REFUSED: Array<[Record<string, unknown>, string]> = [
   // Dropped, roles that aren't a list would leave the grant alone, and an expiry that isn't a number of days would
   // never expire.
   [{ roles: 'r-g1', grant: MINT_GRANT }, 'roles'],
-  [{ roles: 0, grant: MINT_GRANT }, 'roles'],
-  [{ roles: false, grant: MINT_GRANT }, 'roles'],
   [{ roles: ['r-g1'], expiresInDays: '7' }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: 0 }, 'expiresInDays'],
   [{ roles: ['r-g1'], expiresInDays: -1 }, 'expiresInDays'],
@@ -2638,7 +2636,7 @@ test('invites: a mint with a fractional count is stored, as it reads', async () 
   }
 });
 
-test('invites: a mint with expiresInDays expires that many days on, and one with it null or empty never expires', async () => {
+test('invites: a mint with expiresInDays expires that many days on, and one with it null, empty or false never expires', async () => {
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);
   try {
@@ -2646,7 +2644,7 @@ test('invites: a mint with expiresInDays expires that many days on, and one with
     assert.equal(week.status, 200, JSON.stringify(week.body));
     const at = Date.parse(ctx.invites.get(week.body.code)?.expiresAt ?? '');
     assert.ok(Math.abs(at - (Date.now() + 7 * 86_400_000)) < 60_000, `expires at ${new Date(at).toISOString()}`);
-    for (const expiresInDays of [null, '']) {
+    for (const expiresInDays of [null, '', false]) {
       const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], expiresInDays });
       assert.equal(r.status, 200, `${JSON.stringify(expiresInDays)}: ${JSON.stringify(r.body)}`);
       assert.equal(ctx.invites.get(r.body.code)?.expiresAt, undefined, JSON.stringify(expiresInDays));
@@ -2765,11 +2763,47 @@ for (const asSuper of [false, true]) {
   });
 }
 
-test('invites: a mint whose mode, count or subscriptions are null or empty mints as if they were left out', async () => {
+test('invites: a mint whose roles are null, empty, false or 0 beside a grant mints the grant alone, as if roles were left out', async () => {
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);
   try {
-    for (const extra of [{ maxUses: null }, { maxUses: '' }, { mode: null }, { mode: '' }, { subscriptions: null }, { subscriptions: '' }]) {
+    const grant = { caps: ['VIEW_CHANNEL'], scope: { channels: ['c1'] } };
+    for (const roles of [null, '', false, 0]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles, grant });
+      assert.equal(r.status, 200, `${JSON.stringify(roles)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      assert.equal(inv?.roles, undefined, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
+      assert.deepEqual(inv?.grant, grant, `${JSON.stringify(roles)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint whose mode or subscriptions are 0 stores them as sent', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const extra of [{ mode: 0 }, { subscriptions: 0 }]) {
+      const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], ...extra });
+      assert.equal(r.status, 200, `${JSON.stringify(extra)}: ${JSON.stringify(r.body)}`);
+      const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
+      const key = Object.keys(extra)[0]!;
+      assert.equal(inv?.[key], 0, `${JSON.stringify(extra)} stored as ${JSON.stringify(inv)}`);
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('invites: a mint whose mode, count or subscriptions are null, empty or false mints as if they were left out', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    for (const extra of [
+      { maxUses: null }, { maxUses: '' }, { maxUses: false }, { mode: null }, { mode: '' }, { mode: false },
+      { subscriptions: null }, { subscriptions: '' }, { subscriptions: false },
+    ]) {
       const r = await s.call('POST', '/admin/g/G1/invites', { roles: ['r-g1'], ...extra });
       assert.equal(r.status, 200, `${JSON.stringify(extra)}: ${JSON.stringify(r.body)}`);
       const inv = ctx.invites.get(r.body.code) as Record<string, unknown> | undefined;
