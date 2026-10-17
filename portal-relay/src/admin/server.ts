@@ -637,6 +637,9 @@ export class AdminServer {
       roles: this.rolesVisibleIn(guildId, entry?.roles ?? [], session.isSuper),
       ...(session.isSuper ? { otherGuildRoleCount: this.otherGuildRoleCount(guildId, entry?.roles ?? []) } : {}),
       guildPolicy,
+      // Removed from G with /ban: nothing it holds applies in G until an
+      // admin of G gives it access again.
+      banned: this.deps.permissions.isBanned(personaId, guildId),
       names: { channels: clipToGuild(labels, guildId) } satisfies NameMaps,
     });
   }
@@ -778,7 +781,7 @@ export class AdminServer {
     const liftedBan = role?.guildId && role.caps.length ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
-    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   private revokeRole(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, role: string): void {
@@ -827,7 +830,7 @@ export class AdminServer {
       before: { ...where, caps: before },
       after: { ...where, caps, ...(op.level ? { level: op.level } : {}), ...(liftedBan ? { liftedBan } : {}) },
     });
-    sendJson(res, 200, { guildPolicy });
+    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   /**
@@ -837,6 +840,12 @@ export class AdminServer {
    *   ?guildDefault=unset    no guild-wide setting: channels fall back to the
    *                          persona default (404 if none is set)
    * Exactly one of them; a bare DELETE is refused (it used to mean deny).
+   *
+   * A persona removed from G with /ban has nothing in G, whatever is unset:
+   * unsetting would say "falls back to the persona default" and change
+   * nothing. So for a banned persona Unset is refused (409 BANNED) unless
+   * the request also says &liftBan=1 — the admin, asked, chose to lift it —
+   * and then it lifts the ban and unsets, recorded as liftedBan.
    */
   private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, params: URLSearchParams): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
@@ -851,6 +860,7 @@ export class AdminServer {
     const g = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId];
     const where = channelId !== null ? { channelId } : { guildDefault: true };
     const before = this.grantAt(personaId, guildId, channelId ?? undefined);
+    let liftedBan = false;
     if (channelId !== null) {
       // Only a grant that exists can be removed — and only then audited. (An
       // arbitrary id would otherwise land in the audit log, where the panel
@@ -860,9 +870,16 @@ export class AdminServer {
       }
       this.deps.permissions.clearChannel(personaId, guildId, channelId);
     } else if (gd === 'unset') {
-      if (!this.deps.permissions.unsetGuildDefault(personaId, guildId)) {
+      if (g?.default === undefined) {
         return sendJson(res, 404, err('NOT_FOUND', 'this persona has no guild-wide setting in this guild'));
       }
+      if (this.deps.permissions.isBanned(personaId, guildId)) {
+        if (params.get('liftBan') !== '1') {
+          return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild with /ban; unsetting lifts that — send liftBan=1 to do it'));
+        }
+        liftedBan = this.deps.permissions.liftBan(personaId, guildId);
+      }
+      this.deps.permissions.unsetGuildDefault(personaId, guildId);
     } else {
       this.deps.permissions.setGuildDefault(personaId, guildId, []);
     }
@@ -871,9 +888,9 @@ export class AdminServer {
       actor: this.actorOf(session), action: 'persona.grant.clear', target: personaId, guildId, ok: true,
       before: { ...where, caps: before },
       // null: nothing set there any more; []: an explicit deny.
-      after: { ...where, caps: gd === 'deny' ? [] : null },
+      after: { ...where, caps: gd === 'deny' ? [] : null, ...(liftedBan ? { liftedBan } : {}) },
     });
-    sendJson(res, 200, { guildPolicy });
+    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   /** What a persona's own setting at one target of G is now: a channel's
@@ -927,7 +944,7 @@ export class AdminServer {
       return sendJson(res, 400, err('INVALID', (e as Error).message));
     }
     this.audit.append({ actor: this.actorOf(session), action: 'persona.claim', target: personaId, guildId, ok: true, after: { code, roles: result.roles, ...(result.liftedBans ? { liftedBans: result.liftedBans } : {}) } });
-    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper) });
+    sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, result.roles, session.isSuper), banned: this.deps.permissions.isBanned(personaId, guildId) });
   }
 
   /** Global persona-token lifecycle (super-admin only; no guildId — it's not a
@@ -1123,6 +1140,7 @@ export class AdminServer {
       names.guilds = this.guildNames([
         ...Object.keys(policyGuilds),
         ...roles.map((r) => (r as { guildId?: string }).guildId),
+        ...(entry?.bans ?? []),
       ]);
       return sendJson(res, 200, {
         id: p.id,
@@ -1132,6 +1150,8 @@ export class AdminServer {
         roles,
         // Inline per-persona policy (ad-hoc grants), if any.
         policy: entry?.policy ?? null,
+        // Guilds it was removed from with /ban (nothing applies there).
+        bans: entry?.bans ?? [],
         // Guilds (named) where this persona can act, and how.
         guilds: this.guildsWithAccess(id).map((gid) => ({ id: gid, name: this.guildName(gid) })),
         names,

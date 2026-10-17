@@ -1297,6 +1297,56 @@ test('an explicit deny does not lift a ban; a grant does', async () => {
   }
 });
 
+test('Unset guild-wide on a persona removed with /ban: refused unless the ban is lifted with it; the drawer is told', async () => {
+  const { deps, permissions, cleanup } = setupDeps([]);
+  permissions.setPersonaDefault('p1', ['VIEW_CHANNEL', 'READ_HISTORY']);
+  permissions.clearGuild('p1', 'G1');
+  const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const cookie = `portal_admin_session=${session}`;
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie } })).json();
+    const hdr = { cookie, 'x-csrf-token': me.csrf };
+    const detail = await (await fetch(`${base}/admin/g/G1/personas/p1`, { headers: { cookie } })).json();
+    assert.equal(detail.banned, true, 'the drawer is told about the ban');
+    assert.deepEqual(detail.guildPolicy, { default: [] });
+
+    const plain = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=unset`, { method: 'DELETE', headers: hdr });
+    assert.equal(plain.status, 409);
+    assert.equal((await plain.json()).error.code, 'BANNED');
+    assert.equal(permissions.isBanned('p1', 'G1'), true, 'nothing changed');
+    assert.deepEqual(permissions.getEntry('p1')?.policy?.guilds?.G1, { default: [] });
+    assert.equal(deps.audit.read({ limit: 100 }).filter((r) => r.action === 'persona.grant.clear').length, 0);
+
+    const lift = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=unset&liftBan=1`, { method: 'DELETE', headers: hdr });
+    assert.equal(lift.status, 200);
+    assert.deepEqual(await lift.json(), { guildPolicy: null, banned: false });
+    assert.equal(permissions.isBanned('p1', 'G1'), false);
+    assert.deepEqual([...permissions.resolve('p1', 'G1', 'c1')].sort(), ['READ_HISTORY', 'VIEW_CHANNEL'], 'what the panel says: the persona default applies');
+    const rec = deps.audit.read({ limit: 100 }).find((r) => r.action === 'persona.grant.clear')!;
+    assert.deepEqual(rec.after, { guildDefault: true, caps: null, liftedBan: true });
+    const after = await (await fetch(`${base}/admin/g/G1/personas/p1`, { headers: { cookie } })).json();
+    assert.equal(after.banned, false);
+
+    // Not banned: liftBan changes nothing, and a plain Unset works as before.
+    permissions.setGuildDefault('p1', 'G1', []);
+    const again = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=unset`, { method: 'DELETE', headers: hdr });
+    assert.equal(again.status, 200);
+    assert.deepEqual(await again.json(), { guildPolicy: null, banned: false });
+    // A grant's answer says whether the persona is still removed.
+    permissions.clearGuild('p1', 'G1');
+    const deny = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=deny`, { method: 'DELETE', headers: hdr });
+    assert.equal((await deny.json()).banned, true, 'a deny keeps the ban, and says so');
+    const put = await fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: { ...hdr, 'content-type': 'application/json' }, body: JSON.stringify({ channelId: 'c1', level: 'read' }) });
+    assert.equal((await put.json()).banned, false, 'a grant lifts it, and says so');
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
 test('audit view: short hand-chosen codes are hidden outright; deleted roles are labelled as deleted', async () => {
   const { deps, permissions, cleanup } = setupDeps([]);
   const actor = { id: 'super', name: 'Super', kind: 'admin' as const };
