@@ -2340,10 +2340,15 @@ async function openRoleDrawer() {
     status.node,
   ]);
 
+  /** A name the catalog holds: the naming rule is for new names, and a role
+   *  made before it keeps its name — the relay lets it be replaced under
+   *  that name (the save looks it up and asks first). */
+  const inCatalog = (n) => Object.prototype.hasOwnProperty.call(meta.catalog || {}, n);
   /** What is still missing before Create can be pressed, or ''. */
   function missing() {
-    if (!name.value.trim()) return 'Name the role';
-    if (!ROLE_NAME.test(name.value.trim())) return 'Use lower-case letters, digits, dots, dashes or underscores in the name (up to 64)';
+    const n = name.value.trim();
+    if (!n) return 'Name the role';
+    if (!ROLE_NAME.test(n) && !inCatalog(n)) return 'Use lower-case letters, digits, dots, dashes or underscores in the name (up to 64)';
     if (kind.value === 'channels' && !chanList.values().length) return 'Pick at least one channel';
     if (kind.value === 'mirrorRole' && !mirror.value()) return 'Pick a Discord role';
     if (kind.value === 'mirrorRoles' && !mirrors.list.values().length) return 'Pick at least one Discord role';

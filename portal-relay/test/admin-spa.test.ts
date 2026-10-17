@@ -1319,9 +1319,9 @@ const G2_LOBBY = '100000000000002011'; // #lobby in Guild Two
  *  relay keeps (POST /admin/roles replaces a name, as the relay does). With
  *  ?names=1 it names what a super-admin's catalog references, as the relay
  *  does: every role's guild it knows, and their channels. */
-async function rolesTab() {
+async function rolesTab(more: Record<string, any> = {}) {
   const g = '/admin/g/' + G1;
-  const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'] };
+  const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'], ...more };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
   const net: { down: boolean; beforePost?: (body: any) => void } = { down: false };
   const box = appSandbox({
@@ -1786,6 +1786,19 @@ test('role drawer: a new name must be one the relay accepts', async () => {
   const submit = form.querySelector('button[type="submit"]')!;
   assert.equal(submit.disabled, true);
   assert.match(form.textContent, /Use lower-case letters, digits, dots, dashes or underscores in the name \(up to 64\) to create it\./);
+});
+
+test('role drawer: a role made before the naming rule can still be edited under its name', async () => {
+  const old = { caps: [...LEVEL_CAPS.read], scope: { all: true }, guildId: G1 };
+  const { define, confirm, catalog, bodies } = await rolesTab({ 'Old Name': old });
+  await define('Old Name', 'write'); // asserts Create is on
+  const dialog = confirm()!;
+  assert.ok(dialog, 'the existing role is asked about, as any other');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'A role named Old Name already exists — edit it instead?');
+  dialog.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { name: 'Old Name', role: { caps: [...LEVEL_CAPS.write], scope: { all: true }, guildId: G1 }, replace: true, expectedGuildId: G1 });
+  assert.deepEqual(catalog['Old Name'].caps, [...LEVEL_CAPS.write]);
 });
 
 // ── Addresses: the router grammar (lib.js) ──
