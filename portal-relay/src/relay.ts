@@ -216,6 +216,16 @@ export class Relay implements GatewayHooks {
         rotatePersonaToken: (personaId) => this.rotatePersonaToken(personaId),
         revokePersonaToken: (personaId) => this.revokePersonaToken(personaId),
         newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
+        // The effective-access view reads what the relay enforces: capsFor
+        // itself, and the bot's half of it per channel (capsFor's own
+        // computeCapabilities over every capability), so a whole guild can
+        // be counted with one resolve() per persona and channel.
+        capsFor: (personaId, channelId, guildId) => this.capsFor(personaId, channelId, guildId),
+        botCaps: (guildId, channelId) =>
+          computeCapabilities(new Set(ALL_CAPS), this.bot.channelForPerms(channelId), this.bot.meIn(guildId)),
+        listChannelLayout: (gid) => this.bot.listChannelLayout(gid),
+        canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
+        resync: (personaId) => this.resyncPersona(personaId),
       };
       this.admin = new AdminServer(deps);
     }

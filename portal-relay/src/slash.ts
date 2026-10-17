@@ -19,6 +19,7 @@
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
 import { roleGrantsAccess, type PermissionsStore } from './permissions.js';
+import { LEVEL_CAPS, capsLabel, contributingRoles } from './access.js';
 import type { InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
@@ -188,32 +189,9 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
 
 // ── Capability presets ──
 
-const READ_CAPS: Capability[] = ['VIEW_CHANNEL', 'READ_HISTORY'];
-const WRITE_CAPS: Capability[] = [
-  ...READ_CAPS,
-  'SEND_MESSAGES',
-  'SEND_IN_THREADS',
-  'CREATE_THREADS',
-  'ATTACH_FILES',
-  'ADD_REACTIONS',
-  'EDIT_OWN',
-  'DELETE_OWN',
-];
-const FULL_CAPS: Capability[] = [...WRITE_CAPS, 'MANAGE_MESSAGES'];
-export const LEVEL_CAPS: Record<string, Capability[]> = {
-  read: READ_CAPS,
-  write: WRITE_CAPS,
-  full: FULL_CAPS,
-};
-
-/** Render a caps set as its level name when it matches one, else the raw list. */
-function capsLabel(caps: readonly Capability[]): string {
-  const set = new Set(caps);
-  for (const [level, levelCaps] of Object.entries(LEVEL_CAPS).reverse()) {
-    if (levelCaps.length === set.size && levelCaps.every((c) => set.has(c))) return level;
-  }
-  return caps.join(', ') || 'none';
-}
+// The presets and their labels live in access.ts (the admin panel speaks
+// them too); importers of LEVEL_CAPS from here keep working.
+export { LEVEL_CAPS };
 
 // ── Handler ──
 
@@ -569,15 +547,6 @@ export class SlashHandler {
   }
 
   private contributingRoles(personaId: string, guildId: string, channelId: string): string[] {
-    return this.deps.permissions.getRoleNames(personaId).filter((name) => {
-      const role = this.deps.permissions.getRole(name);
-      if (!role) return false;
-      if (role.guildId && role.guildId !== guildId) return false;
-      // A role contributes if removing everything else still leaves caps — cheap
-      // approximation: does a synthetic entry with only this role see the channel?
-      return this.deps.permissions
-        .resolveForRoles([name], guildId, channelId)
-        .has('VIEW_CHANNEL');
-    });
+    return contributingRoles(this.deps.permissions, personaId, guildId, channelId);
   }
 }

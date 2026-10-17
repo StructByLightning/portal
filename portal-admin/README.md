@@ -263,10 +263,41 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
 - `DELETE /admin/g/:gid/personas/:id/grants` with exactly one of `?channelId=`,
   `?guildDefault=deny` (an explicit deny) or `?guildDefault=unset` (fall back to the
   persona default). Audit records carry `before` and `after`.
+- Both grant routes take `expect` (what the panel last saw at the target: caps, or `null`
+  for nothing set; compared as sets — anything else there now is `409 CONFLICT {current}`
+  and nothing is written) and `batchId` (`^[A-Za-z0-9_-]{1,32}$`, kept in the audit
+  record's `detail`); DELETE takes them as a JSON body. Answers carry `effective`: for a
+  channel, what the persona can do there now and why (as a row below); guild-wide,
+  `{guildWide:true, channels, counts:{read,write,full,custom}, direct:{…}}` — how many
+  of the guild's channels at each level, and how many of those through a direct grant.
 - `GET /admin/g/:gid/invites?q=&status=active|spent|all` → newest first, each with
   `status` (`active` · `used` · `expired`); `POST …/invites`, `DELETE …/invites/:code`
 - `GET /admin/g/:gid/roles` → `{catalog, discordRoles, canAuthor}` (a guild-admin gets
-  that guild's roles only); `GET …/channels`; `GET …/audit`
+  that guild's roles only); `GET …/audit`
+- `GET /admin/g/:gid/channels` → `{channels:[{id,name,type,parentId?,categoryId,position,
+  announcement,grantable}], categories:[{id,name,position}]}`
+- Effective access — what the relay enforces (its own `capsFor`: the persona's access
+  within what the relay's bot can do there, nothing after a `/ban`), and why. Each sends
+  `Server-Timing: access;dur=<ms>`.
+  - `GET …/access/summary` → `{channels:[{id, counts:{read,write,full,custom}, botBase,
+    botCantView}], personas:[{id, counts}], considered, computedAt, truncated?}` — per
+    channel that can hold access, how many personas can act there at each level (counted
+    where they can see it, as `/list` counts). Reused for 5 s, dropped by any permissions
+    change; past 100k personas × channels the counts are left out (`truncated`).
+  - `GET …/channels/:cid/access` → `{channel, botCaps, botBase, rows:[{personaId,
+    displayName, avatarUrl, effective, level, base, extra, direct, sources, botLimited,
+    botLacks}], names}`; a thread → `{inert:'thread', parentId}`, a category →
+    `{inert:'category', channels}`. A channel that isn't the guild's is one 404, whatever
+    the reason. `sources` name the reasons: `direct`, `block`, `role` (`how`: all ·
+    channels · mirror), `guildWide`, `personaDefault`, `relayDefault`, `removed` (`/ban`);
+    one that doesn't count there carries `shadowedBy`.
+  - `GET …/personas/:id/access` → `{persona, removed, guildWide (caps|'deny'|null),
+    personaDefault, relayDefault, rows:[{channelId, …}], inactive:[{channelId, caps,
+    reason: thread|category|missing|blocks-nothing}], roles:[{name, caps, scope, channels}],
+    names}` (+ `otherGuildRoleCount` for super-admins)
+  - `GET …/persona-directory?q=` → `{personas:[{id, displayName, avatarUrl,
+    hasAccessHere}]}` — at most 25, the people slash `/add` offers: an exact id first, then
+    names starting with `q`, then the rest.
 - `POST /admin/roles {name, role, replace?, expectedGuildId?}` *(super-admin, global)* —
   a name in use is `409 EXISTS` unless `replace:true` names the guild it belongs to
   (else `409 GUILD_MISMATCH`; replacing never moves a role). New names match

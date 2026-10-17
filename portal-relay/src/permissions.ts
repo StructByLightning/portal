@@ -22,6 +22,9 @@ import type {
   Scope,
 } from './config.js';
 import { WatchedFile } from './file-watch.js';
+import { ALL_CAPS } from './access.js';
+
+export { ALL_CAPS };
 
 /**
  * Mirror lookup: per-channel capabilities of a Discord role in a guild, keyed
@@ -117,6 +120,12 @@ export class PermissionsStore {
   resolve(personaId: string, guildId: string | null, channelId: string): Set<Capability> {
     const entry = this.personas.get(personaId);
     if (!entry) return new Set(this.fileDefault);
+    return this.resolveEntry(entry, guildId, channelId);
+  }
+
+  /** resolve() for an entry as given — the store's own, or a hypothetical one
+   *  (the admin panel's previews: "if this grant were set"). */
+  resolveEntry(entry: PersonaEntry, guildId: string | null, channelId: string): Set<Capability> {
     if (guildId && entry.bans?.includes(guildId)) return new Set();
     const out = this.resolveForRoles(entry.roles ?? [], guildId, channelId);
     if (entry.policy) {
@@ -149,14 +158,28 @@ export class PermissionsStore {
 
   /** Legacy per-persona policy resolution: channel ?? guild-default ?? default. */
   private resolvePolicy(pol: PersonaPolicy, guildId: string | null, channelId: string): Set<Capability> {
+    return new Set(this.explainPolicy(pol, guildId, channelId).caps);
+  }
+
+  /**
+   * Which part of an inline policy decides (guildId, channelId), and what it
+   * gives: the channel's own entry ([] blocks), else the guild's default
+   * ([] denies), else the persona default. The one place this order lives —
+   * resolve() and the admin panel's explanations both go through it.
+   */
+  explainPolicy(
+    pol: PersonaPolicy,
+    guildId: string | null,
+    channelId: string,
+  ): { source: 'channel' | 'guildDefault' | 'personaDefault'; caps: Capability[] } {
     if (guildId) {
       const g = pol.guilds?.[guildId];
       if (g) {
-        if (g.channels?.[channelId]) return new Set(g.channels[channelId]);
-        if (g.default) return new Set(g.default);
+        if (g.channels?.[channelId]) return { source: 'channel', caps: g.channels[channelId] };
+        if (g.default) return { source: 'guildDefault', caps: g.default };
       }
     }
-    return new Set(pol.default);
+    return { source: 'personaDefault', caps: pol.default ?? [] };
   }
 
   /** Does a scope grant apply in (guildId, channelId)? Fail-closed for mirrors. */
@@ -208,6 +231,11 @@ export class PermissionsStore {
       if (caps) for (const c of caps) out.add(c);
     }
     return out;
+  }
+
+  /** What a persona with no entry of its own resolves to, everywhere (a copy). */
+  getFileDefault(): Capability[] {
+    return [...this.fileDefault];
   }
 
   getPolicy(personaId: string): PersonaPolicy | undefined {
@@ -567,12 +595,6 @@ const CAP_REQUIRES: Partial<Record<Capability, bigint>> = {
   VOICE_LISTEN: F.Connect,
   VOICE_SPEAK: F.Speak,
 };
-
-export const ALL_CAPS: Capability[] = [
-  'VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS',
-  'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN',
-  'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'VOICE_LISTEN', 'VOICE_SPEAK',
-];
 
 /** The portal caps a permission bitfield supports (per-channel, post-overwrite).
  *  Backs full-fidelity `mirrorCaps` roles: what could a member holding exactly

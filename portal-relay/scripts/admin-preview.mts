@@ -50,7 +50,7 @@ import { AdminServer, type AdminDeps } from '../src/admin/server.js';
 import { AuditLog } from '../src/admin/audit.js';
 import { ChannelNameResolver } from '../src/admin/names.js';
 import { IdentityStore, generateToken, hashToken } from '../src/identity.js';
-import { PermissionsStore } from '../src/permissions.js';
+import { ALL_CAPS, PermissionsStore } from '../src/permissions.js';
 import { InviteStore } from '../src/invites.js';
 import { LEVEL_CAPS } from '../src/slash.js';
 import type { ChannelMeta } from '../src/discord-bot.js';
@@ -159,7 +159,8 @@ interface FixtureChannel {
   position: number;
   /** Discord announcement channel (the relay maps it to `text`). */
   announcement?: boolean;
-  /** What the relay's bot may do here (none = it can't see the channel). */
+  /** What the relay's bot may do here (none = it can't see the channel;
+   *  full = every capability, as a bot with broad permissions has). */
   bot: Level | 'none';
   /** What members holding each Discord role may do here. */
   access: Partial<Record<'everyone' | 'mods' | 'researchers', Level>>;
@@ -378,18 +379,34 @@ const levelCaps = (l: Level | 'none' | undefined): Capability[] => (l && l !== '
 const roleKey = (gid: string, rid: string): 'everyone' | 'mods' | 'researchers' | null =>
   rid === gid ? 'everyone' : rid === ROLE.mods ? 'mods' : rid === ROLE.researchers ? 'researchers' : null;
 
-// Which channels a Discord role can see, and what it may do in each.
+// Which channels a Discord role can see, and what it may do in each. Worked
+// out once per role, as the relay's mirror cache does.
+const mirrors = new Map<string, Map<string, Set<Capability>>>();
 permissions.setMirrorLookup((gid, rid) => {
+  const k = `${gid}/${rid}`;
+  const hit = mirrors.get(k);
+  if (hit) return hit;
   const out = new Map<string, Set<Capability>>();
   const key = roleKey(gid, rid);
-  if (!key) return out;
-  for (const c of CHANNELS) {
-    if (c.guildId !== gid || c.type === 'category') continue;
-    const caps = levelCaps(c.access[key]);
-    if (caps.length) out.set(c.id, new Set(caps));
+  if (key) {
+    for (const c of CHANNELS) {
+      if (c.guildId !== gid || c.type === 'category') continue;
+      const caps = levelCaps(c.access[key]);
+      if (caps.length) out.set(c.id, new Set(caps));
+    }
   }
+  mirrors.set(k, out);
   return out;
 });
+
+// What the relay's bot can do in a channel — as computeCapabilities works it
+// out: a channel Discord's cache doesn't hold lets only the two capabilities
+// with no Discord permission behind them through.
+const BOT_CAPS: Record<Level | 'none', Capability[]> = { none: [], read: LEVEL_CAPS.read, write: LEVEL_CAPS.write, full: ALL_CAPS };
+const botCaps = (_gid: string, cid: string): Capability[] => {
+  const c = channelById.get(cid);
+  return c ? [...BOT_CAPS[c.bot]] : ['EDIT_OWN', 'DELETE_OWN'];
+};
 
 const meta = (c: FixtureChannel): ChannelMeta => ({
   id: c.id, name: c.name, type: c.type, guildId: c.guildId,
@@ -496,6 +513,26 @@ const deps: AdminDeps = {
     if (cur) identity.upsert({ ...cur, token: hashToken(generateToken()) });
   },
   newInviteCode: newCode,
+  // As Relay.capsFor: nothing for a persona it doesn't know or in a guild it
+  // doesn't serve; else the persona's access within what the bot can do.
+  capsFor: (pid, cid, gid) => {
+    if (!identity.get(pid) || (gid && !allowed.has(gid))) return [];
+    const policy = permissions.resolve(pid, gid, cid);
+    const bot = new Set(botCaps(gid, cid));
+    return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
+  },
+  botCaps,
+  listChannelLayout: (gid) =>
+    joinedGuilds().some((g) => g.id === gid)
+      ? CHANNELS.filter((c) => c.guildId === gid && c.type !== 'thread')
+        .map((c) => ({ id: c.id, categoryId: c.categoryId ?? null, position: c.position, announcement: !!c.announcement }))
+      : [],
+  canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, (cid) => channelById.get(cid)?.guildId === gid),
+  // No agents run in the preview: nothing to re-send.
+  resync: (pid) => {
+    console.error(`[preview] resync ${pid}`);
+    return 0;
+  },
 };
 
 let api = new AdminServer(deps, fakeDiscord);

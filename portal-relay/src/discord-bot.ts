@@ -756,6 +756,29 @@ export class DiscordBot implements WebhookOps, RoleOps {
       .map((c) => this.metaOf(c));
   }
 
+  /**
+   * Where each channel of a guild sits in Discord's sidebar, for the admin
+   * panel's channel list: its category (null at the top level), its raw
+   * position (Discord orders by it, then by id) and whether it is an
+   * announcement channel (ChannelMeta calls those 'text'). Threads have no
+   * place of their own and are left out. Read from the gateway cache only.
+   */
+  listChannelLayout(guildId: string): Array<{ id: string; categoryId: string | null; position: number; announcement: boolean }> {
+    const guild = this.client.guilds.cache.get(guildId);
+    if (!guild) return [];
+    const out: Array<{ id: string; categoryId: string | null; position: number; announcement: boolean }> = [];
+    for (const c of guild.channels.cache.values()) {
+      if (!c || c.isThread()) continue;
+      out.push({
+        id: c.id,
+        categoryId: c.parentId ?? null,
+        position: c.rawPosition,
+        announcement: c.type === ChannelType.GuildAnnouncement,
+      });
+    }
+    return out;
+  }
+
   /** discord.js GuildMember for the bot in a guild, for permission checks. */
   meIn(guildId: string): GuildMember | null {
     return this.client.guilds.cache.get(guildId)?.members.me ?? null;

@@ -36,10 +36,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import type { AccessRole, AdminConfig, GuildPolicy, Scope } from '../config.js';
+import type { AccessRole, AdminConfig, GuildPolicy, PersonaIdentity, Scope } from '../config.js';
 import type { Capability } from '@animalabs/portal-protocol';
 import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
-import { LEVEL_CAPS } from '../slash.js';
+import {
+  LEVEL_CAPS, accessSummary, countedLevel, explainFor, isGrantable, levelOf, subjectOf, zeroCounts,
+  type AccessDeps, type AccessSource, type Explained, type LevelCounts, type Subject,
+} from '../access.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
@@ -54,9 +57,17 @@ import { LoginRateLimit, clientIp } from './login-limit.js';
  *  PA.CLIENT_API and asks for a reload when the relay is newer. */
 export const ADMIN_API_VERSION = 2;
 
-/** Channel types a direct grant (or a role or invite channel list) can name:
- *  a thread uses its parent's access and a category grants nothing. */
-const GRANTABLE_TYPES = new Set(['text', 'voice', 'forum']);
+/** Personas × channels the access summary counts at most. Past it the counts
+ *  are left out (truncated) rather than stalling the event loop or refusing. */
+export const ACCESS_CELL_CAP = 100_000;
+/** How long a guild's access summary is reused. Any permissions change
+ *  drops it at once; the rest (channels, the bot's permissions) can lag this
+ *  much. */
+const SUMMARY_TTL_MS = 5_000;
+/** Rows the persona directory answers with, as slash autocomplete does. */
+const DIRECTORY_ROWS = 25;
+/** A bulk change's id, kept in the audit record of each of its writes. */
+const BATCH_ID = /^[A-Za-z0-9_-]{1,32}$/;
 
 /** New access-role names. Existing names that don't fit are kept (and can be
  *  replaced under the same name). */
@@ -130,6 +141,40 @@ export interface AdminDeps {
   revokePersonaToken(personaId: string): void;
   /** Generate a unique invite code. */
   newInviteCode(): string;
+  /** What the relay enforces for a persona in a channel: Relay.capsFor. */
+  capsFor(personaId: string, channelId: string, guildId: string): Capability[];
+  /** What the relay's bot can do in a channel of G: computeCapabilities over
+   *  every capability, for the bot's member in G — capsFor's Discord half. */
+  botCaps(guildId: string, channelId: string): Capability[];
+  /** Where each channel of G sits in Discord's sidebar (threads left out). */
+  listChannelLayout(guildId: string): Array<{ id: string; categoryId: string | null; position: number; announcement: boolean }>;
+  /** Whether a persona could have any capability in G (the relay's own test,
+   *  PermissionsStore.couldAccessGuild over G's channels). */
+  canAccessGuild(personaId: string, guildId: string): boolean;
+  /** Re-send a persona's channel list to its running agent; channels pushed. */
+  resync(personaId: string): number;
+}
+
+/** The access model's view of the relay (access.ts), as the admin API reads
+ *  it: the relay's own stores and bot caps, and the served-guild test that
+ *  canManageGuild uses. */
+export function accessDepsOf(deps: AdminDeps): AccessDeps {
+  const served = new Map<string, boolean>();
+  return {
+    identity: deps.identity,
+    permissions: deps.permissions,
+    botCaps: (guildId, channelId) => deps.botCaps(guildId, channelId),
+    served: (guildId) => {
+      let v = served.get(guildId);
+      if (v === undefined) served.set(guildId, (v = deps.listGuilds().some((g) => g.id === guildId)));
+      return v;
+    },
+  };
+}
+
+/** Limits a test can lower. */
+export interface AdminLimits {
+  accessCellCap?: number;
 }
 
 export class AdminServer {
@@ -142,14 +187,24 @@ export class AdminServer {
    *  callbacks: each start holds a state in memory until it is used. */
   private loginLimit = new LoginRateLimit();
   private limitTimer?: ReturnType<typeof setInterval>;
+  /** Access summaries by guild, reused for SUMMARY_TTL_MS. */
+  private summaries = new Map<string, { at: number; body: Record<string, unknown> }>();
+  private accessCellCap: number;
+  /** The access model and capsFor disagreed once (said once, loudly). */
+  private driftReported = false;
 
   constructor(
     private deps: AdminDeps,
     /** Injectable fetch — tests drive the OAuth callback without real network. */
     private fetchImpl: FetchLike = fetch,
+    limits: AdminLimits = {},
   ) {
     this.sessions = new SessionStore(deps.config.sessionTtlMs);
     this.audit = deps.audit;
+    this.accessCellCap = limits.accessCellCap ?? ACCESS_CELL_CAP;
+    // Whoever changed it — this panel, slash, an invite, the file — a
+    // summary counted before is no longer what the relay enforces.
+    deps.permissions.onChange(() => this.summaries.clear());
   }
 
   async listen(): Promise<void> {
@@ -286,6 +341,14 @@ export class AdminServer {
     sub: string,
     url: URL,
   ): Promise<void> {
+    // Effective access (what the relay enforces, and why).
+    if (method === 'GET') {
+      if (sub === '/access/summary') return this.onAccessSummary(res, guildId);
+      const chAccess = /^\/channels\/([^/]+)\/access$/.exec(sub);
+      if (chAccess) return this.onChannelAccess(res, guildId, decodeURIComponent(chAccess[1]));
+      const pAccess = /^\/personas\/([^/]+)\/access$/.exec(sub);
+      if (pAccess) return this.onPersonaAccess(res, session, guildId, decodeURIComponent(pAccess[1]));
+    }
     // Read: GET /admin/g/:gid/personas/:id  (drawer detail) — before the generic
     // single-segment read so it isn't shadowed.
     const personaDetail = /^\/personas\/([^/]+)$/.exec(sub);
@@ -324,8 +387,9 @@ export class AdminServer {
       return this.setGrant(res, session, guildId, decodeURIComponent(grantSet[1]), await readJson(req));
     }
     // DELETE /admin/g/:gid/personas/:id/grants?channelId= | ?guildDefault=deny|unset
+    // (optional JSON body: {expect, batchId})
     if (method === 'DELETE' && grantSet) {
-      return this.clearGrant(res, session, guildId, decodeURIComponent(grantSet[1]), url.searchParams);
+      return this.clearGrant(res, session, guildId, decodeURIComponent(grantSet[1]), url.searchParams, await readJson(req));
     }
     // POST /admin/g/:gid/personas/:id/claim  (admin-initiated augment)
     const claim = /^\/personas\/([^/]+)\/claim$/.exec(sub);
@@ -613,7 +677,9 @@ export class AdminServer {
       case 'personas':
         return sendJson(res, 200, paginate(this.personasFor(guildId, page.q, session.isSuper), page, 'personas'));
       case 'channels':
-        return sendJson(res, 200, { channels: this.deps.listChannels(guildId) });
+        return sendJson(res, 200, this.channelsView(guildId));
+      case 'persona-directory':
+        return this.onPersonaDirectory(res, guildId, url);
       case 'audit': {
         const records = this.audit.read({ guildId, limit: page.limit }).map((r) => this.auditView(r, guildId, session.isSuper));
         return sendJson(res, 200, { records, names: await this.auditNames(records, guildId) });
@@ -642,6 +708,244 @@ export class AdminServer {
       banned: this.deps.permissions.isBanned(personaId, guildId),
       names: { channels: clipToGuild(labels, guildId) } satisfies NameMaps,
     });
+  }
+
+  // ── Effective access (access.ts): what the relay enforces, and why ──
+
+  /** G's channels with their place in Discord's sidebar (category, position,
+   *  announcement), whether each can hold a direct grant, and the categories. */
+  private channelsView(guildId: string) {
+    const layout = new Map(this.deps.listChannelLayout(guildId).map((l) => [l.id, l] as const));
+    const channels = this.deps.listChannels(guildId).map((c) => {
+      const l = layout.get(c.id);
+      return { ...c, categoryId: l?.categoryId ?? null, position: l?.position ?? 0, announcement: !!l?.announcement, grantable: isGrantable(c.type) };
+    });
+    const categories = channels.filter((c) => c.type === 'category').map((c) => ({ id: c.id, name: c.name ?? null, position: c.position }));
+    return { channels, categories };
+  }
+
+  /** The personas an access read looks at in G: everyone who could have
+   *  anything there, and everyone with a setting there (a deny, a block, a
+   *  /ban) — never anyone else. */
+  private candidates(guildId: string): PersonaIdentity[] {
+    return this.deps.identity.all().filter(
+      (p) => this.deps.permissions.getPolicy(p.id)?.guilds?.[guildId] !== undefined || this.deps.canAccessGuild(p.id, guildId),
+    );
+  }
+
+  /** One persona in one channel, as the relay enforces it: the model's
+   *  explanation, whose `effective` is checked against capsFor itself. They
+   *  agree (test/access.test.ts); if they ever don't, the relay's answer is
+   *  what is shown, and it is said loudly once. */
+  private enforced(a: AccessDeps, s: Subject, channelId: string, bot: ReadonlySet<Capability>): Explained {
+    const ex = explainFor(a, s, channelId, bot);
+    const relay = this.deps.capsFor(s.personaId, channelId, s.guildId);
+    if (sameCaps(ex.effective, relay)) return ex;
+    if (!this.driftReported) {
+      this.driftReported = true;
+      console.error(`[portal-admin] effective access drifted from capsFor (persona ${s.personaId}, channel ${channelId}): showing capsFor; please report`);
+    }
+    const effective = ALL_CAPS.filter((c) => relay.includes(c));
+    return { ...ex, effective, ...levelOf(effective) };
+  }
+
+  /** What a grant change's answer says the persona can do now: in the
+   *  channel, or (guild-wide) how many of G's channels at each level, and
+   *  how many of those through a direct grant. */
+  private effectAfter(personaId: string, guildId: string, channelId: string | undefined): Explained | { guildWide: true; channels: number; counts: LevelCounts; direct: LevelCounts } {
+    const a = accessDepsOf(this.deps);
+    const s = subjectOf(a, personaId, guildId);
+    if (channelId !== undefined) return this.enforced(a, s, channelId, new Set(this.deps.botCaps(guildId, channelId)));
+    const counts = zeroCounts();
+    const direct = zeroCounts();
+    let channels = 0;
+    for (const ch of this.deps.listChannels(guildId)) {
+      if (!isGrantable(ch.type)) continue;
+      channels++;
+      const ex = this.enforced(a, s, ch.id, new Set(this.deps.botCaps(guildId, ch.id)));
+      const level = countedLevel(ex.effective);
+      if (!level) continue;
+      counts[level]++;
+      if (ex.direct?.length) direct[level]++;
+    }
+    return { guildWide: true, channels, counts, direct };
+  }
+
+  /**
+   * GET …/access/summary — for each channel of G that can hold access, how
+   * many personas can act there at each level (counted where they can see it,
+   * as /list counts), and the bot's own ceiling there; for each persona, in
+   * how many channels. Reused for SUMMARY_TTL_MS, dropped by any permissions
+   * change. Past ACCESS_CELL_CAP personas × channels the counts are left out.
+   */
+  private onAccessSummary(res: ServerResponse, guildId: string): void {
+    const t0 = performance.now();
+    const now = this.nowMs();
+    const hit = this.summaries.get(guildId);
+    if (hit && now - hit.at < SUMMARY_TTL_MS && now >= hit.at) return sendJson(res, 200, hit.body, timing(t0));
+    const channelIds = this.deps.listChannels(guildId).filter((c) => isGrantable(c.type)).map((c) => c.id);
+    const personaIds = this.candidates(guildId).map((p) => p.id);
+    const body = {
+      ...accessSummary(accessDepsOf(this.deps), guildId, channelIds, personaIds, this.accessCellCap),
+      computedAt: new Date(now).toISOString(),
+    };
+    this.summaries.set(guildId, { at: now, body });
+    sendJson(res, 200, body, timing(t0));
+  }
+
+  /**
+   * GET …/channels/:cid/access — who can act in one channel of G, at what
+   * level and why. A thread answers with its parent (it uses the parent's
+   * access), a category with its channels (it grants nothing). A channel
+   * that isn't G's — deleted, hidden from the bot, another guild's — is the
+   * same 404.
+   */
+  private async onChannelAccess(res: ServerResponse, guildId: string, channelId: string): Promise<void> {
+    const t0 = performance.now();
+    const list = this.deps.listChannels(guildId);
+    const ch = list.find((c) => c.id === channelId);
+    if (!ch) return sendJson(res, 404, err('NOT_FOUND', 'no such channel in this guild'), timing(t0));
+    const view = this.channelsView(guildId);
+    const channel = view.channels.find((c) => c.id === channelId)!;
+    const label = (id: string | null | undefined): Record<string, ChannelLabel> => {
+      const c = id ? list.find((x) => x.id === id) : undefined;
+      return c ? { [c.id]: { id: c.id, name: c.name ?? null, type: c.type as ChannelLabel['type'], guildId, ...(c.parentId ? { parentId: c.parentId } : {}) } } : {};
+    };
+    const own = { ...label(ch.id), ...label(ch.parentId), ...label(channel.categoryId) };
+    if (ch.type === 'thread') {
+      return sendJson(res, 200, { channel, inert: 'thread', parentId: ch.parentId ?? null, names: { channels: own } }, timing(t0));
+    }
+    if (ch.type === 'category') {
+      const inside = view.channels.filter((c) => c.categoryId === ch.id).sort((x, y) => x.position - y.position || cmp(x.id, y.id));
+      const names: Record<string, ChannelLabel> = { ...own };
+      for (const c of inside) Object.assign(names, label(c.id));
+      return sendJson(res, 200, { channel, inert: 'category', channels: inside.map((c) => c.id), names: { channels: names } }, timing(t0));
+    }
+    const a = accessDepsOf(this.deps);
+    const botList = this.deps.botCaps(guildId, channelId);
+    const bot = new Set(botList);
+    const rows = [];
+    const mirrored = new Set<string>();
+    for (const p of this.candidates(guildId)) {
+      const ex = this.enforced(a, subjectOf(a, p.id, guildId), channelId, bot);
+      if (!ex.effective.length && ex.direct === null) continue;
+      for (const id of mirrorIds(ex.sources)) mirrored.add(id);
+      rows.push({ personaId: p.id, displayName: p.displayName, avatarUrl: this.deps.identity.avatarUrl(p), ...rowOf(ex) });
+    }
+    rows.sort((x, y) => cmp(x.displayName.toLowerCase(), y.displayName.toLowerCase()) || cmp(x.personaId, y.personaId));
+    sendJson(res, 200, {
+      channel,
+      botCaps: ALL_CAPS.filter((c) => bot.has(c)),
+      botBase: levelOf(botList).base,
+      rows,
+      names: { channels: own, discordRoles: this.roleLabels(mirrored, guildId) } satisfies NameMaps,
+    }, timing(t0));
+  }
+
+  /**
+   * GET …/personas/:pid/access — one persona in G: its guild-wide setting
+   * and persona default (as caps here), what it can do in each channel that
+   * can hold access and why, the direct grants that do nothing (on a thread,
+   * a category, a channel G no longer has, or a block with nothing to
+   * block), and the access roles of G it holds, with in how many channels
+   * each gives something.
+   */
+  private async onPersonaAccess(res: ServerResponse, session: AdminSession, guildId: string, personaId: string): Promise<void> {
+    const t0 = performance.now();
+    const p = this.deps.identity.get(personaId);
+    if (!p) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'), timing(t0));
+    const a = accessDepsOf(this.deps);
+    const s = subjectOf(a, personaId, guildId);
+    const list = this.deps.listChannels(guildId);
+    const byId = new Map(list.map((c) => [c.id, c] as const));
+    const pol = s.entry?.policy;
+    const g = pol?.guilds?.[guildId];
+    const rows = [];
+    const roleChannels = new Map<string, number>();
+    for (const ch of list) {
+      if (!isGrantable(ch.type)) continue;
+      const ex = this.enforced(a, s, ch.id, new Set(this.deps.botCaps(guildId, ch.id)));
+      for (const src of ex.sources) if (src.kind === 'role') roleChannels.set(src.name, (roleChannels.get(src.name) ?? 0) + 1);
+      if (!ex.effective.length && ex.direct === null) continue;
+      rows.push({ channelId: ch.id, ...rowOf(ex) });
+    }
+    // Direct grants that do nothing. A channel not in G's list may be an
+    // archived thread: the name resolver knows (and says nothing of another
+    // guild's channel).
+    const away = Object.keys(g?.channels ?? {}).filter((cid) => !byId.has(cid));
+    const labels = clipToGuild(await this.channelLabels(away), guildId);
+    // Anything not known to be G's reads alike: deleted, hidden, elsewhere.
+    for (const cid of away) if (labels[cid]?.guildId !== guildId) labels[cid] = { id: cid, name: null, unavailable: true };
+    const blocksSomething = ((g?.default ?? pol?.default) ?? []).length > 0;
+    const inactive: Array<{ channelId: string; caps: Capability[]; reason: 'thread' | 'category' | 'missing' | 'blocks-nothing' }> = [];
+    for (const [cid, caps] of Object.entries(g?.channels ?? {})) {
+      const type = byId.get(cid)?.type ?? labels[cid]?.type;
+      if (type === 'thread' || type === 'category') inactive.push({ channelId: cid, caps, reason: type });
+      else if (!byId.has(cid)) inactive.push({ channelId: cid, caps, reason: 'missing' });
+      else if (!caps.length && isGrantable(type) && !blocksSomething) inactive.push({ channelId: cid, caps, reason: 'blocks-nothing' });
+    }
+    const roles = (s.entry?.roles ?? [])
+      .filter((name, i, all) => all.indexOf(name) === i && this.deps.permissions.getRole(name)?.guildId === guildId)
+      .map((name) => {
+        const r = this.deps.permissions.getRole(name)!;
+        return { name, caps: r.caps, scope: r.scope, guildId: r.guildId, ...(r.mirrorCaps ? { mirrorCaps: true } : {}), channels: roleChannels.get(name) ?? 0 };
+      });
+    const names: Record<string, ChannelLabel> = { ...labels };
+    const scoped = new Set<string>([...rows.map((r) => r.channelId), ...inactive.map((x) => x.channelId)]);
+    const mirrored = new Set<string>();
+    for (const r of roles) {
+      const sc = r.scope as { channels?: string[]; mirrorRole?: string; mirrorRoles?: string[] };
+      for (const cid of sc.channels ?? []) scoped.add(cid);
+      for (const id of sc.mirrorRoles ?? (sc.mirrorRole ? [sc.mirrorRole] : [])) mirrored.add(id);
+    }
+    for (const cid of scoped) {
+      const c = byId.get(cid);
+      if (c) names[cid] = { id: c.id, name: c.name ?? null, type: c.type as ChannelLabel['type'], guildId, ...(c.parentId ? { parentId: c.parentId, parentName: byId.get(c.parentId)?.name ?? null } : {}) };
+      else if (!names[cid]) names[cid] = { id: cid, name: null, unavailable: true };
+    }
+    const fileDefault = this.deps.permissions.getFileDefault();
+    sendJson(res, 200, {
+      persona: { id: p.id, displayName: p.displayName, avatarUrl: this.deps.identity.avatarUrl(p) },
+      // Removed from G with /ban: nothing it holds applies in G.
+      removed: !!s.entry?.bans?.includes(guildId),
+      guildWide: g?.default === undefined ? null : g.default.length ? g.default : 'deny',
+      // The persona default applies in every guild; here only its caps are shown.
+      personaDefault: pol?.default?.length ? pol.default : null,
+      relayDefault: !s.entry && fileDefault.length ? fileDefault : null,
+      rows,
+      inactive,
+      roles,
+      ...(session.isSuper ? { otherGuildRoleCount: this.otherGuildRoleCount(guildId, s.entry?.roles ?? []) } : {}),
+      names: { channels: names, discordRoles: this.roleLabels(mirrored, guildId) } satisfies NameMaps,
+    }, timing(t0));
+  }
+
+  /**
+   * GET …/persona-directory?q= — personas to pick from (to add one to G):
+   * the people slash /add autocomplete offers, at most 25, with only id,
+   * name, picture and whether it has access in G already. Matches id or name
+   * anywhere (any case): an exact id first, then names starting with q, then
+   * the rest, each alphabetically. No q: the first 25 alphabetically.
+   */
+  private onPersonaDirectory(res: ServerResponse, guildId: string, url: URL): void {
+    const t0 = performance.now();
+    const q = (url.searchParams.get('q') ?? '').trim().slice(0, 100).toLowerCase();
+    const alpha = (x: PersonaIdentity, y: PersonaIdentity) =>
+      cmp(x.displayName.toLowerCase(), y.displayName.toLowerCase()) || cmp(x.id, y.id);
+    const rank = (p: PersonaIdentity) => (p.id.toLowerCase() === q ? 0 : p.displayName.toLowerCase().startsWith(q) ? 1 : 2);
+    const found = this.deps.identity
+      .all()
+      .filter((p) => !q || p.id.toLowerCase().includes(q) || p.displayName.toLowerCase().includes(q))
+      .sort((x, y) => (q ? rank(x) - rank(y) : 0) || alpha(x, y))
+      .slice(0, DIRECTORY_ROWS);
+    sendJson(res, 200, {
+      personas: found.map((p) => ({
+        id: p.id,
+        displayName: p.displayName,
+        avatarUrl: this.deps.identity.avatarUrl(p),
+        hasAccessHere: this.deps.canAccessGuild(p.id, guildId),
+      })),
+    }, timing(t0));
   }
 
   /** Invites scoped to a guild (those whose `guildId` matches), optional
@@ -802,6 +1106,12 @@ export class AdminServer {
    * deny, stored as []). Nothing that would store a grant that does nothing
    * is accepted: empty caps, threads (they use their parent's access) and
    * categories (they grant nothing) are refused with a code the panel words.
+   *
+   * Optional: {expect} — what the panel last saw there (caps, or null for
+   * nothing set); anything else there now is 409 CONFLICT {current}, and
+   * nothing is written. {batchId} ties a bulk action's writes together in
+   * the audit. The answer says what the persona can do now (`effective`):
+   * in that channel, or — guild-wide — how many channels at each level.
    */
   private setGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, body: any): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
@@ -809,6 +1119,8 @@ export class AdminServer {
     if ('error' in target) return sendJson(res, 400, target);
     const op = grantOperation(body);
     if ('error' in op) return sendJson(res, 400, op);
+    const meta = changeMeta(body);
+    if ('error' in meta) return sendJson(res, 400, meta);
     const { channelId } = target;
     if (channelId !== undefined) {
       // The in-guild test runs first, so the type test below only ever
@@ -818,6 +1130,9 @@ export class AdminServer {
     }
     const caps = op.caps;
     const before = this.grantAt(personaId, guildId, channelId);
+    if (meta.expect !== undefined && !sameCaps(meta.expect, before)) {
+      return sendJson(res, 409, err('CONFLICT', 'this was changed since it was loaded', { current: before }));
+    }
     // An admin granting access here ends a /ban here (an explicit deny doesn't).
     const liftedBan = caps.length > 0 && this.deps.permissions.liftBan(personaId, guildId);
     // The guild key written is always the route's G (I3).
@@ -829,8 +1144,13 @@ export class AdminServer {
       actor: this.actorOf(session), action: 'persona.grant.set', target: personaId, guildId, ok: true,
       before: { ...where, caps: before },
       after: { ...where, caps, ...(op.level ? { level: op.level } : {}), ...(liftedBan ? { liftedBan } : {}) },
+      ...(meta.batchId ? { detail: { batchId: meta.batchId } } : {}),
     });
-    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
+    sendJson(res, 200, {
+      guildPolicy,
+      banned: this.deps.permissions.isBanned(personaId, guildId),
+      effective: this.effectAfter(personaId, guildId, channelId),
+    });
   }
 
   /**
@@ -846,8 +1166,11 @@ export class AdminServer {
    * nothing. So for a banned persona Unset is refused (409 BANNED) unless
    * the request also says &liftBan=1 — the admin, asked, chose to lift it —
    * and then it lifts the ban and unsets, recorded as liftedBan.
+   *
+   * The optional JSON body takes {expect, batchId}, as setGrant does, and the
+   * answer carries `effective` the same way.
    */
-  private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, params: URLSearchParams): void {
+  private clearGrant(res: ServerResponse, session: AdminSession, guildId: string, personaId: string, params: URLSearchParams, body: unknown = {}): void {
     if (!this.deps.identity.get(personaId)) return sendJson(res, 404, err('NOT_FOUND', 'no such persona'));
     const channelId = params.get('channelId');
     const gd = params.get('guildDefault');
@@ -857,9 +1180,14 @@ export class AdminServer {
     if (gd !== null && gd !== 'deny' && gd !== 'unset') {
       return sendJson(res, 400, err('INVALID', 'guildDefault must be deny or unset'));
     }
+    const meta = changeMeta(body);
+    if ('error' in meta) return sendJson(res, 400, meta);
     const g = this.deps.permissions.getEntry(personaId)?.policy?.guilds?.[guildId];
     const where = channelId !== null ? { channelId } : { guildDefault: true };
     const before = this.grantAt(personaId, guildId, channelId ?? undefined);
+    if (meta.expect !== undefined && !sameCaps(meta.expect, before)) {
+      return sendJson(res, 409, err('CONFLICT', 'this was changed since it was loaded', { current: before }));
+    }
     let liftedBan = false;
     if (channelId !== null) {
       // Only a grant that exists can be removed — and only then audited. (An
@@ -889,8 +1217,13 @@ export class AdminServer {
       before: { ...where, caps: before },
       // null: nothing set there any more; []: an explicit deny.
       after: { ...where, caps: gd === 'deny' ? [] : null, ...(liftedBan ? { liftedBan } : {}) },
+      ...(meta.batchId ? { detail: { batchId: meta.batchId } } : {}),
     });
-    sendJson(res, 200, { guildPolicy, banned: this.deps.permissions.isBanned(personaId, guildId) });
+    sendJson(res, 200, {
+      guildPolicy,
+      banned: this.deps.permissions.isBanned(personaId, guildId),
+      effective: this.effectAfter(personaId, guildId, channelId ?? undefined),
+    });
   }
 
   /** What a persona's own setting at one target of G is now: a channel's
@@ -920,7 +1253,7 @@ export class AdminServer {
       };
     }
     if (ch?.type === 'category') return { status: 400, body: err('CATEGORY_TARGET', 'a category grants nothing — pick its channels') };
-    if (!ch || !GRANTABLE_TYPES.has(ch.type ?? '')) {
+    if (!ch || !isGrantable(ch.type)) {
       return { status: 400, body: err('NOT_GRANTABLE', 'access can only be given on a text, voice or forum channel') };
     }
     return null;
@@ -1637,6 +1970,51 @@ function directGrantsIn(g: GuildPolicy | undefined): 'none' | 'grants' | 'denied
   return Array.isArray(g.default) ? 'denied' : 'none';
 }
 
+/** A grant change's optional fields: `expect` — what the panel last saw at
+ *  the target (caps, or null for nothing set) — and `batchId`. */
+function changeMeta(body: unknown): { expect?: Capability[] | null; batchId?: string } | ReturnType<typeof err> {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const out: { expect?: Capability[] | null; batchId?: string } = {};
+  if (b.expect !== undefined) {
+    const ok = b.expect === null || (Array.isArray(b.expect) && b.expect.length <= 64 && b.expect.every((c) => typeof c === 'string'));
+    if (!ok) return err('INVALID', 'expect must be a list of capabilities, or null for nothing set');
+    out.expect = b.expect as Capability[] | null;
+  }
+  if (b.batchId !== undefined) {
+    if (typeof b.batchId !== 'string' || !BATCH_ID.test(b.batchId)) return err('INVALID', 'batchId must be 1–32 letters, digits, dashes or underscores');
+    out.batchId = b.batchId;
+  }
+  return out;
+}
+
+/** Two settings are the same: both unset (null), or the same capabilities in any order. */
+function sameCaps(a: readonly string[] | null, b: readonly string[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  const x = new Set(a);
+  const y = new Set(b);
+  return x.size === y.size && [...x].every((c) => y.has(c));
+}
+
+/** An access row's fields from an explanation. */
+function rowOf(ex: Explained) {
+  return {
+    effective: ex.effective, level: ex.level, base: ex.base, extra: ex.extra,
+    direct: ex.direct, sources: ex.sources, botLimited: ex.botLimited, botLacks: ex.botLacks,
+  };
+}
+
+/** The Discord roles mirror sources follow. */
+function mirrorIds(sources: AccessSource[]): string[] {
+  return sources.flatMap((s) => (s.kind === 'role' && s.mirror ? s.mirror.map((m) => m.id) : []));
+}
+
+const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** The Server-Timing header of an access read: how long it took here. */
+function timing(t0: number): Record<string, string> {
+  return { 'server-timing': `access;dur=${(performance.now() - t0).toFixed(1)}` };
+}
+
 // ── HTTP helpers ──
 
 /** Read and JSON-parse a request body (bounded). Returns {} on empty/invalid. */
@@ -1656,9 +2034,9 @@ async function readJson(req: IncomingMessage): Promise<any> {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const json = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', ...headers });
   res.end(json);
 }
 
