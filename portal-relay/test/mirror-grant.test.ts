@@ -86,7 +86,7 @@ function makeRelay() {
   };
 
   const caps = (pid: string, cid: string) => [...relay.capsFor(pid, cid, GUILD)].sort();
-  return { relay, visible, caps, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { relay, visible, caps, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('enroll with a mirror grant materializes a live access role, not a snapshot', async () => {
@@ -440,9 +440,6 @@ const MALFORMED_FIELDS: Array<[string, Record<string, unknown>, RegExp]> = [
   ['caps-object', { grant: undefined, caps: { SEND_MESSAGES: true } }, /invite caps must be a list of capabilities/],
   // A machine mint's recheck reads the grant, so the shape comes first.
   ['mint-scope-null', { mintedBy: EXISTING, grant: { caps: [...RW], scope: null } }, /invite grant scope must be exactly one/],
-  // JSON reads 1e400 as Infinity, and a save writes it as null, so it reads one way until a reload and another after.
-  ['maxUses-infinite', { maxUses: Infinity }, /invite maxUses must be a finite number above 0/],
-  ['uses-infinite', { uses: Infinity }, /invite uses must be a finite number/],
 ];
 for (const [code, fields, why] of MALFORMED_FIELDS) {
   test(`invite ${code}: enroll and claim refuse it by name, before anything is created or spent`, async () => {
@@ -468,6 +465,31 @@ for (const [code, fields, why] of MALFORMED_FIELDS) {
     }
   });
 }
+
+// JSON reads 1e400 as Infinity, which a save would write as null. Loaded from a hand edit, such an invite is refused
+// by name until the next save drops it; a mint would save, so the invites are written to the file and reloaded.
+test('an invite whose maxUses or uses JSON read as infinite is refused by name at enroll and at a claim', async () => {
+  const t = makeRelay();
+  try {
+    const invite = (code: string, field: string) =>
+      `{"code":"${code}","label":"${code}","mode":"both","guildId":"${GUILD}","grant":${JSON.stringify(MIRROR_GRANT)},${field}}`;
+    writeFileSync(join(t.dir, 'invites.json'), `{"invites":[${invite('count-infinite', '"maxUses":1e400')},${invite('uses-infinite', '"uses":1e400')}]}`);
+    (t.relay.invites as any).reload();
+    const count = t.relay.identity.all().length;
+    for (const [code, why] of [
+      ['count-infinite', /^invite maxUses must be a finite number above 0 — whoever minted it must mint a new one$/],
+      ['uses-infinite', /^invite uses must be a finite number — whoever minted it must mint a new one$/],
+    ] as const) {
+      const enrolled = await outcome(() => t.relay.enroll({ invite: code, desiredName: `n-${code}` }));
+      const claimed = await outcome(() => t.relay.applyInviteAugment(EXISTING, code));
+      assert.ok(why.test(enrolled?.error ?? '') && why.test(claimed?.threw ?? ''), JSON.stringify({ code, enrolled, claimed }));
+    }
+    assert.equal(t.relay.identity.all().length - count, 0, 'no persona created');
+    assert.deepEqual([t.relay.invites.get('count-infinite')?.uses, t.relay.invites.get('uses-infinite')?.uses], [undefined, Infinity], 'no use spent');
+  } finally {
+    t.cleanup();
+  }
+});
 
 test('a misspelled mode is refused by name, at enroll and at a claim, since "mint-only" would be false for it', async () => {
   const t = makeRelay();

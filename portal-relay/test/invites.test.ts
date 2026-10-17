@@ -201,3 +201,23 @@ test('loading names a count or uses that JSON reads as infinite, which a save wo
   assert.ok(line.includes('uses-minus-infinite (invite uses must be a finite number)'), line);
   rmSync(dir, { recursive: true, force: true });
 });
+
+test('a save drops an invite whose count or uses JSON read as infinite, which it would write as null', (t) => {
+  t.mock.method(console, 'error', () => {});
+  const dir = mkdtempSync(join(tmpdir(), 'portal-invites-'));
+  const path = join(dir, 'invites.json');
+  // Written as text, since JSON.stringify would write Infinity as null.
+  const invite = (code: string, field: string) => `{"code":"${code}","label":"${code}","guildId":"g1","roles":["r"],${field}}`;
+  writeFileSync(path, `{"invites":[${[
+    invite('count-infinite', '"maxUses":1e400'),
+    invite('uses-infinite', '"maxUses":5,"uses":1e400'),
+    invite('uses-minus-infinite', '"uses":-1e400'),
+    invite('plain', '"maxUses":5,"uses":1'),
+  ].join(',')}]}`);
+  const store = new InviteStore(path);
+  store.mint({ code: 'fresh', label: 'fresh', guildId: 'g1', roles: ['r'] } as any);
+  const text = readFileSync(path, 'utf8');
+  assert.deepEqual(JSON.parse(text).invites.map((i: { code: string }) => i.code).sort(), ['fresh', 'plain'], text);
+  assert.deepEqual(new InviteStore(path).all().map((i) => i.code).sort(), ['fresh', 'plain']);
+  rmSync(dir, { recursive: true, force: true });
+});

@@ -76,8 +76,9 @@ export function inviteModeProblem(inv: InviteTemplate): string | null {
  * list, and in `uses` and `maxUses` '' would grow as text or exhaust the
  * invite, so they are refused there. A `grant` that is there must be an
  * object, so '', 0 and false are refused there too. A `uses` or `maxUses`
- * that isn't finite, such as JSON's 1e400, is refused as well: a save writes
- * it as null, so it would read one way until a reload and another after.
+ * that isn't finite, such as JSON's 1e400, is refused as well, and the next
+ * save drops the invite: JSON would write it as null, which reads otherwise
+ * (a null uses as 0).
  */
 export function inviteShapeProblem(inv: InviteTemplate): string | null {
   const f = inv as unknown as Record<string, unknown>;
@@ -221,7 +222,7 @@ export class InviteStore {
   }
 
   private persist(): void {
-    this.pruneExpired();
+    this.prune();
     const data: InvitesFile = { invites: this.all() };
     const json = JSON.stringify(data, null, 2) + '\n';
     if (this.file) this.file.write(json);
@@ -235,11 +236,17 @@ export class InviteStore {
    * forensic tail on disk; the audit log holds provenance permanently. An
    * expiresAt that isn't a date (expiryOf's NaN: a value that isn't a string,
    * or a string Date.parse can't read) counts as long expired (fail closed,
-   * matches check).
+   * matches check). An invite whose uses or maxUses is a number that isn't
+   * finite goes too: JSON would write it as null, which reads otherwise (a
+   * null uses as 0), so the refusal it gets as loaded would lapse.
    */
-  private pruneExpired(): void {
+  private prune(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [code, inv] of this.byCode) {
+      if ([inv.uses, inv.maxUses].some((v) => typeof v === 'number' && !Number.isFinite(v))) {
+        this.byCode.delete(code);
+        continue;
+      }
       const at = expiryOf(inv);
       if (at === undefined) continue;
       if (!Number.isFinite(at) || at <= cutoff) this.byCode.delete(code);
