@@ -1010,6 +1010,17 @@ function keepForm(d, key, hooks, status) {
   return true;
 }
 
+/** After a save: put the relay's value (`saved`) in `input` and count the
+ *  form as saved — unless the admin typed into the field while the save was
+ *  at work (it no longer holds `sentText`, what it held when the save was
+ *  sent): that text stays, and stays unsaved. */
+function settleField(input, sentText, saved, tracker) {
+  const typed = input.value;
+  input.value = saved;
+  tracker.reset();
+  if (typed !== sentText) input.value = typed;
+}
+
 /** A read that found the session over: say so where the content would be. */
 function sessionEndedNote() {
   return el('div', { class: 'load-error', role: 'alert' }, [
@@ -1386,22 +1397,22 @@ function profileSection(ctx, d) {
     status.node,
   ]);
   const tracker = ctx.drawer.track(form);
-  if (cropper) cropper.onUploaded = () => tracker.reset();
+  if (cropper) cropper.onUploaded = (saved, sentText) => settleField(avInput, sentText, saved, tracker);
 
-  async function save(value) {
+  /** Save `value`; `sentText` is what the field held when it was sent. */
+  async function save(value, sentText) {
     try {
       const r = await api('PUT', '/admin/personas/' + encodeURIComponent(id) + '/avatar', { avatar: value });
-      avInput.value = r.avatar || '';
+      settleField(avInput, sentText, r.avatar || '', tracker);
       setPreview(avImg, r.avatarUrl);
-      tracker.reset();
       markStale();
       status.ok(value
         ? 'Profile picture saved. It shows from ' + displayName + '’s next message.'
         : 'Profile picture removed. ' + displayName + '’s next message uses the default picture.');
     } catch (e) { status.err(notDone(e)); }
   }
-  ui.onSubmit(form, () => (cropping ? undefined : save(avInput.value.trim())));
-  clearAv.addEventListener('click', () => ui.busy(clearAv, () => { avInput.value = ''; return save(''); }, 'Clearing…'));
+  ui.onSubmit(form, () => (cropping ? undefined : save(avInput.value.trim(), avInput.value)));
+  clearAv.addEventListener('click', () => ui.busy(clearAv, () => { avInput.value = ''; return save('', ''); }, 'Clearing…'));
   return section('Profile picture', [form]);
 }
 
@@ -1522,14 +1533,14 @@ function guildAccessSection(ctx, detail, meta, onChange = () => {}) {
   ]);
   const claimTracker = ctx.drawer.track(claimForm);
   ui.onSubmit(claimForm, async () => {
-    const code = claimCode.value.trim();
+    const sentText = claimCode.value;
+    const code = sentText.trim();
     if (!code) { claimStatus.err('Not applied: enter an invite code first.'); return; }
     try {
       const r = await api('POST', P() + '/claim', { code });
       drawRoles(r.roles);
       noteBan(r);
-      claimCode.value = '';
-      claimTracker.reset();
+      settleField(claimCode, sentText, '', claimTracker); // emptied, unless another code was typed meanwhile
       claimStatus.ok('Applied the invite to ' + displayName + '.');
       markStale(); onChange();
     } catch (e) { claimStatus.err(notDone(e, 'Not applied')); }
@@ -1859,6 +1870,7 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
     const t = target.value;
     const caps = level.value();
     if (!t || !caps.length) return; // Save is off until both are picked
+    const sent = tracker.mark(); // what is saved, if it goes through
     // One target and one operation: a preset by name, Custom… as its caps.
     const body = t === GUILD_WIDE ? { guildDefault: true } : { channelId: t };
     const k = level.level();
@@ -1869,7 +1881,11 @@ function grantEditor(ctx, policy0, channels, names, onChange = () => {}, banned0
       const was = banned;
       noteBanned(r);
       draw(r.guildPolicy);
-      tracker.reset();
+      // What was sent is saved; a level picked while it was at work is not.
+      // Picked another target meanwhile and came back: the form loaded the
+      // level from before this save — show the saved one, unless it was
+      // changed again since.
+      if (!tracker.saved(sent) && target.value === t && !tracker.isDirty()) preload();
       status.ok((t === GUILD_WIDE
         ? displayName + ' → ' + capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).'
         : displayName + ' → ' + capsSummary(caps) + ' in ' + chanText(t, names) + '.') +
@@ -2187,6 +2203,7 @@ async function openMintDrawer(prefill = {}) {
       body.maxUses = n;
     } else if (uses.value !== 'unlimited') body.maxUses = Number(uses.value);
     if (expires.value !== 'never') body.expiresInDays = Number(expires.value);
+    const sent = tracker.mark(); // what is minted, if it goes through
     const k = kind.value();
     if (k === 'roles') {
       const roles = roleList.values();
@@ -2206,7 +2223,7 @@ async function openMintDrawer(prefill = {}) {
     }
     try {
       const r = await api('POST', gpath(gid) + '/invites', body);
-      tracker.reset();
+      tracker.saved(sent); // an edit made while minting stays unsaved (Mint another shows it)
       markStale();
       status.clear();
       ui.toast('Invite minted.');
@@ -2682,8 +2699,10 @@ function setPreview(img, url) {
 // Upload + square-crop control for a persona avatar. Reads a chosen image, lets
 // the admin pan/zoom inside a circular 240px viewport (Discord masks avatars to a
 // circle), renders the selected square to a 256×256 canvas, and POSTs the PNG to
-// /admin/personas/:id/avatar/upload. On success it updates the preview img and URL
-// field passed in. Pure client-side crop — no server image library needed.
+// /admin/personas/:id/avatar/upload. On success it updates the preview img, and
+// hands the stored URL to handle.onUploaded(saved, sentText) — sentText being what
+// the URL field held when the upload went — or, without one, puts it in the field.
+// Pure client-side crop — no server image library needed.
 // onStage(true|false) reports whether a crop is pending.
 function avatarCropper(ctx, avImg, avInput, status, onStage) {
   const { id, displayName } = ctx;
@@ -2759,6 +2778,7 @@ function avatarCropper(ctx, avImg, avInput, status, onStage) {
     const up = el('button', { class: 'btn btn-sm btn-primary', text: 'Upload' });
     const cancel = el('button', { class: 'btn btn-sm', text: 'Cancel', onclick: end });
     up.addEventListener('click', () => ui.busy(up, async () => {
+      const sentText = avInput.value; // what the URL field held as the upload went
       const canvas = el('canvas');
       canvas.width = O; canvas.height = O;
       const c2d = canvas.getContext('2d');
@@ -2767,11 +2787,12 @@ function avatarCropper(ctx, avImg, avInput, status, onStage) {
       if (!blob) { status.err('Not uploaded: the cropped image couldn’t be rendered. Try again.'); return; }
       try {
         const data = await api('POST', '/admin/personas/' + encodeURIComponent(id) + '/avatar/upload', blob, { raw: true, contentType: 'image/png' });
-        avInput.value = (data && data.avatar) || '';
+        const saved = (data && data.avatar) || '';
         setPreview(avImg, data && data.avatarUrl);
         markStale();
         end();
-        if (handle.onUploaded) handle.onUploaded();
+        if (handle.onUploaded) handle.onUploaded(saved, sentText);
+        else avInput.value = saved;
         status.ok('Profile picture uploaded. It shows from ' + displayName + '’s next message.');
       } catch (e) { status.err(notDone(e, 'Not uploaded')); }
     }, 'Uploading…'));

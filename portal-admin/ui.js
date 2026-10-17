@@ -663,14 +663,32 @@
     );
   }
 
-  /** Has `form` changed since it was drawn or last reset()? Controls marked
-   *  data-no-dirty (ones that save the moment they change) don't count. */
+  /**
+   * Has `form` changed since it was drawn or last reset()? Controls marked
+   * data-no-dirty (ones that save the moment they change) don't count.
+   *
+   * A save takes a while, and the form can be changed meanwhile: take mark()
+   * when the save is sent, and once it went through, saved(mark) makes what
+   * was SENT the baseline — an edit made while it was at work stays unsaved
+   * (the drawer asks before it is closed, and a sign-in keeps it). If the
+   * form was reset since the mark (reloaded for something else), that
+   * baseline stands; saved() then returns false.
+   */
   function dirtyTracker(form) {
     let base = snapshot(form);
+    let resets = 0;
     return {
       isDirty: () => snapshot(form) !== base,
       reset() {
         base = snapshot(form);
+        resets++;
+      },
+      mark: () => ({ snap: snapshot(form), at: resets }),
+      saved(m) {
+        if (!m || m.at !== resets) return false;
+        base = m.snap;
+        resets++;
+        return true;
       },
     };
   }
