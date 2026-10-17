@@ -760,6 +760,22 @@ test('styles.css: the toast stack sits at the bottom, and the page and a narrow 
   }
 });
 
+test('styles.css: in a drawer a table’s header sticks to the top of the drawer body, not 46px down (the page’s topbar) over its rows', () => {
+  const css = source('styles.css').replace(/\/\*[\s\S]*?\*\//g, '');
+  // Top-level rules only: a phone rule (inside @media) is checked apart.
+  const top = css.replace(/@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}/g, '');
+  const rules = [...top.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({ sel: m[1].trim(), body: m[2] }));
+  const pad = rules.find((r) => r.sel === '.drawer-body')!.body.match(/padding\s*:\s*(\d+)px\s*;/);
+  assert.ok(pad, '.drawer-body has one padding for every side');
+  const page = rules.find((r) => r.sel === 'table.grid thead th')!;
+  assert.match(page.body, /position\s*:\s*sticky/);
+  assert.match(page.body, /top\s*:\s*46px/, 'on the page: below the sticky topbar');
+  const inDrawer = rules.find((r) => r.sel === '.drawer-body table.grid thead th');
+  assert.ok(inDrawer, 'a drawer rule');
+  // A sticky box keeps inside its scroller's padding: minus that padding is the body's top edge.
+  assert.match(inDrawer!.body, new RegExp('top\\s*:\\s*-' + pad![1] + 'px'), 'flush with the drawer body’s top edge');
+});
+
 test('ui.dirtyTracker: edits make a form dirty; reset() and data-no-dirty do not count', () => {
   const { ctx } = sandbox();
   load(ctx, ['ui.js']);
@@ -2678,10 +2694,10 @@ test('ui.drawer: a question asked over a drawer goes when the drawer closes; req
   assert.equal(drawer.isOpen(), false);
 });
 
-test('lib.errorText: a removal with /ban the page didn’t know about', () => {
+test('lib.errorText: a removal from the guild the page didn’t know about (it can’t tell /ban from Remove, so names neither)', () => {
   const { lib } = libOnly();
   assert.equal(lib.errorText({ status: 409, code: 'BANNED' }, 'Not unset'),
-    'Not unset: it was removed from this guild with /ban since this page was loaded. Reload the page to see that, then try again.');
+    'Not unset: it was removed from this guild since this page was loaded. Reload the page to see that, then try again.');
 });
 
 // ── Invite codes stay out of the address ──
@@ -2947,7 +2963,11 @@ test('lib.sourceChips and pillText: why a persona can act in a channel, and what
   assert.deepEqual(chips({ sources: [{ kind: 'block' }] }), ['blocks nothing']);
   assert.deepEqual(chips({ sources: [{ kind: 'relayDefault', caps: R7 }] }), ['relay default']);
   assert.deepEqual(chips({ sources: [{ kind: 'guildWide', caps: [] }, roleSrc('g1-chatters', W7)] }), ['role g1-chatters', 'denied guild-wide']);
-  assert.deepEqual(chips({ sources: [{ kind: 'removed' }, { ...roleSrc('g1-chatters', W7), shadowedBy: 'removed' }] }), ['removed with /ban']);
+  const removedRow = { sources: [{ kind: 'removed' }, { ...roleSrc('g1-chatters', W7), shadowedBy: 'removed' }] };
+  assert.deepEqual(chips(removedRow), ['removed from this guild']);
+  // The relay records only that it was removed: /ban and the panel's Remove alike.
+  assert.equal(plain(lib.sourceChips(removedRow, NAMES, { guild: 'Guild One' }))[0].title,
+    'Removed from Guild One (with /ban, or Remove from Guild One): nothing it holds applies here until an admin of this guild gives it access again.');
 
   assert.deepEqual(plain(lib.pillText(rows[0], '#research')).text, 'Write');
   assert.equal(lib.pillText({ effective: [...W7, 'MENTION_EVERYONE'] }).text, 'Write +1');
@@ -3663,7 +3683,7 @@ test('channel drawer: an Add kept across Sign in again comes back with names fro
   assert.ok(!back.calls.some((c) => c.startsWith('PUT ')), 'nothing was submitted');
 });
 
-test('channel drawer: adding a persona removed with /ban says so before, asks, and says it lifted the removal; Undo leaves it lifted; the list counts afresh', async () => {
+test('channel drawer: adding a persona removed from the guild says so before, asks, and says it lifted the removal; Undo leaves it lifted; the list counts afresh', async () => {
   const box = await channelsPanel('/#/g/' + GA + '/channels', {
     directory: [{ id: 'nyx', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false, removed: true }],
     handle: (method, path) => {
@@ -3676,9 +3696,9 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   box.rowLink(CH.research).click();
   await settle();
   const input = await typeAhead(box, 'ny');
-  assert.equal(drawerBody.querySelector('.ta-option')!.querySelector('.ta-hint')!.textContent, 'nyx · removed from Guild One with /ban');
+  assert.equal(drawerBody.querySelector('.ta-option')!.querySelector('.ta-hint')!.textContent, 'nyx · removed from Guild One');
   input.fire('keydown', { key: 'Enter' });
-  assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: removed from Guild One with /ban — adding it lifts that');
+  assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: removed from Guild One — adding it lifts that');
 
   const form = drawerBody.querySelector('.add-form')!;
   const addBtn = form.querySelector('button[type="submit"]')!;
@@ -3688,7 +3708,7 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   await settle();
   const modal = doc.querySelector('.modal')!;
   assert.equal(modal.querySelector('h2')!.textContent, 'Lift Nyx’s removal from Guild One?');
-  assert.ok(modal.textContent.includes('Nyx was removed from Guild One with /ban, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.'));
+  assert.ok(modal.textContent.includes('Nyx was removed from Guild One, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.'));
   assert.ok(modal.textContent.includes('Undo takes the grant away again, but the removal stays lifted.'));
   clickable(doc, 'Cancel', modal).click();
   await settle();
@@ -3710,7 +3730,7 @@ test('channel drawer: adding a persona removed with /ban says so before, asks, a
   await settle();
   assert.equal(calls.at(-1), `DELETE /admin/g/${GA}/personas/nyx/grants?channelId=${CH.research}`);
   assert.equal((tr('nyx').nextSibling as FakeElement).textContent,
-    'Undone: no direct grant for Nyx in #research. Effective now: no access. Its removal from Guild One stays lifted: /ban in Discord removes it again.');
+    'Undone: no direct grant for Nyx in #research. Effective now: no access. Its removal from Guild One stays lifted. To remove it again, use Remove from Guild One or /ban in Discord.');
 
   // The lift changed Nyx in every channel of the guild: closed, the list asks again.
   const asked = () => calls.filter((c) => c.endsWith('/access/summary')).length;
@@ -3751,16 +3771,17 @@ test('channel drawer: a channel that isn’t there says so in words — the id o
   assert.ok(!box.drawerBody.textContent.includes(gone));
 });
 
-test('lib: a persona removed with /ban, the lift in words, and the Custom option without doubled words', () => {
+test('lib: a persona removed from the guild (never “with /ban”: Remove from <guild> records the same), the lift in words, and the Custom option without doubled words', () => {
   const { lib } = libOnly();
   const banned = accessRow('p', 'P', [], [{ kind: 'removed' }]);
   assert.equal(lib.isRemoved(banned), true);
   assert.equal(lib.isRemoved(RESEARCH_ROWS()[0]), false);
   assert.equal(lib.isRemoved(null), false);
-  assert.equal(lib.currentlyText('Quill', null, plain(lib.changeKind(null, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One with /ban — adding it lifts that');
-  assert.equal(lib.currentlyText('Quill', banned, plain(lib.changeKind(banned, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One with /ban — adding it lifts that');
+  assert.equal(lib.currentlyText('Quill', null, plain(lib.changeKind(null, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One — adding it lifts that');
+  assert.equal(lib.currentlyText('Quill', banned, plain(lib.changeKind(banned, [...ALL_CAPS], W7)), 'Guild One'), 'Quill: removed from Guild One — adding it lifts that');
   assert.equal(lib.liftText('Quill', W7, '#research', 'Guild One'),
-    'Quill was removed from Guild One with /ban, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.');
+    'Quill was removed from Guild One, so nothing it holds applies there. Giving it Write in #research lifts that: anything it still holds in Guild One applies again.');
+  assert.equal(lib.removeAgainText('Guild One'), 'To remove it again, use Remove from Guild One or /ban in Discord.');
   assert.equal(lib.customOptionText(['READ_HISTORY', 'SEND_MESSAGES']), 'Custom — can’t see the channel');
   assert.equal(lib.customOptionText(['VIEW_CHANNEL', 'SEND_MESSAGES']), 'Custom');
   assert.equal(lib.customOptionText([...F7, 'MENTION_EVERYONE']), 'Full +1 (custom)');
@@ -4342,21 +4363,21 @@ test('persona drawer: a guild-wide change refused as changed meanwhile says so, 
   }
 });
 
-test('persona drawer: a persona removed with /ban says so; giving it access asks first; Unset asks, then lifts the removal', async () => {
+test('persona drawer: a persona removed from the guild says so; giving it access asks first; Unset asks, then lifts the removal', async () => {
   const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: [], roles: [], removed: true, guildWide: 'deny' });
   const { body, gwRow, gwButtons, gwLine, confirm, modal, calls, P } = box;
   const banner = body.querySelector('.access-section')!.querySelector('.banner')!;
   assert.ok(!banner.classList.contains('hidden'), "expected: !banner.classList.contains('hidden')");
   assert.match(banner.textContent, /^Aria was removed from Guild One \(with \/ban, or Remove from Guild One\), so nothing it holds applies here.*It can’t give itself access here again/);
   assert.equal(body.querySelector('.persona-summary')!.textContent, 'Removed from Guild One — nothing it holds applies here');
-  assert.equal(gwRow().querySelector('.gw-level')!.textContent, 'Removed with /ban');
+  assert.equal(gwRow().querySelector('.gw-level')!.textContent, 'Removed from Guild One');
   assert.deepEqual(gwButtons(), ['Set level…', 'Unset'], 'denied already: no Deny');
   assert.equal(clickable(box.doc, 'Remove from Guild One…', body).disabled, true, 'removed already');
 
   // Add asks before it lifts the removal.
   await box.typeChannel('gen');
   box.pickOption('#general');
-  assert.match(box.addForm().querySelector('.currently')!.textContent, /Aria was removed from Guild One with \/ban — adding access here lifts that\./);
+  assert.match(box.addForm().querySelector('.currently')!.textContent, /Aria was removed from Guild One — adding access here lifts that\./);
   box.addForm().fire('submit');
   await settle();
   assert.equal(modal().querySelector('h2')!.textContent, 'Lift Aria’s removal from Guild One?');
@@ -4454,6 +4475,64 @@ test('persona drawer: Remove from Guild One — the confirm lists what goes and 
   doc.getElementById('drawer-close')!.click();
   await settle();
   assert.equal(calls.filter((c) => c.startsWith(`GET /admin/g/${GA}/personas?`)).length, before + 1);
+});
+
+test('persona drawer: after Remove from Guild One, nothing says “with /ban” — the page can’t tell which way it was removed; Undo names both ways', async () => {
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/quill-4d5e6f', {
+    pid: 'quill-4d5e6f', name: 'Quill',
+    directory: [{ id: 'quill-4d5e6f', displayName: 'Quill', avatarUrl: '', hasAccessHere: false, removed: true }],
+  });
+  const { body, modal, confirm, doc } = box;
+  clickable(doc, 'Remove from Guild One…', body).click();
+  await settle();
+  confirm('Remove from Guild One');
+  await settle();
+  // The banner names both ways; every other line just says it was removed.
+  const banner = body.querySelector('.access-section')!.querySelector('.banner')!;
+  assert.match(banner.textContent, /^Quill was removed from Guild One \(with \/ban, or Remove from Guild One\), so nothing it holds applies here/);
+  assert.equal(box.gwRow().querySelector('.gw-level')!.textContent, 'Removed from Guild One');
+  const hint = body.querySelector('.danger-zone')!.querySelector('.field-hint')!.textContent;
+  const said = () => body.textContent.replace(banner.textContent, '').replace(hint, '');
+  assert.ok(!said().includes('with /ban'), said());
+
+  // An access role: asked first, in the same words.
+  const picker = body.querySelectorAll('select').find((s) => (s.getAttribute('aria-label') || '').startsWith('Add an access role'))!;
+  picker.value = 'g1-readers';
+  picker.fire('change');
+  await settle();
+  assert.equal(modal().querySelector('h2')!.textContent, 'Lift Quill’s removal from Guild One?');
+  assert.equal(modal().querySelector('p')!.textContent,
+    'Quill was removed from Guild One, so nothing it holds applies there. Giving it access role g1-readers lifts that: anything it still holds in Guild One applies again.');
+  confirm('Cancel');
+  await settle();
+
+  // Add to channels: the Currently line, the confirm, then Undo.
+  await box.typeChannel('gen');
+  box.pickOption('#general');
+  assert.equal(box.addForm().querySelector('.currently')!.textContent, 'Currently:Quill was removed from Guild One — adding access here lifts that.');
+  box.addForm().fire('submit');
+  await settle();
+  assert.ok(!modal().textContent.includes('with /ban'), modal().textContent);
+  assert.ok(modal().textContent.includes('Quill was removed from Guild One, so nothing it holds applies there. Giving it Write in #general lifts that'), modal().textContent);
+  confirm('Add and lift');
+  await settle();
+  doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Quill →'))!.querySelector('.toast-action')!.click();
+  await settle();
+  assert.ok(body.textContent.includes('Its removal from Guild One stays lifted. To remove it again, use Remove from Guild One or /ban in Discord.'), body.textContent);
+
+  // Add persona: the search says it was removed, not how.
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  const button = clickable(doc, 'Add persona to Guild One');
+  button.click();
+  await settle();
+  const bar = doc.getElementById(button.getAttribute('aria-controls')!)!;
+  const input = bar.querySelector('.ta-input')!;
+  input.value = 'qu';
+  input.fire('input');
+  box.advance(150);
+  await settle();
+  assert.equal(bar.querySelector('.ta-option')!.querySelector('.ta-tag')!.textContent, 'removed from Guild One');
 });
 
 test('persona drawer: Resync re-sends the channel list; a second one at once is “Try again in a few seconds.”; a super-admin is told how many', async () => {

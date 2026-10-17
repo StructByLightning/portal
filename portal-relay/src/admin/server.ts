@@ -1267,7 +1267,7 @@ export class AdminServer {
       }
       if (this.deps.permissions.isBanned(personaId, guildId)) {
         if (params.get('liftBan') !== '1') {
-          return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild with /ban; unsetting lifts that — send liftBan=1 to do it'));
+          return sendJson(res, 409, err('BANNED', 'this persona was removed from this guild (slash /ban or Remove in the panel); unsetting lifts that — send liftBan=1 to do it'));
         }
         liftedBan = this.deps.permissions.liftBan(personaId, guildId);
       }

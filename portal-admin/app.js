@@ -1470,7 +1470,7 @@ function addPersonaBar(gid) {
         value: p.id,
         label: (p.displayName || p.id) + ' (' + p.id + ')',
         title: p.id,
-        tag: p.removed ? 'removed from ' + guild + ' with /ban' : p.hasAccessHere ? null : 'no access here',
+        tag: p.removed ? 'removed from ' + guild : p.hasAccessHere ? null : 'no access here',
       }));
     },
   });
@@ -1671,7 +1671,7 @@ const statusParts = (lines) => (lines.length === 1 ? lines[0] : lines.map((t) =>
  * category in Discord's order — what it can do, why, and its direct grant,
  * changed in place — with rows that read alike folded into one line, the
  * direct grants that do nothing (each with Remove), and, for a persona
- * removed with /ban, what that means. Every change goes through the channel
+ * removed from the guild, what that means. Every change goes through the channel
  * drawer's queue and grant route, with `expect`, answers 'Effective now: …'
  * from the relay, offers Undo for 10 s, and asks first when it would lower
  * guild-wide or default access or lift a removal.
@@ -1724,7 +1724,7 @@ function accessSection(ctx, m) {
     const href = lib.formatRoute(route('g', gid, 'channels', { kind: 'channel', id: cid }));
     const eff = Array.isArray(row.effective) ? row.effective : [];
     const blocked = Array.isArray(row.direct) && !row.direct.length;
-    const chips = lib.sourceChips(row, m.names, { isSuper: isSuper() });
+    const chips = lib.sourceChips(row, m.names, { isSuper: isSuper(), guild });
     const control = ui.directGrantControl({
       value: row.direct,
       canBlock: lib.canBlock(row),
@@ -1865,7 +1865,7 @@ function accessSection(ctx, m) {
         const nowText = ex && Array.isArray(ex.effective) ? lib.effectNowText(ex, u.where) : '';
         lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + displayName + ' in ' + u.where : displayName + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + u.where) +
           '.' + (nowText ? ' Effective now: ' + nowText + '.' : '') +
-          (u.lifted ? ' Its removal from ' + guild + ' stays lifted: /ban in Discord removes it again.' : ''));
+          (u.lifted ? ' Its removal from ' + guild + ' stays lifted. ' + lib.removeAgainText(guild) : ''));
       } catch (e) {
         bad = true;
         lines.push(lib.errorText(e, 'Not undone', { channelId: u.cid, names: m.names, reloaded: true }));
@@ -2020,7 +2020,7 @@ function accessSection(ctx, m) {
       const caps = level.value();
       clear(currentlyList);
       if (items.length && m.access.removed) {
-        currentlyList.appendChild(el('li', { text: displayName + ' was removed from ' + guild + ' with /ban — adding access here lifts that.' }));
+        currentlyList.appendChild(el('li', { text: displayName + ' was removed from ' + guild + ' — adding access here lifts that.' }));
       } else {
         for (const it of items.slice(0, 10)) {
           const row = m.rowOf(it.value);
@@ -2216,7 +2216,7 @@ function rolesSection(ctx, m) {
         // Giving it a role here lifts its removal: asked first.
         const go = await ui.confirmDialog({
           title: 'Lift ' + displayName + '’s removal from ' + guild + '?',
-          body: [displayName + ' was removed from ' + guild + ' with /ban, so nothing it holds applies there. Giving it access role ' + role +
+          body: [displayName + ' was removed from ' + guild + ', so nothing it holds applies there. Giving it access role ' + role +
             ' lifts that: anything it still holds in ' + guild + ' applies again.'],
           confirmLabel: 'Give role and lift',
         });
@@ -2390,7 +2390,7 @@ function moreSection(ctx, m) {
     let levelNode;
     let explain;
     if (removed) {
-      levelNode = el('span', { class: 'badge badge-warn gw-level', text: 'Removed with /ban' });
+      levelNode = el('span', { class: 'badge badge-warn gw-level', text: 'Removed from ' + guild });
       explain = 'Nothing it holds applies in ' + guild + '. Unset (or a level) lifts that.';
     } else if (g === 'deny') {
       levelNode = el('span', { class: 'badge badge-warn gw-level', text: 'Denied' });
@@ -2521,15 +2521,15 @@ function moreSection(ctx, m) {
   async function unsetGuildWide(button) {
     const g = m.access.guildWide;
     const gd = Array.isArray(g) ? g : [];
-    // Removed with /ban: unsetting alone would change nothing, so it lifts
+    // Removed from the guild: unsetting alone would change nothing, so it lifts
     // the removal too — and says so first.
     const lift = !!m.access.removed;
     const go = await ui.confirmDialog(lift ? {
       title: 'Unset ' + displayName + '’s guild-wide level in ' + guild + ' and lift its removal?',
       body: [
-        displayName + ' was removed from ' + guild + ' with /ban, so nothing applies to it there. Unsetting lifts that: channels of ' + guild +
+        displayName + ' was removed from ' + guild + ', so nothing applies to it there. Unsetting lifts that: channels of ' + guild +
           ' without their own direct grant fall back to ' + displayName + '’s persona default, and access roles given here apply again.',
-        'To undo it, use /ban in ' + guild + ' again.',
+        lib.removeAgainText(guild),
       ],
       confirmLabel: 'Unset and lift',
     } : {

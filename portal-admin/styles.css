@@ -205,6 +205,11 @@ table.grid thead th {
   background: var(--panel); border-bottom: 1px solid var(--line); padding: 6px 10px; font-size: 12px;
   text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
 }
+/* In a drawer the scrolling box is .drawer-body, not the page: 46px (the
+   page's topbar) left a gap there with rows showing above the header. A
+   sticky box keeps to the scroller's padding, so -14px (.drawer-body's
+   padding) puts the header flush with the drawer body's top edge. */
+.drawer-body table.grid thead th { top: -14px; }
 table.grid thead th:first-child { border-top-left-radius: 8px; }
 table.grid thead th:last-child { border-top-right-radius: 8px; }
 table.grid tbody tr:last-child td:first-child { border-bottom-left-radius: 8px; }

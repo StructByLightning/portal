@@ -20,7 +20,8 @@
  *   predictDirect, changeKind,         what a direct-grant change would do (only
  *   lowerText, currentlyText,          to ask first: the relay says what it did)
  *   sameCapSet                         the same capabilities, in any order
- *   isRemoved, liftText                a persona removed with /ban, and the lift
+ *   isRemoved, liftText,               a persona removed from the guild (/ban or
+ *   removeAgainText                    Remove from <guild>: the page can't tell which), the lift
  *   grantResultText                    what a direct-grant change did, from the answer
  *   canActInText, personaSummaryText,  the Personas list and the persona drawer:
  *   foldAccessRows, inactiveText,      counts in words, rows that read alike folded,
@@ -453,16 +454,18 @@
    * 'direct grant' · 'blocked here' · 'role g1-chatters' · 'role
    * g1-mods-mirror · mirrors @Mods' · 'guild-wide' · 'persona default' ·
    * 'relay default' · 'overrides guild-wide Write'. A direct grant's chip
-   * names what it replaces here; a persona removed with /ban has that one
-   * chip. → [{ kind, text, title }]. opts.isSuper adds that the persona
-   * default applies in every guild.
+   * names what it replaces here; a persona removed from the guild (with
+   * /ban or Remove from <guild>: the relay records only that it was) has
+   * that one chip. → [{ kind, text, title }]. opts.isSuper adds that the
+   * persona default applies in every guild; opts.guild names the guild.
    */
   function sourceChips(row, names, opts) {
     const o = opts || {};
     const src = ((row && row.sources) || []).slice()
       .sort((a, b) => (SOURCE_ORDER[a.kind] == null ? 9 : SOURCE_ORDER[a.kind]) - (SOURCE_ORDER[b.kind] == null ? 9 : SOURCE_ORDER[b.kind]));
     if (src.some((s) => s.kind === 'removed')) {
-      return [{ kind: 'removed', text: 'removed with /ban', title: 'Removed from this guild with /ban: nothing it holds applies here until an admin of this guild gives it access again.' }];
+      const g = o.guild || 'this guild';
+      return [{ kind: 'removed', text: 'removed from this guild', title: 'Removed from ' + g + ' (with /ban, or Remove from ' + g + '): nothing it holds applies here until an admin of this guild gives it access again.' }];
     }
     const hasGuildWide = src.some((s) => s.kind === 'guildWide');
     const out = [];
@@ -621,7 +624,8 @@
     return 'This lowers ' + name + ' from ' + from + ' to ' + to + ' in ' + where + '. Roles still apply.';
   }
 
-  /** Was the persona removed from this guild with /ban? From its
+  /** Was the persona removed from this guild (with /ban or Remove from
+   *  <guild> — either records the same thing)? From its
    *  explanation in a channel (a row of …/channels/:cid/access, or a
    *  change's answer). */
   function isRemoved(row) {
@@ -631,13 +635,13 @@
   /** The Add form's 'Currently:' line for a persona picked to add:
    *  'Aria: Write via role g1-chatters — no direct grant needed' · 'Nyx: no
    *  access' · 'Cass: Write via the guild-wide level — this lowers it to Read'
-   *  · 'Quill: removed from Guild One with /ban — adding it lifts that'
+   *  · 'Quill: removed from Guild One — adding it lifts that'
    *  (`removedFrom`: the guild's name, for a persona removed there). A change
    *  that leaves what it can do as it is says what Add does to the persona's
    *  own direct grant here: there is none to add ('no direct grant needed'),
    *  it is already that level, or it changes it and nothing else. */
   function currentlyText(name, row, change, removedFrom) {
-    if (removedFrom) return name + ': removed from ' + removedFrom + ' with /ban — adding it lifts that';
+    if (removedFrom) return name + ': removed from ' + removedFrom + ' — adding it lifts that';
     const eff = (row && Array.isArray(row.effective)) ? row.effective : [];
     let s = name + ': ';
     if (!eff.length) s += 'no access';
@@ -662,16 +666,24 @@
     return x.size === y.size && Array.from(x).every((c) => y.has(c));
   }
 
-  /** Before a change that gives a persona removed with /ban access again:
-   *  'Quill was removed from Guild One with /ban, so nothing it holds applies
+  /** Before a change that gives a persona removed from the guild access
+   *  again: 'Quill was removed from Guild One, so nothing it holds applies
    *  there. Giving it Write in #research lifts that: anything it still holds
-   *  in Guild One applies again.' */
+   *  in Guild One applies again.' Never 'with /ban': the panel's Remove from
+   *  <guild> records the same removal, and the page can't tell which it was. */
   function liftText(name, caps, where, guild) {
-    return name + ' was removed from ' + guild + ' with /ban, so nothing it holds applies there. Giving it ' +
+    return name + ' was removed from ' + guild + ', so nothing it holds applies there. Giving it ' +
       levelLabel(caps) + ' in ' + where + ' lifts that: anything it still holds in ' + guild + ' applies again.';
   }
 
-  /** The last line of a confirm that lifts a removal with /ban. */
+  /** Both ways to remove a persona from a guild again, once a removal was
+   *  lifted: 'To remove it again, use Remove from Guild One or /ban in
+   *  Discord.' */
+  function removeAgainText(guild) {
+    return 'To remove it again, use Remove from ' + guild + ' or /ban in Discord.';
+  }
+
+  /** The last line of a confirm that lifts a removal from the guild. */
   const UNDO_KEEPS_LIFT = 'Undo takes the grant away again, but the removal stays lifted.';
 
   /**
@@ -682,7 +694,7 @@
    * g1-chatters.' · 'Blocked guild-wide access for Aria in #research. …'.
    *   o: { name, next (caps; [] a block; null removed), before (what it could
    *        do there before), ex, where, liftedFrom (the guild's name, when the
-   *        change ended its removal with /ban), accessWhere (the channel whose
+   *        change ended its removal from the guild), accessWhere (the channel whose
    *        access applies there, when that is another one: a thread's parent) }
    * An answer without the channel explained (it was deleted meanwhile, or an
    * older relay) says what was done.
@@ -1059,7 +1071,7 @@
       case 'EXISTS': return 'A role named ' + (c.roleName || 'that') + ' already exists — edit it instead?';
       case 'GUILD_MISMATCH': return p + ': ' + (c.roleName ? 'access role ' + c.roleName : 'that access role') + ' belongs to another guild now. Reload the page and try again.';
       case 'INVALID_NAME': return p + ': an access role name uses lower-case letters, digits, dots, dashes and underscores (up to 64), starting with a letter or digit.';
-      case 'BANNED': return p + ': it was removed from this guild with /ban since this page was loaded. Reload the page to see that, then try again.';
+      case 'BANNED': return p + ': it was removed from this guild since this page was loaded. Reload the page to see that, then try again.';
       // The change was made against what this page loaded, and that changed.
       case 'CONFLICT': return p + ': someone else changed this a moment ago. ' + (c.reloaded ? 'Reloaded — check and try again.' : 'Reload the page and try again.');
       default: break;
@@ -1403,7 +1415,7 @@
     botLimitText, effectNowText, remainingText, guildEffectText,
     countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
     channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
-    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, customOptionText,
+    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, isRemoved, currentlyText, sameCapSet, liftText, removeAgainText, customOptionText,
     UNDO_KEEPS_LIFT, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,

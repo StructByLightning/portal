@@ -512,7 +512,7 @@ function drawDrawer(d, gid, cid, data, note) {
     const href = env.formatRoute(env.route('g', gid, 'personas', { kind: 'persona', id: row.personaId }));
     const eff = Array.isArray(row.effective) ? row.effective : [];
     const blocked = Array.isArray(row.direct) && !row.direct.length;
-    const chips = lib.sourceChips(row, names, { isSuper: env.isSuper() });
+    const chips = lib.sourceChips(row, names, { isSuper: env.isSuper(), guild });
     const control = grantable ? ui.directGrantControl({
       value: row.direct,
       canBlock: lib.canBlock(row),
@@ -644,7 +644,7 @@ function drawDrawer(d, gid, cid, data, note) {
   /** Send one change and take the relay's answer for the row. Resolves
    *  { ok, text, undo } — undo: what restores it ({ pid, prev, next, lifted }).
    *  `base`: what is known of a persona without a row here (the Add pick:
-   *  name, picture, whether the directory said it was removed with /ban). */
+   *  name, picture, whether the directory said it was removed from the guild). */
   async function send(pid, name, next, base, refocus) {
     const row = rowOf(pid);
     const expect = row ? row.direct : null;
@@ -698,7 +698,7 @@ function drawDrawer(d, gid, cid, data, note) {
         // Undo takes the grant back; a removal it lifted stays lifted.
         lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + u.name + ' in ' + where : u.name + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + where) +
           '.' + (nowText ? ' Effective now: ' + nowText + '.' : '') +
-          (u.lifted ? ' Its removal from ' + guild + ' stays lifted: /ban in Discord removes it again.' : ''));
+          (u.lifted ? ' Its removal from ' + guild + ' stays lifted. ' + lib.removeAgainText(guild) : ''));
       } catch (e) {
         bad = true;
         if (e.code === 'CONFLICT') conflict = true;
@@ -720,7 +720,7 @@ function drawDrawer(d, gid, cid, data, note) {
     const name = (row && row.displayName) || pid;
     const ck = lib.changeKind(row, botCaps, next);
     if (lib.isRemoved(row) && next && next.length) {
-      // Giving access to a persona removed with /ban lifts the removal in the
+      // Giving access to a persona removed from the guild lifts the removal in the
       // whole guild: asked first, as the confirm says.
       const go = await ui.confirmDialog({
         title: 'Lift ' + name + '’s removal from ' + guild + '?',
@@ -761,12 +761,12 @@ function drawDrawer(d, gid, cid, data, note) {
   if (grantable) {
     const addStatus = ui.statusLine(null);
     /** A persona of the directory as a pick: named, with where it stands
-     *  here, and whether it was removed from the guild with /ban. */
+     *  here, and whether it was removed from the guild. */
     const itemOf = (p) => {
       const row = rowOf(p.id);
       const removed = !!p.removed || lib.isRemoved(row);
       const here = row && row.effective && row.effective.length ? lib.levelLabel(row.effective) + ' here'
-        : removed ? 'removed from ' + guild + ' with /ban'
+        : removed ? 'removed from ' + guild
           : p.hasAccessHere ? 'no access here' : 'no access in ' + guild;
       return { value: p.id, label: p.displayName || p.id, title: p.id, hint: p.id + ' · ' + here, avatarUrl: p.avatarUrl, removed };
     };
@@ -823,7 +823,7 @@ function drawDrawer(d, gid, cid, data, note) {
       const asks = items
         .map((it) => ({ it, ck: lib.changeKind(rowOf(it.value), botCaps, caps) }))
         .filter((c) => lib.needsLowerConfirm(c.ck, caps));
-      // Adding a persona removed with /ban lifts its removal from the guild.
+      // Adding a persona removed from the guild lifts that removal.
       const lifts = items.filter(removedPick);
       if (asks.length || lifts.length) {
         const title = !lifts.length
