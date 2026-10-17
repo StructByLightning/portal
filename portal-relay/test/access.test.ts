@@ -13,10 +13,14 @@
 //   - its policy source is the one explainPolicy picks;
 //   - the summary's counts are capsFor's, counted;
 //   - the access endpoints' rows are capsFor's;
-//   - a preview ({direct}) is what the grant route would make it.
+//   - a preview ({direct}) is what the grant route would make it;
+//   - the panel's own guess at a change (portal-admin/lib.js predictDirect,
+//     which only decides whether to ask before lowering access) is that
+//     preview, and its counting is the summary's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PermissionsBitField } from 'discord.js';
@@ -421,6 +425,76 @@ test('parity: a grant change answers with what the relay enforces where it was m
       }
     }
     assert.deepEqual([...seen].sort(), ['category', 'missing', 'text', 'thread']);
+  } finally {
+    await server.close();
+    t.cleanup();
+  }
+});
+
+/** portal-admin/lib.js, in an empty sandbox (it is the panel's pure code). */
+function panelLib(): any {
+  const ctx = vm.createContext({}) as Record<string, any>;
+  vm.runInContext(readFileSync(new URL('../../portal-admin/lib.js', import.meta.url), 'utf8'), ctx, { filename: 'lib.js' });
+  return ctx.PA.lib;
+}
+const plainOf = (v: unknown) => JSON.parse(JSON.stringify(v));
+
+test('parity: the panel’s guess at a direct-grant change (lib.predictDirect) is the relay’s own preview, for every persona × channel × change', () => {
+  const t = makeRelay();
+  try {
+    const lib = panelLib();
+    const a = accessDepsOf(t.deps);
+    const changes: Array<Capability[] | null> = [null, [], READ, WRITE, FULL, ['SEND_MESSAGES', 'ADD_REACTIONS'], [...WRITE, 'MENTION_EVERYONE'], [...READ, 'VOICE_LISTEN', 'VOICE_SPEAK']];
+    const grantable = CHANNELS.filter((c) => c.guildId === G1 && ['text', 'voice', 'forum'].includes(c.type));
+    let n = 0;
+    const kinds = new Set<string>();
+    for (const pid of IDENTITIES) {
+      for (const c of grantable) {
+        // The row the channel drawer reads (its fields, as JSON carries them).
+        const ex = explain(a, pid, G1, c.id);
+        const row = plainOf({ effective: ex.effective, direct: ex.direct, sources: ex.sources, botLimited: ex.botLimited, botLacks: ex.botLacks });
+        const from = lib.changeKind(row, t.deps.botCaps(G1, c.id), WRITE).from;
+        if (from) kinds.add(from);
+        for (const d of changes) {
+          const want = explain(a, pid, G1, c.id, { direct: d }).effective;
+          const got = plainOf(lib.predictDirect(row, t.deps.botCaps(G1, c.id), d));
+          assert.deepEqual(got, want, `${pid} in ${c.id} with ${JSON.stringify(d)}`);
+          n++;
+        }
+      }
+    }
+    assert.ok(n > 500, `${n} cases`);
+    for (const k of ['direct', 'guildWide', 'personaDefault', 'relayDefault']) assert.ok(kinds.has(k), `the fixture has a persona whose own access comes from ${k}`);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('parity: the panel counts a channel’s rows as the summary counts it (lib.countedLevel, lib.countsFromRows)', async () => {
+  const lib = panelLib();
+  for (const caps of [[], READ, WRITE, FULL, [...WRITE, 'MENTION_EVERYONE'], ['SEND_MESSAGES'], ['VIEW_CHANNEL'], ['EDIT_OWN', 'DELETE_OWN'], ALL_CAPS]) {
+    assert.equal(lib.countedLevel(caps), countedLevel(caps as Capability[]), JSON.stringify(caps));
+  }
+  const t = makeRelay();
+  const fakeDiscord = (async (url: string | URL) => {
+    const u = String(url);
+    const body = u.endsWith('/oauth2/token') ? { access_token: 'x', token_type: 'Bearer' } : u.endsWith('/users/@me') ? { id: 'op', username: 'op' } : [];
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  const server = new AdminServer(t.deps, fakeDiscord);
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const login = await fetch(`${base}/admin/login`, { redirect: 'manual' });
+    const state = /portal_admin_state=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')![1];
+    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const cookie = `portal_admin_session=${/portal_admin_session=([^;]+)/.exec(cb.headers.get('set-cookie') ?? '')![1]}`;
+    const get = async (path: string) => (await fetch(base + path, { headers: { cookie } })).json();
+    const summary = await get(`/admin/g/${G1}/access/summary`);
+    for (const ch of summary.channels) {
+      const body = await get(`/admin/g/${G1}/channels/${ch.id}/access`);
+      assert.deepEqual(plainOf(lib.countsFromRows(body.rows)), ch.counts, ch.id);
+    }
   } finally {
     await server.close();
     t.cleanup();

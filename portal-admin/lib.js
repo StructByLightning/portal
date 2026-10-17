@@ -12,6 +12,12 @@
  *   isGrantableType                    which channels can hold a direct grant
  *   effectNowText, remainingText,      what the relay lets a persona do after a
  *   guildEffectText, botLimitText      change ('Read — the relay bot can’t send in #welcome')
+ *   channelLayout, filterLayout,       the Channels list in Discord's order, its
+ *   countsText, botListNote            counts and warnings in words
+ *   sourceChips, pillText,             a channel drawer row: why, and what it can do
+ *   directValue, canBlock
+ *   predictDirect, changeKind,         what a direct-grant change would do (only
+ *   lowerText, currentlyText           to ask first: the relay says what it did)
  *   chanText, roleText, wherePhrase    ids → names ('#general', '@Mods')
  *   roleMeaning, roleLevelText         an access role in one line
  *   roleNameTaken                      defining a role under a name in use
@@ -241,16 +247,24 @@
     if (!ex || !Array.isArray(ex.effective)) return '';
     if (!ex.effective.length) return 'no remaining access in ' + where;
     const at = accessWhere || where;
-    const live = (ex.sources || []).filter((s) => !s.shadowedBy);
+    const via = viaParts(ex, 'the direct grant in ' + at);
+    const parts = summaryParts(ex.effective);
+    return 'still ' + parts.text + (via.length ? ' via ' + via.join(' and ') : '') + limitsText(ex, parts, at);
+  }
+
+  /** What an explanation's sources that count add up from, in words:
+   *  ['role g1-chatters', 'the guild-wide level'] — `direct` names the
+   *  direct grant ('the direct grant in #research'). */
+  function viaParts(ex, direct) {
+    const live = ((ex && ex.sources) || []).filter((s) => !s.shadowedBy);
     const roles = live.filter((s) => s.kind === 'role').map((s) => s.name);
     const via = [];
     if (roles.length) via.push((roles.length === 1 ? 'role ' : 'roles ') + roles.join(', '));
-    if (live.some((s) => s.kind === 'direct' && s.caps && s.caps.length)) via.push('the direct grant in ' + at);
+    if (live.some((s) => s.kind === 'direct' && s.caps && s.caps.length)) via.push(direct);
     if (live.some((s) => s.kind === 'guildWide' && s.caps && s.caps.length)) via.push('the guild-wide level');
     if (live.some((s) => s.kind === 'personaDefault')) via.push('the persona default');
     if (live.some((s) => s.kind === 'relayDefault')) via.push('the relay default');
-    const parts = summaryParts(ex.effective);
-    return 'still ' + parts.text + (via.length ? ' via ' + via.join(' and ') : '') + limitsText(ex, parts, at);
+    return via;
   }
 
   /** A guild-wide change's answer, for 'Effective now: …': 'Read in 14
@@ -265,6 +279,355 @@
       .sort((a, b) => b.n - a.n);
     if (!groups.length) return 'no access in any channel of ' + guild;
     return groups.map((g, i) => LEVEL_NAME[g.k] + ' in ' + (i === 0 ? plural(g.n, 'channel') : g.n) + (g.d === g.n ? ' (direct grants)' : '')).join(', ');
+  }
+
+  // ── The Channels tab: who can act where ───────────────────────────────────
+  // Everything here formats what the relay said (GET …/channels,
+  // …/access/summary, …/channels/:cid/access): the panel never works out on
+  // its own what a persona can do. The one exception, predictDirect(), only
+  // decides whether to ask before a change (does it lower access that came
+  // from guild-wide or a default?); what the change did is always the relay's
+  // answer. test/access.test.ts holds predictDirect to the relay's own preview.
+
+  /** Where a persona's capabilities in a channel are counted: only where it
+   *  can see the channel (as slash /list counts), under its level; null when
+   *  it isn't counted. As access.ts countedLevel; parity-tested. */
+  function countedLevel(effective) {
+    if (!Array.isArray(effective) || effective.indexOf('VIEW_CHANNEL') < 0) return null;
+    const l = levelOf(effective).level;
+    return l === 'none' ? null : l;
+  }
+
+  /** How many personas a channel's counts hold. */
+  function countsTotal(c) {
+    return c ? (c.read || 0) + (c.write || 0) + (c.full || 0) + (c.custom || 0) : 0;
+  }
+
+  /** A channel's counts in words: '3 can write · 2 can read · 1 full · 1
+   *  custom' (a level nobody is at is left out), '—' when nobody can act
+   *  there, '' when the counts aren't known. */
+  function countsText(c) {
+    if (!c) return '';
+    const parts = [];
+    if (c.write) parts.push(c.write + ' can write');
+    if (c.read) parts.push(c.read + ' can read');
+    if (c.full) parts.push(c.full + ' full');
+    if (c.custom) parts.push(c.custom + ' custom');
+    return parts.length ? parts.join(' · ') : '—';
+  }
+
+  /** A channel's counts from the rows of its access read (…/channels/:cid/
+   *  access lists everyone who can do anything there): what the summary
+   *  counts for it, so the list follows what a drawer read or changed
+   *  without asking for the whole summary again. */
+  function countsFromRows(rows) {
+    const out = { read: 0, write: 0, full: 0, custom: 0 };
+    for (const r of rows || []) {
+      const k = countedLevel(r && r.effective);
+      if (k) out[k] += 1;
+    }
+    return out;
+  }
+
+  /** The list's warning for a channel whose bot can't do everything Write
+   *  needs: 'relay can only read here'. Null when it can (or can't see the
+   *  channel at all: those are listed apart). */
+  function botListNote(s) {
+    if (!s || s.botCantView || s.botBase === undefined) return null;
+    if (s.botBase === 'write' || s.botBase === 'full') return null;
+    return s.botBase === 'read' ? 'relay can only read here' : 'relay is limited here';
+  }
+
+  /** The channel drawer's banner when the relay's bot can't do everything
+   *  Write needs there (from its capabilities in the channel), or null. */
+  function botBannerText(botCaps) {
+    const bot = new Set(botCaps || []);
+    if (!bot.has('VIEW_CHANNEL')) return 'The relay bot can’t see this channel. Grants here take effect once it can.';
+    if (!bot.has('SEND_MESSAGES')) return 'The relay bot can only Read here — anything above Read does nothing until the bot gets Send Messages in this channel.';
+    const lacks = LEVEL_CAPS.write.filter((c) => !bot.has(c));
+    if (!lacks.length) return null;
+    const t = botLimitText(lacks, 'this channel');
+    return t.charAt(0).toUpperCase() + t.slice(1) + ', so Write and Full do only what it can.';
+  }
+
+  /** 'just now' · '12 s ago' · '3 min ago' · '2 h ago'. */
+  function agoText(ms) {
+    const s = Math.max(0, Math.round((ms || 0) / 1000));
+    if (s < 10) return 'just now';
+    if (s < 60) return s + ' s ago';
+    const m = Math.floor(s / 60);
+    if (m < 60) return m + ' min ago';
+    return Math.floor(m / 60) + ' h ago';
+  }
+
+  const cmpText = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  /** Discord's sidebar order within one category: text-like channels before
+   *  voice ones (Discord numbers the two kinds apart), each by position. */
+  function bySidebar(a, b) {
+    return (a.type === 'voice' ? 1 : 0) - (b.type === 'voice' ? 1 : 0) || (a.position || 0) - (b.position || 0) ||
+      cmpText(String(a.name || ''), String(b.name || '')) || cmpText(a.id, b.id);
+  }
+
+  /**
+   * The Channels list, from GET …/channels ({channels, categories}) and
+   * …/access/summary, in Discord's order: channels outside any category
+   * first, then each category by position. Only channels that can hold
+   * access are listed — never a thread (it uses its channel's access), a
+   * category or an unknown kind — and those the relay's bot can't see go to
+   * `hidden`, in the same order.
+   *   → { groups: [{ id, name, rows }], hidden: [rows], truncated, count }
+   * A row: { id, name, type, announcement, categoryId, categoryName, counts
+   * (null when unknown), total, botBase, botCantView }.
+   */
+  function channelLayout(chans, summary) {
+    const all = (chans && chans.channels) || [];
+    const stats = {};
+    for (const s of (summary && summary.channels) || []) stats[s.id] = s;
+    const truncated = !!(summary && summary.truncated);
+    const cats = all.filter((c) => c.type === 'category').slice().sort(bySidebar);
+    const catName = {};
+    for (const c of cats) catName[c.id] = c.name || c.id;
+    const rows = all
+      .filter((c) => (typeof c.grantable === 'boolean' ? c.grantable : isGrantableType(c.type)))
+      .map((c) => {
+        const s = stats[c.id];
+        const counts = s && s.counts && !truncated ? s.counts : null;
+        const cat = c.categoryId && Object.prototype.hasOwnProperty.call(catName, c.categoryId) ? c.categoryId : null;
+        return {
+          id: c.id, name: c.name || null, type: c.type, announcement: !!c.announcement, position: c.position || 0,
+          categoryId: cat, categoryName: cat ? catName[cat] : null,
+          counts, total: counts ? countsTotal(counts) : null,
+          botBase: s ? s.botBase : undefined, botCantView: !!(s && s.botCantView),
+        };
+      });
+    const rank = { '': -1 };
+    cats.forEach((c, i) => { rank[c.id] = i; });
+    const inOrder = (a, b) => rank[a.categoryId || ''] - rank[b.categoryId || ''] || bySidebar(a, b);
+    const seen = rows.filter((r) => !r.botCantView);
+    const groups = [{ id: null, name: null, rows: seen.filter((r) => !r.categoryId).sort(bySidebar) }]
+      .concat(cats.map((c) => ({ id: c.id, name: catName[c.id], rows: seen.filter((r) => r.categoryId === c.id).sort(bySidebar) })))
+      .filter((g) => g.rows.length);
+    return { groups, hidden: rows.filter((r) => r.botCantView).sort(inOrder), truncated, count: rows.length };
+  }
+
+  /** The layout with only the rows a filter keeps: `q` in the channel's name
+   *  (any case, a leading # ignored), `show` 'agents' (someone can act
+   *  there) or 'empty' (nobody can). Groups left empty are dropped. */
+  function filterLayout(layout, q, show) {
+    const needle = String(q || '').trim().toLowerCase().replace(/^#/, '');
+    const keep = (r) => (!needle || String(r.name || r.id).toLowerCase().indexOf(needle) >= 0) &&
+      (show !== 'agents' || (r.total || 0) > 0) && (show !== 'empty' || r.total === 0);
+    return Object.assign({}, layout, {
+      groups: layout.groups.map((g) => Object.assign({}, g, { rows: g.rows.filter(keep) })).filter((g) => g.rows.length),
+      hidden: layout.hidden.filter(keep),
+    });
+  }
+
+  /** A channel as a list or a drawer title names it: '#research', or
+   *  'lounge' / 'ideas' for a voice or forum channel (whose kind is a badge
+   *  beside it). */
+  function channelTitle(c) {
+    const name = (c && c.name) || (c && c.id) || '';
+    return c && (c.type === 'voice' || c.type === 'forum') ? name : '#' + name;
+  }
+
+  /** The badge beside a channel's name: 'announcement' · 'voice' · 'forum'. */
+  function channelBadge(c) {
+    if (!c) return null;
+    if (c.announcement) return 'announcement';
+    return c.type === 'voice' || c.type === 'forum' ? c.type : null;
+  }
+
+  const SOURCE_ORDER = { removed: 0, direct: 1, block: 2, role: 3, guildWide: 4, personaDefault: 5, relayDefault: 6 };
+
+  /**
+   * Why a persona can (or can't) act in a channel, as the channel drawer's
+   * chips — from the relay's explanation (a row of …/channels/:cid/access):
+   * 'direct grant' · 'blocked here' · 'role g1-chatters' · 'role
+   * g1-mods-mirror · mirrors @Mods' · 'guild-wide' · 'persona default' ·
+   * 'relay default' · 'overrides guild-wide Write'. A direct grant's chip
+   * names what it replaces here; a persona removed with /ban has that one
+   * chip. → [{ kind, text, title }]. opts.isSuper adds that the persona
+   * default applies in every guild.
+   */
+  function sourceChips(row, names, opts) {
+    const o = opts || {};
+    const src = ((row && row.sources) || []).slice()
+      .sort((a, b) => (SOURCE_ORDER[a.kind] == null ? 9 : SOURCE_ORDER[a.kind]) - (SOURCE_ORDER[b.kind] == null ? 9 : SOURCE_ORDER[b.kind]));
+    if (src.some((s) => s.kind === 'removed')) {
+      return [{ kind: 'removed', text: 'removed with /ban', title: 'Removed from this guild with /ban: nothing it holds applies here until an admin of this guild gives it access again.' }];
+    }
+    const hasGuildWide = src.some((s) => s.kind === 'guildWide');
+    const out = [];
+    for (const s of src) {
+      const caps = s.caps || [];
+      const replaced = s.shadowedBy === 'direct' || s.shadowedBy === 'block';
+      switch (s.kind) {
+        case 'direct':
+          out.push({ kind: 'direct', text: 'direct grant', title: 'Direct grant here: ' + capsSummary(caps) + '. ' + capsTitle(caps) });
+          break;
+        case 'block':
+          // What it blocks is named by the chip of what it replaces ('overrides
+          // guild-wide Read'), and the row's 'Blocked here' pill; with nothing
+          // to replace, it does nothing — and says so.
+          if (!src.some((x) => (x.kind === 'guildWide' || x.kind === 'personaDefault') && (x.caps || []).length)) {
+            out.push({ kind: 'block', text: 'blocks nothing', title: 'An empty direct grant with no guild-wide level or persona default to block: it does nothing here.' });
+          }
+          break;
+        case 'role': {
+          const ids = s.how === 'mirror' && Array.isArray(s.mirror) ? s.mirror.map((m) => m.id) : [];
+          out.push({
+            kind: 'role',
+            text: 'role ' + s.name + (ids.length ? ' · mirrors ' + orList(ids.map((id) => roleText(id, names))) : ''),
+            title: 'Access role ' + s.name + ' gives ' + capsSummary(caps) + ' here' +
+              (ids.length ? (s.mirrorCaps ? ', as far as ' : ', wherever ') + orList(ids.map((id) => roleText(id, names))) + (s.mirrorCaps ? ' may act here.' : ' can see.') : '.'),
+          });
+          break;
+        }
+        case 'guildWide':
+          if (replaced) {
+            if (caps.length) out.push({ kind: 'override', text: 'overrides guild-wide ' + levelLabel(caps), title: 'The direct grant here replaces the guild-wide ' + capsSummary(caps) + ' in this channel.' });
+          } else if (caps.length) out.push({ kind: 'guildWide', text: 'guild-wide', title: 'Guild-wide: ' + capsSummary(caps) + ' in every channel without its own grant.' });
+          else out.push({ kind: 'guildWide', text: 'denied guild-wide', title: 'Denied guild-wide: the persona default doesn’t apply in this guild. Roles still apply.' });
+          break;
+        case 'personaDefault':
+          if (s.shadowedBy === 'guildWide' || (replaced && hasGuildWide)) break;
+          if (replaced) out.push({ kind: 'override', text: 'overrides persona default ' + levelLabel(caps), title: 'The direct grant here replaces the persona default (' + capsSummary(caps) + ') in this channel.' });
+          else out.push({ kind: 'personaDefault', text: 'persona default', title: 'Persona default: ' + capsSummary(caps) + (o.isSuper ? ' — it applies in every guild.' : '.') });
+          break;
+        case 'relayDefault':
+          out.push({ kind: 'relayDefault', text: 'relay default', title: 'The relay’s default for a persona with no settings of its own: ' + capsSummary(caps) + '.' });
+          break;
+        default:
+          break;
+      }
+    }
+    return out;
+  }
+
+  /** A persona's 'Can do here' pill: 'Read' · 'Write' · 'Write +1' ·
+   *  'Custom' · '—', with '(bot-limited)' when the relay's bot cuts it
+   *  down; the tooltip says what it means in words. → { text, title, level, limited }. */
+  function pillText(row, where) {
+    const eff = (row && Array.isArray(row.effective)) ? row.effective : [];
+    const limited = !!(row && row.botLimited);
+    const level = levelOf(eff).level;
+    let title = eff.length ? capsTitle(eff) : 'Can’t act here.';
+    if (limited) title += ' Cut down: ' + botLimitText(row.botLacks || [], where || 'this channel') + '.';
+    return { text: (eff.length ? levelLabel(eff) : '—') + (limited ? ' (bot-limited)' : ''), title, level, limited };
+  }
+
+  /** The direct-grant control's value for a stored grant: '' (none), 'read',
+   *  'write', 'full', 'custom', or 'block' (an empty grant). */
+  function directValue(direct) {
+    if (direct == null) return '';
+    if (!direct.length) return 'block';
+    const l = levelOf(direct).level;
+    return l === 'custom' ? 'custom' : l;
+  }
+
+  /** The source that decides a persona's own access in a channel (beside its
+   *  access roles), from its explanation: 'direct' (a grant or a block),
+   *  'guildWide', 'personaDefault', 'relayDefault', or null. */
+  function ownSource(row) {
+    for (const s of (row && row.sources) || []) {
+      if (s.shadowedBy) continue;
+      if (s.kind === 'direct' || s.kind === 'block') return 'direct';
+      if (s.kind === 'guildWide' || s.kind === 'personaDefault' || s.kind === 'relayDefault') return s.kind;
+    }
+    return null;
+  }
+
+  /** What a persona's own settings give in a channel when it has no direct
+   *  grant there: the guild-wide level, else the persona default, else the
+   *  relay default (a persona with no settings). */
+  function fallbackCaps(row) {
+    const src = (row && row.sources) || [];
+    const pick = (k) => src.find((s) => s.kind === k);
+    const s = pick('guildWide') || pick('personaDefault') || pick('relayDefault');
+    return s ? s.caps || [] : [];
+  }
+
+  /** Is 'Block guild-wide here' worth offering: would guild-wide or a
+   *  default give the persona something in this channel? */
+  function canBlock(row) {
+    const src = (row && row.sources) || [];
+    return !src.some((s) => s.kind === 'removed') && fallbackCaps(row).length > 0;
+  }
+
+  /**
+   * What a persona could do in a channel with its direct grant there set to
+   * `direct` (caps; [] a block; null: none) — from its explanation now (a row
+   * of …/channels/:cid/access, or null for a persona with nothing there) and
+   * the bot's capabilities there. As the relay resolves it: its access roles
+   * there, with the direct grant in place of the guild-wide level and the
+   * defaults (with none, those apply again); a grant that gives something
+   * ends a /ban here, nothing else does; then only what the bot can do.
+   * Only used to decide whether to ask first; test/access.test.ts holds it to
+   * the relay's own preview.
+   */
+  function predictDirect(row, botCaps, direct) {
+    const src = (row && row.sources) || [];
+    if (src.some((s) => s.kind === 'removed') && !(direct && direct.length)) return [];
+    const policy = new Set();
+    for (const s of src) if (s.kind === 'role') for (const c of s.caps || []) policy.add(c);
+    for (const c of direct ? direct : fallbackCaps(row)) policy.add(c);
+    const bot = new Set(botCaps || []);
+    return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
+  }
+
+  /**
+   * What setting a persona's direct grant in a channel to `direct` would do:
+   *   { kind: 'add' | 'raise' | 'lower' | 'same', before, after, from }
+   * 'add' when it can't act there now, 'lower' when it would lose anything,
+   * 'raise' when it would only gain. `from` is what decides its own access
+   * there now (ownSource) — a lowering of guild-wide or a default access is
+   * asked about first (needsLowerConfirm).
+   */
+  function changeKind(row, botCaps, direct) {
+    const before = (row && Array.isArray(row.effective)) ? row.effective : [];
+    const after = predictDirect(row, botCaps, direct);
+    const a = new Set(after);
+    const b = new Set(before);
+    const lost = before.some((c) => !a.has(c));
+    const gained = after.some((c) => !b.has(c));
+    let kind = 'raise';
+    if (!lost && !gained) kind = 'same';
+    else if (!countedLevel(before) && countedLevel(after)) kind = 'add';
+    else if (lost) kind = 'lower';
+    return { kind, before, after, from: ownSource(row) };
+  }
+
+  const FROM_WORDS = { guildWide: 'guild-wide', personaDefault: 'persona default', relayDefault: 'relay default', direct: 'direct grant' };
+
+  /** Ask before this change? When it gives a direct grant (or a block) that
+   *  lowers access that came from guild-wide or a default. */
+  function needsLowerConfirm(change, direct) {
+    return !!change && direct != null && change.kind === 'lower' &&
+      (change.from === 'guildWide' || change.from === 'personaDefault' || change.from === 'relayDefault');
+  }
+
+  /** 'This lowers Cass from Write (guild-wide) to Read in #research. Roles still apply.' */
+  function lowerText(name, change, where) {
+    const from = summaryParts(change.before).text + (FROM_WORDS[change.from] ? ' (' + FROM_WORDS[change.from] + ')' : '');
+    const to = change.after.length ? summaryParts(change.after).text : 'no access';
+    return 'This lowers ' + name + ' from ' + from + ' to ' + to + ' in ' + where + '. Roles still apply.';
+  }
+
+  /** The Add form's 'Currently:' line for a persona picked to add:
+   *  'Aria: Write via role g1-chatters — no direct grant needed' · 'Nyx: no
+   *  access' · 'Cass: Write via the guild-wide level — this lowers it to Read'. */
+  function currentlyText(name, row, change) {
+    const eff = (row && Array.isArray(row.effective)) ? row.effective : [];
+    let s = name + ': ';
+    if (!eff.length) s += 'no access';
+    else {
+      const via = viaParts(row, 'the direct grant here');
+      s += summaryParts(eff).text + (via.length ? ' via ' + via.join(' and ') : '');
+    }
+    if (change && eff.length && change.kind === 'same') s += ' — no direct grant needed';
+    else if (change && change.kind === 'lower') s += ' — this lowers it to ' + (change.after.length ? summaryParts(change.after).text : 'no access');
+    return s;
   }
 
   // ── Names ─────────────────────────────────────────────────────────────────
@@ -755,6 +1118,8 @@
     },
     // A direct grant in the persona drawer: whose, where and what level.
     grant: { personaId: isPersonaId, target: FIELD.target, caps: FIELD.caps },
+    // The channel drawer's Add form: whom to add (at most 10) and at what level.
+    chanAdd: { personas: (v) => Array.isArray(v) && v.length <= 10 && v.every(isPersonaId), caps: FIELD.caps },
     // Defining an access role.
     role: {
       name: FIELD.text, where: oneOf(['all', 'channels', 'mirrorRole', 'mirrorRoles']), channels: FIELD.snowflakes,
@@ -823,6 +1188,9 @@
     LEVEL_CAPS, ALL_CAPS, LEVELS, LEVEL_NAME, LEVEL_HELP, CAP_LABEL, CAP_WORDS, CAP_GROUPS, adoptModel,
     sortCaps, levelOf, levelLabel, capsWords, capsSummary, capsTitle, isGrantableType,
     botLimitText, effectNowText, remainingText, guildEffectText,
+    countedLevel, countsTotal, countsText, countsFromRows, botListNote, botBannerText, agoText,
+    channelLayout, filterLayout, channelTitle, channelBadge, sourceChips, pillText, directValue,
+    ownSource, fallbackCaps, canBlock, predictDirect, changeKind, needsLowerConfirm, lowerText, currentlyText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
     NOT_GUILD_ADMIN, errorText,

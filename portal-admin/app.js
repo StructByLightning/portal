@@ -1,8 +1,10 @@
 /* Portal Admin SPA — vanilla JS, no dependencies, no build step.
  *
- * Resource-first IA: top-level tabs (Personas / Invites / Access roles / Audit,
- * plus Guilds for super-admins) with a persistent guild scope in the header.
- * Dense tables + a right-side detail drawer for editing one row at a time.
+ * Resource-first IA: top-level tabs (Channels / Personas / Invites / Access
+ * roles / Audit, plus Guilds for super-admins) with a persistent guild scope in
+ * the header. Dense tables + a right-side detail drawer for editing one row at
+ * a time. The Channels tab and its drawer live in channels.js (PA.channels),
+ * which shares this file's helpers through attach(env).
  *
  * Every place has an address after '#' (PA.lib.parseRoute): reload, Back, a
  * shared link and a sign-in all come back to it. One applyRoute() makes the
@@ -210,8 +212,12 @@ function guildMeta(gid = state.guildId) {
   }
   return state.cache[key];
 }
-/** The role catalog changed: it is global, so every guild's cached copy goes. */
-function invalidateGuildMeta() { state.cache = {}; }
+/** The role catalog changed: it is global, so every guild's cached copy goes
+ *  (and what the Channels tab counted). */
+function invalidateGuildMeta() {
+  state.cache = {};
+  window.PA.channels.forget();
+}
 
 /** Name maps for a guild's own pickers (the selected one by default): its
  *  channels, its Discord roles and its name. */
@@ -368,6 +374,32 @@ function bindApp() {
     if (s) { e.preventDefault(); s.focus(); }
   });
   openChannel();
+  window.PA.channels.attach(channelsEnv());
+}
+
+/** What channels.js shares of this file: the API client, addresses, the
+ *  drawer glue and the small widgets. */
+function channelsEnv() {
+  return {
+    api, gpath, qs, state, route, navigate, formatRoute: lib.formatRoute,
+    openDrawer, syncQuery, replaceDrawerRoute, keepForm,
+    markStale() { state.listStale = true; },
+    setList(list) { state.list = list; },
+    guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
+    isSuper, userId, local,
+  };
+}
+
+/** The open drawer is now about `r` (a thread's drawer became its
+ *  channel's): its address in place, without opening it again. `key` is the
+ *  list row it now belongs to. */
+function replaceDrawerRoute(r, key) {
+  const h = lib.formatRoute(r);
+  if (!h || !ui.drawer.isOpen()) return;
+  history.replaceState(null, '', h);
+  state.route = r;
+  state.drawerRoute = h;
+  if (key) state.rowKey = key;
 }
 
 /** The relay speaks a newer admin API than this copy of the panel: say so,
@@ -517,8 +549,8 @@ function forgetUser(uid) {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
-const GUILD_VIEWS = new Set(['personas', 'invites', 'roles', 'audit']);
-const TAB_NAMES = { personas: 'Personas', invites: 'Invites', roles: 'Access roles', audit: 'Audit', guilds: 'Guilds' };
+const GUILD_VIEWS = new Set(['channels', 'personas', 'invites', 'roles', 'audit']);
+const TAB_NAMES = { channels: 'Channels', personas: 'Personas', invites: 'Invites', roles: 'Access roles', audit: 'Audit', guilds: 'Guilds' };
 
 function route(area, gid, view, drawer = null, query = {}) {
   return { area, gid: gid || null, view, drawer, query };
@@ -544,14 +576,14 @@ function canManage(gid) {
 }
 
 /** Where '#/' lands: the last guild and tab this admin used here (while they
- *  may still manage it), else their first guild's Personas. */
+ *  may still manage it), else their first guild's Channels. */
 function homeRoute() {
   const uid = userId();
   const lastGuild = local.get('pa.lastGuild:' + uid);
   const lastTab = local.get('pa.lastTab:' + uid);
   if (lastTab === 'guilds' && isSuper()) return route('guilds', null, 'guilds');
   const gid = lib.isSnowflake(lastGuild) && canManage(lastGuild) ? lastGuild : state.guilds.length ? state.guilds[0].id : null;
-  const view = GUILD_VIEWS.has(lastTab) ? lastTab : 'personas';
+  const view = GUILD_VIEWS.has(lastTab) ? lastTab : 'channels';
   if (gid) return route('g', gid, view);
   return isSuper() ? route('all', null, 'personas') : null;
 }
@@ -587,13 +619,15 @@ function supported(r) {
     return gid ? instead(route('g', gid, 'audit'), 'the guild’s audit') : instead(route('all', null, 'personas'), 'All personas');
   }
   if (r.area !== 'g' && r.area !== 'all') return { route: r, note: null };
-  if (r.view === 'channels' || r.view === 'give') return instead(route('g', r.gid, 'personas'), 'Personas');
+  if (r.view === 'give') return instead(route('g', r.gid, 'channels'), 'Channels');
   const k = r.drawer && r.drawer.kind;
   if (k === 'add' || k === 'invite' || k === 'role') return instead(route(r.area, r.gid, r.view), TAB_NAMES[r.view]);
   const all = r.area === 'all';
-  const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? (all && k === 'persona' ? ['guild'] : []) : all ? ['q', 'guild'] : ['q'];
+  const listKeys = all ? ['q', 'guild'] : r.view === 'channels' ? ['q', 'show', 'cat'] : ['q'];
+  const keep = k === 'mint' ? ['c', 'lvl', 'r'] : r.drawer ? (all && k === 'persona' ? ['guild'] : []) : listKeys;
   const query = {};
   for (const key of keep) if (r.query[key] !== undefined) query[key] = r.query[key];
+  if (query.show === 'all') delete query.show; // the default is no ?show=
   return { route: Object.assign({}, r, { query }), note: null };
 }
 
@@ -614,8 +648,10 @@ function routeGuild(r) {
 }
 
 /** The query of `r`'s list as the page shows it now: the search, and on
- *  #/all/personas the guild in view. */
+ *  #/all/personas the guild in view. A list that keeps more in its address
+ *  (the Channels tab's chips) says what. */
 function listQuery(r) {
+  if (state.list && state.list.query && viewKeyOf(r) === state.viewKey) return state.list.query();
   const q = {};
   if (state.q) q.q = state.q;
   if (r.area === 'all' && r.view === 'personas' && state.guildId) q.guild = state.guildId;
@@ -721,6 +757,9 @@ async function applyRoute(opts = {}) {
       if (listQ !== null) state.q = listQ;
       state.offset = 0;
       if (state.list && state.list.onScope) state.list.onScope();
+    } else if (listQ !== null && state.list && state.list.onQuery) {
+      // A list that reads its whole query (the Channels tab's chips too).
+      state.list.onQuery(r.query);
     } else if (listQ !== null && listQ !== state.q) {
       state.q = listQ;
       state.offset = 0;
@@ -747,6 +786,7 @@ async function applyRoute(opts = {}) {
 
 function openRouteDrawer(r) {
   const k = r.drawer.kind;
+  if (k === 'channel') return window.PA.channels.openDrawer(r.gid, r.drawer.id);
   if (k === 'persona') return openPersonaDrawer(r.drawer.id, { gid: routeGuild(r) });
   if (k === 'mint') return openMintDrawer(r.query);
   if (k === 'newRole') return openRoleDrawer();
@@ -951,8 +991,13 @@ function closeDrawerFor(reason) {
   if (ui.drawer.isOpen()) ui.drawer.close(reason);
 }
 
-/** A drawer changed something its list shows. */
-function markStale() { state.listStale = true; }
+/** A drawer changed something its list shows — and so, perhaps, what the
+ *  Channels tab counts: it asks the relay again next time. (Its own drawer
+ *  moves its counts itself: channelsEnv's markStale.) */
+function markStale() {
+  state.listStale = true;
+  window.PA.channels.forget();
+}
 
 function onDrawerClosed(reason) {
   const key = state.rowKey;
@@ -1017,7 +1062,7 @@ function sessionEndedNote() {
 
 // ── Render dispatch ──────────────────────────────────────────────────────────
 
-const GUILD_TABS = new Set(['personas', 'invites', 'roles', 'audit']);
+const GUILD_TABS = new Set(['channels', 'personas', 'invites', 'roles', 'audit']);
 
 async function render() {
   const view = $('#view');
@@ -1039,7 +1084,8 @@ async function render() {
   const seq = ++state.renderSeq;
   const stale = () => seq !== state.renderSeq;
   try {
-    if (tab === 'personas') await renderPersonas(view, stale);
+    if (tab === 'channels') await window.PA.channels.render(view, stale);
+    else if (tab === 'personas') await renderPersonas(view, stale);
     else if (tab === 'invites') await renderInvites(view, stale);
     else if (tab === 'roles') await renderRoles(view, stale);
     else if (tab === 'audit') await renderAudit(view, stale);

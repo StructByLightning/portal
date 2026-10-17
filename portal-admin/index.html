@@ -5,12 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="same-origin" />
   <title>Portal admin</title>
-  <link rel="stylesheet" href="styles.css?v=5" />
+  <link rel="stylesheet" href="styles.css?v=6" />
   <!-- Classic deferred scripts, run in order; each assigns only window.PA.<module>.
        Bump ?v= on a release so browsers don't mix old and new files. -->
-  <script src="lib.js?v=5" defer></script>
-  <script src="ui.js?v=5" defer></script>
-  <script src="app.js?v=5" defer></script>
+  <script src="lib.js?v=6" defer></script>
+  <script src="ui.js?v=6" defer></script>
+  <script src="channels.js?v=6" defer></script>
+  <script src="app.js?v=6" defer></script>
 </head>
 <body>
   <!-- Sign-in card: only at boot, when /admin/me returns 401. (A session that
@@ -32,6 +33,7 @@
 
       <!-- Tabs are links: each has an address (#/g/<guild>/<tab>). -->
       <nav class="tabs" id="tabs" aria-label="Sections">
+        <a class="tab" data-tab="channels" href="#/">Channels</a>
         <a class="tab" data-tab="personas" href="#/">Personas</a>
         <a class="tab" data-tab="invites" href="#/">Invites</a>
         <a class="tab" data-tab="roles" href="#/">Access roles</a>
@@ -64,7 +66,7 @@
     <main id="view" class="view"><!-- active tab rendered here --></main>
   </div>
 
-  <!-- Right-side detail drawer (persona / mint / role editors) -->
+  <!-- Right-side detail drawer (channel / persona / mint / role editors) -->
   <div id="drawer-scrim" class="drawer-scrim hidden"></div>
   <aside id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true" tabindex="-1">
     <header class="drawer-head">

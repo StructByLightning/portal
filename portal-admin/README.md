@@ -11,12 +11,15 @@ portal-admin/
 │                     and capabilities (a mirror of the relay's, parity-tested),
 │                     channel/role names, one-line summaries of roles and invites,
 │                     the #/… address grammar, drafts, sign-in error words
-├── ui.js             DOM helpers and widgets (window.PA.ui): toasts, status
-│                     lines, busy buttons, confirm dialogs, the level control,
-│                     checkbox lists, the drawer, "Your session ended", the
-│                     expiry bar, the Not-an-admin view
-├── app.js            API client, resource tabs, dense tables, all mutations
-│                     (window.PA.app)
+├── ui.js             DOM helpers and widgets (window.PA.ui): toasts (with an
+│                     Undo), status lines, busy buttons, confirm dialogs, the
+│                     level control, checkbox lists, the type-ahead (an ARIA
+│                     combobox), a persona's level pill and direct-grant control,
+│                     the drawer, "Your session ended", the expiry bar, the
+│                     Not-an-admin view
+├── channels.js       the Channels tab and the channel drawer (window.PA.channels)
+├── app.js            API client, the shell and addresses, the other tabs and
+│                     their mutations (window.PA.app)
 ├── styles.css        self-contained styling (dense, dark/light, CSP-clean)
 ├── Caddyfile.example reverse-proxy + static-serve vhost
 └── README.md
@@ -24,7 +27,8 @@ portal-admin/
 
 Each script is a classic `defer` script wrapped in one IIFE that assigns a
 single global, `window.PA.<module>`; `index.html` loads them in order with a
-`?v=` release query, which you bump when a release changes them. Nothing sets
+`?v=` release query, which you bump (in every file's query alike) when a
+release changes them. Nothing sets
 `innerHTML`. `portal-relay/test/admin-spa.test.ts` checks these rules,
 `lib.js` (against the relay's own `LEVEL_CAPS` and `ALL_CAPS`) and `ui.js`'s
 helpers in `node:vm`.
@@ -39,6 +43,35 @@ README, "Preview the admin panel").
 point being to beat Discord's 50-bot limit). Top-level tabs are *resources*, with
 the guild as a persistent **scope** in the header — not a gate you pass first.
 
+- **Channels** *(the first tab, and where a first visit lands)* — who can act
+  where: slash `/list` and `/caps` for every channel. The guild's channels in
+  Discord's order (outside any category first, then each category, which
+  folds; the fold is remembered per admin and guild), each with how many
+  personas can act there at each level ("3 can write · 2 can read · 1 full")
+  and a warning where the relay's bot can't do everything Write needs
+  ("relay can only read here"). Channels the bot can't see are in a folded
+  group at the end; threads aren't listed (they use their channel's access).
+  A filter and *All · With agents · Empty* narrow the rows. The counts come
+  from the relay (`…/access/summary`), are asked for again when you come back
+  to the window after a minute, and follow every change made in a drawer.
+  Click a channel → its **drawer**:
+  - where it is, *Open in Discord*, and a banner when the relay's bot is the
+    limit there (it can only Read, or can't see the channel);
+  - *Add personas*: pick up to ten with the type-ahead (the guild's persona
+    directory), a level (Write unless changed), and a *Currently:* line for
+    each ("Aria: Write via role g1-chatters — no direct grant needed"); *Add*
+    says what each persona can do now, from the relay's answer;
+  - *Who can act here*: each persona's level ("Write", "Write +1", "(bot-
+    limited)"), why (direct grant · role … · mirrors @Mods · guild-wide ·
+    persona default · relay default · overrides guild-wide Write), and its
+    direct grant, changed in place (— · Read · Write · Full · Custom… · Block
+    guild-wide here). Every change answers "Effective now: …" (or what is left
+    after a removal), offers **Undo** for 10 seconds, and asks first when it
+    would lower access that came from guild-wide or a default. A change made
+    meanwhile elsewhere is refused and the rows are read again;
+  - the slash equivalent, and *Invite a new agent here*.
+  Opening a thread's address shows its channel ("Threads use #research's
+  access."); a category's opens the list with that category unfolded.
 - **Personas** — the one place for a persona (portal's only kind of speaker).
   The table (avatar · name · id · access roles · direct grants?) lists the
   personas with access in the selected guild; super-admins can switch it to
@@ -84,6 +117,8 @@ can't carry it), so reload, Back, a shared link and a sign-in keep it:
 
 ```
 #/                                  the last guild and tab you used here
+#/g/<guild>/channels[?q=&show=agents|empty&cat=<category>]
+#/g/<guild>/channels/c/<channel>    (a thread's → its channel's; a category's → ?cat=)
 #/g/<guild>/personas[?q=]           #/g/<guild>/personas/p/<persona>
 #/g/<guild>/invites[?q=]            #/g/<guild>/invites/new[?r=<role>,…|c=<channel>&lvl=read|write|full]
 #/g/<guild>/roles[?q=]              #/g/<guild>/roles/new
@@ -99,16 +134,17 @@ relay holds (up to 100 characters, on one line); it is percent-encoded in the
 address. A search that is a whole invite code (`inv_…`) goes into the address
 as its first 12 characters only, as the audit shows codes.
 
-`lib.parseRoute` also knows the addresses later versions add (channels, give
-access, invite detail, role detail, the global audit); this version says
+`lib.parseRoute` also knows the addresses later versions add (give access,
+adding a persona, invite detail, role detail, the global audit); this version says
 "That page isn't available yet" and shows the nearest page there is. Ids are
 checked (guilds and channels are 5–25 digits; an invite is only ever the hash
 of its code, never the code); anything else is "That link wasn't valid" and
 home. A link into a guild you can't manage shows why — never that guild's data
 or name — with the guilds you do manage and Try again.
 
-Changing guild, tab or drawer adds a history entry; a search changes `?q=`
-in place, so Back never steps through keystrokes. A drawer opened from its
+Changing guild, tab or drawer adds a history entry; a search (and the
+Channels tab's chips) changes the address in place, so Back never steps
+through keystrokes. A drawer opened from its
 list closes with Back; one reached by a link or a reload is replaced by its
 list. Leaving a drawer with unsaved changes (Back, a link, closing the page)
 asks first.
@@ -178,7 +214,8 @@ at most one `login.rate_limited` record per address per minute, with a count
 (and `step: login` for refused starts).
 
 Browser storage is a convenience only (the panel works without it):
-`localStorage` keeps `pa.lastGuild:<user>` and `pa.lastTab:<user>` (cleared on
+`localStorage` keeps `pa.lastGuild:<user>`, `pa.lastTab:<user>` and
+`pa.collapsed:<user>:<guild>` (the Channels tab's folded groups; all cleared on
 Sign out), `sessionStorage` keeps `pa.returnTo` and `pa.draft` for one sign-in.
 
 ## How it fits together
@@ -320,10 +357,13 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   of an open drawer on a wide screen), and the page keeps that much room at
   its end, so nothing stays hidden under them. A button that sends a
   request is disabled until the answer arrives, so a double click sends one.
-- Keyboard: `/` focuses the active search box. Tabs and persona names are
-  links. In the drawer, `Esc` (or a click on the dimmed page) asks "Discard
+- Keyboard: `/` focuses the active search box. Tabs, channel rows and
+  persona names are links. A type-ahead opens its list as you type (or with
+  `↓`); `↑`/`↓` move, `Enter` picks, `Esc` closes the list (the next `Esc` is
+  the drawer's), `Backspace` in the empty field removes the last pick. In the drawer, `Esc` (or a click on the dimmed page) asks "Discard
   changes?" when a form has unsaved edits, otherwise leaves a focused field,
   otherwise closes the drawer and puts focus back on the link that opened it.
   `Tab` stays inside the drawer and dialogs; `Enter` submits the section's form.
-- Below 640px wide the top bar wraps, tables scroll sideways inside their box,
-  and the drawer takes the whole screen.
+- Below 640px wide the top bar wraps, the channel drawer's rows become
+  labelled cards, other tables scroll sideways inside their box, and the
+  drawer takes the whole screen.

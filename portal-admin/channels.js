@@ -1,0 +1,893 @@
+/* Portal Admin — the Channels tab and the channel drawer (window.PA.channels).
+ *
+ * The panel's first tab: who can act in each channel of the guild, at what
+ * level, and why — slash /list and /caps for every channel at once — and, in
+ * a channel's drawer, adding personas and changing their direct grants in
+ * place, with a 10 s Undo.
+ *
+ * Everything shown about access is the relay's own: the list reads GET
+ * …/channels and …/access/summary, the drawer …/channels/:cid/access, and
+ * every change answers with what the persona can do there now (its
+ * `effective`), which replaces the row and moves the list's counts. Nothing
+ * here works out access by itself; PA.lib.changeKind only decides whether to
+ * ask before a change that would lower guild-wide or default access.
+ *
+ * Like every panel script, one IIFE that assigns a single global,
+ * PA.channels. app.js hands over the helpers it shares (the API client,
+ * addresses, the drawer glue) with attach(env) when it boots.
+ */
+(function () {
+'use strict';
+
+const PA = (window.PA = window.PA || {});
+
+/** app.js's helpers (see attach). */
+let env = null;
+
+/** On window focus, a list older than this is asked for again. */
+const REFETCH_AFTER_MS = 60_000;
+/** How long the Undo of a change stays up. */
+const UNDO_MS = 10_000;
+/** A write the relay paused (429) is tried again after this, at most 3 times. */
+const RETRY_MS = 3_000;
+const MAX_RETRIES = 3;
+/** Personas one Add can take. */
+const MAX_ADD = 10;
+
+const el = (tag, attrs, children) => PA.ui.el(tag, attrs, children);
+const clear = (n) => PA.ui.clear(n);
+const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
+
+// ── Data: per guild, its channels and the access summary ──────────────────
+// Cached per guild (the list and a drawer opened from it share it), asked
+// for again on window focus once older than a minute, and patched from the
+// answers to changes, so the list follows a change without a round trip.
+
+const cache = {};    // gid → { chans, summary, at } — at 0: ask again
+const inflight = {}; // gid → the request in flight
+let generation = 0;  // forget() bumps it: an answer asked for before is not kept
+
+function load(gid, force) {
+  const have = cache[gid];
+  if (!force && have && have.at) return Promise.resolve(have);
+  if (inflight[gid]) return inflight[gid];
+  const g = env.gpath(gid);
+  const gen = generation;
+  const p = Promise.all([
+    env.api('GET', g + '/channels'),
+    // Without counts the list still lists: the summary failing (an older
+    // relay, a hiccup) leaves them out, and says so.
+    env.api('GET', g + '/access/summary').catch((e) => {
+      if (e.status === 401 || e.handled) throw e;
+      return null;
+    }),
+  ]).then(([chans, summary]) => {
+    const v = { chans: chans || {}, summary, at: Date.now() };
+    if (gen === generation) cache[gid] = v;
+    else v.at = 0; // forgotten while in flight: shown once, asked again next time
+    return v;
+  });
+  inflight[gid] = p;
+  const done = () => { if (inflight[gid] === p) delete inflight[gid]; };
+  p.then(done, done);
+  return p;
+}
+
+/** A drawer read (or changed) who can act in a channel: the list's counts
+ *  for it become what those rows add up to — the same count the summary
+ *  makes. Resolves whether they changed. A change that ended a /ban changed
+ *  the persona in every channel of the guild (`everywhere`): the list asks
+ *  again next time. */
+function patchSummary(gid, cid, rows, everywhere) {
+  const c = cache[gid];
+  if (!c) return false;
+  if (everywhere) {
+    c.at = 0;
+    return true;
+  }
+  const s = c.summary && !c.summary.truncated && Array.isArray(c.summary.channels) ? c.summary.channels.find((x) => x.id === cid) : null;
+  if (!s || !s.counts) return false;
+  const next = PA.lib.countsFromRows(rows);
+  const same = ['read', 'write', 'full', 'custom'].every((k) => (s.counts[k] || 0) === next[k]);
+  s.counts = next;
+  return !same;
+}
+
+/** What the list knows of a channel (its name, for a drawer's first title). */
+function knownChannel(gid, cid) {
+  const c = cache[gid];
+  const all = (c && c.chans && c.chans.channels) || [];
+  return all.find((x) => x.id === cid) || null;
+}
+
+// ── Writes: one at a time, each with what it expects to replace ───────────
+
+let tail = Promise.resolve();
+
+/** Run `task` after every write queued before it. A relay that says "slow
+ *  down" (429) is asked again after a few seconds, up to three times;
+ *  `onPause` says so meanwhile. */
+function enqueue(task, onPause) {
+  const run = async () => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await task();
+      } catch (e) {
+        if (e && (e.status === 429 || e.code === 'RATE_LIMITED') && attempt < MAX_RETRIES) {
+          if (onPause) onPause();
+          await new Promise((r) => setTimeout(r, RETRY_MS));
+          continue;
+        }
+        throw e;
+      }
+    }
+  };
+  const p = tail.then(run, run);
+  tail = p.catch(() => {});
+  return p;
+}
+
+/** Set a persona's direct grant in a channel to `next` (caps; [] blocks;
+ *  null removes it), through the hardened grant route: a preset by name, a
+ *  block as {deny}, anything else as caps — with `expect`, what this page
+ *  last saw there, so a change made meanwhile is refused (409), not
+ *  overwritten. */
+function writeGrant(gid, pid, cid, next, expect) {
+  const P = env.gpath(gid) + '/personas/' + encodeURIComponent(pid) + '/grants';
+  if (next == null) return env.api('DELETE', P + '?channelId=' + encodeURIComponent(cid), { expect });
+  const body = { channelId: cid };
+  const v = PA.lib.directValue(next);
+  if (v === 'block') body.deny = true;
+  else if (v === 'custom') body.caps = next.slice();
+  else body.level = v;
+  body.expect = expect;
+  return env.api('PUT', P, body);
+}
+
+const sameSet = (a, b) => {
+  const x = new Set(a || []);
+  const y = new Set(b || []);
+  return x.size === y.size && [...x].every((c) => y.has(c));
+};
+
+// ── The Channels tab ───────────────────────────────────────────────────────
+
+/** Collapsed groups, per admin and guild (localStorage; a convenience):
+ *  the keys whose state differs from the default — a category ('cat:<id>')
+ *  folded, or the 'hidden' group (folded by default) unfolded. */
+function collapseStore(gid) {
+  const key = 'pa.collapsed:' + env.userId() + ':' + gid;
+  let set;
+  try {
+    const v = JSON.parse(env.local.get(key) || '[]');
+    set = new Set(Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, 500) : []);
+  } catch {
+    set = new Set();
+  }
+  return {
+    isOpen: (k) => (k === 'hidden' ? set.has(k) : !set.has(k)),
+    remember(k, open) {
+      if (open === (k !== 'hidden')) set.delete(k);
+      else set.add(k);
+      env.local.set(key, JSON.stringify([...set]));
+    },
+  };
+}
+
+/** 'Personas who can act here, where they can see it: 1 at Write, 2 at Read.' */
+function countsTitle(c) {
+  const parts = ['write', 'read', 'full', 'custom'].filter((k) => c[k]).map((k) => c[k] + ' at ' + PA.lib.LEVEL_NAME[k]);
+  return parts.length ? 'Personas who can act here, where they can see it: ' + parts.join(', ') + '.' : 'Nobody can act here.';
+}
+
+/**
+ * The Channels tab: a toolbar built once (filter, chips, 'updated … ago')
+ * and the rows, which are all that a filter, a chip or a refetch redraws —
+ * so the filter keeps its focus and caret. The address follows the filter
+ * and the chips in place (?q= ?show=); ?cat= unfolds one category only.
+ */
+async function render(view, stale) {
+  const lib = PA.lib;
+  const ui = PA.ui;
+  const gid = env.state.guildId;
+  const q0 = (env.state.route && env.state.route.query) || {};
+  const f = { q: q0.q || '', show: q0.show || 'all', cat: q0.cat || null };
+  const store = collapseStore(gid);
+
+  clear(view);
+  const search = el('input', {
+    id: 'list-search', class: 'search', type: 'search', placeholder: 'Filter channels…', 'aria-label': 'Filter channels',
+    value: f.q, autocomplete: 'off',
+  });
+  const chips = [['all', 'All'], ['agents', 'With agents'], ['empty', 'Empty']].map(([v, text]) =>
+    el('button', { class: 'chip', 'data-show': v, 'aria-pressed': String(f.show === v), text }));
+  const chipBox = el('div', { class: 'chips', role: 'group', 'aria-label': 'Which channels to show' }, chips);
+  const updated = el('span', { class: 'muted updated' });
+  const status = ui.statusLine(null);
+  const results = el('div', { class: 'results' });
+  view.appendChild(el('div', { class: 'toolbar' }, [search, chipBox, el('div', { class: 'toolbar-actions' }, [updated])]));
+  view.appendChild(status.node);
+  view.appendChild(results);
+  results.appendChild(el('p', { class: 'muted loading', role: 'status', text: 'Loading…' }));
+
+  let data = null;
+  let rowNodes = new Map(); // channel id → its <li>, built once per answer
+  let seq = 0;
+  let urlTimer = null;
+  let tickTimer = null;
+  let scrolledTo = null; // the ?cat= already scrolled to
+
+  const list = {
+    kind: 'channels',
+    search,
+    status,
+    results,
+    /** The list's part of the address, as it is now. */
+    query() {
+      const q = {};
+      if (f.q) q.q = f.q;
+      if (f.show && f.show !== 'all') q.show = f.show;
+      if (f.cat) q.cat = f.cat;
+      return q;
+    },
+    /** The address changed under the list (Back, an edited address). */
+    onQuery(q) {
+      const next = { q: q.q || '', show: q.show || 'all', cat: q.cat || null };
+      if (next.q === f.q && next.show === f.show && next.cat === f.cat) return;
+      Object.assign(f, next);
+      search.value = f.q;
+      scrolledTo = null;
+      draw();
+    },
+    /** Redraw from what is known (a drawer patched it); ask again only when
+     *  that is out of date. */
+    refresh: () => refresh(false),
+    reload: () => refresh(true),
+    isOld: () => !!data && (!cache[gid] || !cache[gid].at || Date.now() - data.at > REFETCH_AFTER_MS),
+  };
+  env.setList(list);
+
+  function syncChips(counted) {
+    for (const c of chips) {
+      c.setAttribute('aria-pressed', String(c.dataset.show === f.show));
+      c.disabled = !counted && c.dataset.show !== 'all';
+      if (c.disabled) c.setAttribute('title', 'Counts aren’t available for this guild.');
+      else c.removeAttribute('title');
+    }
+  }
+
+  function tickUpdated() {
+    clearTimeout(tickTimer);
+    if (env.state.list !== list || !data) return;
+    updated.textContent = 'updated ' + lib.agoText(Date.now() - data.at);
+    updated.setAttribute('title', new Date(data.at).toLocaleString());
+    tickTimer = setTimeout(tickUpdated, 5_000);
+  }
+
+  function rowNode(r, inHidden) {
+    const hit = rowNodes.get(r.id);
+    if (hit) return hit;
+    const href = env.formatRoute(env.route('g', gid, 'channels', { kind: 'channel', id: r.id }));
+    const badge = lib.channelBadge(r);
+    const warn = lib.botListNote(r);
+    const counts = r.counts ? lib.countsText(r.counts) : '';
+    const li = el('li', { class: 'chan-item' }, [el('a', { class: 'chan-row', href, 'data-key': 'channel:' + r.id }, [
+      el('span', { class: 'chan-name', text: lib.channelTitle(r) }),
+      badge ? el('span', { class: 'badge', text: badge }) : null,
+      inHidden && r.categoryName ? el('span', { class: 'muted chan-cat', text: 'in ' + r.categoryName }) : null,
+      warn ? el('span', { class: 'chan-warn', title: 'The relay’s bot can’t do everything Write needs in this channel.' }, [
+        el('span', { 'aria-hidden': 'true', text: '⚠ ' }), warn,
+      ]) : null,
+      counts ? el('span', { class: 'chan-counts', title: countsTitle(r.counts), text: counts }) : null,
+    ])]);
+    rowNodes.set(r.id, li);
+    return li;
+  }
+
+  function groupNode(key, head, rows, open, inHidden) {
+    const listId = ui.uid('chan-group');
+    const ul = el('ul', { id: listId, class: 'chan-list' + (open ? '' : ' hidden') }, rows.map((r) => rowNode(r, inHidden)));
+    let btn = null;
+    if (head) {
+      btn = el('button', { class: 'cat-head', 'data-group': key, 'data-key': 'group:' + key, 'aria-expanded': String(open), 'aria-controls': listId }, head);
+      btn.addEventListener('click', () => {
+        const nowOpen = btn.getAttribute('aria-expanded') !== 'true';
+        btn.setAttribute('aria-expanded', String(nowOpen));
+        ul.classList.toggle('hidden', !nowOpen);
+        // A filter shows every match: folding then is for the moment only.
+        if (!f.q) store.remember(key, nowOpen);
+        if (f.cat) {
+          f.cat = null;
+          env.syncQuery();
+        }
+      });
+    }
+    return el('section', { class: 'chan-group' + (head ? '' : ' chan-group-plain'), 'data-group': key }, [btn, ul]);
+  }
+
+  function draw() {
+    if (!data) return;
+    const t0 = now();
+    const counted = !!data.summary && !data.summary.truncated;
+    syncChips(counted);
+    const layout = lib.channelLayout(data.chans, data.summary);
+    const shown = lib.filterLayout(layout, f.q, counted ? f.show : 'all');
+    // ?cat=: only that category unfolded (its channels the bot can't see,
+    // if that is all it has, are in the last group).
+    let catKey = null;
+    if (f.cat) {
+      if (layout.groups.some((g) => g.id === f.cat)) catKey = 'cat:' + f.cat;
+      else if (layout.hidden.some((r) => r.categoryId === f.cat)) catKey = 'hidden';
+    }
+    const isOpen = (k) => (f.q ? true : catKey ? k === catKey : store.isOpen(k));
+    const a = document.activeElement;
+    const focusKey = a && results.contains(a) && a.dataset ? a.dataset.key || null : null;
+
+    const out = el('div', { class: 'chan-board' });
+    if (!layout.count) {
+      out.appendChild(el('p', { class: 'empty-note', role: 'status', text: 'No channels cached for this guild yet — the relay sees channels once the bot has joined.' }));
+    } else {
+      if (data.summary && data.summary.truncated) {
+        out.appendChild(el('p', { class: 'muted hint', text: 'Counts unavailable for a guild this size — open a channel to see who can act there.' }));
+      } else if (!data.summary) {
+        out.appendChild(el('p', { class: 'muted hint', text: 'Counts unavailable right now — open a channel to see who can act there.' }));
+      }
+      const groups = el('div', { class: 'chan-groups' });
+      for (const g of shown.groups) {
+        const key = g.id ? 'cat:' + g.id : 'none';
+        const all = layout.groups.find((x) => x.id === g.id);
+        const n = (all || g).rows.length;
+        const head = g.id
+          ? [el('span', { class: 'cat-name', text: g.name }), el('span', { class: 'cat-count', text: ' · ' + lib.plural(n, 'channel') })]
+          : null;
+        groups.appendChild(groupNode(key, head, g.rows, g.id ? isOpen(key) : true, false));
+      }
+      if (shown.hidden.length) {
+        groups.appendChild(groupNode('hidden', [el('span', { text: 'The relay can’t see these (' + shown.hidden.length + ')' })], shown.hidden, isOpen('hidden'), true));
+      }
+      if (!shown.groups.length && !shown.hidden.length) {
+        const why = f.q ? 'No channel matches “' + f.q + '”.'
+          : f.show === 'agents' ? 'No channel has a persona that can act in it.' : 'Every channel has a persona that can act in it.';
+        out.appendChild(el('p', { class: 'empty-note', role: 'status', text: why }));
+      } else out.appendChild(groups);
+      out.appendChild(el('p', { class: 'muted hint chan-foot', text: 'Threads use their channel’s access and aren’t listed.' }));
+    }
+    clear(results);
+    results.appendChild(out);
+    if (focusKey) {
+      const node = Array.from(results.querySelectorAll('[data-key]')).find((n) => n.dataset.key === focusKey);
+      if (node) node.focus();
+    }
+    // ?cat=: bring that category into view, once.
+    if (catKey && scrolledTo !== f.cat) {
+      scrolledTo = f.cat;
+      const sec = Array.from(results.querySelectorAll('section')).find((s) => s.dataset && s.dataset.group === catKey);
+      if (sec && typeof sec.scrollIntoView === 'function') sec.scrollIntoView({ block: 'start' });
+    }
+    if (typeof performance !== 'undefined' && typeof performance.measure === 'function') {
+      try { performance.measure('pa:channels-draw', { start: t0, end: now() }); } catch { /* not measured */ }
+    }
+  }
+
+  async function refresh(force) {
+    const mine = ++seq;
+    results.setAttribute('aria-busy', 'true');
+    try {
+      const d = await load(gid, force);
+      if (mine !== seq || stale() || env.state.list !== list) return;
+      // A new answer, or counts a drawer's change patched in place: the rows
+      // are built again.
+      rowNodes = new Map();
+      data = d;
+      draw();
+      tickUpdated();
+    } catch (e) {
+      if (mine !== seq || e.handled || env.state.list !== list) return;
+      clear(results);
+      results.appendChild(e.status === 401 ? env.sessionEndedNote() : env.loadError(env.couldntLoad('this guild’s channels', e), () => refresh(true)));
+    } finally {
+      if (mine === seq) results.removeAttribute('aria-busy');
+    }
+  }
+
+  search.addEventListener('input', () => {
+    f.q = search.value.trim();
+    f.cat = null;
+    draw();
+    // The address follows in place (Back never steps through keystrokes).
+    clearTimeout(urlTimer);
+    urlTimer = setTimeout(() => {
+      urlTimer = null;
+      if (env.state.list === list) env.syncQuery();
+    }, 150);
+  });
+  for (const c of chips) {
+    c.addEventListener('click', () => {
+      if (c.disabled || f.show === c.dataset.show) return;
+      f.show = c.dataset.show;
+      draw();
+      env.syncQuery();
+    });
+  }
+
+  await refresh(false);
+}
+
+// ── The channel drawer ─────────────────────────────────────────────────────
+
+/** Open a channel's drawer (#/g/{gid}/channels/c/{cid}). A thread's address
+ *  becomes its channel's, saying so; a category's becomes the list with
+ *  that category unfolded. */
+async function openDrawer(gid, cid) {
+  const known = knownChannel(gid, cid);
+  const d = env.openDrawer({ title: known && known.type !== 'thread' && known.type !== 'category' ? PA.lib.channelTitle(known) : 'Channel', key: 'channel:' + cid });
+  await loadInto(d, gid, cid, null);
+}
+
+async function loadInto(d, gid, cid, note) {
+  let data;
+  try {
+    data = await env.api('GET', env.gpath(gid) + '/channels/' + encodeURIComponent(cid) + '/access');
+  } catch (e) {
+    if (!d.isCurrent() || e.handled) return;
+    if (e.status === 404) {
+      d.setTitle('Channel');
+      d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'No channel with id ' + cid + ' in this guild: it was deleted, or the relay can’t see it.' }));
+      return;
+    }
+    d.setBody(e.status === 401 ? env.sessionEndedNote() : env.loadError(env.couldntLoad('this channel', e), () => loadInto(d, gid, cid, note)));
+    return;
+  }
+  if (!d.isCurrent()) return;
+  if (data.inert === 'thread') {
+    if (!data.parentId) {
+      d.setTitle(PA.lib.chanText(cid, data.names));
+      d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'This is a thread, and the channel it belongs to isn’t known. Threads use their channel’s access.' }));
+      return;
+    }
+    // In place: the address is now the channel's, as if it had been opened.
+    env.replaceDrawerRoute(env.route('g', gid, 'channels', { kind: 'channel', id: data.parentId }), 'channel:' + data.parentId);
+    d.setTitle(PA.lib.chanText(data.parentId, data.names));
+    return loadInto(d, gid, data.parentId, 'Threads use ' + PA.lib.chanText(data.parentId, data.names) + '’s access.');
+  }
+  if (data.inert === 'category') {
+    env.navigate(env.route('g', gid, 'channels', null, { cat: cid }), { replace: true });
+    return;
+  }
+  drawDrawer(d, gid, cid, data, note);
+}
+
+function drawDrawer(d, gid, cid, data, note) {
+  const lib = PA.lib;
+  const ui = PA.ui;
+  const ch = data.channel || { id: cid };
+  let names = data.names || {};
+  let rows = (data.rows || []).slice();
+  let botCaps = data.botCaps || [];
+  const grantable = ch.grantable !== false;
+  const where = lib.chanText(cid, names);
+  const guild = env.guildName(gid);
+  const rowOf = (pid) => rows.find((r) => r.personaId === pid) || null;
+  d.setTitle(lib.channelTitle(ch));
+
+  // ── Header: where it is, Discord, the bot's limits ──
+  const cat = ch.categoryId && names.channels && names.channels[ch.categoryId] ? names.channels[ch.categoryId].name : null;
+  const kind = ch.announcement ? 'announcement' : ch.type || 'channel';
+  const top = el('div', { class: 'chan-head' }, [
+    el('p', { class: 'chan-sub muted' }, [
+      el('span', { text: (cat ? 'in ' + cat + ' · ' : '') + kind }),
+      el('a', { href: 'https://discord.com/channels/' + gid + '/' + cid, target: '_blank', rel: 'noopener', text: 'Open in Discord' }),
+    ]),
+  ]);
+  const noteLine = ui.statusLine(top);
+  if (note) noteLine.info(note);
+  const banner = el('p', { class: 'banner banner-warn hidden', role: 'note' });
+  top.appendChild(banner);
+  function syncBanner() {
+    const b = lib.botBannerText(botCaps);
+    banner.textContent = b || '';
+    banner.classList.toggle('hidden', !b);
+  }
+  syncBanner();
+
+  // ── Who can act here ──
+  const whoHead = el('h3');
+  const whoStatus = ui.statusLine(null);
+  const statusRow = el('tr', { class: 'row-status hidden' }, [el('td', { colspan: '4' }, [whoStatus.node])]);
+  const tbody = el('tbody');
+  const whoTable = el('div', { class: 'table-wrap' }, [el('table', { class: 'grid cards who-table' }, [
+    el('thead', {}, [el('tr', {}, ['Persona', 'Can do here', 'Why', 'Direct grant'].map((h) => el('th', { scope: 'col', text: h })))]),
+    tbody,
+  ])]);
+  const whoEmpty = el('p', { class: 'empty-note hidden', text: 'Nobody can act here yet' + (grantable ? ' — add a persona above.' : '.') });
+
+  /** A result about one persona, on the line under its row (where the
+   *  change was made); at the top of the table when it has none. */
+  function report(kind, msg, opts, pid) {
+    const tr = pid ? Array.from(tbody.children).find((n) => n.dataset && n.dataset.pid === pid) : null;
+    const after = tr ? tr.nextSibling : tbody.firstChild;
+    if (after !== statusRow) tbody.insertBefore(statusRow, after);
+    statusRow.classList.remove('hidden');
+    whoStatus[kind](msg, opts);
+  }
+  const paused = (pid) => () => report('info', 'Paused for a few seconds (rate limit).', null, pid);
+
+  function rowTr(row) {
+    const name = row.displayName || row.personaId;
+    const href = env.formatRoute(env.route('g', gid, 'personas', { kind: 'persona', id: row.personaId }));
+    const eff = Array.isArray(row.effective) ? row.effective : [];
+    const blocked = Array.isArray(row.direct) && !row.direct.length;
+    const chips = lib.sourceChips(row, names, { isSuper: env.isSuper() });
+    const control = grantable ? ui.directGrantControl({
+      value: row.direct,
+      canBlock: lib.canBlock(row),
+      label: 'Direct grant for ' + name + ' in ' + where,
+      apply: (next) => change(row.personaId, next),
+    }) : null;
+    return el('tr', { 'data-pid': row.personaId, class: eff.length ? null : 'who-none' }, [
+      el('td', { 'data-label': 'Persona' }, [el('span', { class: 'who-name' }, [
+        env.avatarThumb(row.avatarUrl, ''),
+        href ? el('a', { class: 'link', href, title: row.personaId, text: name }) : el('span', { title: row.personaId, text: name }),
+      ])]),
+      el('td', { 'data-label': 'Can do here' }, [el('span', { class: 'who-can' }, [
+        ui.levelPill(row, where),
+        blocked ? el('span', { class: 'badge badge-warn', title: 'Blocks guild-wide and persona-default access in this channel. Roles still apply.', text: 'Blocked here' }) : null,
+      ])]),
+      el('td', { 'data-label': 'Why' }, [chips.length
+        ? el('span', { class: 'src-chips' }, chips.map((c) => el('span', { class: 'src-chip src-' + c.kind, title: c.title, text: c.text })))
+        : el('span', { class: 'muted', text: '—' })]),
+      el('td', { 'data-label': 'Direct grant' }, [control ? control.node : el('span', { class: 'muted', text: row.direct ? lib.levelLabel(row.direct) : '—' })]),
+    ]);
+  }
+
+  function drawRows() {
+    const keep = statusRow.classList.contains('hidden') ? null : statusRow.previousSibling && statusRow.previousSibling.dataset ? statusRow.previousSibling.dataset.pid : null;
+    clear(tbody);
+    for (const r of rows) tbody.appendChild(rowTr(r));
+    const n = rows.filter((r) => Array.isArray(r.effective) && r.effective.length).length;
+    whoHead.textContent = 'Who can act here (' + n + ')';
+    whoTable.classList.toggle('hidden', !rows.length);
+    whoEmpty.classList.toggle('hidden', rows.length > 0);
+    const at = keep ? Array.from(tbody.children).find((x) => x.dataset.pid === keep) : null;
+    if (!statusRow.classList.contains('hidden')) tbody.insertBefore(statusRow, at ? at.nextSibling : tbody.firstChild);
+  }
+
+  /** A persona's row from a change's answer (the relay's explanation of the
+   *  channel for it), or null when the answer has none. */
+  function rowFrom(pid, base, ex) {
+    if (!ex || !Array.isArray(ex.effective)) return null;
+    return {
+      personaId: pid, displayName: (base && base.displayName) || pid, avatarUrl: base ? base.avatarUrl : undefined,
+      effective: ex.effective, level: ex.level, base: ex.base, extra: ex.extra, direct: ex.direct === undefined ? null : ex.direct,
+      sources: ex.sources || [], botLimited: !!ex.botLimited, botLacks: ex.botLacks || [],
+    };
+  }
+
+  /** Put a row in (in name order, as the relay sends them), or replace it.
+   *  `refocus`: the change came from the row's own control, whose focus
+   *  went when it was turned off — the new row's control gets it. */
+  function put(row, refocus) {
+    if (!row) return;
+    const i = rows.findIndex((r) => r.personaId === row.personaId);
+    const oldTr = Array.from(tbody.children).find((n) => n.dataset && n.dataset.pid === row.personaId) || null;
+    const tr = rowTr(row);
+    if (i >= 0) rows[i] = row;
+    else {
+      const key = (r) => (r.displayName || r.personaId).toLowerCase();
+      let j = rows.findIndex((r) => key(r) > key(row) || (key(r) === key(row) && r.personaId > row.personaId));
+      if (j < 0) j = rows.length;
+      rows.splice(j, 0, row);
+    }
+    const a = document.activeElement;
+    const lost = !a || a === document.body || !a.isConnected || (oldTr && oldTr.contains(a));
+    if (oldTr) replaceNode(tbody, tr, oldTr);
+    else {
+      const next = rows[rows.indexOf(row) + 1];
+      const nextTr = next ? Array.from(tbody.children).find((n) => n.dataset && n.dataset.pid === next.personaId) : null;
+      tbody.insertBefore(tr, nextTr || null);
+    }
+    const n = rows.filter((r) => Array.isArray(r.effective) && r.effective.length).length;
+    whoHead.textContent = 'Who can act here (' + n + ')';
+    whoTable.classList.remove('hidden');
+    whoEmpty.classList.add('hidden');
+    if (refocus && lost) {
+      const sel = tr.querySelector('select');
+      if (sel) sel.focus();
+    }
+    syncCurrently();
+  }
+
+  /** Read the channel again (after "someone else changed this"): the rows,
+   *  the bot's limits, the names. Resolves whether it could. */
+  async function reloadRows(pid) {
+    try {
+      const fresh = await env.api('GET', env.gpath(gid) + '/channels/' + encodeURIComponent(cid) + '/access');
+      if (!d.isCurrent() || fresh.inert) return false;
+      rows = (fresh.rows || []).slice();
+      botCaps = fresh.botCaps || [];
+      names = fresh.names || names;
+      if (patchSummary(gid, cid, rows, false)) env.markStale();
+      const a = document.activeElement;
+      const lost = !a || a === document.body || !a.isConnected;
+      drawRows();
+      syncBanner();
+      syncCurrently();
+      if (pid && lost) {
+        const tr = Array.from(tbody.children).find((n) => n.dataset && n.dataset.pid === pid);
+        const sel = tr && tr.querySelector('select');
+        if (sel) sel.focus();
+        else {
+          whoHead.setAttribute('tabindex', '-1');
+          whoHead.focus();
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** What a change did, in the copy guide's words, from the relay's answer. */
+  function resultText(name, next, before, ex, wasRemoved) {
+    const nowText = lib.effectNowText(ex, where);
+    const lifted = wasRemoved && ex && !(ex.sources || []).some((s) => s.kind === 'removed') ? ' That lifted its removal from ' + guild + '.' : '';
+    if (next == null) return 'Removed ' + name + '’s direct grant in ' + where + ' — ' + lib.remainingText(ex, where) + '.';
+    if (!next.length) return 'Blocked guild-wide access for ' + name + ' in ' + where + '. Effective now: ' + nowText + '.';
+    // Nothing it can do changed (a role or guild-wide gave it already) — but
+    // when the relay's bot is what holds it back, that is the news.
+    if (ex && !ex.botLimited && sameSet(before, ex.effective)) return name + ' → ' + lib.capsSummary(next) + ' in ' + where + '. No change to what ' + name + ' can do there: ' + nowText + '.' + lifted;
+    return name + ' → ' + lib.capsSummary(next) + ' in ' + where + '. Effective now: ' + nowText + '.' + lifted;
+  }
+
+  /** Send one change and take the relay's answer for the row. Resolves
+   *  { ok, text, undo } — undo: what restores it ({ pid, prev, next }). */
+  async function send(pid, name, next, base, refocus) {
+    const row = rowOf(pid);
+    const expect = row ? row.direct : null;
+    const before = row ? row.effective : [];
+    const wasRemoved = !!row && (row.sources || []).some((s) => s.kind === 'removed');
+    try {
+      const r = await enqueue(() => writeGrant(gid, pid, cid, next, expect), paused(pid));
+      const ex = r && r.effective;
+      const fresh = rowFrom(pid, row || base, ex);
+      if (fresh) put(fresh, refocus);
+      patchSummary(gid, cid, rows, wasRemoved && !!fresh && !(fresh.sources || []).some((s) => s.kind === 'removed'));
+      env.markStale();
+      return { ok: true, text: resultText(name, next, before, ex, wasRemoved), undo: { pid, name, prev: expect, next: next == null ? null : next.slice() } };
+    } catch (e) {
+      return { ok: false, error: e };
+    }
+  }
+
+  /** The list behind follows a change made after this drawer closed (an Undo). */
+  function afterClose() {
+    if (d.isCurrent()) return;
+    const l = env.state.list;
+    if (l && l.kind === 'channels') l.refresh();
+  }
+
+  /** Put changes back as they were, newest first — each sent with what it
+   *  set as `expect`, so one changed again since is refused, not undone. */
+  async function undo(list) {
+    const lines = [];
+    let bad = false;
+    let conflict = false;
+    let pid = null;
+    for (const u of list.slice().reverse()) {
+      pid = u.pid;
+      const row = rowOf(u.pid);
+      try {
+        const r = await enqueue(() => writeGrant(gid, u.pid, cid, u.prev, u.next), paused(u.pid));
+        const fresh = rowFrom(u.pid, row || { displayName: u.name }, r && r.effective);
+        if (fresh) put(fresh, false);
+        patchSummary(gid, cid, rows, false);
+        env.markStale();
+        lines.push('Undone: ' + (u.prev == null ? 'no direct grant for ' + u.name + ' in ' + where : u.name + ' → ' + (u.prev.length ? lib.capsSummary(u.prev) : 'blocked') + ' in ' + where) +
+          '. Effective now: ' + lib.effectNowText(r && r.effective, where) + '.');
+      } catch (e) {
+        bad = true;
+        if (e.code === 'CONFLICT') conflict = true;
+        lines.push(lib.errorText(e, 'Not undone', { channelId: cid, names, reloaded: true }));
+      }
+    }
+    if (conflict && d.isCurrent()) await reloadRows(pid);
+    report(bad ? 'err' : 'ok', parts(lines), { toastText: lines.join(' ') }, list.length === 1 ? pid : null);
+    afterClose();
+  }
+
+  const parts = (lines) => (lines.length === 1 ? lines[0] : lines.map((t) => el('span', { class: 'status-part', text: t })));
+  const undoAction = (list) => ({ label: 'Undo', ariaLabel: 'Undo the last change in ' + where, run: () => undo(list) });
+
+  /** A row's direct-grant control picked `next`: ask first when it lowers
+   *  guild-wide or default access, then send it. Resolves true when saved. */
+  async function change(pid, next) {
+    const row = rowOf(pid);
+    const name = (row && row.displayName) || pid;
+    const ck = lib.changeKind(row, botCaps, next);
+    if (lib.needsLowerConfirm(ck, next)) {
+      const go = await ui.confirmDialog(next.length ? {
+        title: 'Lower ' + name + '’s access in ' + where + '?',
+        body: [lib.lowerText(name, ck, where), 'You can undo it for a few seconds afterwards, or set it again any time.'],
+        confirmLabel: 'Lower to ' + lib.levelLabel(next),
+      } : {
+        title: 'Block guild-wide access for ' + name + ' in ' + where + '?',
+        body: ['Blocks guild-wide and persona-default access in this channel. ' + lib.lowerText(name, ck, where)],
+        confirmLabel: 'Block guild-wide here',
+      });
+      if (!go) return false;
+    }
+    const res = await send(pid, name, next, row, true);
+    if (res.ok) {
+      report('ok', res.text, { action: undoAction([res.undo]), ms: UNDO_MS }, pid);
+      return true;
+    }
+    const e = res.error;
+    if (e.code === 'CONFLICT') {
+      const ok = await reloadRows(pid);
+      report('err', lib.errorText(e, 'Not saved', { reloaded: ok }), null, pid);
+      return false;
+    }
+    report('err', lib.errorText(e, next == null ? 'Not removed' : 'Not saved', { channelId: cid, names }), null, pid);
+    return false;
+  }
+
+  // ── Add personas ──
+  let addSection = null;
+  let syncCurrently = () => {};
+  if (grantable) {
+    const addStatus = ui.statusLine(null);
+    const ta = ui.typeahead({
+      label: 'Personas',
+      placeholder: 'Type a persona’s name…',
+      max: MAX_ADD,
+      name: 'persona',
+      empty: 'No persona matches.',
+      source: async (q) => {
+        const r = await env.api('GET', env.gpath(gid) + '/persona-directory' + env.qs({ q }));
+        return (r.personas || []).map((p) => {
+          const row = rowOf(p.id);
+          const here = row && row.effective && row.effective.length ? lib.levelLabel(row.effective) + ' here' : p.hasAccessHere ? 'no access here' : 'no access in ' + guild;
+          return { value: p.id, label: p.displayName || p.id, title: p.id, hint: p.id + ' · ' + here, avatarUrl: p.avatarUrl };
+        });
+      },
+    });
+    ta.input.id = ui.uid('field');
+    const level = ui.levelControl({ value: lib.LEVEL_CAPS.write, label: 'Level' });
+    const currentlyList = el('ul', { class: 'currently-list' });
+    const currently = el('div', { class: 'currently hidden' }, [el('div', { class: 'field-label', text: 'Currently:' }), currentlyList]);
+    const addBtn = el('button', { type: 'submit', class: 'btn btn-primary', text: 'Add' });
+    const why = el('span', { class: 'field-hint' });
+    const form = el('form', { class: 'add-form', novalidate: true }, [
+      el('div', { class: 'field' }, [el('label', { for: ta.input.id, text: 'Personas' }), ta.node]),
+      ui.field({ label: 'Level', control: level.node }),
+      currently,
+      el('div', { class: 'inline' }, [addBtn, why]),
+      addStatus.node,
+    ]);
+    const tracker = d.track(form);
+
+    syncCurrently = () => {
+      const items = ta.items();
+      const caps = level.value();
+      clear(currentlyList);
+      for (const it of items) {
+        const row = rowOf(it.value);
+        const ck = caps.length ? lib.changeKind(row, botCaps, caps) : null;
+        currentlyList.appendChild(el('li', { text: lib.currentlyText(it.label, row, ck) }));
+      }
+      currently.classList.toggle('hidden', !items.length);
+      const missing = !items.length ? 'Pick a persona to add.' : !caps.length ? 'Pick a level.' : '';
+      addBtn.disabled = !!missing;
+      why.textContent = missing;
+    };
+    ta.onChange(syncCurrently);
+    level.onChange(syncCurrently);
+
+    ui.onSubmit(form, async () => {
+      const items = ta.items();
+      const caps = level.value();
+      if (!items.length || !caps.length) return; // Add is off until both are picked
+      const asks = items
+        .map((it) => ({ it, ck: lib.changeKind(rowOf(it.value), botCaps, caps) }))
+        .filter((c) => lib.needsLowerConfirm(c.ck, caps));
+      if (asks.length) {
+        const go = await ui.confirmDialog({
+          title: asks.length === 1 ? 'Lower ' + asks[0].it.label + '’s access in ' + where + '?' : 'Lower access for ' + asks.length + ' personas in ' + where + '?',
+          body: asks.map((c) => lib.lowerText(c.it.label, c.ck, where)),
+          confirmLabel: 'Add at ' + lib.levelLabel(caps),
+        });
+        if (!go) return;
+      }
+      addStatus.clear();
+      const lines = [];
+      const undos = [];
+      const left = [];
+      let conflict = false;
+      for (const it of items) {
+        const res = await send(it.value, it.label, caps, { displayName: it.label, avatarUrl: it.avatarUrl }, false);
+        if (res.ok) {
+          lines.push(res.text);
+          undos.push(res.undo);
+          continue;
+        }
+        left.push(it);
+        if (res.error.code === 'CONFLICT') conflict = true;
+        lines.push(lib.errorText(res.error, 'Not saved for ' + it.label, { channelId: cid, names, reloaded: true }));
+        if (res.error.status === 401) {
+          // The session ended: the rest would be refused too. They stay
+          // picked (and kept across Sign in again).
+          for (const rest of items.slice(items.indexOf(it) + 1)) left.push(rest);
+          break;
+        }
+      }
+      if (conflict) await reloadRows(null);
+      ta.set(left);
+      if (!left.length) tracker.reset();
+      syncCurrently();
+      const opts = { toastText: lines.join(' ') };
+      if (undos.length) Object.assign(opts, { action: undoAction(undos), ms: UNDO_MS });
+      addStatus[left.length ? 'err' : 'ok'](parts(lines), opts);
+    }, { busyLabel: 'Adding…' });
+
+    // Kept across "Sign in again": whom to add and at what level.
+    env.keepForm(d, 'chanAdd', {
+      serialize: () => ({ personas: ta.values(), caps: level.value() }),
+      restore(fl) {
+        if (fl.personas) ta.set(fl.personas.map((id) => ({ value: id, label: (rowOf(id) || {}).displayName || id, title: id })));
+        if (fl.caps) level.set(fl.caps);
+        syncCurrently();
+      },
+      isDirty: () => tracker.isDirty(),
+    }, addStatus);
+    syncCurrently();
+    addSection = el('section', { class: 'drawer-section' }, [el('h3', { text: 'Add personas' }), form]);
+  }
+
+  drawRows();
+  // What this read says is the list's count for the channel now (another
+  // tab or slash may have changed it since the list was drawn).
+  if (patchSummary(gid, cid, rows, false)) env.markStale();
+  const body = el('div', { class: 'drawer-sections' }, [
+    top,
+    addSection,
+    el('section', { class: 'drawer-section' }, [whoHead, whoTable, whoEmpty]),
+    el('div', { class: 'drawer-foot' }, [
+      grantable ? el('a', { class: 'btn btn-sm', href: env.formatRoute(env.route('g', gid, 'invites', { kind: 'mint' }, { c: cid, lvl: 'write' })), text: 'Invite a new agent here' }) : null,
+      el('p', { class: 'hint muted' }, ['In Discord: ', el('code', { text: '/add persona:… level:write' }), ' — run it in ' + where]),
+    ]),
+  ]);
+  d.setBody(body);
+}
+
+function replaceNode(parent, node, old) {
+  parent.insertBefore(node, old);
+  parent.removeChild(old);
+}
+
+/** On coming back to the window: a list older than a minute asks again. */
+function onFocus() {
+  const l = env && env.state.list;
+  if (l && l.kind === 'channels' && l.isOld()) l.reload();
+}
+
+PA.channels = {
+  /** app.js's helpers: { api, gpath, qs, state, route, formatRoute, navigate,
+   *  openDrawer, replaceDrawerRoute, markStale, setList, syncQuery,
+   *  guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
+   *  keepForm, isSuper, userId, local }. */
+  attach(e) {
+    const first = !env;
+    env = e;
+    if (first && typeof window.addEventListener === 'function') window.addEventListener('focus', onFocus);
+  },
+  render,
+  openDrawer,
+  /** Forget what is known about a guild (every guild when none is named):
+   *  something changed elsewhere in the panel, so the next look asks again. */
+  forget(gid) {
+    generation++;
+    for (const k of Object.keys(cache)) if (gid === undefined || k === gid) delete cache[k];
+    for (const k of Object.keys(inflight)) if (gid === undefined || k === gid) delete inflight[k];
+  },
+};
+})();

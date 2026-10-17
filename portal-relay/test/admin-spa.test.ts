@@ -19,7 +19,7 @@ import { LEVEL_CAPS } from '../src/slash.js';
 import { ALL_CAPS } from '../src/permissions.js';
 
 const ADMIN = fileURLToPath(new URL('../../portal-admin/', import.meta.url));
-const SCRIPTS = ['lib.js', 'ui.js', 'app.js'];
+const SCRIPTS = ['lib.js', 'ui.js', 'channels.js', 'app.js'];
 const source = (f: string) => readFileSync(join(ADMIN, f), 'utf8');
 
 // ── A minimal DOM: enough for ui.js's helpers, and for booting app.js ──
@@ -63,6 +63,25 @@ class FakeNode {
     this.childNodes.splice(i, 1);
     n.parentNode = null;
     return n;
+  }
+  /** As the DOM does: before `ref`, or at the end when `ref` is null. */
+  insertBefore(n: FakeNode, ref: FakeNode | null) {
+    if (ref === n) ref = n.nextSibling; // as the DOM spec has it
+    if (ref === null) return this.appendChild(n);
+    if (n.parentNode) n.parentNode.removeChild(n);
+    const i = this.childNodes.indexOf(ref);
+    if (i < 0) throw new Error('not a child');
+    n.parentNode = this;
+    this.childNodes.splice(i, 0, n);
+    return n;
+  }
+  get nextSibling(): FakeNode | null {
+    const p = this.parentNode;
+    return p ? p.childNodes[p.childNodes.indexOf(this) + 1] ?? null : null;
+  }
+  get previousSibling(): FakeNode | null {
+    const p = this.parentNode;
+    return p ? p.childNodes[p.childNodes.indexOf(this) - 1] ?? null : null;
   }
   get textContent(): string {
     return this.childNodes.map((c) => c.textContent).join('');
@@ -435,13 +454,14 @@ const tick = () => new Promise((r) => setImmediate(r));
 
 // ── The rules every panel script follows ──
 
-test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .app, .CLIENT_API)', () => {
+test('panel scripts: the only global they add is PA (window.PA.lib, .ui, .channels, .app, .CLIENT_API)', () => {
   const { ctx } = sandbox();
   const before = new Set(Object.getOwnPropertyNames(ctx));
   load(ctx);
   const added = Object.getOwnPropertyNames(ctx).filter((k) => !before.has(k));
   assert.deepEqual(added, ['PA']);
-  assert.deepEqual(Object.keys(ctx.PA).sort(), ['CLIENT_API', 'app', 'lib', 'ui']);
+  assert.deepEqual(Object.keys(ctx.PA).sort(), ['CLIENT_API', 'app', 'channels', 'lib', 'ui']);
+  assert.equal(typeof ctx.PA.channels.render, 'function');
   assert.equal(ctx.PA.CLIENT_API, 2);
   assert.equal(typeof ctx.PA.ui.toast, 'function');
   assert.equal(typeof ctx.PA.app.boot, 'function');
@@ -480,14 +500,19 @@ test('index.html: the session bar has a copy inside the drawer, between its head
   assert.match(css, /body:has\(#drawer:not\(\.hidden\)\) #session-bar \{ visibility: hidden; \}/, 'the page’s copy is not shown behind the drawer');
 });
 
-test('index.html loads lib.js, ui.js, then app.js, deferred and versioned', () => {
+test('index.html loads lib.js, ui.js, channels.js, then app.js, deferred and versioned alike', () => {
   const html = source('index.html');
   const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
-  assert.equal(scripts.length, 3);
+  assert.equal(scripts.length, 4);
   assert.match(scripts[0], /src="lib\.js\?v=\d+"/);
   assert.match(scripts[1], /src="ui\.js\?v=\d+"/);
-  assert.match(scripts[2], /src="app\.js\?v=\d+"/);
+  assert.match(scripts[2], /src="channels\.js\?v=\d+"/);
+  assert.match(scripts[3], /src="app\.js\?v=\d+"/);
   for (const s of scripts) assert.match(s, /\sdefer\b/);
+  // One release: every file (and the stylesheet) carries the same ?v=.
+  const versions = new Set([...html.matchAll(/\?v=(\d+)/g)].map((m) => m[1]));
+  assert.equal(versions.size, 1, [...versions].join(', '));
+  assert.ok(SCRIPTS.every((f) => html.includes('src="' + f + '?v=')), 'the tests load what the page loads');
   assert.match(html, /id="toasts"/);
 });
 
@@ -863,15 +888,17 @@ class Refusal {
 /** The relay's refusal: {error: {code, message, …extra}} with an HTTP status. */
 const refuse = (status: number, code: string, message = code, extra: Record<string, unknown> = {}) => new Refusal(status, { code, message, ...extra });
 
-/** A sandbox with index.html's shell, signed in as a one-guild admin. Every
- *  request lands in `calls` as 'METHOD /path?query', and every JSON body sent
- *  in `bodies`. `routes` adds or replaces GET answers by path. */
+/** A sandbox with index.html's shell, signed in as a one-guild admin, on
+ *  Guild One's Personas tab unless `url` says otherwise (a first visit, '/',
+ *  lands on Channels). Every request lands in `calls` as 'METHOD
+ *  /path?query', and every JSON body sent in `bodies`. `routes` adds or
+ *  replaces GET answers by path. */
 function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandler; url?: string; session?: Record<string, string>; local?: Record<string, string> } = {}) {
   const box = sandbox();
   const { ctx, doc } = box;
   const calls: string[] = [];
   const bodies: any[] = [];
-  const nav = new FakeNav(opts.url ?? '/');
+  const nav = new FakeNav(opts.url ?? '/#/g/' + G1 + '/personas');
   doc.nav = nav;
   const sessionStore = fakeStorage(opts.session);
   const localStore = fakeStorage(opts.local);
@@ -910,7 +937,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
   const { el } = ctx.PA.ui;
   // As index.html has them: links, whose addresses the app keeps up to date.
   const tab = (name: string, cls = 'tab') => el('a', { class: cls, 'data-tab': name, href: '#/', text: name });
-  const tabs = { personas: tab('personas'), invites: tab('invites'), roles: tab('roles'), audit: tab('audit'), guilds: tab('guilds', 'tab tab-super hidden') };
+  const tabs = { channels: tab('channels'), personas: tab('personas'), invites: tab('invites'), roles: tab('roles'), audit: tab('audit'), guilds: tab('guilds', 'tab tab-super hidden') };
   doc.body.appendChild(el('div', { id: 'login', class: 'hidden' }, [
     el('a', { id: 'login-btn', href: '/admin/login', text: 'Sign in with Discord' }), el('div', { id: 'login-error', class: 'hidden' }),
   ]));
@@ -2089,7 +2116,8 @@ test('app routes: a link that isn’t valid goes to the last guild and tab, and 
 
 test('app routes: home is the last guild and tab; the place is remembered as you go', async () => {
   const { here, localStore, tabs } = await panelAt('/');
-  assert.equal(here(), '#/g/' + GA + '/personas', 'a first visit lands on Personas');
+  assert.equal(here(), '#/g/' + GA + '/channels', 'a first visit lands on Channels');
+  assert.equal(tabs.channels.getAttribute('aria-current'), 'page');
   tabs.audit.click();
   await settle();
   assert.equal(localStore.getItem('pa.lastTab:' + ME_GWEN.user.id), 'audit');
@@ -2097,9 +2125,12 @@ test('app routes: home is the last guild and tab; the place is remembered as you
 });
 
 test('app routes: a page a later version adds says so and shows the nearest one', async () => {
-  const { here, doc } = await panelAt('/#/g/' + GA + '/channels/c/' + CH.research);
-  assert.equal(here(), '#/g/' + GA + '/personas');
-  assert.ok(doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Personas instead.'));
+  const { here, doc } = await panelAt('/#/g/' + GA + '/give?c=' + CH.research);
+  assert.equal(here(), '#/g/' + GA + '/channels');
+  assert.ok(doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Channels instead.'));
+  const add = await panelAt('/#/g/' + GA + '/personas/add');
+  assert.equal(add.here(), '#/g/' + GA + '/personas');
+  assert.ok(add.doc.getElementById('toasts')!.textContent.includes('That page isn’t available yet — showing Personas instead.'));
 });
 
 test('app routes: the search box keeps ?q= in place — Back never steps through keystrokes', async () => {
@@ -2157,7 +2188,7 @@ test('app routes: the relay’s own “not an admin of this guild” shows the s
 
 test('app routes: a super-admin’s page, for anyone else, goes home', async () => {
   const { here } = await panelAt('/#/guilds');
-  assert.equal(here(), '#/g/' + GA + '/personas');
+  assert.equal(here(), '#/g/' + GA + '/channels');
 });
 
 // ── A session that ends mid-task ──
@@ -3130,4 +3161,781 @@ test('grant editor: Save refused as changed meanwhile keeps focus where it was',
   await settle();
   assert.match(box.form.querySelector('.status-line')!.textContent, /^Not saved: someone else changed this/);
   assert.equal(box.doc.activeElement, box.save, 'Save is still there, and keeps focus');
+});
+
+// ── P7: the Channels tab and the channel drawer ──
+
+const R7 = [...LEVEL_CAPS.read];
+const W7 = [...LEVEL_CAPS.write];
+const F7 = [...LEVEL_CAPS.full];
+const z7 = () => ({ read: 0, write: 0, full: 0, custom: 0 });
+
+test('lib: a channel’s counts and the bot’s limits, in words', () => {
+  const { lib } = libOnly();
+  assert.equal(lib.countsText({ read: 2, write: 3, full: 0, custom: 0 }), '3 can write · 2 can read');
+  assert.equal(lib.countsText({ read: 2, write: 1, full: 1, custom: 1 }), '1 can write · 2 can read · 1 full · 1 custom');
+  assert.equal(lib.countsText({ read: 3, write: 0, full: 0, custom: 0 }), '3 can read');
+  assert.equal(lib.countsText(z7()), '—', 'nobody: a dash');
+  assert.equal(lib.countsText(null), '', 'not known: nothing');
+  assert.equal(lib.countsTotal({ read: 2, write: 1, full: 1, custom: 1 }), 5);
+  // Counted where it can see the channel, under its level — as the relay's summary counts.
+  assert.equal(lib.countedLevel(W7), 'write');
+  assert.equal(lib.countedLevel([...W7, 'MENTION_EVERYONE']), 'custom');
+  assert.equal(lib.countedLevel(['SEND_MESSAGES', 'EDIT_OWN']), null, 'without View it isn’t counted');
+  assert.equal(lib.countedLevel([]), null);
+  assert.deepEqual(plain(lib.countsFromRows([{ effective: W7 }, { effective: R7 }, { effective: R7 }, { effective: F7 }, { effective: [] }, { effective: ['EDIT_OWN'] }])),
+    { read: 2, write: 1, full: 1, custom: 0 });
+
+  assert.equal(lib.botListNote({ botBase: 'read', botCantView: false }), 'relay can only read here');
+  assert.equal(lib.botListNote({ botBase: null, botCantView: false }), 'relay is limited here');
+  assert.equal(lib.botListNote({ botBase: 'full', botCantView: false }), null);
+  assert.equal(lib.botListNote({ botBase: 'write', botCantView: false }), null);
+  assert.equal(lib.botListNote({ botBase: null, botCantView: true }), null, 'listed apart');
+  assert.equal(lib.botBannerText(R7), 'The relay bot can only Read here — anything above Read does nothing until the bot gets Send Messages in this channel.');
+  assert.equal(lib.botBannerText([]), 'The relay bot can’t see this channel. Grants here take effect once it can.');
+  assert.equal(lib.botBannerText(W7.filter((c) => c !== 'ATTACH_FILES')), 'The relay bot can’t attach files in this channel, so Write and Full do only what it can.');
+  assert.equal(lib.botBannerText([...ALL_CAPS]), null);
+
+  assert.equal(lib.agoText(3_000), 'just now');
+  assert.equal(lib.agoText(12_000), '12 s ago');
+  assert.equal(lib.agoText(185_000), '3 min ago');
+  assert.equal(lib.agoText(2 * 3_600_000 + 5), '2 h ago');
+});
+
+/** Guild One's channels as GET …/channels answers: with their place in
+ *  Discord's sidebar. lounge (voice) is first by position in General, but
+ *  Discord lists voice channels after the text ones. */
+const PLACE: Record<string, { categoryId: string | null; position: number; announcement?: boolean }> = {
+  [CH.welcome]: { categoryId: null, position: 0, announcement: true },
+  [CH.catGeneral]: { categoryId: null, position: 1 },
+  [CH.lounge]: { categoryId: CH.catGeneral, position: 0 },
+  [CH.general]: { categoryId: CH.catGeneral, position: 1 },
+  [CH.random]: { categoryId: CH.catGeneral, position: 2 },
+  [CH.catResearch]: { categoryId: null, position: 2 },
+  [CH.research]: { categoryId: CH.catResearch, position: 0 },
+  [CH.designReview]: { categoryId: null, position: 0 },
+  [CH.labNotes]: { categoryId: CH.catResearch, position: 1 },
+  [CH.ideas]: { categoryId: CH.catResearch, position: 2 },
+  [CH.catArchive]: { categoryId: null, position: 3 },
+  [CH.oldLogs]: { categoryId: CH.catArchive, position: 0 },
+};
+const G1_LAYOUT = G1_CHANNELS.map((c) => ({ ...c, categoryId: PLACE[c.id].categoryId, position: PLACE[c.id].position, announcement: !!PLACE[c.id].announcement, grantable: ['text', 'voice', 'forum'].includes(c.type) }));
+const G1_CHANNELS_VIEW = { channels: G1_LAYOUT, categories: G1_LAYOUT.filter((c) => c.type === 'category').map((c) => ({ id: c.id, name: c.name, position: c.position })) };
+const stat = (id: string, counts: Partial<ReturnType<typeof z7>>, botBase: string | null = 'full', botCantView = false) => ({ id, counts: { ...z7(), ...counts }, botBase, botCantView });
+const G1_SUMMARY = {
+  channels: [
+    stat(CH.welcome, { read: 3 }, 'read'),
+    stat(CH.general, { write: 1, read: 2, full: 1 }),
+    stat(CH.random, { read: 1, full: 1 }),
+    stat(CH.lounge, { read: 2, full: 1 }),
+    stat(CH.research, { write: 1, read: 2, full: 1 }),
+    stat(CH.labNotes, { read: 2, full: 1 }),
+    stat(CH.ideas, { read: 2, full: 1 }),
+    stat(CH.oldLogs, {}, null, true),
+  ],
+  personas: [], considered: 6, computedAt: '2026-01-01T00:00:00.000Z',
+};
+
+test('lib.channelLayout: Discord’s order, uncategorised first; threads, categories and what the bot can’t see apart', () => {
+  const { lib } = libOnly();
+  const l = lib.channelLayout(G1_CHANNELS_VIEW, G1_SUMMARY);
+  const names = (rows: any[]) => plain(rows.map((r) => r.name));
+  assert.deepEqual(plain(l.groups.map((g: any) => g.name)), [null, 'General', 'Research'], 'Archive holds only a channel the bot can’t see');
+  assert.deepEqual(names(l.groups[0].rows), ['welcome']);
+  assert.deepEqual(names(l.groups[1].rows), ['general', 'random', 'lounge'], 'text before voice, as Discord lists them');
+  assert.deepEqual(names(l.groups[2].rows), ['research', 'lab-notes', 'ideas']);
+  assert.deepEqual(names(l.hidden), ['old-logs']);
+  assert.equal(l.hidden[0].categoryName, 'Archive');
+  assert.equal(l.count, 8, 'no thread, no category');
+  assert.equal(l.groups[0].rows[0].announcement, true);
+  assert.deepEqual(plain(l.groups[2].rows[0].counts), { read: 2, write: 1, full: 1, custom: 0 });
+  assert.equal(l.groups[2].rows[0].total, 4);
+
+  const f = (q: string, show?: string) => {
+    const x = lib.filterLayout(l, q, show);
+    return [...x.groups.flatMap((g: any) => names(g.rows)), ...names(x.hidden)];
+  };
+  assert.deepEqual(f('res'), ['research']);
+  assert.deepEqual(f('#LAB'), ['lab-notes'], 'any case, a leading # ignored');
+  assert.deepEqual(f('', 'empty'), ['old-logs']);
+  assert.equal(f('', 'agents').length, 7);
+  assert.deepEqual(plain(lib.filterLayout(l, 'zzz').groups), [], 'groups left empty go');
+
+  // Too many personas × channels to count: the counts are unknown, not zero.
+  const t = lib.channelLayout(G1_CHANNELS_VIEW, { ...G1_SUMMARY, truncated: true, channels: G1_SUMMARY.channels.map(({ counts: _c, ...rest }) => rest) });
+  assert.equal(t.truncated, true);
+  assert.equal(t.groups[1].rows[0].counts, null);
+  assert.deepEqual(names(t.hidden), ['old-logs'], 'the bot’s limits are still known');
+  // No summary at all: listed anyway.
+  assert.equal(lib.channelLayout(G1_CHANNELS_VIEW, null).count, 8);
+  assert.equal(lib.channelTitle({ name: 'lounge', type: 'voice' }), 'lounge');
+  assert.equal(lib.channelTitle({ name: 'research', type: 'text' }), '#research');
+  assert.equal(lib.channelBadge({ type: 'text', announcement: true }), 'announcement');
+  assert.equal(lib.channelBadge({ type: 'forum' }), 'forum');
+  assert.equal(lib.channelBadge({ type: 'text' }), null);
+});
+
+/** Rows of #research as GET …/channels/:cid/access answers (the preview's world). */
+const roleSrc = (name: string, caps: string[], extra: object = {}) => ({ kind: 'role', name, caps, how: 'channels', ...extra });
+const accessRow = (personaId: string, displayName: string, effective: string[], sources: object[], direct: string[] | null = null, extra: object = {}) =>
+  ({ personaId, displayName, avatarUrl: '', effective, level: 'x', base: null, extra: [], direct, sources, botLimited: false, botLacks: [], ...extra });
+const RESEARCH_ROWS = () => [
+  accessRow('aria', 'Aria', W7, [roleSrc('g1-chatters', W7), { kind: 'direct', caps: W7 }], W7),
+  accessRow('cass', 'Cass', R7, [{ kind: 'guildWide', caps: R7 }]),
+  accessRow('quill', 'Quill', F7, [roleSrc('g1-mods-mirror', F7, { how: 'mirror', mirror: [{ id: MODS }], mirrorCaps: true })]),
+  accessRow('sol', 'Sol', R7, [{ kind: 'personaDefault', caps: R7 }]),
+];
+
+test('lib.sourceChips and pillText: why a persona can act in a channel, and what it can do, in the copy guide’s words', () => {
+  const { lib } = libOnly();
+  const rows = RESEARCH_ROWS();
+  const chips = (row: object, opts?: object) => plain(lib.sourceChips(row, NAMES, opts)).map((c: any) => c.text);
+  assert.deepEqual(chips(rows[0]), ['direct grant', 'role g1-chatters'], 'a direct grant first');
+  assert.deepEqual(chips(rows[1]), ['guild-wide']);
+  assert.deepEqual(chips(rows[2]), ['role g1-mods-mirror · mirrors @Mods']);
+  assert.deepEqual(chips(rows[3]), ['persona default']);
+  assert.match(plain(lib.sourceChips(rows[3], NAMES, { isSuper: true }))[0].title, /applies in every guild/, 'super-admins: it applies everywhere');
+  assert.doesNotMatch(plain(lib.sourceChips(rows[3], NAMES))[0].title, /every guild/);
+  // A direct grant names what it replaces here; a block too (its pill says "Blocked here").
+  assert.deepEqual(chips({ sources: [{ kind: 'direct', caps: R7 }, { kind: 'guildWide', caps: W7, shadowedBy: 'direct' }, { kind: 'personaDefault', caps: R7, shadowedBy: 'direct' }] }), ['direct grant', 'overrides guild-wide Write']);
+  assert.deepEqual(chips({ sources: [{ kind: 'block' }, { kind: 'personaDefault', caps: R7, shadowedBy: 'block' }] }), ['overrides persona default Read']);
+  assert.deepEqual(chips({ sources: [{ kind: 'block' }] }), ['blocks nothing']);
+  assert.deepEqual(chips({ sources: [{ kind: 'relayDefault', caps: R7 }] }), ['relay default']);
+  assert.deepEqual(chips({ sources: [{ kind: 'guildWide', caps: [] }, roleSrc('g1-chatters', W7)] }), ['role g1-chatters', 'denied guild-wide']);
+  assert.deepEqual(chips({ sources: [{ kind: 'removed' }, { ...roleSrc('g1-chatters', W7), shadowedBy: 'removed' }] }), ['removed with /ban']);
+
+  assert.deepEqual(plain(lib.pillText(rows[0], '#research')).text, 'Write');
+  assert.equal(lib.pillText({ effective: [...W7, 'MENTION_EVERYONE'] }).text, 'Write +1');
+  assert.equal(lib.pillText({ effective: [] }).text, '—');
+  const limited = lib.pillText({ effective: R7, botLimited: true, botLacks: W7.filter((c) => !R7.includes(c)) }, '#welcome');
+  assert.equal(limited.text, 'Read (bot-limited)');
+  assert.match(limited.title, /Cut down: the relay bot can’t send in #welcome\./);
+  assert.equal(lib.pillText({ effective: ['SEND_MESSAGES'] }).text, 'Custom');
+  assert.match(lib.pillText({ effective: ['SEND_MESSAGES'] }).title, /can’t see the channel/);
+
+  assert.equal(lib.directValue(null), '');
+  assert.equal(lib.directValue([]), 'block');
+  assert.equal(lib.directValue(W7), 'write');
+  assert.equal(lib.directValue([...R7, 'ADD_REACTIONS']), 'custom');
+  assert.equal(lib.canBlock(rows[1]), true, 'guild-wide would apply');
+  assert.equal(lib.canBlock(rows[3]), true, 'the persona default would apply');
+  assert.equal(lib.canBlock(rows[2]), false, 'only a role: nothing to block');
+  assert.equal(lib.canBlock({ sources: [{ kind: 'guildWide', caps: [] }] }), false, 'denied guild-wide: nothing to block');
+});
+
+test('lib.changeKind: what a direct grant would change — asked about only when it lowers guild-wide or default access', () => {
+  const { lib } = libOnly();
+  const all = [...ALL_CAPS];
+  const cassRead = accessRow('cass', 'Cass', R7, [{ kind: 'guildWide', caps: R7 }]);
+  const same = plain(lib.changeKind(cassRead, all, R7));
+  assert.equal(same.kind, 'same', 'Read where guild-wide gives Read');
+  assert.equal(lib.needsLowerConfirm(same, R7), false);
+
+  const cassWrite = accessRow('cass', 'Cass', W7, [{ kind: 'guildWide', caps: W7 }]);
+  const lower = plain(lib.changeKind(cassWrite, all, R7));
+  assert.equal(lower.kind, 'lower');
+  assert.equal(lower.from, 'guildWide');
+  assert.equal(lib.needsLowerConfirm(lower, R7), true);
+  assert.equal(lib.lowerText('Cass', lower, '#research'), 'This lowers Cass from Write (guild-wide) to Read in #research. Roles still apply.');
+  const block = plain(lib.changeKind(cassWrite, all, []));
+  assert.equal(lib.needsLowerConfirm(block, []), true, 'a block lowers it too');
+  assert.equal(lib.lowerText('Cass', block, '#research'), 'This lowers Cass from Write (guild-wide) to no access in #research. Roles still apply.');
+
+  // A role keeps what it gives: lowering the direct grant changes nothing there.
+  const aria = RESEARCH_ROWS()[0];
+  assert.equal(lib.changeKind(aria, all, R7).kind, 'same');
+  assert.equal(lib.changeKind(aria, all, null).kind, 'same', 'removing it: still Write via the role');
+  // Lowering one's own direct grant, or removing it, is not asked about (Undo is there).
+  const solDirect = accessRow('sol', 'Sol', F7, [{ kind: 'direct', caps: F7 }, { kind: 'personaDefault', caps: R7, shadowedBy: 'direct' }], F7);
+  const down = plain(lib.changeKind(solDirect, all, W7));
+  assert.equal(down.kind, 'lower');
+  assert.equal(lib.needsLowerConfirm(down, W7), false);
+  const off = plain(lib.changeKind(solDirect, all, null));
+  assert.deepEqual(off.after, R7, 'without it the persona default applies again');
+  assert.equal(lib.needsLowerConfirm(off, null), false);
+
+  // Nothing there yet: 'add'; and only what the bot can do.
+  assert.equal(lib.changeKind(null, all, W7).kind, 'add');
+  assert.deepEqual(plain(lib.changeKind(null, R7, W7).after), R7, 'the bot can only read here');
+  assert.equal(lib.changeKind(accessRow('quill', 'Quill', W7, [roleSrc('g1-chatters', W7)]), all, F7).kind, 'raise');
+  // Removed with /ban: a grant that gives something ends it, a block doesn't.
+  const banned = accessRow('p', 'P', [], [{ kind: 'removed' }, { ...roleSrc('g1-readers', R7), shadowedBy: 'removed' }]);
+  assert.deepEqual(plain(lib.predictDirect(banned, all, W7)), W7);
+  assert.deepEqual(plain(lib.predictDirect(banned, all, [])), []);
+  assert.deepEqual(plain(lib.predictDirect(banned, all, null)), []);
+
+  assert.equal(lib.currentlyText('Nyx', null, plain(lib.changeKind(null, all, W7))), 'Nyx: no access');
+  const chatter = accessRow('aria', 'Aria', W7, [roleSrc('g1-chatters', W7)]);
+  assert.equal(lib.currentlyText('Aria', chatter, plain(lib.changeKind(chatter, all, W7))), 'Aria: Write via role g1-chatters — no direct grant needed');
+  assert.equal(lib.currentlyText('Cass', cassWrite, lower), 'Cass: Write via the guild-wide level — this lowers it to Read');
+  assert.equal(lib.currentlyText('Aria', aria, plain(lib.changeKind(aria, all, F7))), 'Aria: Write via role g1-chatters and the direct grant here');
+});
+
+test('lib drafts: the channel drawer’s Add form keeps whom (at most 10) and the level', () => {
+  const { lib } = libOnly();
+  const at = 1_000;
+  const d = lib.makeDraft({ userId: 'u1', route: '#/g/' + G1 + '/channels/c/' + CH.research, form: 'chanAdd', fields: { personas: ['nyx', 'aria'], caps: W7, code: 'inv_x' }, at });
+  assert.deepEqual(plain(d.fields), { personas: ['nyx', 'aria'], caps: W7 }, 'only its fields');
+  const many = lib.makeDraft({ userId: 'u1', route: '#/g/' + G1 + '/channels', form: 'chanAdd', fields: { personas: Array.from({ length: 11 }, (_, i) => 'p' + i) }, at });
+  assert.deepEqual(plain(many.fields), {}, 'more than one Add can take: not kept');
+});
+
+test('ui.typeahead: an ARIA combobox — debounced, ↓/Enter pick, Esc closes the list only, Backspace removes a chip', async () => {
+  const { ctx, doc, advance } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const { el, typeahead, drawer } = ctx.PA.ui;
+  const dom = drawerDom(doc, el);
+  const asked: string[] = [];
+  const people = [{ value: 'nyx', label: 'Nyx', hint: 'nyx · no access here' }, { value: 'juniper', label: 'Juniper' }, { value: 'aria', label: 'Aria', group: 'Can act here' }];
+  const ta = typeahead({ label: 'Personas', ariaLabel: 'Personas to add', max: 2, name: 'persona', source: async (q: string) => { asked.push(q); return people.filter((p) => p.label.toLowerCase().includes(q.toLowerCase())); } });
+  const form = el('form', {}, [ta.node]);
+  const handle = drawer.open({ title: '#research', body: form });
+  const tracker = handle.track(form);
+  const input = ta.input;
+  const list = doc.getElementById(input.getAttribute('aria-controls'))!;
+  assert.equal(input.getAttribute('role'), 'combobox');
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(list.getAttribute('role'), 'listbox');
+  assert.equal(input.getAttribute('aria-label'), 'Personas to add');
+  const changes: string[][] = [];
+  ta.onChange((v: string[]) => changes.push(plain(v)));
+
+  input.focus();
+  for (const v of ['n', 'ny']) {
+    input.value = v;
+    input.fire('input');
+    advance(100);
+  }
+  await settle();
+  assert.deepEqual(asked, [], 'not before a pause');
+  advance(150);
+  await settle();
+  assert.deepEqual(asked, ['ny'], 'once, with what was typed last');
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  const opts = () => list.querySelectorAll('[role="option"]');
+  assert.deepEqual(opts().map((o) => o.textContent), ['Nyxnyx · no access here']);
+  assert.equal(input.getAttribute('aria-activedescendant'), opts()[0].id, 'the first option is active');
+  assert.equal(tracker.isDirty(), false, 'typing is a search, not a change');
+
+  // Esc closes the list — and only the list: the drawer stays open.
+  doc.key('Escape');
+  input.fire('keydown', { key: 'Escape' });
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(drawer.isOpen(), true, 'Esc with the list open is the list’s');
+
+  // ↓ opens it again; Enter picks.
+  input.fire('keydown', { key: 'ArrowDown' });
+  advance(150);
+  await settle();
+  const enter = input.fire('keydown', { key: 'Enter' });
+  assert.equal(enter.defaultPrevented, true, 'Enter in the open list never submits the form');
+  assert.deepEqual(plain(ta.values()), ['nyx']);
+  assert.deepEqual(changes, [['nyx']]);
+  assert.equal(input.value, '');
+  assert.equal(tracker.isDirty(), true, 'a pick is a change (Discard changes? asks)');
+  const chip = dom.drawer.querySelector('.tag')!;
+  assert.equal(chip.querySelector('button')!.getAttribute('aria-label'), 'Remove Nyx');
+
+  // Grouped options; what is picked isn't offered again.
+  input.value = '';
+  input.fire('input');
+  advance(150);
+  await settle();
+  assert.deepEqual(opts().map((o) => o.querySelector('.ta-label')!.textContent), ['Juniper', 'Aria']);
+  assert.equal(list.querySelector('[role="group"]')!.textContent.startsWith('Can act here'), true);
+  input.fire('keydown', { key: 'ArrowDown' });
+  input.fire('keydown', { key: 'Enter' });
+  assert.deepEqual(plain(ta.values()), ['nyx', 'aria']);
+  // At most `max`.
+  input.fire('input');
+  advance(150);
+  await settle();
+  input.fire('keydown', { key: 'Enter' });
+  assert.deepEqual(plain(ta.values()), ['nyx', 'aria'], 'no third');
+
+  // Backspace in the empty field removes the last chip; ✕ removes its own.
+  input.value = '';
+  input.fire('keydown', { key: 'Escape' });
+  input.fire('keydown', { key: 'Backspace' });
+  assert.deepEqual(plain(ta.values()), ['nyx']);
+  dom.drawer.querySelector('.tag')!.querySelector('button')!.click();
+  assert.deepEqual(plain(ta.values()), []);
+  assert.equal(doc.activeElement, input);
+  assert.equal(tracker.isDirty(), false);
+
+  // Esc with the list closed is the drawer's again.
+  doc.key('Escape');
+  doc.key('Escape');
+  assert.equal(drawer.isOpen(), false);
+});
+
+test('ui.directGrantControl: picks apply at once; a refused one goes back; Custom… and Block guild-wide here', async () => {
+  const { ctx } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const { directGrantControl } = ctx.PA.ui;
+  const sent: unknown[] = [];
+  let answer = true;
+  const c = directGrantControl({ value: W7, canBlock: false, label: 'Direct grant for Aria in #research', apply: async (v: unknown) => { sent.push(plain(v)); return answer; } });
+  const sel = c.select;
+  assert.equal(sel.getAttribute('aria-label'), 'Direct grant for Aria in #research');
+  assert.equal(sel.hasAttribute('data-no-dirty'), true, 'it saves as it changes');
+  assert.deepEqual(sel.options.map((o: FakeElement) => o.textContent), ['—', 'Read', 'Write', 'Full', 'Custom…']);
+  assert.equal(sel.value, 'write');
+
+  sel.value = 'full';
+  sel.fire('change');
+  assert.equal(sel.disabled, true, 'one change at a time');
+  await settle();
+  assert.deepEqual(sent.at(-1), F7);
+  assert.equal(sel.value, 'full');
+  assert.deepEqual(plain(c.value()), F7);
+
+  answer = false; // refused, or cancelled at a confirm
+  sel.value = '';
+  sel.fire('change');
+  await settle();
+  assert.equal(sent.at(-1), null);
+  assert.equal(sel.value, 'full', 'back to what is saved');
+
+  // Custom…: the capabilities inline; Apply sends them.
+  answer = true;
+  sel.value = 'custom';
+  sel.fire('change');
+  const boxes = c.node.querySelectorAll('input').filter((i: FakeElement) => i.type === 'checkbox');
+  assert.ok(boxes.length > 0, 'the capabilities are open');
+  const mention = boxes.find((b: FakeElement) => b.value === 'MENTION_EVERYONE')!;
+  mention.checked = true;
+  mention.fire('change');
+  c.node.querySelectorAll('button').find((b: FakeElement) => b.textContent === 'Apply')!.click();
+  await settle();
+  assert.deepEqual(sent.at(-1), ALL_CAPS.filter((x) => [...F7, 'MENTION_EVERYONE'].includes(x)));
+  assert.equal(sel.value, 'custom');
+  assert.equal(sel.options.find((o: FakeElement) => o.value === 'custom')!.textContent, 'Full +1 (custom)');
+  // Cancel in Custom… leaves it as it is.
+  sel.value = 'custom';
+  sel.fire('change');
+  const n = sent.length;
+  c.node.querySelectorAll('button').find((b: FakeElement) => b.textContent === 'Cancel')!.click();
+  assert.equal(sent.length, n);
+  assert.equal(c.node.querySelectorAll('input').filter((i: FakeElement) => i.type === 'checkbox').length, 0);
+
+  // Block guild-wide here: offered when something would be blocked, or when set.
+  const b = directGrantControl({ value: null, canBlock: true, label: 'x', apply: async () => true });
+  assert.equal(b.select.options.at(-1).textContent, 'Block guild-wide here');
+  const set = directGrantControl({ value: [], canBlock: false, label: 'x', apply: async () => true });
+  assert.equal(set.select.value, 'block');
+});
+
+test('ui.toast: an Undo toast runs its action once, then goes; it stays while focused', () => {
+  const { ctx, doc, advance } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, toast } = ctx.PA.ui;
+  const host = el('div', { id: 'toasts' });
+  doc.body.appendChild(host);
+  let undone = 0;
+  const t = toast('Removed Aria’s direct grant in #research — still Write via role g1-chatters.', { action: { label: 'Undo', run: () => undone++ }, ms: 10_000 });
+  const undo = t.node.querySelector('.toast-action')!;
+  assert.equal(undo.textContent, 'Undo');
+  assert.equal(t.node.getAttribute('role'), 'status');
+  t.node.fire('focusin');
+  advance(20_000);
+  assert.equal(host.children.length, 1, 'held while focused');
+  t.node.fire('focusout');
+  advance(9_000);
+  assert.equal(host.children.length, 1);
+  advance(1_500);
+  assert.equal(host.children.length, 0, 'about 10 s after');
+  const again = toast('x', { action: { label: 'Undo', run: () => undone++ }, ms: 10_000 });
+  again.node.querySelector('.toast-action')!.click();
+  assert.equal(undone, 1);
+  assert.equal(host.children.length, 0, 'gone once used');
+});
+
+/** The panel on the Channels tab over Guild One's fixture: #research's
+ *  access read answers from `research` (mutable), and grant writes go to
+ *  `handle`. Personas: aria, cass, quill, sol (with access), nyx (none). */
+async function channelsPanel(url: string, opts: { handle?: FakeHandler; research?: any[]; local?: Record<string, string>; session?: Record<string, string>; routes?: Record<string, unknown>; botCaps?: string[] } = {}) {
+  const g = '/admin/g/' + GA;
+  const state = { research: opts.research ?? RESEARCH_ROWS() };
+  const access = () => ({
+    channel: G1_LAYOUT.find((c) => c.id === CH.research), botCaps: opts.botCaps ?? [...ALL_CAPS], botBase: 'full',
+    rows: state.research, names: { channels: { [CH.research]: { id: CH.research, name: 'research', type: 'text' }, [CH.catResearch]: { id: CH.catResearch, name: 'Research', type: 'category' } }, discordRoles: { [MODS]: { name: 'Mods', guildId: GA } } },
+  });
+  const box = await panelAt(url, {
+    local: opts.local,
+    session: opts.session,
+    routes: {
+      [g + '/channels']: G1_CHANNELS_VIEW,
+      [g + '/access/summary']: G1_SUMMARY,
+      [g + '/channels/' + CH.designReview + '/access']: { channel: G1_LAYOUT.find((c) => c.id === CH.designReview), inert: 'thread', parentId: CH.research, names: { channels: { [CH.research]: { id: CH.research, name: 'research', type: 'text' }, [CH.designReview]: { id: CH.designReview, name: 'design-review', type: 'thread', parentId: CH.research } } } },
+      [g + '/channels/' + CH.catResearch + '/access']: { channel: G1_LAYOUT.find((c) => c.id === CH.catResearch), inert: 'category', channels: [CH.research, CH.labNotes, CH.ideas], names: { channels: {} } },
+      [g + '/personas']: { personas: [{ id: 'aria', displayName: 'Aria', roles: [] }], total: 1, limit: 50, offset: 0 },
+      ...opts.routes,
+    },
+    handle: (method, path, body, headers) => {
+      if (method === 'GET' && path === g + '/channels/' + CH.research + '/access') return access();
+      if (method === 'GET' && path.startsWith(g + '/persona-directory')) {
+        const q = new URL(path, 'http://panel.invalid').searchParams.get('q') ?? '';
+        const all = [{ id: 'nyx', displayName: 'Nyx', avatarUrl: '', hasAccessHere: false }, { id: 'juniper', displayName: 'Juniper', avatarUrl: '', hasAccessHere: true }];
+        return { personas: all.filter((p) => p.displayName.toLowerCase().includes(q.toLowerCase())) };
+      }
+      return opts.handle?.(method, path, body, headers);
+    },
+  });
+  const view = box.doc.getElementById('view')!;
+  const drawerBody = box.doc.getElementById('drawer-body')!;
+  const rowLink = (cid: string) => view.querySelectorAll('.chan-row').find((a) => a.dataset.key === 'channel:' + cid)!;
+  const tr = (pid: string) => drawerBody.querySelectorAll('tr').find((t) => t.dataset.pid === pid)!;
+  const pick = (pid: string, v: string) => {
+    const s = tr(pid).querySelector('select')!;
+    s.value = v;
+    s.fire('change');
+  };
+  return { ...box, state, view, drawerBody, rowLink, tr, pick, g };
+}
+
+/** A change's answer, as the relay sends it: the channel explained for the persona. */
+const echo = (effective: string[], sources: object[], direct: string[] | null, extra: object = {}) =>
+  ({ guildPolicy: {}, banned: false, effective: { effective, level: 'x', base: null, extra: [], direct, sources, botLimited: false, botLacks: [], ...extra } });
+
+test('Channels tab: a first visit lands here — Discord’s order, counts in words, the relay’s limits, threads never listed', async () => {
+  const { here, view, doc, tabs, rowLink, calls } = await channelsPanel('/');
+  assert.equal(here(), '#/g/' + GA + '/channels');
+  assert.equal(doc.title, 'Portal admin — Channels — Guild One');
+  assert.equal(tabs.channels.getAttribute('aria-current'), 'page');
+  assert.ok(calls.includes(`GET /admin/g/${GA}/access/summary`));
+  const names = view.querySelectorAll('.chan-row').map((a) => a.querySelector('.chan-name')!.textContent);
+  assert.deepEqual(names, ['#welcome', '#general', '#random', 'lounge', '#research', '#lab-notes', 'ideas', '#old-logs']);
+  assert.doesNotMatch(view.textContent, /design-review|Archive ·/);
+  const heads = view.querySelectorAll('.cat-head');
+  assert.deepEqual(heads.map((h) => h.textContent), ['General · 3 channels', 'Research · 3 channels', 'The relay can’t see these (1)']);
+  assert.deepEqual(heads.map((h) => h.getAttribute('aria-expanded')), ['true', 'true', 'false'], 'the last group starts folded');
+  const hiddenList = doc.getElementById(heads[2].getAttribute('aria-controls')!)!;
+  assert.ok(hiddenList.classList.contains('hidden'));
+  assert.ok(hiddenList.textContent.includes('#old-logs'));
+  assert.match(rowLink(CH.welcome).textContent, /announcement.*relay can only read here.*3 can read/);
+  assert.equal(rowLink(CH.research).querySelector('.chan-counts')!.textContent, '1 can write · 2 can read · 1 full');
+  assert.equal(rowLink(CH.research).getAttribute('href'), '#/g/' + GA + '/channels/c/' + CH.research);
+  assert.equal(rowLink(CH.lounge).querySelector('.badge')!.textContent, 'voice');
+  assert.ok(view.textContent.includes('Threads use their channel’s access and aren’t listed.'));
+  assert.equal(view.querySelector('.updated')!.textContent, 'updated just now');
+});
+
+test('Channels tab: the filter keeps its focus and puts ?q= in place; chips ?show=; ?cat= unfolds one category; folding is remembered', async () => {
+  const { here, view, doc, nav, advance, calls, localStore } = await channelsPanel('/#/g/' + GA + '/channels');
+  const search = doc.getElementById('list-search')!;
+  search.focus();
+  const entries = nav.entries.length;
+  const mark = calls.length;
+  search.value = 'res';
+  search.fire('input');
+  const shown = () => view.querySelectorAll('.chan-row').map((a) => a.querySelector('.chan-name')!.textContent);
+  assert.deepEqual(shown(), ['#research'], 'at once');
+  assert.equal(doc.getElementById('list-search'), search, 'the same box');
+  assert.equal(doc.activeElement, search, 'focus stays');
+  advance(200);
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/channels?q=res');
+  assert.equal(nav.entries.length, entries, 'in place (replaceState)');
+  assert.deepEqual(calls.slice(mark), [], 'nothing asked: the filter runs here');
+
+  search.value = '';
+  search.fire('input');
+  clickable(doc, 'Empty').click();
+  assert.equal(here(), '#/g/' + GA + '/channels?show=empty');
+  assert.deepEqual(shown(), ['#old-logs']);
+  assert.equal(clickable(doc, 'Empty').getAttribute('aria-pressed'), 'true');
+  clickable(doc, 'All').click();
+  assert.equal(here(), '#/g/' + GA + '/channels');
+
+  // Folding General is remembered for this admin and guild; signing out forgets it.
+  const general = view.querySelectorAll('.cat-head').find((h) => h.textContent.startsWith('General'))!;
+  general.click();
+  assert.equal(general.getAttribute('aria-expanded'), 'false');
+  const key = 'pa.collapsed:' + ME_GWEN.user.id + ':' + GA;
+  assert.deepEqual(JSON.parse(localStore.getItem(key)!), ['cat:' + CH.catGeneral]);
+  const again = await channelsPanel('/#/g/' + GA + '/channels', { local: { [key]: localStore.getItem(key)! } });
+  assert.equal(again.view.querySelectorAll('.cat-head').find((h) => h.textContent.startsWith('General'))!.getAttribute('aria-expanded'), 'false');
+  clickable(again.doc, 'Sign out').click();
+  await settle();
+  assert.equal(again.localStore.getItem(key), null);
+
+  // ?cat=: only that category open.
+  const cat = await channelsPanel('/#/g/' + GA + '/channels?cat=' + CH.catResearch);
+  assert.deepEqual(cat.view.querySelectorAll('.cat-head').map((h) => h.getAttribute('aria-expanded')), ['false', 'true', 'false']);
+});
+
+test('channel drawer: who can act here, at what level and why; add a persona at Write; a removal says what is left, and Undo puts it back', async () => {
+  const { here, rowLink, drawerBody, doc, tr, pick, calls, bodies, advance, g, view } = await channelsPanel('/#/g/' + GA + '/channels', {
+    handle: (method, path, body) => {
+      if (method === 'PUT' && path === g + '/personas/nyx/grants') return echo(W7, [{ kind: 'direct', caps: W7 }], W7);
+      if (method === 'DELETE' && path === g + '/personas/aria/grants?channelId=' + CH.research) return echo(W7, [roleSrc('g1-chatters', W7)], null);
+      if (method === 'PUT' && path === g + '/personas/aria/grants') return echo(W7, [roleSrc('g1-chatters', W7), { kind: 'direct', caps: W7 }], W7);
+      return undefined;
+    },
+  });
+  rowLink(CH.research).click();
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/channels/c/' + CH.research);
+  assert.equal(doc.getElementById('drawer-title')!.textContent, '#research');
+  assert.match(drawerBody.querySelector('.chan-sub')!.textContent, /^in Research · text/);
+  assert.equal(drawerBody.querySelector('a[target="_blank"]')!.getAttribute('href'), 'https://discord.com/channels/' + GA + '/' + CH.research);
+  assert.equal(drawerBody.querySelector('h3:not(.x)')!.textContent, 'Add personas');
+  const cells = (pid: string) => tr(pid).children.map((td) => td.textContent);
+  assert.deepEqual(cells('aria').slice(0, 3), ['Aria', 'Write', 'direct grantrole g1-chatters']);
+  assert.deepEqual(cells('quill').slice(0, 3), ['Quill', 'Full', 'role g1-mods-mirror · mirrors @Mods']);
+  assert.deepEqual(cells('cass').slice(0, 3), ['Cass', 'Read', 'guild-wide']);
+  assert.deepEqual(cells('sol').slice(0, 3), ['Sol', 'Read', 'persona default']);
+  assert.equal(tr('aria').querySelector('select')!.value, 'write');
+  assert.equal(tr('aria').querySelector('a')!.getAttribute('href'), '#/g/' + GA + '/personas/p/aria');
+  assert.ok(drawerBody.textContent.includes('Who can act here (4)'));
+  assert.ok(drawerBody.textContent.includes('In Discord: /add persona:… level:write — run it in #research'));
+
+  // Add: type 'ny', pick Nyx; Write is picked already; Add.
+  const input = drawerBody.querySelector('.ta-input')!;
+  input.focus();
+  input.value = 'ny';
+  input.fire('input');
+  advance(150);
+  await settle();
+  assert.ok(calls.includes(`GET ${g}/persona-directory?q=ny`));
+  input.fire('keydown', { key: 'Enter' });
+  assert.equal(drawerBody.querySelector('.currently')!.textContent, 'Currently:Nyx: no access');
+  const level = drawerBody.querySelector('.add-form')!.querySelectorAll('input').find((i) => i.type === 'radio' && i.checked)!;
+  assert.equal(level.value, 'write', 'Write is preselected');
+  drawerBody.querySelector('.add-form')!.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
+  const addLine = drawerBody.querySelector('.add-form')!.querySelector('.status-line')!;
+  assert.equal(addLine.textContent, 'Nyx → Write in #research. Effective now: Write.');
+  assert.deepEqual(drawerBody.querySelectorAll('tr[data-pid]').map((t) => t.dataset.pid), ['aria', 'cass', 'nyx', 'quill', 'sol'], 'the row appears, in name order');
+  assert.equal(drawerBody.querySelector('.ta-chips')!.querySelectorAll('.tag').length, 0, 'the picks are done');
+
+  // Aria's direct grant to '—': the line under her row says what is left.
+  pick('aria', '');
+  await settle();
+  assert.equal(calls.at(-1), `DELETE ${g}/personas/aria/grants?channelId=${CH.research}`);
+  assert.deepEqual(bodies.at(-1), { expect: W7 }, 'with what the drawer showed');
+  const line = tr('aria').nextSibling as FakeElement;
+  assert.equal(line.textContent, 'Removed Aria’s direct grant in #research — still Write via role g1-chatters.');
+  assert.deepEqual(cells('aria').slice(0, 3), ['Aria', 'Write', 'role g1-chatters']);
+  // Undo, from its toast: Write again, sent expecting no grant.
+  const toastUndo = doc.getElementById('toasts')!.querySelectorAll('.toast').find((t) => t.textContent.startsWith('Removed Aria'))!.querySelector('.toast-action')!;
+  toastUndo.click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
+  assert.equal((tr('aria').nextSibling as FakeElement).textContent, 'Undone: Aria → Write in #research. Effective now: Write.');
+  assert.equal(tr('aria').querySelector('select')!.value, 'write');
+
+  // Closed, the list follows: its counts are the drawer's rows now, without asking again.
+  const before = calls.filter((c) => c.endsWith('/access/summary')).length;
+  doc.key('Escape'); // out of the field it is in
+  doc.key('Escape'); // and the drawer closes
+  await settle();
+  assert.equal(here(), '#/g/' + GA + '/channels');
+  assert.equal(rowLink(CH.research).querySelector('.chan-counts')!.textContent, '2 can write · 2 can read · 1 full');
+  assert.equal(calls.filter((c) => c.endsWith('/access/summary')).length, before);
+  assert.equal(doc.activeElement, rowLink(CH.research), 'focus back on its row');
+  void view;
+});
+
+test('channel drawer: lowering guild-wide access asks first (Cancel sends nothing); the same level says “No change”', async () => {
+  const cassWrite = accessRow('cass', 'Cass', W7, [{ kind: 'guildWide', caps: W7 }]);
+  const { tr, pick, bodies, doc, drawerBody, rowLink, g } = await channelsPanel('/#/g/' + GA + '/channels', {
+    research: [cassWrite, accessRow('sol', 'Sol', R7, [{ kind: 'personaDefault', caps: R7 }])],
+    handle: (method, path, body) => {
+      if (method === 'PUT' && path === g + '/personas/cass/grants') return echo(R7, [{ kind: 'direct', caps: R7 }, { kind: 'guildWide', caps: W7, shadowedBy: 'direct' }], R7);
+      if (method === 'PUT' && path === g + '/personas/sol/grants') return echo(R7, [{ kind: 'direct', caps: R7 }, { kind: 'personaDefault', caps: R7, shadowedBy: 'direct' }], R7);
+      return undefined;
+    },
+  });
+  rowLink(CH.research).click();
+  await settle();
+  const n = bodies.length;
+  pick('cass', 'read');
+  await settle();
+  const modal = doc.querySelector('.modal')!;
+  assert.equal(modal.querySelector('h2')!.textContent, 'Lower Cass’s access in #research?');
+  assert.ok(modal.textContent.includes('This lowers Cass from Write (guild-wide) to Read in #research. Roles still apply.'));
+  clickable(doc, 'Cancel', modal).click();
+  await settle();
+  assert.equal(bodies.length, n, 'nothing sent');
+  assert.equal(tr('cass').querySelector('select')!.value, '', 'back to what is set');
+
+  pick('cass', 'read');
+  await settle();
+  clickable(doc, 'Lower to Read', doc.querySelector('.modal')!).click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'read', expect: null });
+  assert.equal((tr('cass').nextSibling as FakeElement).textContent, 'Cass → Read in #research. Effective now: Read.');
+  assert.deepEqual(tr('cass').children[2].textContent, 'direct grantoverrides guild-wide Write');
+
+  // Read where the persona default already gives Read: no question, and it says so.
+  pick('sol', 'read');
+  await settle();
+  assert.equal(doc.querySelector('.modal'), null);
+  assert.equal((tr('sol').nextSibling as FakeElement).textContent, 'Sol → Read in #research. No change to what Sol can do there: Read.');
+  void drawerBody;
+});
+
+test('channel drawer: changed meanwhile — the conflict copy, the rows read again; a paused write waits and goes on', async () => {
+  let conflict = true;
+  let paused = 1;
+  let box: Awaited<ReturnType<typeof channelsPanel>>;
+  box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    handle: (method, path) => {
+      if (method === 'PUT' && path === box.g + '/personas/sol/grants' && conflict) {
+        // Another tab gave Sol Full here a moment ago.
+        box.state.research = box.state.research.map((r: any) => (r.personaId === 'sol' ? accessRow('sol', 'Sol', F7, [{ kind: 'direct', caps: F7 }, { kind: 'personaDefault', caps: R7, shadowedBy: 'direct' }], F7) : r));
+        return refuse(409, 'CONFLICT', 'this was changed since it was loaded', { current: F7 });
+      }
+      if (method === 'PUT' && path === box.g + '/personas/cass/grants') {
+        if (paused-- > 0) return refuse(429, 'RATE_LIMITED', 'slow down');
+        return echo(W7, [{ kind: 'direct', caps: W7 }, { kind: 'guildWide', caps: R7, shadowedBy: 'direct' }], W7);
+      }
+      return undefined;
+    },
+  });
+  const { tr, pick, calls, bodies, advance } = box;
+  const sel = tr('sol').querySelector('select')!;
+  sel.focus();
+  pick('sol', 'write');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.research, level: 'write', expect: null });
+  assert.equal(calls.at(-1), `GET /admin/g/${GA}/channels/${CH.research}/access`, 'read again');
+  assert.equal((tr('sol').nextSibling as FakeElement).textContent, 'Not saved: someone else changed this a moment ago. Reloaded — check and try again.');
+  assert.equal(tr('sol').querySelector('select')!.value, 'full', 'the row as it is now');
+  assert.equal(box.doc.activeElement, tr('sol').querySelector('select'), 'focus on its control, not lost');
+
+  conflict = false;
+  pick('cass', 'write');
+  await settle();
+  assert.equal((tr('cass').nextSibling as FakeElement).textContent, 'Paused for a few seconds (rate limit).');
+  advance(3_000);
+  await settle();
+  assert.equal((tr('cass').nextSibling as FakeElement).textContent, 'Cass → Write in #research. Effective now: Write.');
+  assert.equal(bodies.filter((b) => b.channelId === CH.research && b.level === 'write').length, 3, 'Sol once, Cass twice (paused, then sent again)');
+});
+
+test('channel drawer: a thread’s address becomes its channel’s, saying so; a category’s opens the list there; a persona’s name is a link Back returns from', async () => {
+  const t = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.designReview);
+  assert.equal(t.here(), '#/g/' + GA + '/channels/c/' + CH.research);
+  assert.equal(t.nav.entries.length, 1, 'in place');
+  assert.equal(t.doc.getElementById('drawer-title')!.textContent, '#research');
+  assert.ok(t.drawerBody.querySelector('.status-info')!.textContent === 'Threads use #research’s access.');
+  assert.ok(t.tr('aria'), 'the channel’s rows');
+
+  const c = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.catResearch);
+  assert.equal(c.here(), '#/g/' + GA + '/channels?cat=' + CH.catResearch);
+  assert.equal(c.doc.getElementById('drawer')!.classList.contains('hidden'), true);
+  assert.deepEqual(c.view.querySelectorAll('.cat-head').map((h) => h.getAttribute('aria-expanded')), ['false', 'true', 'false']);
+
+  const p = await channelsPanel('/#/g/' + GA + '/channels');
+  p.rowLink(CH.research).click();
+  await settle();
+  p.tr('aria').querySelector('a')!.click();
+  await settle();
+  assert.equal(p.here(), '#/g/' + GA + '/personas/p/aria');
+  assert.equal(p.doc.getElementById('drawer-title')!.textContent, 'Aria aria');
+  p.nav.back();
+  await settle();
+  assert.equal(p.here(), '#/g/' + GA + '/channels/c/' + CH.research);
+  assert.equal(p.doc.getElementById('drawer-title')!.textContent, '#research');
+  assert.ok(p.tr('aria'));
+});
+
+test('channel drawer: the relay bot’s limits are a banner; a change it cuts down says so', async () => {
+  const { drawerBody, tr, pick } = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    botCaps: R7,
+    research: [accessRow('cass', 'Cass', R7, [{ kind: 'guildWide', caps: R7 }])],
+    handle: (method, path) => (method === 'PUT' && path.endsWith('/personas/cass/grants')
+      ? echo(R7, [{ kind: 'direct', caps: W7 }, { kind: 'guildWide', caps: R7, shadowedBy: 'direct' }], W7, { botLimited: true, botLacks: W7.filter((c) => !R7.includes(c)) })
+      : undefined),
+  });
+  assert.equal(drawerBody.querySelector('.banner-warn')!.textContent, 'The relay bot can only Read here — anything above Read does nothing until the bot gets Send Messages in this channel.');
+  pick('cass', 'write');
+  await settle();
+  assert.equal((tr('cass').nextSibling as FakeElement).textContent, 'Cass → Write in #research. Effective now: Read — the relay bot can’t send in #research.');
+  assert.equal(tr('cass').children[1].textContent, 'Read (bot-limited)');
+});
+
+test('Channels tab: back on the window after a minute, the list is asked for again', async () => {
+  const { ctx, nav, calls } = await channelsPanel('/#/g/' + GA + '/channels');
+  const asked = () => calls.filter((c) => c.endsWith('/access/summary')).length;
+  assert.equal(asked(), 1);
+  nav.dispatch('focus');
+  await settle();
+  assert.equal(asked(), 1, 'not while it is fresh');
+  const real = Date.now();
+  vm.runInContext('Date.now = () => ' + (real + 61_000), ctx);
+  nav.dispatch('focus');
+  await settle();
+  assert.equal(asked(), 2);
+});
+
+test('channel drawer: an Add refused because the session ended keeps whom and at what level across Sign in again', async () => {
+  const at = '#/g/' + GA + '/channels/c/' + CH.research;
+  const box = await channelsPanel('/' + at, { handle: (method, path) => (method === 'PUT' && path.endsWith('/personas/nyx/grants') ? refuse(401, 'UNAUTHENTICATED') : undefined) });
+  const { drawerBody, doc, advance, sessionStore, nav } = box;
+  const input = drawerBody.querySelector('.ta-input')!;
+  input.focus();
+  input.value = 'ny';
+  input.fire('input');
+  advance(150);
+  await settle();
+  input.fire('keydown', { key: 'Enter' });
+  const form = drawerBody.querySelector('.add-form')!;
+  const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  for (const i of form.querySelectorAll('input')) if (i.type === 'radio') i.checked = i === read;
+  read.fire('change');
+  form.fire('submit');
+  await settle();
+  assert.equal(form.querySelector('.status-line')!.textContent, 'Not saved for Nyx: your session ended. Sign in again, then save it.');
+  assert.equal(doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Your session ended — this change was NOT saved.');
+  assert.equal(form.querySelector('.ta-chips')!.querySelectorAll('input').length, 1, 'Nyx is still picked');
+  clickable(doc, 'Sign in again', doc.querySelector('.modal')!).click();
+  assert.deepEqual(nav.assigned, ['/admin/login']);
+  const kept = JSON.parse(sessionStore.getItem('pa.draft')!);
+  assert.equal(kept.route, at);
+  assert.equal(kept.form, 'chanAdd');
+  assert.deepEqual(kept.fields, { personas: ['nyx'], caps: R7 });
+
+  // Back from Discord, at the same place: the form as it was; nothing sent.
+  const back = await channelsPanel('/' + at, { session: { 'pa.draft': JSON.stringify(kept) } });
+  const f2 = back.drawerBody.querySelector('.add-form')!;
+  assert.deepEqual(f2.querySelector('.ta-chips')!.querySelectorAll('input').map((i) => i.value), ['nyx']);
+  assert.equal(f2.querySelectorAll('input').find((i) => i.type === 'radio' && i.checked)!.value, 'read');
+  assert.equal(f2.querySelector('.status-line')!.textContent, 'Restored your unsaved change — review and save. Nothing was submitted.');
+  assert.ok(!back.calls.some((c) => c.startsWith('PUT ')), 'nothing was submitted');
+});
+
+test('Channels tab: a change made elsewhere in the panel (a persona’s drawer) is counted afresh when the tab is shown again', async () => {
+  const box = await channelsPanel('/#/g/' + GA + '/channels', {
+    handle: (method, path) => (method === 'PUT' && path === '/admin/g/' + GA + '/personas/aria/grants' ? { guildPolicy: { channels: { [CH.labNotes]: W7 } }, banned: false } : undefined),
+  });
+  const asked = () => box.calls.filter((c) => c.endsWith('/access/summary')).length;
+  box.tabs.personas.click();
+  await settle();
+  box.tabs.channels.click();
+  await settle();
+  assert.equal(asked(), 1, 'nothing changed: the tab draws what it had');
+  box.tabs.personas.click();
+  await settle();
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.grant-form')!;
+  const target = form.querySelector('select')!;
+  target.value = CH.labNotes;
+  target.fire('change');
+  const w = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'write')!;
+  w.checked = true;
+  w.fire('change');
+  form.fire('submit');
+  await settle();
+  box.doc.key('Escape');
+  box.doc.key('Escape');
+  await settle();
+  box.tabs.channels.click();
+  await settle();
+  assert.equal(asked(), 2, 'asked again');
 });
