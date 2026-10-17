@@ -343,7 +343,7 @@ export class PortalMcplServer {
               req.id,
               owningSet === undefined ? ERR_CAPABILITY_DENIED : ERR_FEATURE_SET_NOT_ENABLED,
               owningSet === undefined
-                ? unknownToolMessage(toolName, this.availableTools())
+                ? unknownToolMessage(toolName)
                 : `${toolName} isn't enabled for this host, so the call didn't run, and calling it again won't change that. ` +
                   'If you need it, ask whoever runs this host.',
             );
@@ -355,7 +355,7 @@ export class PortalMcplServer {
           const out =
             this.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
               ? await this.identity.handleToolCall(toolName, toolArgs)
-              : await this.agent.handleToolCall(toolName, toolArgs, this.availableTools());
+              : await this.agent.handleToolCall(toolName, toolArgs);
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
           break;
         }

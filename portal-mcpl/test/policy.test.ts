@@ -353,14 +353,12 @@ test('a malformed featureSets/update is answered with an error and denies everyt
   assert.equal(h.internal.policy.allows('tools'), false);
 });
 
-test('an unknown tool name is refused with the closest tools this host offers', async () => {
+test('an unknown tool name is refused, pointing to the tools listed', async () => {
   const h = serverHarness();
   h.internal.policy.applyRequest({ effectiveCapabilities: ALL_USES });
   await h.internal.handleRequest({ id: 1, method: 'tools/call', params: { name: 'send_mesage', arguments: {} } });
   assert.equal(h.errors[0].code, -32002);
-  assert.equal(h.errors[0].message, 'There\'s no Portal tool named "send_mesage", so nothing ran. Did you mean "send_message"?');
-  await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'frobnicate', arguments: {} } });
-  assert.equal(h.errors[1].message, 'There\'s no Portal tool named "frobnicate", so nothing ran. Call one of the tools listed for you.');
+  assert.equal(h.errors[0].message, 'There\'s no Portal tool named "send_mesage", so nothing ran. Call one of the tools listed for you.');
 });
 
 test('a tool that throws answers with its message alone, flagged isError', async () => {
@@ -377,17 +375,15 @@ test('a tool that throws answers with its message alone, flagged isError', async
   });
 });
 
-test('unknown-tool suggestions come from the tools this host has enabled', async () => {
+test('a name that is no tool, an inherited one included, is refused at the gate', async () => {
   const h = serverHarness();
   // `tools` alone leaves portal.messaging disabled and portal.history enabled.
   h.internal.policy.applyRequest({ effectiveCapabilities: ['tools'] });
-  await h.internal.handleRequest({ id: 1, method: 'tools/call', params: { name: 'send_mesage', arguments: {} } });
-  assert.equal(h.errors[0].message, 'There\'s no Portal tool named "send_mesage", so nothing ran. Call one of the tools listed for you.');
-  await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'fetch_histroy', arguments: {} } });
-  assert.equal(h.errors[1].message, 'There\'s no Portal tool named "fetch_histroy", so nothing ran. Did you mean "fetch_history"?');
+  await h.internal.handleRequest({ id: 1, method: 'tools/call', params: { name: 'fetch_histroy', arguments: {} } });
+  assert.equal(h.errors[0].message, 'There\'s no Portal tool named "fetch_histroy", so nothing ran. Call one of the tools listed for you.');
   // An inherited property name isn't a declared tool.
-  await h.internal.handleRequest({ id: 3, method: 'tools/call', params: { name: 'constructor', arguments: {} } });
-  assert.match(h.errors[2].message, /^There's no Portal tool named "constructor", so nothing ran\./);
+  await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'constructor', arguments: {} } });
+  assert.equal(h.errors[1].message, 'There\'s no Portal tool named "constructor", so nothing ran. Call one of the tools listed for you.');
 });
 
 test("a retired tool reaches its pointer even when its feature set is disabled", async () => {
@@ -485,7 +481,7 @@ test('channels/open and channels/close name the id they were given, and the form
   });
 });
 
-test('an unknown name near a persona tool is offered it, on the Claude Code server and a plain MCP host', async () => {
+test('an unknown name is refused in the result, on the Claude Code server and a plain MCP host', async () => {
   const identity: IdentityToolHandler = { async handleToolCall() { return {}; } } as unknown as IdentityToolHandler;
   const { PortalCcChannelServer } = await import('../src/server-cc.js');
   const client = new PortalClient({ url: 'ws://test', token: 't', personaId: 'p' });
@@ -499,36 +495,18 @@ test('an unknown name near a persona tool is offered it, on the Claude Code serv
   };
   await internal.handleRequest({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_persona', arguments: {} } });
   assert.equal(sent[0].isError, true);
-  assert.match(sent[0].content![0].text, /^There's no Portal tool named "list_persona", so nothing ran\. Did you mean "list_personas"/);
+  assert.equal(sent[0].content![0].text, 'There\'s no Portal tool named "list_persona", so nothing ran. Call one of the tools listed for you.');
   const h = serverHarness({ identity });
   h.internal.mcplEnabled = false;
   await h.internal.handleRequest({ id: 2, method: 'tools/call', params: { name: 'list_persona', arguments: {} } });
   const answer = h.responses.at(-1) as { content: Array<{ text: string }>; isError: boolean };
   assert.equal(answer.isError, true);
-  assert.match(answer.content[0].text, /^There's no Portal tool named "list_persona", so nothing ran\. Did you mean "list_personas"/);
+  assert.equal(answer.content[0].text, 'There\'s no Portal tool named "list_persona", so nothing ran. Call one of the tools listed for you.');
 });
 
-test('the unknown-tool refusal lists at most three near names, closest first, within the cutoff', () => {
-  const tools = ['abcdef', 'abcdeg', 'abcdxx', 'abxxxx', 'zzzzzz', 'abcdez'].map((name) => ({ name }));
-  // Distances from "abcdeh": 1, 1, 2, 4, 6, 1; the cutoff for six letters is max(2, 2) = 2.
-  assert.equal(
-    unknownToolMessage('abcdeh', tools),
-    'There\'s no Portal tool named "abcdeh", so nothing ran. Did you mean "abcdef" or "abcdeg" or "abcdez"?',
-  );
-  // Closest first, whatever order the tools come in.
-  assert.equal(
-    unknownToolMessage('abcdxy', [{ name: 'abcdzz' }, { name: 'abcdxx' }]),
-    'There\'s no Portal tool named "abcdxy", so nothing ran. Did you mean "abcdxx" or "abcdzz"?',
-  );
-  // A longer name allows more edits: fourteen letters allow four, so three deletions still match.
-  assert.match(unknownToolMessage('gt_pndng_pings', [{ name: 'get_pending_pings' }]), /Did you mean "get_pending_pings"\?$/);
-  // Twelve letters allow four edits: four still match, five don't, which a cutoff of floor(length/4) would change.
-  assert.match(unknownToolMessage('abcdefghijkl', [{ name: 'abcdefghwxyz' }]), /Did you mean "abcdefghwxyz"\?$/);
-  assert.match(unknownToolMessage('abcdefghijkl', [{ name: 'abcdefgvwxyz' }]), /Call one of the tools listed for you\.$/);
-  assert.match(unknownToolMessage('abc', [{ name: 'xyz' }]), /Call one of the tools listed for you\.$/);
-  // With nothing offered, there's nothing listed to call.
-  assert.match(unknownToolMessage('abc', []), /\. No Portal tools are enabled for you here; if you need them, ask whoever runs this host\.$/);
-  assert.match(unknownToolMessage(42, [{ name: 'send_message' }]), /^There's no Portal tool named 42, so nothing ran\. Call one of the tools listed for you\.$/);
+test('the unknown-tool refusal quotes the name as it was sent', () => {
+  assert.equal(unknownToolMessage('abc'), 'There\'s no Portal tool named "abc", so nothing ran. Call one of the tools listed for you.');
+  assert.equal(unknownToolMessage(42), 'There\'s no Portal tool named 42, so nothing ran. Call one of the tools listed for you.');
 });
 
 test('a voice receipt says what was said, and only an error suggests saying it again', () => {

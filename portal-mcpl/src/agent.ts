@@ -167,23 +167,16 @@ export class PortalAgent {
     return formatChannelLabel(c.name ?? c.id, c.guildId ? this.client.cache.getGuild(c.guildId)?.name : undefined);
   }
 
-  /** Dispatch a tool call. Returns a plain JSON-able result. `offered` is
-   *  what the host was offered, which an unknown name's suggestions come
-   *  from: a server that offers tools above this agent (the persona tools)
-   *  passes its whole list. */
-  async handleToolCall(
-    name: string,
-    args: Record<string, unknown>,
-    offered: readonly { name: string }[] = this.tools,
-  ): Promise<unknown> {
+  /** Dispatch a tool call. Returns a plain JSON-able result. */
+  async handleToolCall(name: string, args: Record<string, unknown>): Promise<unknown> {
     // A tool that won't run is answered before its arguments are looked at:
-    // a retired tool's pointer, or an unknown name's nearest tools, is the
-    // whole answer, whatever channel the call names.
+    // a retired tool's pointer, or the unknown-name refusal, is the whole
+    // answer, whatever channel the call names.
     if (this.hostOwnsChannelLifecycle && Object.hasOwn(RETIRED_WHEN_HOST_OWNS_CHANNELS, name)) {
       throw new Error(RETIRED_WHEN_HOST_OWNS_CHANNELS[name]);
     }
     if (!toolDefinitions.some((tool) => tool.name === name)) {
-      throw new Error(unknownToolMessage(name, offered));
+      throw new Error(unknownToolMessage(name));
     }
     // THE chokepoint for channel addressing: every tool that takes a channelId
     // goes through here, so a name is resolved exactly once, before any side
@@ -395,7 +388,7 @@ export class PortalAgent {
         return { ok: true };
       }
       default:
-        throw new Error(unknownToolMessage(name, offered));
+        throw new Error(unknownToolMessage(name));
     }
   }
 }
@@ -440,34 +433,9 @@ export function shortJson(v: unknown): string {
 }
 
 /**
- * The refusal for a tool name the server doesn't have. It names the closest
- * of the tools this agent can call, so a typo is fixed in one step.
+ * The refusal for a tool name the server doesn't have. The agent holds the
+ * list of tools it can call, so the refusal points there.
  */
-export function unknownToolMessage(name: unknown, available: readonly { name: string }[]): string {
-  const asked = typeof name === 'string' ? name : '';
-  const close = available
-    .map((tool) => ({ name: tool.name, distance: editDistance(asked, tool.name) }))
-    .filter((c) => c.distance <= Math.max(2, Math.floor(asked.length / 3)))
-    .sort((a, b) => a.distance - b.distance)
-    .slice(0, 3)
-    .map((c) => `"${c.name}"`);
-  const lead = `There's no Portal tool named ${shortJson(name)}, so nothing ran.`;
-  if (close.length > 0) return `${lead} Did you mean ${close.join(' or ')}?`;
-  return available.length > 0
-    ? `${lead} Call one of the tools listed for you.`
-    : `${lead} No Portal tools are enabled for you here; if you need them, ask whoever runs this host.`;
-}
-
-function editDistance(a: string, b: string): number {
-  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    let diagonal = row[0];
-    row[0] = i;
-    for (let j = 1; j <= b.length; j++) {
-      const above = row[j];
-      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
-      diagonal = above;
-    }
-  }
-  return row[b.length];
+export function unknownToolMessage(name: unknown): string {
+  return `There's no Portal tool named ${shortJson(name)}, so nothing ran. Call one of the tools listed for you.`;
 }

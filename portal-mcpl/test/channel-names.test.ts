@@ -307,11 +307,11 @@ test("a retired tool points to the host's own channel tools without claiming the
   }
 });
 
-test('an unknown tool is answered with its nearest names before its arguments are looked at', async () => {
+test('an unknown tool is answered before its arguments are looked at', async () => {
   const { agent, sent } = agentWithCache();
   await assert.rejects(
     agent.handleToolCall('send_mesage', { channelId: '#nope', content: 'hi' }),
-    /^Error: There's no Portal tool named "send_mesage", so nothing ran\. Did you mean "send_message"\?$/,
+    /^Error: There's no Portal tool named "send_mesage", so nothing ran\. Call one of the tools listed for you\.$/,
   );
   // Retired tools aren't offered where they're retired.
   await assert.rejects(
