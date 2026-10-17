@@ -20,16 +20,16 @@ import type {
   RpcRequest,
   RpcResponse,
 } from '@animalabs/portal-protocol';
-import type { InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
+import type { AccessRole, InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
 import { DiscordBot, type ChannelMeta, type IncomingMessage } from './discord-bot.js';
 import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore } from './invites.js';
+import { InviteStore, grantShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
-import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
+import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities, roleGrantsAccess } from './permissions.js';
 import { ReadStateStore } from './read-state.js';
 import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
@@ -65,6 +65,42 @@ const ECHO_RECOVERY_MAX_AGE_MS = 5 * 60_000;
 /** list_members page cap — the limit used to be unbounded, so one call could
  *  dump a guild's whole roster (issue #27). */
 const MAX_MEMBERS_PAGE = 1000;
+
+/** The access role an inline mirror grant materializes into, and its name:
+ *  the guild in clear plus 128 bits of digest over (guild, roles, caps), so a
+ *  grant in one guild can't be made to name another guild's role. */
+function mirrorRoleFor(
+  guildId: string,
+  scope: { mirrorRole: string } | { mirrorRoles: string[] },
+  caps: Capability[],
+): { name: string; role: AccessRole } {
+  const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
+  const sortedCaps = [...new Set(caps)].sort();
+  const digest = createHash('sha256').update(JSON.stringify({ guildId, roleIds, caps: sortedCaps })).digest('hex');
+  return {
+    name: `mirror-${guildId}-${digest.slice(0, 32)}`,
+    role: {
+      caps: sortedCaps,
+      scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
+      guildId,
+    },
+  };
+}
+
+/** Same guild, same caps, same scope, same mirrorCaps — order-insensitive. */
+function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
+  const norm = (r: AccessRole) => {
+    const sc = r.scope as Record<string, unknown>;
+    const scope =
+      sc.all === true ? 'all'
+      : Array.isArray(sc.channels) ? `ch:${[...(sc.channels as string[])].sort().join(',')}`
+      : typeof sc.mirrorRole === 'string' ? `mr:${sc.mirrorRole}`
+      : Array.isArray(sc.mirrorRoles) ? `mr:${[...(sc.mirrorRoles as string[])].sort().join(',')}`
+      : JSON.stringify(sc);
+    return JSON.stringify([r.guildId, [...new Set(r.caps)].sort(), scope, !!r.mirrorCaps]);
+  };
+  return norm(a) === norm(b);
+}
 
 export class Relay implements GatewayHooks {
   private bot: DiscordBot;
@@ -176,7 +212,7 @@ export class Relay implements GatewayHooks {
         discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
-        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
+        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code, { byAdmin: true }),
         rotatePersonaToken: (personaId) => this.rotatePersonaToken(personaId),
         revokePersonaToken: (personaId) => this.revokePersonaToken(personaId),
         newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
@@ -197,6 +233,7 @@ export class Relay implements GatewayHooks {
       canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
       resync: (personaId) => this.resyncPersona(personaId),
       newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
+      isGuildServed: (guildId) => this.bot.isGuildAllowed(guildId),
     });
   }
 
@@ -403,6 +440,10 @@ export class Relay implements GatewayHooks {
    *  joining a pre-authorized guild). The bot's cache already holds every
    *  joined guild, so no Discord reconnect is involved — just tell sessions. */
   private onGuildAllowChange(c: GuildAllowChange): void {
+    // A guild leaving the allow-list keeps no portal commands.
+    for (const gid of c.removed) {
+      void this.bot.clearSlashCommands(gid).catch((e) => console.error('[portal-relay] slash clear:', (e as Error).message));
+    }
     for (const gid of c.added) {
       this.mirror.invalidateGuild(gid);
       void this.bot.syncSlashCommands(gid).catch((e) => console.error('[portal-relay] slash sync:', (e as Error).message));
@@ -639,6 +680,10 @@ export class Relay implements GatewayHooks {
     // rights — a revoked/demoted spawner's outstanding codes die here.
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
+    // Before anything is created or consumed: an invite whose grant can't be
+    // applied must fail loudly, not mint a persona with no access.
+    const grantProblem = this.inviteGrantProblem(checked);
+    if (grantProblem) return { error: grantProblem };
 
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
     const clash = this.nameClash(displayName, d.uniqueName === true);
@@ -721,7 +766,7 @@ export class Relay implements GatewayHooks {
     if (!grant && inv.caps?.length) {
       console.error(
         `[portal-relay] invite "${inv.label ?? inv.code}" uses deprecated blanket caps; ` +
-          `honouring as scope:{all}. Re-mint scoped (RFC-004).`,
+          `honouring as scope:{all} of its guild. Re-mint scoped (RFC-004).`,
       );
       grant = { caps: inv.caps, scope: { all: true } };
     }
@@ -735,7 +780,10 @@ export class Relay implements GatewayHooks {
         this.permissions.setPersonaPolicy(personaId, { default: [] }); // malformed mirror grant → deny
         return;
       }
-      this.permissions.addPersonaRoles(personaId, [role]);
+      // setPersonaRoles, not addPersonaRoles: this persona has no entry yet
+      // unless the invite carried roles, and enrollment sets exactly what the
+      // invite grants (no copy of the file default).
+      this.permissions.setPersonaRoles(personaId, [...new Set([...this.permissions.getRoleNames(personaId), role])]);
       return;
     }
     this.permissions.setPersonaPolicy(personaId, this.scopeToPolicy(inv.guildId, grant.scope, grant.caps));
@@ -760,28 +808,63 @@ export class Relay implements GatewayHooks {
       console.error('[portal-relay] mirror grant without guildId — denying (no channels in scope)');
       return null;
     }
-    const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
-    const sortedCaps = [...new Set(caps)].sort();
-    const hash = createHash('sha256')
-      .update(JSON.stringify({ guildId, roleIds, caps: sortedCaps }))
-      .digest('hex')
-      .slice(0, 8);
-    const name = `mirror-${hash}`;
-    if (!this.permissions.getRole(name)) {
-      this.permissions.setRole(name, {
-        caps: sortedCaps,
-        scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
-        guildId,
-      });
+    const { name, role } = mirrorRoleFor(guildId, scope, caps);
+    const existing = this.permissions.getRole(name);
+    if (existing) {
+      // Reuse only the IDENTICAL role. A name hit on anything else — another
+      // guild, other caps, another scope — must never hand that role out.
+      if (!sameAccessRole(existing, role)) {
+        console.error(`[portal-relay] mirror grant name ${name} collides with a different access role — refusing`);
+        return null;
+      }
+      return name;
     }
+    this.permissions.setRole(name, role);
     return name;
+  }
+
+  /**
+   * Why an invite's grant can't be applied, or null. Checked BEFORE a persona
+   * is created or a use is consumed, so a bad invite fails loudly instead of
+   * minting a persona with no access. The grant (or legacy blanket caps) must
+   * be well-formed and name its guild — every scope resolves within one guild
+   * (grantShapeProblem) — and a mirror grant must not collide with a
+   * different access role of the same name.
+   */
+  private inviteGrantProblem(inv: InviteTemplate): string | null {
+    const shape = grantShapeProblem(inv);
+    if (shape) return shape;
+    // A role name that resolves to nothing is refused, not stored: a name
+    // left on a persona would come alive if a role of that name were created
+    // later — possibly in another guild, by someone the invite's minter
+    // never meant to delegate to.
+    const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
+    if (missing.length) return `invite names access role(s) that no longer exist: ${missing.join(', ')} — it must be re-minted`;
+    const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
+    if (!grant || !inv.guildId) return null;
+    if (isMirrorScope(grant.scope)) {
+      const { name, role } = mirrorRoleFor(inv.guildId, grant.scope, grant.caps);
+      const existing = this.permissions.getRole(name);
+      if (existing && !sameAccessRole(existing, role)) return 'invite mirror grant conflicts with an existing access role';
+    }
+    return null;
   }
 
   /** Turn a (guild, scope, caps) grant into a default-deny PersonaPolicy.
    *  Static scopes only — mirror shapes go through materializeMirrorGrant so
    *  they resolve live; reaching here with one is a caller bug (deny). */
   private scopeToPolicy(guildId: string | undefined, scope: Scope, caps: Capability[]): PersonaPolicy {
-    if ('all' in scope) return { default: caps };
+    // `all` = every channel of the INVITE'S guild — a guild default — never a
+    // persona-wide default (which would apply in every guild the relay
+    // serves). Same rule as access roles (scope:{all} is guild-bound). No
+    // guild, no grant.
+    if ((scope as { all?: unknown }).all === true) {
+      if (!guildId) {
+        console.error('[portal-relay] scope:{all} grant without guildId — denying');
+        return { default: [] };
+      }
+      return { default: [], guilds: { [guildId]: { default: caps } } };
+    }
     if (!guildId || !('channels' in scope)) {
       console.error('[portal-relay] scoped grant without guildId or with a mirror shape — denying');
       return { default: [] };
@@ -973,7 +1056,7 @@ export class Relay implements GatewayHooks {
    * grant, consumes a use, and returns the resulting role set. Throws rpcError on
    * any rejection. Auditing is the caller's responsibility (actor differs).
    */
-  private applyInviteAugment(personaId: string, code: string): { roles: string[] } {
+  private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[]; liftedBans?: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
     if (!this.identity.get(personaId)) throw rpcError('NOT_FOUND', 'no such persona');
     const checked = this.invites.check(code, Date.now());
@@ -994,44 +1077,83 @@ export class Relay implements GatewayHooks {
     // was and the invite unconsumed — otherwise a rejected claim still grants
     // its roles, and can be repeated past maxUses.
     const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-    if (grant && isMirrorScope(grant.scope) && !checked.guildId) {
-      throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
+    const grantProblem = this.inviteGrantProblem(checked);
+    if (grantProblem) throw rpcError('INVALID_PARAMS', grantProblem);
+    // A persona banned from a guild (/ban) can't give itself access there
+    // again by claiming an invite — only an admin can. An admin-initiated
+    // claim is that admin's decision, and lifts the ban in each guild where
+    // the invite actually grants something (a role with no capabilities
+    // grants nothing, so it doesn't).
+    const touched = new Set<string>();
+    const grantsIn = new Set<string>();
+    if (grant && checked.guildId) touched.add(checked.guildId), grantsIn.add(checked.guildId);
+    for (const r of checked.roles ?? []) {
+      const role = this.permissions.getRole(r);
+      if (!role?.guildId) continue;
+      touched.add(role.guildId);
+      if (roleGrantsAccess(role)) grantsIn.add(role.guildId);
     }
-    if (checked.roles?.length) {
-      this.permissions.addPersonaRoles(personaId, checked.roles);
+    const banned = [...touched].filter((g) => this.permissions.isBanned(personaId, g));
+    if (banned.length && !opts.byAdmin) {
+      throw rpcError('FORBIDDEN', 'this persona was banned from that server; only an admin there can give it access again');
     }
+    let mirrorRole: string | null = null;
     if (grant && isMirrorScope(grant.scope)) {
       // Same live-role materialization as enroll; a silent snapshot here is
       // strictly worse because an augmented persona has no reason to suspect
       // its shiny new scope is already fossilizing.
-      const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-      if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
-      this.permissions.addPersonaRoles(personaId, [role]);
+      mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+      if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
+    }
+    const liftedBans = banned.filter((g) => grantsIn.has(g) && this.permissions.liftBan(personaId, g));
+    if (checked.roles?.length) {
+      this.permissions.addPersonaRoles(personaId, checked.roles);
+    }
+    if (mirrorRole) {
+      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
     } else if (grant) {
       const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-      const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
     }
     this.invites.consume(code);
-    return { roles: this.permissions.getRoleNames(personaId) };
+    return { roles: this.permissions.getRoleNames(personaId), ...(liftedBans.length ? { liftedBans } : {}) };
   }
 
-  /** Union two policies (most-permissive) for augment-merge. */
+  /**
+   * Union two policies for augment-merge: the result grants at least what
+   * `base` granted EVERYWHERE, plus what `add` grants. Resolution is
+   * channel override ?? guild default ?? persona default, so a new override
+   * or guild default starts from what that place resolved to before (never
+   * from empty, which would narrow it), and a guild default `add` brings also
+   * reaches existing non-empty channel overrides in that guild ("every
+   * channel of G" — an explicit [] channel deny is left as it is). A guild
+   * default is only written when `add` brings one: an undefined guild default
+   * stays transparent.
+   */
   private mergePolicy(base: PersonaPolicy, add: PersonaPolicy): PersonaPolicy {
-    const out: PersonaPolicy = { default: [...new Set([...base.default, ...add.default])] };
+    const union = (...lists: Array<Capability[] | undefined>): Capability[] => [...new Set(lists.flatMap((l) => l ?? []))];
+    const out: PersonaPolicy = { default: union(base.default, add.default) };
     const guilds: Record<string, { default?: Capability[]; channels?: Record<string, Capability[]> }> = {
       ...(base.guilds ?? {}),
     };
     for (const [gid, gp] of Object.entries(add.guilds ?? {})) {
       const cur = guilds[gid] ?? {};
+      const guildBase = cur.default ?? base.default; // what G resolves to today
+      const addDefault = gp.default ?? [];
       const channels = { ...(cur.channels ?? {}) };
-      for (const [cid, caps] of Object.entries(gp.channels ?? {})) {
-        channels[cid] = [...new Set([...(channels[cid] ?? []), ...caps])];
+      if (addDefault.length) {
+        for (const [cid, caps] of Object.entries(channels)) {
+          if (caps.length) channels[cid] = union(caps, addDefault);
+        }
       }
-      guilds[gid] = {
-        default: [...new Set([...(cur.default ?? []), ...(gp.default ?? [])])],
-        ...(Object.keys(channels).length ? { channels } : {}),
-      };
+      for (const [cid, caps] of Object.entries(gp.channels ?? {})) {
+        channels[cid] = union(channels[cid] ?? union(guildBase, addDefault), caps);
+      }
+      const next: { default?: Capability[]; channels?: Record<string, Capability[]> } = {};
+      if (addDefault.length) next.default = union(guildBase, addDefault);
+      else if (cur.default !== undefined) next.default = cur.default;
+      if (Object.keys(channels).length) next.channels = channels;
+      guilds[gid] = next;
     }
     if (Object.keys(guilds).length) out.guilds = guilds;
     return out;

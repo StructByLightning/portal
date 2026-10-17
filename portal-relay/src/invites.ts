@@ -13,6 +13,34 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import type { InviteTemplate, InvitesFile } from './config.js';
 import { WatchedFile } from './file-watch.js';
 
+/**
+ * Why an invite's grant (or deprecated blanket caps) can't be applied as
+ * written, or null. A grant needs a guild (every scope resolves inside one),
+ * at least one capability, and exactly one scope: a non-empty channel list,
+ * one or more Discord roles to mirror, or `all: true`. Enroll and claim refuse
+ * such an invite before anything is created or consumed; loading warns.
+ */
+export function grantShapeProblem(inv: InviteTemplate): string | null {
+  const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true as const } } : undefined);
+  if (!grant) return null;
+  if (!inv.guildId) return 'invite grants access but names no guild — it must be re-minted with a guild';
+  const caps = (grant as { caps?: unknown }).caps;
+  if (!Array.isArray(caps) || caps.length === 0 || !caps.every((c) => typeof c === 'string' && c)) {
+    return 'invite grant names no capabilities';
+  }
+  const sc = (grant as { scope?: unknown }).scope as Record<string, unknown> | undefined;
+  if (!sc || typeof sc !== 'object' || Object.keys(sc).length !== 1) {
+    return 'invite grant scope must be exactly one of channels, mirrorRole, mirrorRoles or all';
+  }
+  const ids = (v: unknown) => Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' && x);
+  const ok =
+    sc.all === true ||
+    ids(sc.channels) ||
+    (typeof sc.mirrorRole === 'string' && sc.mirrorRole !== '') ||
+    ids(sc.mirrorRoles);
+  return ok ? null : 'invite grant scope is malformed';
+}
+
 export type InviteRejection =
   | 'unknown'
   | 'expired'
@@ -97,6 +125,16 @@ export class InviteStore {
       byCode.set(inv.code, inv);
     }
     this.byCode = byCode;
+    // An invite whose grant can't be applied (no guild, no caps, a malformed
+    // scope) is refused at enroll and claim. Flag it so it is re-minted
+    // rather than discovered by the agent that tries it.
+    const bad = [...byCode.values()]
+      .map((i) => [i, grantShapeProblem(i)] as const)
+      .filter(([, why]) => why)
+      .map(([i, why]) => `${i.label ?? i.code.slice(0, 12)} (${why})`);
+    if (bad.length) {
+      console.error(`[portal-relay] invites: ${bad.length} invite(s) will be refused: ${bad.join('; ')}`);
+    }
   }
 
   private persist(): void {

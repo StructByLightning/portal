@@ -934,6 +934,13 @@ export class DiscordBot implements WebhookOps, RoleOps {
    * from non-admins; the authoritative gate is server-side in SlashHandler.
    * No-op unless a slashCommand handler is wired (relay opts in).
    */
+  /** Remove portal's slash commands from a guild (it left the allow-list). */
+  async clearSlashCommands(guildId: string): Promise<void> {
+    const app = this.client.application;
+    if (!app || !this.client.guilds.cache.has(guildId)) return;
+    await app.commands.set([], guildId);
+  }
+
   async syncSlashCommands(guildId?: string): Promise<void> {
     if (!this.handlers.slashCommand) return;
     const app = this.client.application;
@@ -953,6 +960,19 @@ export class DiscordBot implements WebhookOps, RoleOps {
         ...(o.choices ? { choices: o.choices.map((v) => ({ name: v, value: v })) } : {}),
       })),
     }));
+    if (!guildId) {
+      // Startup/reconnect: a joined guild that isn't allowed keeps no portal
+      // commands (it may have been removed from the list while the relay was
+      // down; a live removal clears them in clearSlashCommands).
+      for (const gid of this.client.guilds.cache.keys()) {
+        if (this.guildAllowed(gid)) continue;
+        try {
+          await app.commands.set([], gid);
+        } catch (err) {
+          console.error(`[discord-bot] slash clear failed (${gid}):`, (err as Error).message);
+        }
+      }
+    }
     const gids = guildId
       ? [guildId]
       : [...this.client.guilds.cache.keys()].filter((id) => this.guildAllowed(id));

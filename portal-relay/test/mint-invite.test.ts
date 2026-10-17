@@ -517,3 +517,29 @@ test('mark_read passes count, since and keepPings through to the read-state stor
     t.cleanup();
   }
 });
+
+test('an invite granting scope:{all} covers every channel of ITS guild only — never every guild', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_all', label: 'all', grant: { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { all: true } }, guildId: GUILD });
+    const res = await t.relay.enroll({ invite: 'inv_all', desiredName: 'whole-guild' });
+    assert.ok(!('error' in res), JSON.stringify(res));
+    const policy = t.relay.permissions.getPolicy(res.personaId);
+    assert.deepEqual(policy.default, [], 'no persona-wide default');
+    assert.deepEqual(policy.guilds?.[GUILD]?.default, ['VIEW_CHANNEL', 'READ_HISTORY']);
+    assert.deepEqual(t.relay.capsFor(res.personaId, FOREIGN_CHAN, OTHER_GUILD), [], 'nothing in another guild');
+    // No guild on the invite: refused before anything is created or used up.
+    t.relay.invites.mint({ code: 'inv_all_noguild', label: 'x', grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } });
+    const count = t.relay.identity.all().length;
+    const bare = await t.relay.enroll({ invite: 'inv_all_noguild', desiredName: 'nowhere' });
+    assert.ok('error' in bare && /names no guild/.test(bare.error));
+    assert.equal(t.relay.identity.all().length, count);
+    assert.equal(t.relay.invites.get('inv_all_noguild').uses ?? 0, 0);
+    // Legacy blanket caps without a guild: the same.
+    t.relay.invites.mint({ code: 'inv_blanket', label: 'old', caps: ['VIEW_CHANNEL'] } as any);
+    const blanket = await t.relay.enroll({ invite: 'inv_blanket', desiredName: 'old-style' });
+    assert.ok('error' in blanket && /names no guild/.test(blanket.error));
+  } finally {
+    t.cleanup();
+  }
+});

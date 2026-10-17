@@ -378,3 +378,75 @@ test("every slash command fits Discord's limits (a violation fails the whole reg
     }
   }
 });
+
+test('nothing runs in a guild the relay does not serve (commands can linger there)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-slash-unserved-'));
+  writeFileSync(join(dir, 'identity.json'), JSON.stringify({ personas: [{ id: 'p1', displayName: 'P', avatar: '', token: 't' }] }));
+  writeFileSync(join(dir, 'permissions.json'), JSON.stringify({ roles: {}, personas: {} }));
+  writeFileSync(join(dir, 'invites.json'), JSON.stringify({ invites: [] }));
+  const permissions = new PermissionsStore(join(dir, 'permissions.json'));
+  const handler = new SlashHandler({
+    identity: new IdentityStore(join(dir, 'identity.json'), ''),
+    permissions,
+    invites: new InviteStore(join(dir, 'invites.json')),
+    superadmins: [], guildAdmins: {},
+    capsFor: () => [], canAccessGuild: () => false, resync: () => 0, newInviteCode: () => 'inv_X',
+    isGuildServed: () => false,
+  });
+  const admin = { id: 'a1', name: 'A', hasManageGuild: true };
+  try {
+    assert.match(handler.handle({ command: 'invite', guildId: 'G', channelId: 'c', channelName: 'c', invoker: admin, options: { role: 'x' } }), /not enabled in this server/);
+    assert.deepEqual(handler.autocomplete({ command: 'add', guildId: 'G', channelId: 'c', invoker: admin, option: 'persona', partial: '', options: {} }), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("/add-role and /remove-role replies list only this guild's roles to a guild admin", () => {
+  const t = makeHandler();
+  try {
+    t.permissions.addPersonaRoles('evander-1', ['g2-role']);
+    const added = t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'guild-role' }));
+    assert.match(added, /`guild-role`/);
+    assert.doesNotMatch(added, /g2-role/);
+    const removed = t.handler.handle(t.inv('remove-role', { persona: 'evander-1', role: 'guild-role' }));
+    assert.doesNotMatch(removed, /g2-role/);
+    assert.match(t.handler.handle(t.inv('add-role', { persona: 'evander-1', role: 'guild-role' }, SUPER)), /g2-role/, 'a superadmin sees them all');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('/ban holds until an admin grants access again; /add or /add-role lifts it', () => {
+  const t = makeHandler();
+  try {
+    t.handler.handle(t.inv('ban', { persona: 'rhys-1' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), true);
+    t.handler.handle(t.inv('add', { persona: 'rhys-1', level: 'read' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), false);
+    assert.ok(t.permissions.resolve('rhys-1', GUILD, CHAN).has('READ_HISTORY'));
+    assert.equal(t.permissions.resolve('rhys-1', GUILD, OTHER_CHAN).size, 0, 'only what was granted');
+
+    t.handler.handle(t.inv('ban', { persona: 'ash-1' }));
+    t.handler.handle(t.inv('add-role', { persona: 'ash-1', role: 'guild-role' }));
+    assert.equal(t.permissions.isBanned('ash-1', GUILD), false);
+    assert.ok(t.permissions.resolve('ash-1', GUILD, OTHER_CHAN).has('VIEW_CHANNEL'));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('/add-role of a role that grants nothing does not lift a ban', () => {
+  const t = makeHandler();
+  try {
+    t.permissions.setRole('nothing-role', { caps: ['VIEW_CHANNEL'], scope: { channels: [] }, guildId: GUILD });
+    t.permissions.setRole('capless-role', { caps: [], scope: { all: true }, guildId: GUILD });
+    t.handler.handle(t.inv('ban', { persona: 'rhys-1' }));
+    t.handler.handle(t.inv('add-role', { persona: 'rhys-1', role: 'nothing-role' }));
+    t.handler.handle(t.inv('add-role', { persona: 'rhys-1', role: 'capless-role' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), true);
+  } finally {
+    t.cleanup();
+  }
+});
+

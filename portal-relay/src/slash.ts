@@ -18,7 +18,7 @@
  */
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
-import type { PermissionsStore } from './permissions.js';
+import { roleGrantsAccess, type PermissionsStore } from './permissions.js';
 import type { InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
@@ -231,12 +231,19 @@ export interface SlashDeps {
   /** Re-push the full channel set to a persona; returns channels pushed. */
   resync(personaId: string): number;
   newInviteCode(): string;
+  /** Whether the relay serves this guild (allow-listed). Commands linger in a
+   *  guild until Discord drops them, and a joined-but-not-allowed guild is not
+   *  one portal administers — so nothing runs there. */
+  isGuildServed?(guildId: string): boolean;
 }
 
 export class SlashHandler {
   constructor(private deps: SlashDeps) {}
 
   handle(inv: SlashInvocation): string {
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(inv.guildId)) {
+      return 'Portal is not enabled in this server.';
+    }
     if (!this.authorized(inv.invoker, inv.guildId)) {
       this.audit(inv, 'authz.denied', undefined, false, { command: inv.command });
       return 'Not authorized: requires Manage Server here, or portal superadmin.';
@@ -286,6 +293,13 @@ export class SlashHandler {
     return this.isSuper(inv.invoker) || role.guildId === inv.guildId;
   }
 
+  /** The role names a reply may list: all of them to a superadmin, only this
+   *  guild's to anyone else (another guild's roles are not theirs to see). */
+  private visibleRoles(roles: string[], inv: SlashInvocation): string[] {
+    if (this.isSuper(inv.invoker)) return roles;
+    return roles.filter((r) => this.deps.permissions.getRole(r)?.guildId === inv.guildId);
+  }
+
   private audit(
     inv: SlashInvocation,
     action: string,
@@ -316,6 +330,7 @@ export class SlashHandler {
     const persona = this.target(inv);
     if (typeof persona === 'string') return persona;
     const level = inv.options.level && LEVEL_CAPS[inv.options.level] ? inv.options.level : 'full';
+    this.deps.permissions.liftBan(persona.id, inv.guildId); // an admin granting access here ends a /ban
     this.deps.permissions.setChannel(persona.id, inv.guildId, inv.channelId, LEVEL_CAPS[level]);
     const effective = this.deps.capsFor(persona.id, inv.channelId, inv.guildId);
     this.audit(inv, 'slash.add', persona.id, true, { level });
@@ -363,9 +378,10 @@ export class SlashHandler {
       this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can assign it.`;
     }
-    const roles = this.deps.permissions.addPersonaRoles(persona.id, [name]);
+    if (roleGrantsAccess(role)) this.deps.permissions.liftBan(persona.id, role.guildId); // an admin granting access there ends a /ban
+    const roles = this.visibleRoles(this.deps.permissions.addPersonaRoles(persona.id, [name]), inv);
     this.audit(inv, 'slash.add-role', persona.id, true, { role: name });
-    return `**${persona.displayName}** now holds \`${name}\` (all roles: ${roles.map((r) => `\`${r}\``).join(', ')}).`;
+    return `**${persona.displayName}** now holds \`${name}\` (roles here: ${roles.map((r) => `\`${r}\``).join(', ')}).`;
   }
 
   private removeRole(inv: SlashInvocation): string {
@@ -382,9 +398,9 @@ export class SlashHandler {
       this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
     }
-    const roles = this.deps.permissions.removePersonaRole(persona.id, name);
+    const roles = this.visibleRoles(this.deps.permissions.removePersonaRole(persona.id, name), inv);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });
-    return `Removed \`${name}\` from **${persona.displayName}** (remaining: ${roles.map((r) => `\`${r}\``).join(', ') || 'none'}).`;
+    return `Removed \`${name}\` from **${persona.displayName}** (remaining here: ${roles.map((r) => `\`${r}\``).join(', ') || 'none'}).`;
   }
 
   private invite(inv: SlashInvocation): string {
@@ -490,6 +506,7 @@ export class SlashHandler {
     // Same gate as execution: a user who can see the command (e.g. after a
     // guild admin widened visibility in Integrations settings) but can't run
     // it must not be able to enumerate personas or the role catalog by typing.
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(req.guildId)) return [];
     if (!this.authorized(req.invoker, req.guildId)) return [];
     if (req.option === 'persona') return this.personaChoices(req);
     if (req.option === 'role' || req.option === 'role2' || req.option === 'role3') {
