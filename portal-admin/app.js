@@ -1697,18 +1697,30 @@ async function openPersonaDrawer(id, hint = {}) {
     return;
   }
   if (!d.isCurrent()) return;
-  if (outdated && !(isSuper && !global)) {
-    // Never 'No persona': that relay can't tell. A super-admin still gets
-    // Identity, which it has.
-    if (global) d.setTitle(global.displayName || id, id);
-    const ctx = { id, displayName: (global && global.displayName) || name, drawer: d, gid };
-    d.setBody(el('div', { class: 'drawer-sections' }, [
-      relayOutdated('where ' + ctx.displayName + ' can act in ' + guildName(gid) + ', or change it'),
-      global ? identitySection(ctx, global, true).node : null,
-    ]));
-    return;
+  if (outdated) {
+    // That relay can't say where it can act here, but its persona read
+    // (…/personas/:id, older than the access views) names it — or says it
+    // isn't there. A super-admin still gets Identity, which it has.
+    let detail = null;
+    try { detail = await api('GET', gpath(gid) + '/personas/' + encodeURIComponent(id)).catch(missing); } catch (e) {
+      if (!d.isCurrent()) return;
+      d.setBody(e.status === 401 ? sessionEndedNote() : loadError(couldntLoad(name, e), () => openPersonaDrawer(id, hint)));
+      return;
+    }
+    if (!d.isCurrent()) return;
+    if (detail || global) {
+      const displayName = (detail && detail.displayName) || (global && global.displayName) || id;
+      d.setTitle(displayName, id);
+      const ctx = { id, displayName, drawer: d, gid };
+      d.setBody(el('div', { class: 'drawer-sections' }, [
+        relayOutdated('where ' + displayName + ' can act in ' + guildName(gid) + ', or change it'),
+        global ? identitySection(ctx, global, true).node : null,
+      ]));
+      return;
+    }
   }
-  if (gid && !outdated ? !access : !global) {
+  // (An outdated relay that got here said itself that it has no such persona.)
+  if (outdated || (gid ? !access : !global)) {
     d.setBody(el('p', { class: 'empty-note', role: 'status', text: 'No persona with id “' + id + '”.' }));
     return;
   }

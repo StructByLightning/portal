@@ -335,8 +335,9 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   older relay (deployed after the panel, or rolled back) the Channels tab, a channel's
   drawer and a persona's drawer in a guild say "This panel needs the relay updated —
   Reload once the relay is updated" instead of asking for what it doesn't have; the
-  Personas list still lists (without counts, and without *Add persona*), and a
-  super-admin still gets a persona's *Identity*. An access read answered `404` is
+  Personas list still lists (without counts, and without *Add persona*), a persona's
+  drawer is named from that relay's own `GET …/personas/:id` (which says, itself, when
+  there is no such persona), and a super-admin still gets the persona's *Identity*. An access read answered `404` is
   checked against `/admin/me` before anything says the persona or channel is gone (a
   relay rolled back since the tab loaded). A relay older than `apiVersion` 2 (one that
   sends none) reads a grant without `caps` and every guild-wide `DELETE` as a deny, so

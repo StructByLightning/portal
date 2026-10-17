@@ -6120,3 +6120,12 @@ test('persona drawer: on a relay that has the access views, a persona that isn�
   const box = await personaPanel('/#/g/' + GA + '/personas/p/nobody-0', { handle: (method, path) => (path.endsWith('/personas/nobody-0/access') ? refuse(404, 'NOT_FOUND', 'no such persona') : undefined) });
   assert.equal(box.body.textContent, 'No persona with id “nobody-0”.');
 });
+
+test('persona drawer on a relay older than the panel: named from that relay’s own persona read; one it says isn’t there is “No persona”', async () => {
+  const me2 = { ...ME_GWEN, apiVersion: 2 };
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { me: me2, handle: API2_RELAY });
+  assert.equal(box.doc.getElementById('drawer-title')!.textContent, 'Aria aria', 'named, as that relay names it');
+  assert.match(box.body.textContent, /can’t show where Aria can act in Guild One, or change it here/);
+  const none = await personaPanel('/#/g/' + GA + '/personas/p/nobody-0', { me: me2, handle: API2_RELAY });
+  assert.equal(none.body.textContent, 'No persona with id “nobody-0”.', 'that relay’s persona read says so itself');
+});
