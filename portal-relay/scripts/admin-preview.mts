@@ -210,28 +210,39 @@ const ACCESS_ROLES = {
   'g2-desk': { caps: WRITE, scope: { all: true }, guildId: G2 },
 };
 
+// Ids as the relay mints them (a name, a dash, six hex digits): the ones the
+// panel's acceptance steps name, e.g. #/g/<G1>/personas/p/aria-1a2b3c.
+const P = {
+  aria: 'aria-1a2b3c',
+  cass: 'cass-2b3c4d',
+  nyx: 'nyx-7a8b9c',
+  juniper: 'juniper-3c4d5e',
+  quill: 'quill-4d5e6f',
+  sol: 'sol-6d7e8f',
+};
+
 const PERSONAS = [
-  { id: 'aria', displayName: 'Aria', color: [0x5b, 0x8d, 0xef] },
-  { id: 'cass', displayName: 'Cass', color: [0xe0, 0x7a, 0x5f] },
-  { id: 'nyx', displayName: 'Nyx', color: [0x3d, 0x40, 0x5b] },
-  { id: 'juniper', displayName: 'Juniper', color: [0x81, 0xb2, 0x9a] },
-  { id: 'quill', displayName: 'Quill', color: [0xf2, 0xcc, 0x8f] },
-  { id: 'sol', displayName: 'Sol', color: [0xf4, 0xa2, 0x61] },
+  { id: P.aria, displayName: 'Aria', color: [0x5b, 0x8d, 0xef] },
+  { id: P.cass, displayName: 'Cass', color: [0xe0, 0x7a, 0x5f] },
+  { id: P.nyx, displayName: 'Nyx', color: [0x3d, 0x40, 0x5b] },
+  { id: P.juniper, displayName: 'Juniper', color: [0x81, 0xb2, 0x9a] },
+  { id: P.quill, displayName: 'Quill', color: [0xf2, 0xcc, 0x8f] },
+  { id: P.sol, displayName: 'Sol', color: [0xf4, 0xa2, 0x61] },
 ];
 
 const PERMISSIONS: Record<string, unknown> = {
   // Aria: talks in #general and #research through her access role, and holds
   // her own direct grant in #research too.
-  aria: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE } } } } },
+  [P.aria]: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE } } } } },
   // Cass: reads all of Guild One guild-wide, but is blocked in #random.
-  cass: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
+  [P.cass]: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
   // Nyx: no entry at all — no access anywhere.
   // Juniper: grants on a thread id and a category id, which grant nothing.
-  juniper: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ } } } } },
+  [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ } } } } },
   // Quill: mirrors @Mods with their per-channel permissions.
-  quill: { roles: ['g1-mods-mirror'] },
+  [P.quill]: { roles: ['g1-mods-mirror'] },
   // Sol: a persona default (every guild) plus Guild Two's desk role.
-  sol: { roles: ['g2-desk'], policy: { default: READ } },
+  [P.sol]: { roles: ['g2-desk'], policy: { default: READ } },
 };
 
 const newCode = () => `inv_${randomBytes(18).toString('base64url')}`;
@@ -249,16 +260,16 @@ type AuditLine = { ts: string; actor: { id: string; name: string; kind: 'admin' 
 const admin = (u: UserKey) => ({ id: USERS[u].id, name: USERS[u].global_name, kind: 'admin' as const });
 const AUDIT: AuditLine[] = [
   { ts: iso(NOW - 6 * DAY), actor: admin('op'), action: 'login.ok', ok: true, detail: { isSuper: true, adminGuilds: [] } },
-  { ts: iso(NOW - 6 * DAY + 60_000), actor: admin('op'), action: 'persona.role.assign', target: 'aria', guildId: G1, ok: true, after: { role: 'g1-chatters' } },
-  { ts: iso(NOW - 5 * DAY), actor: admin('gwen'), action: 'slash.add', target: 'aria', guildId: G1, ok: true, detail: { via: 'slash', channelId: C.research, level: 'write' } },
-  { ts: iso(NOW - 5 * DAY + 90_000), actor: admin('dee'), action: 'persona.role.assign', target: 'sol', guildId: G2, ok: true, after: { role: 'g2-desk' } },
+  { ts: iso(NOW - 6 * DAY + 60_000), actor: admin('op'), action: 'persona.role.assign', target: P.aria, guildId: G1, ok: true, after: { role: 'g1-chatters' } },
+  { ts: iso(NOW - 5 * DAY), actor: admin('gwen'), action: 'slash.add', target: P.aria, guildId: G1, ok: true, detail: { via: 'slash', channelId: C.research, level: 'write' } },
+  { ts: iso(NOW - 5 * DAY + 90_000), actor: admin('dee'), action: 'persona.role.assign', target: P.sol, guildId: G2, ok: true, after: { role: 'g2-desk' } },
   { ts: iso(NOW - 5 * DAY + 120_000), actor: admin('dee'), action: 'invite.mint', target: INVITES[5].code as string, guildId: G2, ok: true, after: INVITES[5] },
   { ts: iso(NOW - 4 * DAY), actor: admin('gwen'), action: 'invite.mint', target: INVITES[1].code as string, guildId: G1, ok: true, after: INVITES[1] },
-  { ts: iso(NOW - 3 * DAY), actor: admin('gwen'), action: 'persona.grant.set', target: 'cass', guildId: G1, ok: true, after: { caps: READ } },
-  { ts: iso(NOW - 3 * DAY + 30_000), actor: admin('gwen'), action: 'persona.grant.set', target: 'cass', guildId: G1, ok: true, after: { channelId: C.random, caps: [] } },
+  { ts: iso(NOW - 3 * DAY), actor: admin('gwen'), action: 'persona.grant.set', target: P.cass, guildId: G1, ok: true, after: { caps: READ } },
+  { ts: iso(NOW - 3 * DAY + 30_000), actor: admin('gwen'), action: 'persona.grant.set', target: P.cass, guildId: G1, ok: true, after: { channelId: C.random, caps: [] } },
   { ts: iso(NOW - 2 * DAY), actor: admin('gwen'), action: 'slash.invite', target: INVITES[3].code as string, guildId: G1, ok: true, detail: { via: 'slash', channelId: C.general, roles: ['g1-chatters'], channelLevel: 'write' } },
   { ts: iso(NOW - 1 * DAY), actor: admin('gwen'), action: 'invite.mint', target: INVITES[0].code as string, guildId: G1, ok: true, after: INVITES[0] },
-  { ts: iso(NOW - 20 * 3_600_000), actor: admin('op'), action: 'persona.role.revoke', target: 'cass', guildId: G1, ok: true, before: { role: 'g1-readers' } },
+  { ts: iso(NOW - 20 * 3_600_000), actor: admin('op'), action: 'persona.role.revoke', target: P.cass, guildId: G1, ok: true, before: { role: 'g1-readers' } },
   { ts: iso(NOW - 6 * 3_600_000), actor: admin('otto'), action: 'authz.denied', guildId: G1, ok: false, detail: { via: 'slash', channelId: C.general, command: 'add' } },
   { ts: iso(NOW - 5 * 3_600_000), actor: admin('otto'), action: 'login.denied', ok: false, detail: { reason: 'no_manageable_guild' } },
   { ts: iso(NOW - 3 * 3_600_000), actor: admin('op'), action: 'invite.mint', target: INVITES[4].code as string, guildId: G1, ok: true, after: INVITES[4] },
