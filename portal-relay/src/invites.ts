@@ -244,7 +244,7 @@ export class InviteStore {
    * or a string Date.parse can't read) counts as long expired (fail closed,
    * matches check). An invite whose uses or maxUses is a number that isn't
    * finite goes too, since JSON can't write either as read: it would write
-   * null, and a null uses reads as 0, which would end the invite's refusal.
+   * null.
    */
   private prune(): void {
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
