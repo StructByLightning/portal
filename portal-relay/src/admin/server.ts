@@ -35,7 +35,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join, extname } from 'node:path';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { AccessRole, AdminConfig, GuildPolicy, PersonaIdentity, Scope } from '../config.js';
 import type { Capability } from '@animalabs/portal-protocol';
 import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
@@ -77,10 +77,19 @@ export const RESYNC_EVERY_MS = 10_000;
 const ROLE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const SESSION_COOKIE = 'portal_admin_session';
-/** The sign-ins this browser has in flight: up to STATES_PER_BROWSER OAuth
- *  states, newest first, joined with '.' (base64url never contains one). */
-const STATE_COOKIE = 'portal_admin_state';
+/** The sign-ins this browser has in flight: one cookie per OAuth state, named
+ *  after it (stateCookieName) and holding it. A request writes or deletes only
+ *  the cookies of the states it is about, never one rebuilt from what it read
+ *  earlier, so two tabs' sign-ins can't erase each other's. A new sign-in past
+ *  STATES_PER_BROWSER ends this browser's oldest. */
+const STATE_COOKIE_PREFIX = 'portal_admin_state_';
+const STATE_COOKIE_NAME = /^portal_admin_state_[0-9a-f]{16}$/;
 const STATES_PER_BROWSER = 3;
+/** At most this many state cookies are looked at in one request. */
+const STATE_COOKIES_READ = 32;
+/** The one state cookie of earlier versions (every state, joined with '.'):
+ *  cleared when a browser still sends it. */
+const LEGACY_STATE_COOKIE = 'portal_admin_state';
 /** An OAuth state as issued: 32 random bytes, base64url. */
 const STATE_FORMAT = /^[A-Za-z0-9_-]{43}$/;
 
@@ -427,12 +436,15 @@ export class AdminServer {
   // ── Auth flow ──
 
   /**
-   * Start a sign-in: a fresh state, kept server-side and in this browser's
-   * state cookie next to the (at most two) other live sign-ins it has in
-   * flight, so a second tab doesn't break the first. ?reauth=1 only marks
-   * the login.ok record. Rate limited per client address, and the state is
-   * counted against that address (SessionStore.issueState), so no one can
-   * start enough sign-ins to push out everyone else's.
+   * Start a sign-in: a fresh state, kept server-side and in a cookie of its
+   * own in this browser, next to the (at most two) other live sign-ins it
+   * has in flight, so a second tab doesn't break the first. Only this
+   * browser's own state cookies are touched: the new one is set; ones the
+   * server no longer has, and past the cap the oldest, are deleted by name.
+   * ?reauth=1 only marks the login.ok record. Rate limited per client
+   * address, and the state is counted against that address
+   * (SessionStore.issueState), so no one can start enough sign-ins to push
+   * out everyone else's.
    */
   private onLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
     const ip = clientIp(req);
@@ -442,8 +454,14 @@ export class AdminServer {
       return this.loginFailed(res, 'rate_limited');
     }
     const state = this.sessions.issueState({ reauth: url.searchParams.get('reauth') === '1', client: ip });
-    const others = this.liveStates(cookieStates(req));
-    this.setStateCookie(res, [state, ...others]);
+    this.setStateCookie(res, state);
+    const held = cookieStates(req);
+    const live = held
+      .filter((h) => h.state !== null && this.sessions.stateStatus(h.state) === 'live')
+      .sort((a, b) => (this.sessions.stateIssueOrder(a.state!) ?? 0) - (this.sessions.stateIssueOrder(b.state!) ?? 0));
+    const evict = live.slice(0, Math.max(0, live.length - (STATES_PER_BROWSER - 1)));
+    for (const h of held) if (!live.includes(h) || evict.includes(h)) clearCookie(res, h.name, '/admin');
+    if (getCookie(req, LEGACY_STATE_COOKIE) !== undefined) clearCookie(res, LEGACY_STATE_COOKIE, '/admin');
     redirect(res, authorizeUrl(this.deps.config.oauthClientId, this.deps.config.redirectUri, state));
   }
 
@@ -453,7 +471,7 @@ export class AdminServer {
    * redirect comes from the request.
    *
    * Login CSRF: a state is accepted only if this server issued it, it is
-   * live and unused, AND it is in this browser's HttpOnly state cookie.
+   * live and unused, AND this browser holds its HttpOnly state cookie.
    */
   private async onCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     // Per client address, before anything else is looked at.
@@ -469,8 +487,8 @@ export class AdminServer {
     const code = q.get('code') || undefined;
 
     // 1. Discord says the sign-in didn't happen (Cancel on its consent
-    //    screen, or its own error). The state cookie is left alone: other
-    //    tabs' sign-ins go on.
+    //    screen, or its own error). No state cookie is touched: other tabs'
+    //    sign-ins go on.
     const discordError = q.get('error');
     if (discordError !== null) {
       if (discordError === 'access_denied') {
@@ -484,16 +502,16 @@ export class AdminServer {
     // 2. Back (or a reload) onto a callback already used, while signed in:
     //    home, as is. The code is never looked at, so a code sent from
     //    elsewhere can't replace a signed-in browser's session.
-    const inCookie = cookieStates(req);
+    const mine = hasStateCookie(req, state);
     const current = this.sessions.get(getCookie(req, SESSION_COOKIE));
-    if (current && (!state || !inCookie.includes(state) || this.sessions.stateStatus(state) === 'unknown')) {
+    if (current && (!state || !mine || this.sessions.stateStatus(state) === 'unknown')) {
       return redirect(res, this.deps.config.postLoginUrl);
     }
 
     // 3. The state: started in this browser, by this server, recently. A
-    //    failure leaves the cookie as it was, so a junk callback can't end
-    //    another tab's sign-in.
-    if (!state || !inCookie.includes(state)) {
+    //    failure touches no cookie, so a junk callback can't end another
+    //    tab's sign-in.
+    if (!state || !mine) {
       this.recordLoginFailed({ reason: 'mismatch' });
       return this.loginFailed(res, 'mismatch');
     }
@@ -563,9 +581,11 @@ export class AdminServer {
       return this.loginFailed(res, 'not_admin');
     }
 
-    // 6. Signed in. The state is spent; a session this browser already had
-    //    (the same admin signing in again, or another one) ends here.
-    this.setStateCookie(res, this.liveStates(inCookie));
+    // 6. Signed in. The state is spent, and so is its cookie — only its own:
+    //    a sign-in another tab started while Discord was answering keeps its
+    //    cookie. A session this browser already had (the same admin signing
+    //    in again, or another one) ends here.
+    clearCookie(res, stateCookieName(state), '/admin');
     if (current) this.sessions.destroy(current.id);
     const session = this.sessions.create({
       userId: result.user.id,
@@ -590,18 +610,9 @@ export class AdminServer {
     redirect(res, this.deps.config.postLoginUrl);
   }
 
-  /** The states this server still has in flight, in the order given. */
-  private liveStates(states: string[]): string[] {
-    return states.filter((s) => this.sessions.stateStatus(s) === 'live');
-  }
-
-  /** The state cookie as `states` (newest first, at most STATES_PER_BROWSER),
-   *  or cleared when there are none. Max-Age is a sign-in's lifetime (600 s),
-   *  counted from the newest. */
-  private setStateCookie(res: ServerResponse, states: string[]): void {
-    const keep = [...new Set(states)].slice(0, STATES_PER_BROWSER);
-    if (!keep.length) return clearCookie(res, STATE_COOKIE, '/admin');
-    setCookie(res, STATE_COOKIE, keep.join('.'), {
+  /** `state`'s own cookie. Max-Age is a sign-in's lifetime (600 s). */
+  private setStateCookie(res: ServerResponse, state: string): void {
+    setCookie(res, stateCookieName(state), state, {
       httpOnly: true,
       secure: this.deps.config.cookieSecure,
       sameSite: 'Lax',
@@ -2212,11 +2223,34 @@ function appendSetCookie(res: ServerResponse, cookie: string): void {
   res.setHeader('set-cookie', list);
 }
 
-/** The well-formed states in this browser's state cookie, newest first. */
-function cookieStates(req: IncomingMessage): string[] {
-  const raw = getCookie(req, STATE_COOKIE);
-  if (!raw) return [];
-  return raw.split('.', STATES_PER_BROWSER + 1).filter((s) => STATE_FORMAT.test(s)).slice(0, STATES_PER_BROWSER);
+/** The name of `state`'s cookie: the prefix and 16 hex digits of its SHA-256
+ *  (exported for tests). */
+export function stateCookieName(state: string): string {
+  return STATE_COOKIE_PREFIX + createHash('sha256').update(state).digest('hex').slice(0, 16);
+}
+
+/** Does this browser hold `state`'s cookie (it started this sign-in)? */
+function hasStateCookie(req: IncomingMessage, state: string | undefined): state is string {
+  return !!state && STATE_FORMAT.test(state) && getCookie(req, stateCookieName(state)) === state;
+}
+
+/** This browser's state cookies (at most STATE_COOKIES_READ): each one's name,
+ *  and its state — null when it doesn't hold a well-formed state under its
+ *  own name. */
+function cookieStates(req: IncomingMessage): Array<{ name: string; state: string | null }> {
+  const header = req.headers.cookie;
+  if (!header) return [];
+  const out: Array<{ name: string; state: string | null }> = [];
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const name = part.slice(0, eq).trim();
+    if (!STATE_COOKIE_NAME.test(name) || out.some((h) => h.name === name)) continue;
+    const v = part.slice(eq + 1).trim();
+    out.push({ name, state: STATE_FORMAT.test(v) && stateCookieName(v) === name ? v : null });
+    if (out.length >= STATE_COOKIES_READ) break;
+  }
+  return out;
 }
 
 function getCookie(req: IncomingMessage, name: string): string | undefined {

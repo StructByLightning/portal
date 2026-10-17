@@ -169,8 +169,10 @@ Changing guild, tab or drawer adds a history entry; a search (and the
 Channels tab's chips) changes the address in place, so Back never steps
 through keystrokes. A drawer opened from its
 list closes with Back; one reached by a link or a reload is replaced by its
-list. Leaving a drawer with unsaved changes (Back, a link, closing the page)
-asks first.
+list. Leaving a drawer with unsaved changes (Back, Forward, a link, closing
+the page) asks first; Cancel steps back to the drawer's own history entry
+(each entry the panel has been at carries its place in `history.state`), so
+Back and Forward still go where they went.
 
 ## When the session ends
 
@@ -309,7 +311,11 @@ Lists accept `?q=&limit=&offset=` and return `{ items…, total, limit, offset }
   features:{invites,avatarUploads,allowlistEditable}, session:{expiresAt}}` — `levels`
   and `caps` are the relay's Read/Write/Full and capability list (the panel keeps a
   copy for an older relay); a relay whose `apiVersion` is newer than the panel's
-  `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. `POST /admin/logout`
+  `PA.CLIENT_API` gets a "The panel was updated — Reload" banner. A relay older than
+  `apiVersion` 2 (one that sends none) reads a grant without `caps` and every guild-wide
+  `DELETE` as a deny, so the panel sends it direct grants as `{caps}` only (no
+  `channelId` meaning guild-wide), Deny guild-wide as a bare `DELETE`, and offers no
+  *Unset*. `POST /admin/logout`
 - `GET /admin/g/:gid/personas` → `{personas:[{id,displayName,roles,hasOverride,directGrants,guildWideDenied,
   inactiveGrants}], total,limit,offset}`; `directGrants` is `grants` (a direct grant gives something
   here), `denied` (denied guild-wide, nothing given) or `none`; `inactiveGrants` counts the direct

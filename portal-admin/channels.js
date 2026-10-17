@@ -136,6 +136,9 @@ function enqueue(task, onPause) {
 function writeGrant(gid, pid, cid, next, expect) {
   const P = env.gpath(gid) + '/personas/' + encodeURIComponent(pid) + '/grants';
   if (next == null) return env.api('DELETE', P + '?channelId=' + encodeURIComponent(cid), { expect });
+  // A relay older than the panel's grant API reads a grant without caps as
+  // a deny: it is sent the caps alone (a block as none).
+  if (env.grantApi && !env.grantApi()) return env.api('PUT', P, { channelId: cid, caps: next.slice() });
   const body = { channelId: cid };
   const v = PA.lib.directValue(next);
   if (v === 'block') body.deny = true;
@@ -933,7 +936,7 @@ PA.channels = {
   /** app.js's helpers: { api, gpath, qs, state, route, formatRoute, navigate,
    *  openDrawer, replaceDrawerRoute, markStale, setList, syncQuery,
    *  guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
-   *  keepForm, isSuper, userId, local }. */
+   *  keepForm, isSuper, userId, local, grantApi }. */
   attach(e) {
     const first = !env;
     env = e;

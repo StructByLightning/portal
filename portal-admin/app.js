@@ -33,6 +33,20 @@ const LIMIT = 50;
  *  speaks; when the relay is newer, the panel asks for a reload. */
 const CLIENT_API = 2;
 
+/** The first relay API with the direct-grant operations this panel sends: a
+ *  level by name, guild-wide as {guildDefault: true}, and Unset and Deny
+ *  guild-wide as their own operations. An older relay (one that sends no
+ *  apiVersion: the panel can be deployed before it) reads a grant without
+ *  caps as a deny and every guild-wide DELETE as a deny, so it is sent caps
+ *  only, and offered no Unset (see moreSection and PA.channels.writeGrant). */
+const GRANT_API = 2;
+
+/** The admin API the relay speaks: 1 for one too old to say. */
+function relayApi() {
+  const v = state.me && state.me.apiVersion;
+  return typeof v === 'number' ? v : 1;
+}
+
 const state = {
   me: null,        // /admin/me: { user, isSuper, guilds, csrf, apiVersion, levels, caps, features, session }
   guilds: [],      // the guilds this admin may manage (and the relay serves), named
@@ -53,6 +67,9 @@ const state = {
   addPushed: false,  // the Add persona bar was opened from its list: closing it goes Back
   addQuery: '',      // text to start the Add persona bar with (an empty search's 'Add one')
   addPickPushed: false, // a persona picked in that bar replaced its entry, which was pushed
+  histIdx: 0,      // where this entry is in the tab's history (each entry is stamped)
+  routeAt: 0,      // histIdx of the entry state.route was shown at
+  restoring: null, // the address a Cancel is stepping back to, until it lands
   draft: null,     // an unsaved form brought back across a sign-in, until used
   leaving: false,  // on the way to sign in: no "Leave site?" question
   expiryTimer: null,
@@ -95,11 +112,14 @@ const isSuper = () => !!(state.me && state.me.isSuper);
 // ── API layer ──────────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
-  /** `detail`: the rest of the relay's error body (parentId, reason, existing, current…). */
-  constructor(status, code, message, detail) {
+  /** `detail`: the rest of the relay's error body (parentId, reason, existing, current…).
+   *  `method`: the request's, so a lost answer to a change can be told from a
+   *  failed read (lib.errorText). */
+  constructor(status, code, message, detail, method) {
     super(message || code || ('HTTP ' + status));
     this.status = status;
     this.code = code;
+    this.method = method;
     for (const k of ['parentId', 'reason', 'existing', 'current']) if (detail && detail[k] !== undefined) this[k] = detail[k];
   }
 }
@@ -127,18 +147,22 @@ async function api(method, path, body, opts = {}) {
   if (method !== 'GET' && state.me && state.me.csrf) req.headers['X-CSRF-Token'] = state.me.csrf;
   let res;
   try { res = await fetch(path, req); }
-  catch { throw new ApiError(0, 'NETWORK', 'network error'); }
+  catch { throw new ApiError(0, 'NETWORK', 'network error', null, method); }
   noteClock(res);
   if (res.status === 401) {
     if (!opts.boot && !opts.quiet && state.me) sessionEnded(method === 'GET' ? 'read' : 'mutation');
-    throw new ApiError(401, 'UNAUTHENTICATED', 'login required');
+    throw new ApiError(401, 'UNAUTHENTICATED', 'login required', null, method);
   }
   let data = null;
-  const text = await res.text();
+  // A body lost mid-read (even after a 2xx) is no answer: a change may have
+  // been made, so it reads as unconfirmed, never as "not made".
+  let text;
+  try { text = await res.text(); }
+  catch { throw new ApiError(0, 'NETWORK', 'network error', null, method); }
   if (text) { try { data = JSON.parse(text); } catch { /* non-JSON */ } }
   if (!res.ok) {
     const b = (data && data.error) || {};
-    const e = new ApiError(res.status, b.code, b.message, b);
+    const e = new ApiError(res.status, b.code, b.message, b, method);
     if (res.status === 403 && b.code === 'CSRF' && method !== 'GET' && !opts.retried && state.me) {
       const fresh = await refreshMe();
       if (fresh) return api(method, path, body, Object.assign({}, opts, { retried: true }));
@@ -187,7 +211,7 @@ function notDone(e, prefix = 'Not saved', ctx) {
 
 /** A failed read, as a line: 'Couldn’t load <what>: <reason>.' */
 function couldntLoad(what, e) {
-  if (e && e.code === 'NETWORK') return 'Couldn’t reach the relay to load ' + what + '. Try again.';
+  if (lib.noAnswer(e)) return 'Couldn’t reach the relay to load ' + what + '. Try again.';
   if (e && e.status === 403 && e.code === 'FORBIDDEN') return NOT_GUILD_ADMIN;
   const why = String((e && e.message) || 'something went wrong').trim().replace(/[.\s]+$/, '');
   return 'Couldn’t load ' + what + ': ' + why + '.';
@@ -256,10 +280,17 @@ function showLogin(errMsg) {
   }
 }
 
+/** The address of what the page shows: the address bar's, except while
+ *  "Discard changes?" is up after Back or a link — the bar already shows the
+ *  destination then, but the page is still the drawer. */
+function shownHash() {
+  return state.shownHash || location.hash;
+}
+
 /** Before going to sign in: keep this address to come back to (unless it is
  *  only home, and an earlier one is waiting). */
 function keepReturnTo() {
-  const r = lib.parseRoute(location.hash);
+  const r = lib.parseRoute(shownHash());
   const h = r && r.area !== 'home' ? lib.formatRoute(r) : null;
   if (h && lib.isSafeReturnTo(h)) session.set('pa.returnTo', h);
 }
@@ -273,10 +304,11 @@ function saveDraft() {
   session.del('pa.draft');
   const f = ui.drawer.isOpen() ? ui.drawer.activeForm() : null;
   if (!f || (f.isDirty && !f.isDirty())) return;
-  if (!state.drawerRoute || state.drawerRoute !== location.hash) return;
+  const here = shownHash();
+  if (!state.drawerRoute || state.drawerRoute !== here) return;
   let fields;
   try { fields = f.serialize(); } catch { return; }
-  const d = lib.makeDraft({ userId: userId(), route: location.hash, form: f.key, fields, at: Date.now() });
+  const d = lib.makeDraft({ userId: userId(), route: here, form: f.key, fields, at: Date.now() });
   if (d) session.set('pa.draft', JSON.stringify(d));
 }
 
@@ -302,6 +334,10 @@ function sessionEnded(kind) {
 async function boot() {
   const btn = $('#login-btn');
   if (btn && !boot.bound) { boot.bound = true; btn.addEventListener('click', keepReturnTo); }
+  // This entry's place in the tab's history (kept across a reload).
+  const hs = history.state;
+  state.histIdx = hs && typeof hs.paIdx === 'number' ? hs.paIdx : 0;
+  replaceHash(location.pathname + location.search + location.hash);
   const params = new URLSearchParams(location.search);
   // Why a sign-in came back here: a fixed code, put in words by a fixed
   // table (nothing from the URL is shown), and taken out of the address.
@@ -309,7 +345,7 @@ async function boot() {
   if (params.has('login_error')) {
     params.delete('login_error');
     const rest = params.toString();
-    history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+    replaceHash(location.pathname + (rest ? '?' + rest : '') + location.hash);
   }
   let me;
   try { me = await api('GET', '/admin/me', undefined, { boot: true }); }
@@ -343,7 +379,7 @@ async function boot() {
   const returnTo = takeSession('pa.returnTo');
   state.draft = lib.readDraft(takeSession('pa.draft'), { userId: userId(), now: Date.now() });
   const here = lib.parseRoute(location.hash);
-  if (here && here.area === 'home' && lib.isSafeReturnTo(returnTo)) history.replaceState(null, '', returnTo);
+  if (here && here.area === 'home' && lib.isSafeReturnTo(returnTo)) replaceHash(returnTo);
 
   bindApp();
   scheduleExpiry();
@@ -356,8 +392,8 @@ function bindApp() {
   bindApp.done = true;
   $('#logout-btn').addEventListener('click', logout);
   // Back, Forward, a link, an edited address: one place makes the page match.
-  window.addEventListener('popstate', () => applyRoute());
-  window.addEventListener('hashchange', () => applyRoute());
+  window.addEventListener('popstate', onHistory);
+  window.addEventListener('hashchange', onHistory);
   window.addEventListener('beforeunload', (e) => {
     if (state.leaving || !ui.drawer.isDirty()) return;
     e.preventDefault();
@@ -390,6 +426,7 @@ function channelsEnv() {
     setList(list) { state.list = list; },
     guildName, avatarThumb, loadError, couldntLoad, sessionEndedNote,
     isSuper, userId, local,
+    grantApi: () => relayApi() >= GRANT_API,
   };
 }
 
@@ -441,6 +478,7 @@ function refreshMe() {
         if (((me.user && me.user.id) || '') !== userId()) { otherAdmin(); return null; }
         state.me.csrf = me.csrf;
         state.me.session = me.session;
+        state.me.apiVersion = me.apiVersion; // what changes are sent in (relayApi)
         if (typeof me.apiVersion === 'number' && me.apiVersion > CLIENT_API) showUpdateBanner();
         if (me.levels && me.caps) lib.adoptModel(me.levels, me.caps);
         if (ui.sessionResumed()) ui.toast('You’re signed in again. Carry on where you were.');
@@ -559,14 +597,62 @@ function route(area, gid, view, drawer = null, query = {}) {
   return { area, gid: gid || null, view, drawer, query };
 }
 
+// Every history entry the panel has been at carries its place in the tab's
+// history ({ paIdx }, in history.state). A step Back or Forward can then be
+// told from a new entry (a link, an edited address), and undone exactly: a
+// Cancel on 'Discard changes?' steps back with history.go(), never with a new
+// entry, so Back and Forward stay as they were.
+
+function stamp() { return { paIdx: state.histIdx }; }
+/** history.replaceState, keeping this entry's place. */
+function replaceHash(url) { history.replaceState(stamp(), '', url); }
+/** history.pushState, one place further on. */
+function pushHash(url) {
+  state.histIdx++;
+  history.pushState(stamp(), '', url);
+}
+/** After Back, Forward, a link or an edited address: where are we now? An
+ *  entry without a stamp is a new one, one place further on. */
+function noteHistory() {
+  const s = history.state;
+  if (s && typeof s.paIdx === 'number') {
+    state.histIdx = s.paIdx;
+    return;
+  }
+  state.histIdx++;
+  replaceHash(location.pathname + location.search + location.hash);
+}
+function onHistory() {
+  noteHistory();
+  if (state.restoring) {
+    const want = state.restoring;
+    state.restoring = null;
+    // A Cancel's step back landed elsewhere (an entry this tab hadn't
+    // stamped, from before an update): put the drawer's address on top.
+    if (location.hash !== want) {
+      pushHash(want);
+      state.drawerPushed = false; // under it now is where the admin was going
+    }
+  }
+  applyRoute();
+}
+/** Back to the entry at `at`, whose address is `hash` (Cancel). */
+function stepBackTo(hash, at) {
+  const delta = at - state.histIdx;
+  if (delta) {
+    state.restoring = hash;
+    history.go(delta);
+  } else if (location.hash !== hash) replaceHash(hash);
+}
+
 /** Go to `r`: a new history entry (Back comes back here), or with
  *  { replace: true } in place of this one (search, filters, fixes). */
 function navigate(r, opts = {}) {
   const hash = lib.formatRoute(r);
   if (!hash) return Promise.resolve();
   if (hash !== location.hash) {
-    if (opts.replace) history.replaceState(null, '', hash);
-    else history.pushState(null, '', hash);
+    if (opts.replace) replaceHash(hash);
+    else pushHash(hash);
   }
   return applyRoute();
 }
@@ -595,8 +681,9 @@ function goHome() {
   const h = homeRoute();
   if (h) return navigate(h, { replace: true });
   // Nowhere to land: a guild-admin none of whose guilds is served now.
-  history.replaceState(null, '', '#/');
+  replaceHash('#/');
   state.route = lib.parseRoute('#/');
+  state.routeAt = state.histIdx;
   showNotAdmin(null);
 }
 
@@ -698,38 +785,38 @@ async function applyRoute(opts = {}) {
   }
   r = sup.route;
   const canonical = lib.formatRoute(r);
-  if (canonical !== hash) history.replaceState(null, '', canonical);
+  if (canonical !== hash) replaceHash(canonical);
 
   const prev = state.route;
-  // Leaving a drawer with unsaved changes (Back, a link): put the address
-  // back on top, and ask first. Discard goes Back to where the admin was
-  // going (the entry just under it), which then shows as usual.
+  // Leaving a drawer with unsaved changes (Back, Forward, a link, an edited
+  // address): ask first. The address already shows where the admin was
+  // going; Discard shows that place. Cancel stays: it steps back to the
+  // drawer's own entry with history.go(), so no entry is added or dropped —
+  // Forward and Back still go where they went (stepBackTo).
   if (prev && prev.area !== 'home' && ui.drawer.isOpen() && ui.drawer.isDirty() && lib.formatRoute(prev) !== canonical) {
-    const prevHash = lib.formatRoute(prev);
-    history.pushState(null, '', prevHash);
     if (discardAsked) return;
     discardAsked = true;
+    const prevHash = lib.formatRoute(prev);
+    const at = state.routeAt;
     // One question at a time: Esc may have asked already (ui.drawer shares it).
     const asked = ui.drawer.id();
-    const discard = await ui.drawer.confirmDiscard();
+    // Until it's answered, the page is still the drawer: a sign-in from here
+    // (a save answered 401 meanwhile) keeps the drawer's place and form.
+    state.shownHash = prevHash;
+    let discard;
+    try { discard = await ui.drawer.confirmDiscard(); } finally { state.shownHash = null; }
     discardAsked = false;
-    // Answered elsewhere (Esc's Discard closed it), or the page moved on.
-    if (!ui.drawer.isOpen() || ui.drawer.id() !== asked || location.hash !== prevHash) return;
-    if (!discard) {
-      // Cancel: stay. Under the address put back is where the admin was
-      // going — the drawer's own list after Back, but after a link, Forward
-      // or an edited address somewhere else, which closing must not go to:
-      // closing then puts the list in place of the drawer instead.
-      if (state.drawerPushed && canonical !== lib.formatRoute(listOf(prev))) state.drawerPushed = false;
-      return;
-    }
+    if (ui.drawer.isOpen() && ui.drawer.id() !== asked) return; // another drawer since
+    if (!discard && ui.drawer.isOpen()) return stepBackTo(prevHash, at);
+    // Discarded (here, or by Esc's question, which closed it): show the
+    // address as it is now.
     closeDrawerFor('route');
-    history.back();
-    return;
+    return applyRoute();
   }
   // A kept form is only for the place it was kept at.
   if (state.draft && state.draft.route !== canonical) state.draft = null;
   state.route = r;
+  state.routeAt = state.histIdx;
 
   if (r.area === 'g' && !canManage(r.gid)) return showNotAdmin(r);
   remember(r);
@@ -812,7 +899,8 @@ function syncQuery() {
   const hash = lib.formatRoute(next);
   if (!hash) return;
   state.route = next;
-  if (hash !== location.hash) history.replaceState(null, '', hash);
+  state.routeAt = state.histIdx;
+  if (hash !== location.hash) replaceHash(hash);
 }
 
 /** Where a persona's drawer is, from the list being shown. From the list of
@@ -1015,15 +1103,17 @@ function onDrawerClosed(reason) {
   state.rowKey = null;
   // Closed by the admin (✕, Esc, the scrim, Done): the address follows. Back
   // to the list it was opened from; or, for one reached by a link or a
-  // reload, its list in place of it.
+  // reload, its list in place of it. (Closed by Discard while the address
+  // has already moved on — Back with unsaved changes — the place it moved to
+  // is shown by the applyRoute that asked.)
   if (reason !== 'route') {
     state.drawerRoute = null;
     const r = state.route;
-    if (r && r.drawer) {
+    if (r && r.drawer && location.hash === lib.formatRoute(r)) {
       const list = listOf(r);
       state.route = list;
       if (state.drawerPushed) history.back();
-      else history.replaceState(null, '', lib.formatRoute(list));
+      else replaceHash(lib.formatRoute(list));
     }
   }
   state.drawerPushed = false;
@@ -1061,6 +1151,21 @@ function keepForm(d, key, hooks, status) {
   try { hooks.restore(dr.fields); } catch (e) { console.error('[portal-admin] restore', e); return false; }
   status.info('Restored your unsaved change — review and save. Nothing was submitted.');
   return true;
+}
+
+/** After a save: put the relay's value (`saved`) in `input` and count the
+ *  form as saved — unless the admin typed into the field while the save was
+ *  at work (it no longer holds `sentText`, what it held when the save was
+ *  sent): that text stays, and stays unsaved. */
+function settleField(input, sentText, saved, tracker) {
+  const typed = input.value;
+  // Something else in the form changed while this field was being saved
+  // (a crop picked meanwhile): the form keeps its old baseline, so that edit
+  // stays unsaved and closing still asks.
+  const others = tracker.dirtyBesides ? tracker.dirtyBesides(input) : false;
+  input.value = saved;
+  if (!others) tracker.reset();
+  if (typed !== sentText) input.value = typed;
 }
 
 /** A read that found the session over: say so where the content would be. */
@@ -2340,6 +2445,12 @@ function moreSection(ctx, m) {
   const guild = m.guild;
   const det = el('details', { class: 'advanced more' }, [el('summary', { text: 'More' })]);
   const touched = [];
+  // A relay older than GRANT_API is asked only what it reads right: a level
+  // as its caps and Deny guild-wide as a bare DELETE. It can't unset a
+  // guild-wide level, so Unset isn't offered. Which relay it is, is checked
+  // when a change is sent.
+  const grantApi = () => relayApi() >= GRANT_API;
+  const OLD_RELAY_UNSET = 'This relay is older than the panel and can’t unset a guild-wide level. Set another level or deny guild-wide instead, or update the relay.';
 
   // ── Guild-wide level ──
   const gwRow = el('div', { class: 'gw-row' });
@@ -2373,7 +2484,10 @@ function moreSection(ctx, m) {
     setBtn = el('button', { class: 'btn btn-sm', 'aria-expanded': String(!gwForm.classList.contains('hidden')), 'aria-controls': formId, text: 'Set level…' });
     setBtn.addEventListener('click', () => openSet(true));
     buttons.push(setBtn);
-    if (g !== null && g !== undefined) {
+    if (g !== null && g !== undefined && !grantApi()) {
+      // An older relay can't unset (it would store a deny): say so instead.
+      buttons.push(el('span', { class: 'muted', text: 'Unset needs the relay updated', title: OLD_RELAY_UNSET }));
+    } else if (g !== null && g !== undefined) {
       const unset = el('button', {
         class: 'btn btn-sm', text: 'Unset',
         'aria-label': 'Unset ' + displayName + '’s guild-wide level in ' + guild + (removed ? ' and lift its removal' : ''),
@@ -2406,8 +2520,8 @@ function moreSection(ctx, m) {
     gwRow.appendChild(el('div', { class: 'gw-value' }, [levelNode, el('span', { class: 'gw-explain muted', text: ' ' + explain })]));
     gwRow.appendChild(el('div', { class: 'inline' }, buttons));
     const hints = [];
-    if (buttons.some((b) => b.textContent === 'Unset')) hints.push('Unset: falls back to the persona default.');
-    if (buttons.some((b) => b.textContent === 'Deny guild-wide')) hints.push('Deny guild-wide: blocks the persona default here; roles still apply.');
+    if (buttons.some((b) => b.tagName === 'BUTTON' && b.textContent === 'Unset')) hints.push('Unset: falls back to the persona default.');
+    if (buttons.some((b) => b.tagName === 'BUTTON' && b.textContent === 'Deny guild-wide')) hints.push('Deny guild-wide: blocks the persona default here; roles still apply.');
     gwHint.textContent = hints.join(' ');
     gwHint.classList.toggle('hidden', !hints.length);
   }
@@ -2472,16 +2586,24 @@ function moreSection(ctx, m) {
       });
       if (!go) return;
     }
-    const body = { guildDefault: true };
+    const sent = tracker.mark(); // what is saved, if it goes through
+    // An older relay takes caps only (it would store a missing caps as a
+    // deny) and reads a grant with no channelId as guild-wide.
+    const body = {};
     const k = level.level();
-    if (k && k !== 'custom') body.level = k;
-    else body.caps = caps;
-    body.expect = loadedGuildWide();
+    if (!grantApi()) body.caps = caps;
+    else {
+      body.guildDefault = true;
+      if (k && k !== 'custom') body.level = k;
+      else body.caps = caps;
+      body.expect = loadedGuildWide();
+    }
     try {
       const r = await api('PUT', m.path + '/grants', body);
-      tracker.reset();
       markStale();
-      openSet(false);
+      // What was sent is saved; a level picked while it was at work is not,
+      // and keeps the form open with it.
+      if (tracker.saved(sent) && !tracker.isDirty()) openSet(false);
       await after();
       gwStatus.ok(displayName + ' → ' + lib.capsSummary(caps) + ' guild-wide in ' + guild + ' (every channel without its own grant).' + guildEffect(r) +
         (r && r.liftedBan ? ' That lifted its removal from ' + guild + '.' : ''));
@@ -2507,7 +2629,8 @@ function moreSection(ctx, m) {
     if (!go) return;
     await ui.busy(button, async () => {
       try {
-        const r = await api('DELETE', m.path + '/grants?guildDefault=deny', { expect: loadedGuildWide() });
+        // An older relay denies guild-wide on a DELETE that names no channel.
+        const r = await api('DELETE', m.path + '/grants' + (grantApi() ? '?guildDefault=deny' : ''), grantApi() ? { expect: loadedGuildWide() } : undefined);
         markStale();
         await after();
         gwStatus.ok(displayName + ' is denied guild-wide in ' + guild + ': its persona default no longer applies here. Access roles and direct grants still do.' + guildEffect(r));
@@ -2519,6 +2642,9 @@ function moreSection(ctx, m) {
   }
 
   async function unsetGuildWide(button) {
+    // Offered only by a relay that can do it; one that turned out older
+    // since this was drawn would store a deny instead. Nothing is sent.
+    if (!grantApi()) { gwStatus.err('Not unset: ' + OLD_RELAY_UNSET); drawGw(); return; }
     const g = m.access.guildWide;
     const gd = Array.isArray(g) ? g : [];
     // Removed from the guild: unsetting alone would change nothing, so it lifts
@@ -2542,6 +2668,7 @@ function moreSection(ctx, m) {
       confirmLabel: 'Unset guild-wide',
     });
     if (!go) return;
+    if (!grantApi()) { gwStatus.err('Not unset: ' + OLD_RELAY_UNSET); drawGw(); return; }
     await ui.busy(button, async () => {
       try {
         const r = await api('DELETE', m.path + '/grants?guildDefault=unset' + (lift ? '&liftBan=1' : ''), { expect: loadedGuildWide() });
@@ -2568,13 +2695,13 @@ function moreSection(ctx, m) {
   ]);
   const claimTracker = ctx.drawer.track(claimForm);
   ui.onSubmit(claimForm, async () => {
-    const code = claimCode.value.trim();
+    const sentText = claimCode.value;
+    const code = sentText.trim();
     if (!code) { claimStatus.err('Not applied: enter an invite code first.'); return; }
     try {
       const was = !!m.access.removed;
       const r = await api('POST', m.path + '/claim', { code });
-      claimCode.value = '';
-      claimTracker.reset();
+      settleField(claimCode, sentText, '', claimTracker); // emptied, unless another code was typed meanwhile
       markStale();
       let now = '';
       try { if (await m.reload()) now = ' Effective now: ' + m.effectText() + '.'; } catch { /* the line says what was done */ }
@@ -2702,22 +2829,22 @@ function profileSection(ctx, d) {
     status.node,
   ]);
   const tracker = ctx.drawer.track(form);
-  if (cropper) cropper.onUploaded = () => tracker.reset();
+  if (cropper) cropper.onUploaded = (saved, sentText) => settleField(avInput, sentText, saved, tracker);
 
-  async function save(value) {
+  /** Save `value`; `sentText` is what the field held when it was sent. */
+  async function save(value, sentText) {
     try {
       const r = await api('PUT', '/admin/personas/' + encodeURIComponent(id) + '/avatar', { avatar: value });
-      avInput.value = r.avatar || '';
+      settleField(avInput, sentText, r.avatar || '', tracker);
       setPreview(avImg, r.avatarUrl);
-      tracker.reset();
       markStale();
       status.ok(value
         ? 'Profile picture saved. It shows from ' + displayName + '’s next message.'
         : 'Profile picture removed. ' + displayName + '’s next message uses the default picture.');
     } catch (e) { status.err(notDone(e)); }
   }
-  ui.onSubmit(form, () => (cropping ? undefined : save(avInput.value.trim())));
-  clearAv.addEventListener('click', () => ui.busy(clearAv, () => { avInput.value = ''; return save(''); }, 'Clearing…'));
+  ui.onSubmit(form, () => (cropping ? undefined : save(avInput.value.trim(), avInput.value)));
+  clearAv.addEventListener('click', () => ui.busy(clearAv, () => { avInput.value = ''; return save('', ''); }, 'Clearing…'));
   return section('Profile picture', [form]);
 }
 
@@ -2820,17 +2947,32 @@ function discordRoleChoices(discordRoles, withEveryone) {
     .map((r) => ({ value: r.id, text: roleText(r.id, { discordRoles: { [r.id]: r } }) }));
 }
 
-/** A 'Show @everyone' toggle for a Discord-role picker, or null when the guild
- *  has no @everyone role to show. */
+/** A 'Show @everyone' toggle for a Discord-role picker (node null when the
+ *  guild has no @everyone role to show). show() turns it on, as a click would. */
 function everyoneToggle(discordRoles, onToggle) {
   const has = (discordRoles || []).some((r) => !r.pooled && (r.id === state.guildId || r.name === '@everyone'));
-  if (!has) return { node: null, on: () => false };
+  if (!has) return { node: null, on: () => false, show() {} };
   const box = el('input', { type: 'checkbox', 'data-no-dirty': true });
   box.addEventListener('change', () => onToggle(box.checked));
-  return { node: el('label', { class: 'check-inline' }, [box, el('span', { text: 'Show @everyone' })]), on: () => box.checked };
+  return {
+    node: el('label', { class: 'check-inline' }, [box, el('span', { text: 'Show @everyone' })]),
+    on: () => box.checked,
+    show() {
+      if (box.checked) return;
+      box.checked = true;
+      onToggle(true);
+    },
+  };
 }
 
-/** One Discord role to mirror: a select that starts at 'Pick a Discord role…'. */
+/** Is `id` a Discord role the pickers offer only behind 'Show @everyone'? */
+function behindEveryone(discordRoles, id) {
+  return !discordRoleChoices(discordRoles, false).some((o) => o.value === id) &&
+    discordRoleChoices(discordRoles, true).some((o) => o.value === id);
+}
+
+/** One Discord role to mirror: a select that starts at 'Pick a Discord role…'.
+ *  restore(id) puts back a kept choice — @everyone too, showing it first. */
 function mirrorRolePicker(discordRoles) {
   const select = el('select', { name: 'mirrorRole' });
   function fill(withEveryone) {
@@ -2846,14 +2988,29 @@ function mirrorRolePicker(discordRoles) {
   select.addEventListener('change', changed);
   const toggle = everyoneToggle(discordRoles, (on) => { fill(on); changed(); });
   fill(false);
-  return { select, toggle: toggle.node, value: () => select.value, onChange: (fn) => listeners.push(fn) };
+  return {
+    select, toggle: toggle.node, value: () => select.value, onChange: (fn) => listeners.push(fn),
+    restore(id) {
+      if (!id) return;
+      if (behindEveryone(discordRoles, id)) toggle.show();
+      if (Array.from(select.options).some((o) => o.value === id)) select.value = id;
+    },
+  };
 }
 
-/** Several Discord roles to mirror: a checkbox list. */
+/** Several Discord roles to mirror: a checkbox list. restore(ids) puts back
+ *  kept choices — @everyone too, showing it first. */
 function mirrorRoleList(discordRoles) {
   const list = ui.checkList({ label: 'Discord roles', empty: 'This guild has no Discord roles to mirror.', options: discordRoleChoices(discordRoles, false) });
   const toggle = everyoneToggle(discordRoles, (on) => list.setOptions(discordRoleChoices(discordRoles, on)));
-  return { list, toggle: toggle.node };
+  return {
+    list, toggle: toggle.node,
+    restore(ids) {
+      if (!ids) return;
+      if (ids.some((id) => behindEveryone(discordRoles, id))) toggle.show();
+      list.setValues(ids);
+    },
+  };
 }
 
 /**
@@ -2983,7 +3140,7 @@ async function openMintDrawer(prefill = {}) {
       if (f.kind) kind.set(f.kind);
       if (f.roles) roleList.setValues(f.roles.filter((r) => mine.includes(r)));
       if (f.channels) chanList.setValues(f.channels);
-      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
+      mirror.restore(f.mirrorRole);
       if (f.caps) level.set(f.caps);
       if (f.uses) uses.value = f.uses;
       if (f.usesOther != null) usesOther.value = f.usesOther;
@@ -3006,6 +3163,7 @@ async function openMintDrawer(prefill = {}) {
       body.maxUses = n;
     } else if (uses.value !== 'unlimited') body.maxUses = Number(uses.value);
     if (expires.value !== 'never') body.expiresInDays = Number(expires.value);
+    const sent = tracker.mark(); // what is minted, if it goes through
     const k = kind.value();
     if (k === 'roles') {
       const roles = roleList.values();
@@ -3025,7 +3183,7 @@ async function openMintDrawer(prefill = {}) {
     }
     try {
       const r = await api('POST', gpath(gid) + '/invites', body);
-      tracker.reset();
+      tracker.saved(sent); // an edit made while minting stays unsaved (Mint another shows it)
       markStale();
       status.clear();
       ui.toast('Invite minted.');
@@ -3046,12 +3204,15 @@ async function openMintDrawer(prefill = {}) {
     });
     const another = el('button', { class: 'btn', text: 'Mint another' });
     another.addEventListener('click', () => { d.setBody(form); label.focus(); });
-    const done = el('button', { class: 'btn', text: 'Done', onclick: () => ui.drawer.close() });
+    // As ✕: the form behind the card may hold an edit made while this was
+    // minting (it is not in this invite), and closing asks before it goes.
+    const done = el('button', { class: 'btn', text: 'Done', onclick: () => d.requestClose() });
     d.setBody(el('section', { class: 'result-card', 'aria-labelledby': headId }, [
       el('h3', { id: headId, text: 'Invite ready' }),
       el('p', { class: 'invite-code-wrap' }, [codeEl]),
       el('p', { class: 'invite-summary', text: lib.inviteSummary(inv, names, Date.now()) }),
       el('p', { class: 'muted', text: 'Hand this code to the enrolling agent.' }),
+      tracker.isDirty() ? el('p', { class: 'warn-line', text: 'The form was changed while this invite was being minted; that change isn’t in it. Mint another shows it.' }) : null,
       el('div', { class: 'inline' }, [copy, another, done]),
       cardStatus.node,
     ]));
@@ -3085,6 +3246,8 @@ async function renderRoles(view, stale) {
   const meta = await guildMeta();
   if (stale()) return;
   let data = null; // fetched once per visit; the filter runs locally
+  let epoch = 0; // bumped when the catalog changes: an older reply isn't cached
+  const invalidate = () => { data = null; epoch++; };
   const actions = [];
   if (meta.canAuthor) {
     // A link: defining a role has an address (#/g/{gid}/roles/new).
@@ -3094,8 +3257,13 @@ async function renderRoles(view, stale) {
     placeholder: 'Filter access roles…',
     actions,
     load: async () => {
-      if (!data) data = await api('GET', G() + '/roles' + qs({ names: '1' }));
-      const { catalog, discordRoles, canAuthor, names: rawNames } = data;
+      let d = data;
+      if (!d) {
+        const at = epoch;
+        d = await api('GET', G() + '/roles' + qs({ names: '1' }));
+        if (at === epoch && !data) data = d; // a reply from before a change draws nothing and isn't kept
+      }
+      const { catalog, discordRoles, canAuthor, names: rawNames } = d;
       const names = withChannelList(rawNames, meta.channels, discordRoles);
       names.guilds = Object.assign({ [state.guildId]: currentGuildName() }, names.guilds);
       const here = (n) => (catalog[n] && catalog[n].guildId === state.guildId ? 0 : 1);
@@ -3117,7 +3285,7 @@ async function renderRoles(view, stale) {
         if (canAuthor) {
           cells.push(el('td', {}, [r.guildId ? el('span', { text: guildText(r.guildId, names) }) : el('span', { class: 'muted', text: '—' })]));
           const del = el('button', { class: 'btn btn-sm btn-danger', text: 'Delete', 'aria-label': 'Delete access role ' + n });
-          del.addEventListener('click', () => deleteRole(n, del, list, () => { data = null; }));
+          del.addEventListener('click', () => deleteRole(n, del, list, invalidate));
           cells.push(el('td', {}, [del]));
         }
         return el('tr', {}, cells);
@@ -3133,7 +3301,7 @@ async function renderRoles(view, stale) {
     },
   });
   // A role created in the drawer: refetch on the redraw that closing it triggers.
-  list.invalidate = () => { data = null; };
+  list.invalidate = invalidate;
 }
 
 async function openRoleDrawer() {
@@ -3150,7 +3318,7 @@ async function openRoleDrawer() {
   if (!d.isCurrent()) return;
   if (!meta.canAuthor) {
     // Only super-admins define access roles: a link here lands on the list.
-    ui.drawer.close();
+    d.close();
     ui.toast('Only super-admins can define access roles. Ask one to add the role you need.', { kind: 'info' });
     return;
   }
@@ -3189,10 +3357,15 @@ async function openRoleDrawer() {
     status.node,
   ]);
 
+  /** A name the catalog holds: the naming rule is for new names, and a role
+   *  made before it keeps its name — the relay lets it be replaced under
+   *  that name (the save looks it up and asks first). */
+  const inCatalog = (n) => Object.prototype.hasOwnProperty.call(meta.catalog || {}, n);
   /** What is still missing before Create can be pressed, or ''. */
   function missing() {
-    if (!name.value.trim()) return 'Name the role';
-    if (!ROLE_NAME.test(name.value.trim())) return 'Use lower-case letters, digits, dots, dashes or underscores in the name (up to 64)';
+    const n = name.value.trim();
+    if (!n) return 'Name the role';
+    if (!ROLE_NAME.test(n) && !inCatalog(n)) return 'Use lower-case letters, digits, dots, dashes or underscores in the name (up to 64)';
     if (kind.value === 'channels' && !chanList.values().length) return 'Pick at least one channel';
     if (kind.value === 'mirrorRole' && !mirror.value()) return 'Pick a Discord role';
     if (kind.value === 'mirrorRoles' && !mirrors.list.values().length) return 'Pick at least one Discord role';
@@ -3225,8 +3398,8 @@ async function openRoleDrawer() {
       if (f.where) kind.value = f.where;
       syncKind();
       if (f.channels) chanList.setValues(f.channels);
-      if (f.mirrorRole && Array.from(mirror.select.options).some((o) => o.value === f.mirrorRole)) mirror.select.value = f.mirrorRole;
-      if (f.mirrorRoles) mirrors.list.setValues(f.mirrorRoles);
+      mirror.restore(f.mirrorRole);
+      mirrors.restore(f.mirrorRoles);
       if (f.caps) level.set(f.caps);
       update();
     },
@@ -3235,6 +3408,9 @@ async function openRoleDrawer() {
   ui.onSubmit(form, async () => {
     if (missing()) return; // Create is off until the form is complete
     status.clear(); // a line about the last try is not about this one
+    // What is sent is read now; the form stays editable while the relay is
+    // asked, and an edit made meanwhile is not part of this save.
+    const sent = tracker.mark();
     const roleName = name.value.trim();
     let scope;
     if (kind.value === 'all') scope = { all: true };
@@ -3260,9 +3436,12 @@ async function openRoleDrawer() {
      *  asking. The relay refuses a name in use (EXISTS) unless asked to
      *  replace it in the guild it belongs to; if it was made, deleted or
      *  moved between the look and the save, look again, once. Resolves true
-     *  when the role was saved. */
+     *  when the role was saved. A drawer discarded while the relay was asked
+     *  goes no further: no question (it would belong to whatever drawer is
+     *  open now) and nothing sent. */
     async function attempt(again) {
       const { existing, seen } = await lookup();
+      if (!d.isCurrent()) return false;
       const body = { name: roleName, role };
       if (existing) {
         const taken = lib.roleNameTaken(roleName, existing, role, gid, seen);
@@ -3287,14 +3466,28 @@ async function openRoleDrawer() {
       invalidateGuildMeta();
       if (state.list && state.list.invalidate) state.list.invalidate();
       markStale();
-      // Through the form's line, so an earlier 'Not created' toast goes too.
-      status.ok((existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.');
-      ui.drawer.close(); // the list redraws with the role
+      // Through the form's line, so an earlier 'Not created' toast goes too
+      // (and, if this drawer was closed meanwhile, the toast still says it).
+      const done = (existing ? 'Changed access role ' : 'Created access role ') + roleName + ': ' + lib.roleMeaning(role, names) + '.';
+      tracker.saved(sent);
+      if (d.isCurrent() && tracker.isDirty()) {
+        // Changed while it was being saved: that change was not sent. The
+        // drawer stays with it, unsaved — closing asks, a sign-in keeps it,
+        // and Create sends it (asking first, as the role exists now).
+        status.ok(done + ' The form was changed while it was being saved; that change isn’t saved yet.');
+        return true;
+      }
+      status.ok(done);
+      d.close(); // the list redraws with the role — never another drawer
       return true;
     }
 
-    try { await attempt(false); } catch (e) { status.err(notDone(e, 'Not created', { roleName })); }
-  }, { busyLabel: 'Creating…' });
+    try { await attempt(false); } catch (e) {
+      // A look that failed after the drawer was discarded changed nothing,
+      // and the admin has moved on: nothing to say.
+      if (d.isCurrent() || e.method !== 'GET') status.err(notDone(e, 'Not created', { roleName }));
+    }
+  }, { busyLabel: 'Creating…', settled: update }); // edited while it was at work: Create as the form is now
   d.setBody(form);
 }
 
@@ -3488,8 +3681,10 @@ function setPreview(img, url) {
 // Upload + square-crop control for a persona avatar. Reads a chosen image, lets
 // the admin pan/zoom inside a circular 240px viewport (Discord masks avatars to a
 // circle), renders the selected square to a 256×256 canvas, and POSTs the PNG to
-// /admin/personas/:id/avatar/upload. On success it updates the preview img and URL
-// field passed in. Pure client-side crop — no server image library needed.
+// /admin/personas/:id/avatar/upload. On success it updates the preview img, and
+// hands the stored URL to handle.onUploaded(saved, sentText) — sentText being what
+// the URL field held when the upload went — or, without one, puts it in the field.
+// Pure client-side crop — no server image library needed.
 // onStage(true|false) reports whether a crop is pending.
 function avatarCropper(ctx, avImg, avInput, status, onStage) {
   const { id, displayName } = ctx;
@@ -3565,6 +3760,7 @@ function avatarCropper(ctx, avImg, avInput, status, onStage) {
     const up = el('button', { class: 'btn btn-sm btn-primary', text: 'Upload' });
     const cancel = el('button', { class: 'btn btn-sm', text: 'Cancel', onclick: end });
     up.addEventListener('click', () => ui.busy(up, async () => {
+      const sentText = avInput.value; // what the URL field held as the upload went
       const canvas = el('canvas');
       canvas.width = O; canvas.height = O;
       const c2d = canvas.getContext('2d');
@@ -3573,11 +3769,12 @@ function avatarCropper(ctx, avImg, avInput, status, onStage) {
       if (!blob) { status.err('Not uploaded: the cropped image couldn’t be rendered. Try again.'); return; }
       try {
         const data = await api('POST', '/admin/personas/' + encodeURIComponent(id) + '/avatar/upload', blob, { raw: true, contentType: 'image/png' });
-        avInput.value = (data && data.avatar) || '';
+        const saved = (data && data.avatar) || '';
         setPreview(avImg, data && data.avatarUrl);
         markStale();
         end();
-        if (handle.onUploaded) handle.onUploaded();
+        if (handle.onUploaded) handle.onUploaded(saved, sentText);
+        else avInput.value = saved;
         status.ok('Profile picture uploaded. It shows from ' + displayName + '’s next message.');
       } catch (e) { status.err(notDone(e, 'Not uploaded')); }
     }, 'Uploading…'));

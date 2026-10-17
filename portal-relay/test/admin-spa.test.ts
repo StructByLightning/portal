@@ -301,12 +301,14 @@ class FakeDocument {
 }
 
 /**
- * The address bar and the history: entries of path+search+hash, Back and
- * Forward, and the window events they fire (popstate, then hashchange, after
- * the current task — as a browser does). pushState/replaceState fire nothing.
+ * The address bar and the history: entries of path+search+hash (each with
+ * its history.state), Back, Forward and go(n), and the window events they
+ * fire (popstate, then hashchange, after the current task — as a browser
+ * does). pushState/replaceState fire nothing.
  */
 class FakeNav {
   entries: string[];
+  states: unknown[] = [null];
   i = 0;
   listeners = new Map<string, Array<(e: unknown) => void>>();
   assigned: string[] = [];
@@ -367,34 +369,45 @@ class FakeNav {
       get length() {
         return nav.entries.length;
       },
-      pushState(_s: unknown, _t: string, u: string) {
+      /** A structured clone, as a browser keeps it. */
+      get state() {
+        const v = nav.states[nav.i];
+        return v == null ? null : JSON.parse(JSON.stringify(v));
+      },
+      pushState(st: unknown, _t: string, u: string) {
         nav.entries.splice(nav.i + 1);
+        nav.states.splice(nav.i + 1);
         nav.entries.push(nav.resolve(u));
+        nav.states.push(st == null ? null : JSON.parse(JSON.stringify(st)));
         nav.i++;
       },
-      replaceState(_s: unknown, _t: string, u: string) {
+      replaceState(st: unknown, _t: string, u: string) {
         nav.entries[nav.i] = nav.resolve(u);
+        nav.states[nav.i] = st == null ? null : JSON.parse(JSON.stringify(st));
+      },
+      go(n: number) {
+        const to = nav.i + n;
+        if (!n || to < 0 || to >= nav.entries.length) return;
+        nav.i = to;
+        nav.fireNav();
       },
       back() {
-        if (nav.i > 0) {
-          nav.i--;
-          nav.fireNav();
-        }
+        this.go(-1);
       },
       forward() {
-        if (nav.i < nav.entries.length - 1) {
-          nav.i++;
-          nav.fireNav();
-        }
+        this.go(1);
       },
     };
   })();
-  /** A link click, or an address typed into the bar: a new entry and the events. */
+  /** A link click, or an address typed into the bar: a new entry (with no
+   *  state) and the events. */
   go(href: string) {
     const to = this.resolve(href);
     if (to === this.entries[this.i]) return;
     this.entries.splice(this.i + 1);
+    this.states.splice(this.i + 1);
     this.entries.push(to);
+    this.states.push(null);
     this.i++;
     this.fireNav();
   }
@@ -800,6 +813,29 @@ test('ui.dirtyTracker: edits make a form dirty; reset() and data-no-dirty do not
   assert.equal(t.isDirty(), false);
 });
 
+test('ui.dirtyTracker: saved(mark) makes what was sent the baseline, so edits made meanwhile stay unsaved', () => {
+  const { ctx } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, dirtyTracker } = ctx.PA.ui;
+  const text = el('input', { type: 'text' });
+  const form = el('form');
+  (form as any).elements = [text];
+  const t = dirtyTracker(form);
+  text.value = 'read';
+  const sent = t.mark();
+  text.value = 'full'; // while the save is at work
+  assert.equal(t.saved(sent), true);
+  assert.equal(t.isDirty(), true, 'full was never sent');
+  text.value = 'read';
+  assert.equal(t.isDirty(), false, 'read is what was saved');
+  // Reset since the mark (the form was reloaded for something else): that baseline stands.
+  const again = t.mark();
+  text.value = 'other';
+  t.reset();
+  assert.equal(t.saved(again), false);
+  assert.equal(t.isDirty(), false);
+});
+
 // ── The drawer and the toast stack, from the keyboard ──
 
 /** index.html's drawer markup (with its copy of the session bar) and toast stack. */
@@ -983,6 +1019,15 @@ function accessBody(o: {
   };
 }
 
+/** An answer that isn't the relay's: the proxy in front of it (Caddy) with
+ *  an empty 502/503/504 when the relay went away mid-request or isn't there. */
+/** A 200 whose body never arrived (the connection dropped mid-read). */
+class BodyLost {}
+class ProxyAnswer {
+  constructor(public status: number, public text = '') {}
+}
+const proxy = (status: number, text = '') => new ProxyAnswer(status, text);
+
 /** A sandbox with index.html's shell, signed in as a one-guild admin, on
  *  Guild One's Personas tab unless `url` says otherwise (a first visit, '/',
  *  lands on Channels). Every request lands in `calls` as 'METHOD
@@ -1010,7 +1055,7 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       const route = url.pathname;
       const g = '/admin/g/' + G1;
       const routes: Record<string, unknown> = {
-        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+        '/admin/me': { user: { name: 'Gwen' }, isSuper: false, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
         '/admin/guilds': { guilds: [{ id: G1, name: 'Guild One' }] },
         [g + '/roles']: { catalog: {}, discordRoles: [], canAuthor: false },
         [g + '/channels']: { channels: [] },
@@ -1026,6 +1071,8 @@ function appSandbox(opts: { routes?: Record<string, unknown>; handle?: FakeHandl
       if (body === undefined) return { status: 404, ok: false, text: async () => '{"error":{"code":"NOT_FOUND"}}' };
       // refuse(status, code, message, extra) answers as the relay refuses.
       if (body instanceof Refusal) return { status: body.status, ok: false, text: async () => JSON.stringify({ error: body.error }) };
+      if (body instanceof ProxyAnswer) return { status: body.status, ok: false, text: async () => body.text };
+      if (body instanceof BodyLost) return { status: 200, ok: true, text: async () => { throw new TypeError('network error'); } };
       return { status: 200, ok: true, text: async () => JSON.stringify(body) };
     },
   });
@@ -1354,26 +1401,34 @@ const G2_LOBBY = '100000000000002011'; // #lobby in Guild Two
  *  relay keeps (POST /admin/roles replaces a name, as the relay does). With
  *  ?names=1 it names what a super-admin's catalog references, as the relay
  *  does: every role's guild it knows, and their channels. */
-async function rolesTab() {
+async function rolesTab(more: Record<string, any> = {}, opts: { holdFirstList?: Promise<void> } = {}) {
+  let lists = 0; // the tab's list loads (with names), in order
   const g = '/admin/g/' + G1;
-  const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'] };
+  const catalog: Record<string, any> = { 'g1-readers': G1_CATALOG['g1-readers'], ...more };
   const known: Record<string, string> = { [G1]: 'Guild One', [G2]: 'Guild Two' };
-  const net: { down: boolean; beforePost?: (body: any) => void } = { down: false };
+  const net: { down: boolean; beforePost?: (body: any) => void; holdLookup?: Promise<void>; holdPost?: Promise<void> } = { down: false };
   const box = appSandbox({
     routes: {
-      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test' },
+      '/admin/me': { user: { name: 'Op' }, isSuper: true, guilds: [{ id: G1, name: 'Guild One' }], csrf: 'csrf-test', apiVersion: 2 },
       [g + '/channels']: { channels: G1_CHANNELS },
     },
-    handle: (method, path, body) => {
+    handle: async (method, path, body) => {
       if (net.down) throw new Error('offline');
       if (method === 'GET' && path.startsWith(g + '/roles')) {
         if (!new URL(path, 'http://panel.invalid').searchParams.has('names')) return { catalog, discordRoles: [], canAuthor: true };
+        if (opts.holdFirstList && lists++ === 0) {
+          const snapshot = structuredClone(catalog); // what the catalog was when it was asked
+          await opts.holdFirstList; // the tab's first load, answered late
+          return { catalog: snapshot, discordRoles: [], canAuthor: true, names: { channels: {}, discordRoles: {}, guilds: {} } };
+        }
+        if (net.holdLookup) await net.holdLookup; // the drawer's look, answered late
         const guilds: Record<string, string> = {};
         for (const r of Object.values(catalog)) if (known[r.guildId]) guilds[r.guildId] = known[r.guildId];
         const names = { channels: { [G2_LOBBY]: { id: G2_LOBBY, name: 'lobby', type: 'text' } }, discordRoles: {}, guilds };
         return { catalog, discordRoles: [], canAuthor: true, names };
       }
       if (method === 'POST' && path === '/admin/roles') {
+        if (net.holdPost) await net.holdPost; // the save, answered late
         net.beforePost?.(body); // someone else, just before this request lands
         // As the relay does: a name in use only with replace, in its own guild.
         const cur = Object.hasOwn(catalog, body.name) ? catalog[body.name] : undefined;
@@ -1620,7 +1675,31 @@ test('lib.errorText: the relay’s refusal codes in the copy guide’s words', (
   assert.equal(t({ code: 'TARGET_REQUIRED', status: 400 }), 'Not saved: this page is out of date. Reload the page and try again.');
   assert.equal(t({ code: 'EXISTS', status: 409 }, 'Not created', { roleName: 'g1-chatters' }), 'A role named g1-chatters already exists — edit it instead?');
   assert.equal(t({ code: 'RATE_LIMITED', status: 429 }), 'Paused for a few seconds (rate limit).');
-  assert.equal(t({ code: 'NETWORK', status: 0 }), 'Couldn’t reach the relay. Nothing was changed. Try again.');
+  assert.equal(t({ code: 'NETWORK', status: 0, method: 'GET' }), 'Couldn’t reach the relay. Nothing was changed. Try again.', 'a failed read changed nothing');
+  for (const method of ['POST', 'PUT', 'DELETE', undefined]) {
+    assert.equal(t({ code: 'NETWORK', status: 0, method }, 'Not minted'),
+      'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.',
+      'a change whose answer was lost may have been made: ' + method);
+    // Behind Caddy the lost answer is the proxy's 502/504 (503 with the relay
+    // down), with no relay error body: just as unconfirmed.
+    for (const status of [500, 502, 503, 504]) {
+      assert.equal(t({ status, message: 'HTTP ' + status, method }, 'Not minted'),
+        'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.',
+        `the proxy's ${status} to a change: ${method}`);
+    }
+    // The relay's own INTERNAL error can come after the change was stored.
+    assert.equal(t({ code: 'INTERNAL', status: 500, message: 'internal error', method }, 'Not minted'),
+      'The relay ran into an error, so this change may or may not have been made. Reload the page and check before you try again.',
+      'an internal error on a change: ' + method);
+  }
+  for (const status of [502, 503, 504]) {
+    assert.equal(t({ status, message: 'HTTP ' + status, method: 'GET' }), 'Couldn’t reach the relay. Nothing was changed. Try again.', `the proxy's ${status} to a read`);
+  }
+  assert.equal(t({ code: 'INTERNAL', status: 500, message: 'internal error', method: 'GET' }, 'Not created'), 'Not created: internal error.', 'a read changed nothing');
+  // A refusal the relay answered with its own code is a refusal, 5xx or not.
+  assert.equal(t({ code: 'UNAVAILABLE', status: 503, message: 'avatar uploads not configured (set PORTAL_AVATAR_DIR)', method: 'POST' }, 'Not uploaded'),
+    'Not uploaded: avatar uploads not configured (set PORTAL_AVATAR_DIR).');
+  assert.equal(t({ code: 'INVALID', status: 400, message: 'bad', method: 'POST' }), 'Not saved: bad.');
   assert.equal(t({ code: 'FORBIDDEN', status: 403, reason: 'NOT_GUILD_ADMIN', message: 'not an admin of this guild' }),
     'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
   assert.equal(t({ code: 'FORBIDDEN', status: 403, message: 'channel is not in this guild' }), 'Not saved: channel is not in this guild.', 'a route’s own refusal says what it is');
@@ -1728,6 +1807,148 @@ test('role drawer: a new name must be one the relay accepts', async () => {
   const submit = form.querySelector('button[type="submit"]')!;
   assert.equal(submit.disabled, true);
   assert.match(form.textContent, /Use lower-case letters, digits, dots, dashes or underscores in the name \(up to 64\) to create it\./);
+});
+
+test('role drawer: a look that answers after the drawer was discarded asks nothing and closes no other drawer', async () => {
+  const { define, confirm, button, net, doc, bodies, calls } = await rolesTab();
+  let answer!: () => void;
+  net.holdLookup = new Promise<void>((r) => { answer = r; });
+  await define('g1-readers', 'write'); // the name exists: the late answer would ask to edit it
+  assert.ok(calls.includes(`GET /admin/g/${G1}/roles?names=1`), 'the look is out');
+  // Discard that drawer while the relay thinks…
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  clickable(doc, 'Discard changes', confirm()!).click();
+  await settle();
+  // …and start on another one.
+  button('+ Define access role')!.click();
+  await settle();
+  const input = doc.getElementById('drawer-body')!.querySelector('input[name="name"]')!;
+  input.value = 'g1-new-one';
+  input.fire('input');
+  const posts = bodies.length;
+  net.holdLookup = undefined;
+  answer();
+  await settle();
+  assert.equal(confirm(), null, 'no question about the discarded form');
+  assert.equal(bodies.length, posts, 'nothing sent');
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'), 'the new drawer stays open');
+  assert.equal(doc.getElementById('drawer-body')!.querySelector('input[name="name"]')!.value, 'g1-new-one', 'with its unsaved edit');
+});
+
+test('ui.drawer: a handle closes only its own drawer', () => {
+  const { ctx, doc } = sandbox();
+  load(ctx, ['ui.js']);
+  const { el, drawer } = ctx.PA.ui;
+  drawerDom(doc, el);
+  const first = drawer.open({ title: 'One' });
+  const second = drawer.open({ title: 'Two' });
+  first.close();
+  assert.equal(drawer.isOpen(), true, 'a replaced drawer’s handle leaves the open one alone');
+  second.close();
+  assert.equal(drawer.isOpen(), false);
+});
+
+test('role drawer: a role made before the naming rule can still be edited under its name', async () => {
+  const old = { caps: [...LEVEL_CAPS.read], scope: { all: true }, guildId: G1 };
+  const { define, confirm, catalog, bodies } = await rolesTab({ 'Old Name': old });
+  await define('Old Name', 'write'); // asserts Create is on
+  const dialog = confirm()!;
+  assert.ok(dialog, 'the existing role is asked about, as any other');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'A role named Old Name already exists — edit it instead?');
+  dialog.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(bodies.at(-1), { name: 'Old Name', role: { caps: [...LEVEL_CAPS.write], scope: { all: true }, guildId: G1 }, replace: true, expectedGuildId: G1 });
+  assert.deepEqual(catalog['Old Name'].caps, [...LEVEL_CAPS.write]);
+});
+
+/** The open role drawer's form, and a level picked on it as an admin would. */
+function roleForm(doc: FakeDocument) {
+  const form = doc.getElementById('drawer-body')!.querySelector('form')!;
+  const radio = (k: string) => form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === k)!;
+  const pick = (k: string) => {
+    for (const o of form.querySelectorAll('input')) if (o.type === 'radio') o.checked = false;
+    radio(k).checked = true;
+    radio(k).fire('change');
+  };
+  return { form, radio, pick };
+}
+
+test('role drawer: a level picked while Create is at work stays, unsaved — the drawer stays open, and closing asks', async () => {
+  const { define, confirm, catalog, net, doc, bodies } = await rolesTab();
+  let answer!: () => void;
+  net.holdPost = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  assert.equal(bodies.at(-1).role.caps.length, LEVEL_CAPS.read.length, 'Read was sent');
+  const { form, radio, pick } = roleForm(doc);
+  pick('full'); // while the relay saves Read
+  net.holdPost = undefined;
+  answer();
+  await settle();
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.read], 'the relay saved Read');
+  const drawer = doc.getElementById('drawer')!;
+  assert.ok(!drawer.classList.contains('hidden'), 'the drawer stays, with the change made meanwhile');
+  assert.equal(radio('full').checked, true);
+  assert.equal(form.querySelector('.status-line')!.textContent,
+    'Created access role g1-brand-new: Read in every channel of Guild One. The form was changed while it was being saved; that change isn’t saved yet.');
+  assert.equal(form.querySelector('button[type="submit"]')!.disabled, false, 'Create is on for it');
+
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'Discard changes?', 'Full was never saved');
+  clickable(doc, 'Cancel', confirm()!).click();
+  await settle();
+
+  // Create sends it — as an edit of the role that exists now, after asking.
+  form.fire('submit');
+  await settle();
+  assert.equal(confirm()!.querySelector('h2')!.textContent, 'A role named g1-brand-new already exists — edit it instead?');
+  confirm()!.querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.full]);
+  assert.ok(drawer.classList.contains('hidden'), 'saved as it shows: the drawer closes');
+});
+
+test('role drawer: an edit made while the name is being looked up is not sent, and stays unsaved', async () => {
+  const { define, catalog, net, doc, bodies } = await rolesTab();
+  let answer!: () => void;
+  net.holdLookup = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  const { radio, pick } = roleForm(doc);
+  pick('write'); // before Create's request has even gone
+  net.holdLookup = undefined;
+  answer();
+  await settle();
+  assert.deepEqual(bodies.at(-1).role.caps, [...LEVEL_CAPS.read], 'what was pressed is what was sent');
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.read]);
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'), 'the drawer stays');
+  assert.equal(radio('write').checked, true, 'with Write, unsaved');
+  assert.equal(doc.getElementById('drawer-body')!.querySelector('.status-line')!.textContent.endsWith('that change isn’t saved yet.'), true);
+});
+
+test('role drawer: a name emptied while Create is at work leaves Create off after the answer', async () => {
+  const { define, net, doc } = await rolesTab();
+  let answer!: () => void;
+  net.holdPost = new Promise<void>((r) => { answer = r; });
+  await define('g1-brand-new', 'read');
+  const { form } = roleForm(doc);
+  const input = form.querySelector('input[name="name"]')!;
+  input.value = '';
+  input.fire('input');
+  net.holdPost = undefined;
+  answer();
+  await settle();
+  assert.ok(!doc.getElementById('drawer')!.classList.contains('hidden'));
+  assert.equal(form.querySelector('button[type="submit"]')!.disabled, true, 'not turned back on by the finished save');
+  assert.match(form.textContent, /Name the role to create it\./);
+});
+
+test('role drawer: created as it shows, the drawer closes without asking', async () => {
+  const { define, confirm, catalog, doc } = await rolesTab();
+  await define('g1-brand-new', 'write');
+  assert.deepEqual(catalog['g1-brand-new'].caps, [...LEVEL_CAPS.write]);
+  assert.equal(confirm(), null);
+  assert.ok(doc.getElementById('drawer')!.classList.contains('hidden'));
 });
 
 // ── Addresses: the router grammar (lib.js) ──
@@ -1887,8 +2108,8 @@ test('lib.loginErrorText: the fixed table; anything else is a generic line', () 
 
 // ── Addresses in the app: reload, Back, links ──
 
-const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1' };
-const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1' };
+const ME_OP = { user: { id: '200000000000000001', name: 'Op' }, isSuper: true, guilds: [], csrf: 'csrf-1', apiVersion: 2 };
+const ME_GWEN = { user: { id: '200000000000000002', name: 'Gwen' }, isSuper: false, guilds: [{ id: GA, name: 'Guild One' }], csrf: 'csrf-1', apiVersion: 2 };
 
 /** The panel signed in as `me`, at `url`, over Guild One's fixture. */
 async function panelAt(url: string, opts: { me?: unknown; guilds?: unknown[]; handle?: FakeHandler; routes?: Record<string, unknown>; session?: Record<string, string>; local?: Record<string, string> } = {}) {
@@ -2298,9 +2519,11 @@ test('session: Back out of a drawer with unsaved changes asks first; Cancel stay
   await settle();
   const ask = box.doc.querySelector('.modal')!;
   assert.equal(ask.querySelector('h2')!.textContent, 'Discard changes?');
-  assert.equal(box.here(), g + '/invites/new', 'the address is put back while it asks');
+  assert.ok(box.drawerOpen(), 'the drawer stays while it asks');
   clickable(box.doc, 'Cancel', ask).click();
   await settle();
+  assert.equal(box.here(), g + '/invites/new', 'Cancel: the address is the drawer’s again');
+  assert.deepEqual([box.nav.entries.length, box.nav.i], [2, 1], 'the same entry, not a copy of it');
   assert.ok(box.drawerOpen());
   assert.equal(box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, 'x');
   box.nav.back();
@@ -2557,6 +2780,38 @@ test('session: a drawer with no address keeps no draft; a grant draft opens only
   }
 });
 
+test('session: a kept form that mirrors @everyone comes back with @everyone shown and picked', async () => {
+  const g = '#/g/' + GA;
+  const discordRoles = [
+    { id: GA, guildId: GA, name: '@everyone', pooled: false },
+    { id: MODS, guildId: GA, name: 'Mods', pooled: false },
+  ];
+  const routes = { [`/admin/g/${GA}/roles`]: { catalog: G1_CATALOG, discordRoles, canAuthor: true } };
+  const at = (route: string, form: string, fields: object) => ({
+    'pa.draft': JSON.stringify({ v: 1, userId: ME_OP.user.id, route, form, fields, at: Date.now() }),
+  });
+  const everyone = (body: FakeElement) => body.querySelectorAll('label').find((l) => l.textContent === 'Show @everyone')!.querySelector('input')!;
+
+  // Define access role, one Discord role.
+  let box = await panelAt('/' + g + '/roles/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/roles/new', 'role', { name: 'g1-all', where: 'mirrorRole', mirrorRole: GA, caps: [...LEVEL_CAPS.read] }) });
+  let body = box.doc.getElementById('drawer-body')!;
+  assert.equal(body.querySelector('select[name="mirrorRole"]')!.value, GA, 'the kept role is picked');
+  assert.equal(everyone(body).checked, true, 'and @everyone is shown');
+  assert.ok(body.textContent.includes('Restored your unsaved change'));
+
+  // Several Discord roles.
+  box = await panelAt('/' + g + '/roles/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/roles/new', 'role', { name: 'g1-some', where: 'mirrorRoles', mirrorRoles: [GA, MODS], caps: [...LEVEL_CAPS.read] }) });
+  body = box.doc.getElementById('drawer-body')!;
+  const ticked = body.querySelector('.check-list[aria-label="Discord roles"]')!.querySelectorAll('input').filter((i) => i.checked).map((i) => i.value);
+  assert.deepEqual(ticked.sort(), [GA, MODS].sort(), 'neither is dropped');
+
+  // Mint invite, mirror.
+  box = await panelAt('/' + g + '/invites/new', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }], routes, session: at(g + '/invites/new', 'mint', { kind: 'mirror', mirrorRole: GA, caps: [...LEVEL_CAPS.read] }) });
+  body = box.doc.getElementById('drawer-body')!;
+  assert.equal(body.querySelector('select[name="mirrorRole"]')!.value, GA);
+  assert.equal(everyone(body).checked, true);
+});
+
 // ── The all-persona drawer names its guild in its address ──
 
 test('app routes: from All personas a drawer’s address names the guild, so a reload keeps its “Access in” section', async () => {
@@ -2642,6 +2897,63 @@ test('session: Cancel after a link out of a dirty drawer; closing it then goes t
   assert.equal(box.nav.i, depth - 1, 'Back to the list it was opened from');
 });
 
+test('session: Cancel on leaving a dirty drawer leaves Back and Forward as they were', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/personas', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { [`/admin/g/${GA}/personas/sol/access`]: accessBody({ id: 'sol', name: 'Sol' }) },
+  });
+  const title = () => box.doc.getElementById('drawer-title')!.textContent;
+  const modal = () => box.doc.querySelector('.modal');
+  // Open Aria, then Sol; Back to Aria; change something there.
+  clickable(box.doc, 'Aria').click();
+  await settle();
+  box.nav.go(g + '/personas/p/sol');
+  await settle();
+  assert.equal(title(), 'Sol sol');
+  box.nav.back();
+  await settle();
+  assert.equal(box.here(), g + '/personas/p/aria');
+  const form = box.doc.getElementById('drawer-body')!.querySelector('form.persona-add')!;
+  const read = form.querySelectorAll('input').find((i) => i.type === 'radio' && i.value === 'read')!;
+  for (const r of form.querySelectorAll('input').filter((i) => i.type === 'radio')) r.checked = false;
+  read.checked = true;
+  read.fire('change');
+  const entries = [...box.nav.entries];
+  const at = box.nav.i;
+
+  // Back again, Cancel: nothing in the history changes — Sol is still Forward.
+  box.nav.back();
+  await settle();
+  clickable(box.doc, 'Cancel', modal()!).click();
+  await settle();
+  assert.deepEqual(box.nav.entries, entries, 'no entry added or dropped');
+  assert.equal(box.nav.i, at);
+  assert.equal(box.here(), g + '/personas/p/aria');
+  assert.equal(title(), 'Aria aria');
+  assert.equal(read.checked, true, 'the change is still there');
+  assert.ok(form.isConnected, 'in the same drawer');
+
+  // Forward, Cancel: the same.
+  box.nav.history.forward();
+  await settle();
+  clickable(box.doc, 'Cancel', modal()!).click();
+  await settle();
+  assert.deepEqual(box.nav.entries, entries);
+  assert.equal(box.nav.i, at);
+  assert.equal(box.here(), g + '/personas/p/aria');
+
+  // Forward, Discard: Sol.
+  box.nav.history.forward();
+  await settle();
+  clickable(box.doc, 'Discard changes', modal()!).click();
+  await settle();
+  assert.equal(box.here(), g + '/personas/p/sol');
+  assert.equal(title(), 'Sol sol');
+  assert.equal(modal(), null);
+  assert.deepEqual(box.nav.entries, entries);
+});
+
 test('session: Esc then Back on a dirty drawer asks one question; its answer closes that drawer only', async () => {
   const g = '#/g/' + GA;
   const box = await panelAt('/' + g + '/invites', { me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }] });
@@ -2692,6 +3004,185 @@ test('ui.drawer: a question asked over a drawer goes when the drawer closes; req
   assert.equal(await again, true);
   assert.equal(await closing, true);
   assert.equal(drawer.isOpen(), false);
+});
+
+test('session: a change whose answer never came says it may have been made, not that nothing changed', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method) => {
+      if (down && method === 'POST') throw new Error('connection reset'); // sent; the answer was lost
+      return undefined;
+    },
+  });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  down = true;
+  form.fire('submit');
+  await settle();
+  assert.ok(box.calls.includes(`POST /admin/g/${GA}/invites`), 'the mint was sent');
+  const line = form.querySelector('.status-line')!;
+  assert.equal(line.textContent, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.');
+  assert.ok(!/Nothing was changed|Try again\./.test(line.textContent), 'never “try again” as if nothing happened');
+});
+
+test('session: behind the proxy, a change whose answer was lost (an empty 502/504) says it may have been made', async () => {
+  const g = '#/g/' + GA;
+  for (const status of [502, 503, 504]) {
+    let down = false;
+    const box = await panelAt('/' + g + '/invites/new', {
+      me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+      // The relay took the mint and went away before answering: Caddy answers.
+      handle: (method) => (down && method === 'POST' ? proxy(status) : undefined),
+    });
+    const form = fillMint(box.doc, 'x', 'g1-readers');
+    down = true;
+    form.fire('submit');
+    await settle();
+    assert.ok(box.calls.includes(`POST /admin/g/${GA}/invites`), 'the mint was sent');
+    const line = form.querySelector('.status-line')!.textContent;
+    assert.equal(line, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.', String(status));
+    assert.ok(!/Not minted|HTTP/.test(line), `never “Not minted: HTTP ${status}”`);
+  }
+});
+
+test('session: behind the proxy, a read answered by an empty 502 says the relay couldn’t be reached', async () => {
+  const g = '#/g/' + GA;
+  const box = await panelAt('/' + g + '/invites', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method, path) => (method === 'GET' && path.startsWith(`/admin/g/${GA}/invites`) ? proxy(502, '<html>Bad Gateway</html>') : undefined),
+  });
+  const view = box.doc.getElementById('view')!;
+  assert.match(view.textContent, /Couldn’t reach the relay to load this list\. Try again\./);
+  assert.ok(!/HTTP 502|Bad Gateway/.test(view.textContent));
+});
+
+test('mint: a label changed while the invite is being minted stays unsaved; Mint another shows it', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: async (method, path, body) => {
+      if (method !== 'POST' || path !== `/admin/g/${GA}/invites`) return undefined;
+      if (gate) await gate;
+      return { code: 'inv_fixtureinvite0000000b', invite: { guildId: GA, ...body, uses: 0 } };
+    },
+  });
+  gate = new Promise<void>((r) => { answer = r; });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  form.fire('submit');
+  await settle();
+  const label = form.querySelector('input[name="label"]')!;
+  label.value = 'y'; // typed while it mints
+  label.fire('input');
+  gate = undefined;
+  answer();
+  await settle();
+  assert.ok(box.doc.getElementById('drawer-body')!.textContent.includes('Invite ready'));
+  clickable(box.doc, 'Mint another').click();
+  assert.equal(box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!.value, 'y');
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(box.doc.querySelector('.modal')!.querySelector('h2')!.textContent, 'Discard changes?', '“y” was never minted');
+});
+
+test('mint: Done on the minted card asks first when the form was changed while it minted; untouched, it just closes', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: async (method, path, body) => {
+      if (method !== 'POST' || path !== `/admin/g/${GA}/invites`) return undefined;
+      if (gate) await gate;
+      return { code: 'inv_fixtureinvite0000000b', invite: { guildId: GA, ...body, uses: 0 } };
+    },
+  });
+  const drawer = box.doc.getElementById('drawer')!;
+  const body = box.doc.getElementById('drawer-body')!;
+  gate = new Promise<void>((r) => { answer = r; });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  form.fire('submit');
+  await settle();
+  const label = form.querySelector('input[name="label"]')!;
+  label.value = 'y'; // typed while it mints
+  label.fire('input');
+  gate = undefined;
+  answer();
+  await settle();
+  assert.ok(body.textContent.includes('Invite ready'));
+  assert.match(body.querySelector('p.warn-line')!.textContent, /changed while this invite was being minted; that change isn’t in it\. Mint another shows it\./);
+
+  clickable(box.doc, 'Done').click();
+  await settle();
+  const dialog = box.doc.querySelector('.modal')!;
+  assert.ok(dialog, 'Done asks, as ✕ does');
+  assert.equal(dialog.querySelector('h2')!.textContent, 'Discard changes?');
+  clickable(box.doc, 'Cancel', dialog).click();
+  await settle();
+  assert.ok(!drawer.classList.contains('hidden'), 'Cancel keeps the drawer');
+  assert.ok(body.textContent.includes('Invite ready'), 'with the code still on screen');
+  clickable(box.doc, 'Mint another').click();
+  assert.equal(body.querySelector('input[name="label"]')!.value, 'y', 'and the edit behind it');
+
+  // Minted with nothing changed meanwhile: Done closes without a question.
+  body.querySelector('form')!.fire('submit');
+  await settle();
+  assert.ok(body.textContent.includes('Invite ready'));
+  assert.equal(body.querySelector('p.warn-line'), null, 'nothing to warn about');
+  clickable(box.doc, 'Done').click();
+  await settle();
+  assert.equal(box.doc.querySelector('.modal'), null, 'no question');
+  assert.ok(drawer.classList.contains('hidden'), 'closed');
+});
+
+test('persona drawer: text typed into a field while its save is at work stays, unsaved (picture URL, invite code)', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/personas/p/aria', {
+    me: { ...ME_OP, features: { invites: true, avatarUploads: false, allowlistEditable: true } }, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatar: '', avatarUrl: '', roles: [], policy: null, guilds: [], names: {} } },
+    handle: async (method, path, body) => {
+      if (method === 'PUT' && path === '/admin/personas/aria/avatar') {
+        if (gate) await gate;
+        return { avatar: body.avatar, avatarUrl: body.avatar };
+      }
+      if (method === 'POST' && path === `/admin/g/${GA}/personas/aria/claim`) {
+        if (gate) await gate;
+        return { roles: ['g1-chatters'], banned: false };
+      }
+      return undefined;
+    },
+  });
+  const body = box.doc.getElementById('drawer-body')!;
+  for (const [name, sent, typed] of [['avatar', 'https://example.invalid/a.png', 'https://example.invalid/b.png'], ['code', 'inv_fixtureinvite0000000c', 'inv_fixtureinvite0000000d']]) {
+    const input = body.querySelector(`input[name="${name}"]`)!;
+    const form = input.closest('form')!;
+    input.value = sent;
+    input.fire('input');
+    gate = new Promise<void>((r) => { answer = r; });
+    form.fire('submit');
+    await settle();
+    input.value = typed; // the admin goes on typing
+    input.fire('input');
+    gate = undefined;
+    answer();
+    await settle();
+    assert.equal(input.value, typed, name + ': what was typed meanwhile is not overwritten');
+    box.doc.getElementById('drawer-close')!.click();
+    await settle();
+    const ask = box.doc.querySelector('.modal');
+    assert.ok(ask, name + ': and it is unsaved, so closing asks');
+    clickable(box.doc, 'Cancel', ask!).click();
+    await settle();
+    input.value = name === 'avatar' ? sent : '';
+    input.fire('input');
+  }
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(box.doc.querySelector('.modal'), null, 'back to what was saved: nothing to ask about');
 });
 
 test('lib.errorText: a removal from the guild the page didn’t know about (it can’t tell /ban from Remove, so names neither)', () => {
@@ -4363,6 +4854,73 @@ test('persona drawer: a guild-wide change refused as changed meanwhile says so, 
   }
 });
 
+test('persona drawer: a guild-wide level picked while Save is at work stays unsaved, so closing asks', async () => {
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    guildWide: R8,
+    handle: async (method, path, body) => {
+      if (method === 'PUT' && body?.guildDefault === true && gate) await gate; // the relay takes its time, then answers below
+      return undefined;
+    },
+  });
+  clickable(box.doc, 'Set level…', box.gwRow()).click();
+  const form = box.body.querySelector('form.guild-wide-form')!;
+  box.level(form, 'write');
+  gate = new Promise<void>((r) => { answer = r; });
+  form.fire('submit');
+  await settle();
+  box.level(form, 'full'); // picked while Write is being saved
+  gate = undefined;
+  answer();
+  await settle();
+  assert.deepEqual(box.world.guildWide, W8, 'the relay saved Write');
+  assert.ok(!form.classList.contains('hidden'), 'the form stays open on the pick made meanwhile');
+  assert.equal(box.radioIn(form, 'full').checked, true);
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.equal(box.modal().querySelector('h2')!.textContent, 'Discard changes?', 'Full was never saved');
+});
+
+test('persona drawer: a relay older than the panel is sent caps it reads right — a channel’s and guild-wide — Deny as a bare DELETE, and no Unset', async () => {
+  const sent: string[] = [];
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    me: { ...ME_GWEN, apiVersion: undefined }, // from before apiVersion 2: it sends none
+    guildWide: R8,
+    handle: (method, path, body) => {
+      // As that relay does: a PUT stores body.caps (none: a deny), on the
+      // channel or, with no channelId, guild-wide; a DELETE without a
+      // channelId denies guild-wide, whatever else it says.
+      if (!path.startsWith('/admin/g/' + GA + '/personas/aria/grants')) return undefined;
+      sent.push(method + ' ' + path);
+      return { guildPolicy: {}, banned: false };
+    },
+  });
+  const { addForm, typeChannel, pickOption, bodies, level, gwRow, gwButtons } = box;
+  await typeChannel('lab');
+  pickOption('#lab-notes');
+  level(addForm(), 'write');
+  addForm().fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { channelId: CH.labNotes, caps: W8 }, 'a level as its caps, never a name it would read as a deny');
+
+  assert.deepEqual(gwButtons(), ['Set level…', 'Deny guild-wide'], 'no Unset: it would store a deny');
+  assert.match(gwRow().textContent, /Unset needs the relay updated/);
+  clickable(box.doc, 'Set level…', gwRow()).click();
+  const form = box.body.querySelector('form.guild-wide-form')!;
+  level(form, 'full');
+  form.fire('submit');
+  await settle();
+  assert.deepEqual(bodies.at(-1), { caps: F8 }, 'guild-wide: caps with no channelId');
+
+  clickable(box.doc, 'Deny guild-wide', gwRow()).click();
+  await settle();
+  box.modal().querySelector('button.btn-danger-solid')!.click();
+  await settle();
+  assert.equal(sent.at(-1), `DELETE /admin/g/${GA}/personas/aria/grants`, 'the bare DELETE it denies with');
+  assert.ok(!sent.some((c) => c.includes('guildDefault=')), sent.join('\n'));
+});
+
 test('persona drawer: a persona removed from the guild says so; giving it access asks first; Unset asks, then lifts the removal', async () => {
   const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: [], roles: [], removed: true, guildWide: 'deny' });
   const { body, gwRow, gwButtons, gwLine, confirm, modal, calls, P } = box;
@@ -4718,3 +5276,120 @@ test('persona drawer: picking a second access role while the first is being give
   const roles = box.body.querySelectorAll('section').find((x) => x.querySelector('h3')?.textContent === 'Access roles in Guild One')!;
   assert.match(roles.querySelector('.status-line')!.textContent, /^Gave Aria access role g1-readers \(Read in every channel of Guild One\)\. Effective now: /);
 });
+
+test('session: a change answered 200 whose body was lost mid-read says it may have been made', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method) => (down && method === 'POST' ? new BodyLost() : undefined),
+  });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  down = true;
+  form.fire('submit');
+  await settle();
+  assert.equal(form.querySelector('.status-line')!.textContent, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.');
+});
+
+test('persona drawer: a crop started while a picture URL save is at work stays unsaved, so closing asks', async () => {
+  const g = '#/g/' + GA;
+  let answer!: () => void;
+  let gate: Promise<void> | undefined;
+  const box = await panelAt('/' + g + '/personas/p/aria', {
+    me: { ...ME_OP, features: { invites: true, avatarUploads: true, allowlistEditable: true } }, guilds: [{ id: GA, name: 'Guild One' }],
+    routes: { '/admin/personas/aria': { id: 'aria', displayName: 'Aria', avatar: '', avatarUrl: '', roles: [], policy: null, guilds: [], names: {} } },
+    handle: async (method, path, body) => {
+      if (method === 'PUT' && path === '/admin/personas/aria/avatar') {
+        if (gate) await gate;
+        return { avatar: body.avatar, avatarUrl: body.avatar };
+      }
+      return undefined;
+    },
+  });
+  const ctx: any = box.ctx;
+  ctx.FileReader = class { result: any; onload: any; onerror: any; readAsDataURL() { this.result = 'data:image/png;base64,AAAA'; setImmediate(() => this.onload()); } };
+  ctx.Image = class { naturalWidth = 100; naturalHeight = 100; onload: any; onerror: any; set src(_v: string) { setImmediate(() => this.onload()); } get src() { return ''; } };
+  const input = box.doc.getElementById('drawer-body')!.querySelector('input[name="avatar"]')!;
+  const form = input.closest('form')!;
+  input.value = 'https://example.invalid/a.png';
+  input.fire('input');
+  gate = new Promise<void>((r) => { answer = r; });
+  form.fire('submit');
+  await settle();
+  const file = form.querySelector('input[type="file"]')!;
+  (file as any).files = [{ type: 'image/png', name: 'x.png' }];
+  file.fire('change');
+  await settle();
+  assert.ok(form.querySelector('.cropper-zoom'), 'a crop is pending');
+  gate = undefined;
+  answer();
+  await settle();
+  assert.equal(input.value, 'https://example.invalid/a.png', 'the URL as saved');
+  assert.equal(ctx.PA.ui.drawer.isDirty(), true, 'the pending crop is still a change');
+  box.doc.getElementById('drawer-close')!.click();
+  await settle();
+  assert.ok(box.doc.querySelector('.modal'), 'closing asks first');
+});
+
+test('access roles: a list reply from before a role was created is not kept, so a search still shows the new role', async () => {
+  let release!: () => void;
+  const hold = new Promise<void>((r) => { release = r; });
+  const t = await rolesTab({}, { holdFirstList: hold });
+  await t.define('g1-brand-new', 'write'); // closing the drawer loads the list afresh
+  await settle();
+  release(); // the first load, from before the role existed, lands last
+  await settle();
+  const search = t.doc.getElementById('list-search')!;
+  search.value = 'g1';
+  search.fire('input');
+  t.advance(300);
+  await settle();
+  assert.ok(t.rows().some((r) => r[0] === 'g1-brand-new'), JSON.stringify(t.rows()));
+});
+
+test('session: a 401 while “Discard changes?” is up keeps the drawer’s place and form for after the sign-in', async () => {
+  const g = '#/g/' + GA;
+  let release!: () => void;
+  let gate: Promise<void> | null = null;
+  const box = await panelAt('/' + g + '/invites', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: async (method) => {
+      if (method === 'POST' && gate) { await gate; return refuse(401, 'UNAUTHENTICATED', 'login required'); }
+      return undefined;
+    },
+  });
+  clickable(box.doc, '+ Mint invite').click();
+  await settle();
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  gate = new Promise<void>((r) => { release = r; });
+  form.fire('submit');
+  await settle();
+  // An edit while it's at work keeps the form dirty; then Back asks.
+  const label = box.doc.getElementById('drawer-body')!.querySelector('input[name="label"]')!;
+  label.value = 'xy';
+  label.fire('input');
+  box.nav.back();
+  await settle();
+  const heads = box.doc.querySelectorAll('.modal').map((m) => m.querySelector('h2')?.textContent);
+  assert.ok(heads.includes('Discard changes?'), 'Back asks: ' + JSON.stringify(heads) + ' at ' + box.here());
+  release(); // the save comes back 401 while the question is up
+  await settle();
+  const ended = box.doc.querySelectorAll('.modal').find((m) => /Your session ended/.test(m.querySelector('h2')?.textContent || ''));
+  assert.ok(ended, 'the session-ended dialog: ' + JSON.stringify(box.doc.querySelectorAll('.modal').map((m) => m.querySelector('h2')?.textContent)));
+  clickable(box.doc, 'Sign in again', ended!).click();
+  assert.equal(box.sessionStore.getItem('pa.returnTo'), g + '/invites/new', 'the drawer’s place, not where Back was going');
+  const draft = JSON.parse(box.sessionStore.getItem('pa.draft')!);
+  assert.equal(draft.route, g + '/invites/new');
+  assert.equal(draft.fields.label, 'xy');
+});
+
+test('lib.isSafeReturnTo: any address the router accepts can be come back to (a long, non-ASCII persona id)', () => {
+  const { lib } = libOnly();
+  const id = '名'.repeat(60) + '-1a2b3c';
+  const hash = lib.formatRoute({ area: 'g', gid: '100000000000000001', view: 'personas', drawer: { kind: 'persona', id }, query: {} });
+  assert.ok(hash.length > 512, String(hash.length));
+  assert.ok(lib.parseRoute(hash), 'the router takes it');
+  assert.equal(lib.isSafeReturnTo(hash), true);
+  assert.equal(lib.isSafeReturnTo('#/' + 'a'.repeat(3000)), false, 'still bounded');
+});
+

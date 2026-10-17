@@ -1042,11 +1042,29 @@
   const NOT_GUILD_ADMIN = 'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.';
 
   /**
+   * Did the request get no answer from the relay itself? Not when the
+   * connection failed (NETWORK), and not when the proxy in front of it
+   * (Caddy) answered in its place: a 5xx without the relay's error body —
+   * 502 or 504 when the relay went away mid-request (a crash or a restart,
+   * perhaps just after it stored the change), 502 or 503 when it isn't
+   * running. The relay's own answers always carry a code.
+   */
+  function noAnswer(e) {
+    return !!e && (e.code === 'NETWORK' || (!e.code && e.status >= 500));
+  }
+
+  /**
    * A failed change as its status line: '<prefix>: <reason>. <what to do>.'
-   * `e` is the API error ({status, code, message, …the error body's fields}),
-   * `ctx` what the request was about: { channelId, names } for a grant,
-   * { roleName } for an access role. The relay's codes get the copy guide's
-   * words; anything else says what the relay said.
+   * `e` is the API error ({status, code, message, method, …the error body's
+   * fields}), `ctx` what the request was about: { channelId, names } for a
+   * grant, { roleName } for an access role. The relay's codes get the copy
+   * guide's words; anything else says what the relay said.
+   *
+   * No answer from the relay (noAnswer): a read that failed changed nothing,
+   * but a change may have been made before the answer was lost — so it says
+   * to look before trying again (another try could mint a second invite).
+   * The same for the relay's own INTERNAL error on a change: it can come
+   * after the change was stored (say, writing its audit record failed).
    */
   function errorText(e, prefix, ctx) {
     const p = prefix || 'Not saved';
@@ -1054,8 +1072,16 @@
     const code = e && e.code;
     const label = c.channelId && c.names && c.names.channels ? c.names.channels[c.channelId] : null;
     const bare = (label && label.name) || 'That channel';
+    const read = !!e && e.method === 'GET';
+    if (noAnswer(e)) {
+      return read
+        ? 'Couldn’t reach the relay. Nothing was changed. Try again.'
+        : 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.';
+    }
+    if (!read && code === 'INTERNAL') {
+      return 'The relay ran into an error, so this change may or may not have been made. Reload the page and check before you try again.';
+    }
     switch (code) {
-      case 'NETWORK': return 'Couldn’t reach the relay. Nothing was changed. Try again.';
       case 'RATE_LIMITED': return 'Paused for a few seconds (rate limit).';
       case 'CSRF': return p + ': this page’s security token is out of date. Reload the page and try again.';
       case 'THREAD_TARGET': {
@@ -1309,7 +1335,9 @@
    *  a panel address in a narrow character set; it is only ever parsed into a
    *  route, never assigned to location. */
   function isSafeReturnTo(s) {
-    return typeof s === 'string' && /^#\/[A-Za-z0-9/%._~?=&,:-]{0,512}$/.test(s) && parseRoute(s) !== null;
+    // The same length limit as parseRoute (2048 in all), so any address the
+    // panel routes to can be come back to after a sign-in.
+    return typeof s === 'string' && /^#\/[A-Za-z0-9/%._~?=&,:-]{0,2046}$/.test(s) && parseRoute(s) !== null;
   }
 
   // ── Drafts ────────────────────────────────────────────────────────────────
@@ -1419,7 +1447,7 @@
     UNDO_KEEPS_LIFT, grantResultText, canActInText, personaSummaryText, rowSignature, foldAccessRows, runText, inactiveText, removeConfirm, removedText,
     chanText, roleText, guildText, plural, wherePhrase, isMirror, roleLevelText, roleMeaning, roleNameTaken, grantSummary,
     shortDate, usesText, usedText, modeText, inviteSummary, inviteStatusText,
-    NOT_GUILD_ADMIN, errorText,
+    NOT_GUILD_ADMIN, noAnswer, errorText,
     isSnowflake, isPersonaId, isRoleName, parseRoute, formatRoute, isSafeReturnTo, addressText,
     DRAFT_FORMS, draftFields, makeDraft, readDraft, loginErrorText,
   };

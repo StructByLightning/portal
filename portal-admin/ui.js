@@ -327,6 +327,9 @@
    * button is locked with busy(). `run` reports its own result and errors.
    * A `run` that leaves nothing to send turns the button off with
    * setDisabled(); focus the button had then goes to the form's first field.
+   * opts.settled() runs once the button is back as it was: a form whose
+   * submit button is on only when it is complete says so again then (it can
+   * have been edited while the submission was at work).
    */
   function onSubmit(form, run, opts) {
     const o = opts || {};
@@ -341,6 +344,7 @@
       const p = button ? busy(button, work, o.busyLabel, firstField) : Promise.resolve().then(work);
       p.catch((err) => console.error('[portal-admin]', err)).then(() => {
         pending = false;
+        if (o.settled) o.settled();
       });
     });
     return form;
@@ -1121,14 +1125,46 @@
     );
   }
 
-  /** Has `form` changed since it was drawn or last reset()? Controls marked
-   *  data-no-dirty (ones that save the moment they change) don't count. */
+  /**
+   * Has `form` changed since it was drawn or last reset()? Controls marked
+   * data-no-dirty (ones that save the moment they change) don't count.
+   *
+   * A save takes a while, and the form can be changed meanwhile: take mark()
+   * when the save is sent, and once it went through, saved(mark) makes what
+   * was SENT the baseline — an edit made while it was at work stays unsaved
+   * (the drawer asks before it is closed, and a sign-in keeps it). If the
+   * form was reset since the mark (reloaded for something else), that
+   * baseline stands; saved() then returns false.
+   */
   function dirtyTracker(form) {
     let base = snapshot(form);
+    let resets = 0;
     return {
       isDirty: () => snapshot(form) !== base,
       reset() {
         base = snapshot(form);
+        resets++;
+      },
+      mark: () => ({ snap: snapshot(form), at: resets }),
+      /** Has anything but `control` changed since the baseline? (Lets a save
+       *  of one field settle without counting other edits made meanwhile as
+       *  saved.) A form whose controls came or went counts as changed. */
+      dirtyBesides(control) {
+        const ctrls = Array.from(form.elements || [])
+          .filter((c) => /^(INPUT|SELECT|TEXTAREA)$/.test(c.tagName))
+          .filter((c) => !/^(button|submit|reset|image)$/.test(c.type) && !c.hasAttribute('data-no-dirty'));
+        const now = JSON.parse(snapshot(form));
+        const was = JSON.parse(base);
+        if (now.length !== was.length) return true;
+        const i = ctrls.indexOf(control);
+        if (i >= 0) { now.splice(i, 1); was.splice(i, 1); }
+        return JSON.stringify(now) !== JSON.stringify(was);
+      },
+      saved(m) {
+        if (!m || m.at !== resets) return false;
+        base = m.snap;
+        resets++;
+        return true;
       },
     };
   }
@@ -1169,8 +1205,10 @@
   const drawer = {
     /**
      * Open the drawer at once: { title, subtitle, body, onClose }. Without a
-     * body it shows 'Loading…'. Returns a handle whose setBody/setTitle do
-     * nothing once this drawer has been closed or replaced.
+     * body it shows 'Loading…'. Returns a handle whose setBody/setTitle/close
+     * do nothing once this drawer has been closed or replaced. Anything that
+     * waits on the relay checks isCurrent() before it asks a question, since
+     * a question belongs to whichever drawer is open when it is asked.
      */
     open(opts) {
       bindDrawer();
@@ -1183,6 +1221,17 @@
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
+        /** Close this drawer — only if it is still the one open: a reply that
+         *  lands after it was closed or replaced must not close another. */
+        close(reason) {
+          if (handle.isCurrent()) drawer.close(reason);
+        },
+        /** Close as ✕ does — asking 'Discard changes?' first when a tracked
+         *  form is dirty — only if this is still the drawer open. Resolves
+         *  true if it closed. A drawer's own Done uses this, not close(). */
+        requestClose() {
+          return handle.isCurrent() ? drawer.requestClose() : Promise.resolve(false);
+        },
         setTitle(title, subtitle) {
           if (!handle.isCurrent()) return;
           clear(d.title);

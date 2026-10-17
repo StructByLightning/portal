@@ -327,8 +327,8 @@ test('parity: the access endpoints, over the relay’s own wiring, show capsFor'
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     const login = await fetch(`${base}/admin/login`, { redirect: 'manual' });
-    const state = /portal_admin_state=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')![1];
-    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const [, stateCookie, state] = /(portal_admin_state_[0-9a-f]{16})=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')!;
+    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `${stateCookie}=${state}` } });
     const cookie = `portal_admin_session=${/portal_admin_session=([^;]+)/.exec(cb.headers.get('set-cookie') ?? '')![1]}`;
     const get = async (path: string) => {
       const r = await fetch(base + path, { headers: { cookie } });
@@ -385,8 +385,8 @@ test('parity: a grant change answers with what the relay enforces where it was m
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     const login = await fetch(`${base}/admin/login`, { redirect: 'manual' });
-    const state = /portal_admin_state=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')![1];
-    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const [, stateCookie, state] = /(portal_admin_state_[0-9a-f]{16})=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')!;
+    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `${stateCookie}=${state}` } });
     const cookie = `portal_admin_session=${/portal_admin_session=([^;]+)/.exec(cb.headers.get('set-cookie') ?? '')![1]}`;
     const { csrf } = await (await fetch(`${base}/admin/me`, { headers: { cookie } })).json();
     const remove = async (pid: string, cid: string) => {
@@ -486,8 +486,8 @@ test('parity: the panel counts a channel’s rows as the summary counts it (lib.
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     const login = await fetch(`${base}/admin/login`, { redirect: 'manual' });
-    const state = /portal_admin_state=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')![1];
-    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const [, stateCookie, state] = /(portal_admin_state_[0-9a-f]{16})=([^;]+)/.exec(login.headers.get('set-cookie') ?? '')!;
+    const cb = await fetch(`${base}/admin/callback?code=c&state=${state}`, { redirect: 'manual', headers: { cookie: `${stateCookie}=${state}` } });
     const cookie = `portal_admin_session=${/portal_admin_session=([^;]+)/.exec(cb.headers.get('set-cookie') ?? '')![1]}`;
     const get = async (path: string) => (await fetch(base + path, { headers: { cookie } })).json();
     const summary = await get(`/admin/g/${G1}/access/summary`);

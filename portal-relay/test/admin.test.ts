@@ -9,7 +9,7 @@ import { PermissionsStore, ALL_CAPS } from '../src/permissions.js';
 import { LEVEL_CAPS } from '../src/slash.js';
 import { InviteStore } from '../src/invites.js';
 import { GuildAllowStore } from '../src/guild-allowlist.js';
-import { AdminServer, type AdminDeps, type AdminLimits } from '../src/admin/server.js';
+import { AdminServer, stateCookieName, type AdminDeps, type AdminLimits } from '../src/admin/server.js';
 import { deriveAdminGuilds } from '../src/admin/oauth.js';
 import { SessionStore } from '../src/admin/sessions.js';
 import { AuditLog } from '../src/admin/audit.js';
@@ -304,19 +304,31 @@ function parseSetCookie(res: Response, name: string): string | undefined {
   return undefined;
 }
 
+/** The OAuth state /admin/login put in its state cookie. */
+function loginState(res: Response): string | undefined {
+  for (const c of res.headers.getSetCookie?.() ?? []) {
+    const first = c.split(';')[0];
+    const eq = first.indexOf('=');
+    if (first.startsWith('portal_admin_state_') && first.slice(0, eq) === stateCookieName(first.slice(eq + 1))) return first.slice(eq + 1);
+  }
+  return undefined;
+}
+/** The Cookie header of a browser that started the sign-in for `state`. */
+const stateCookie = (state: string) => `${stateCookieName(state)}=${state}`;
+
 async function login(base: string, guilds: unknown[]): Promise<string> {
   // 1. /login → state cookie + redirect carrying the same state.
   const loginRes = await fetch(`${base}/admin/login`, { redirect: 'manual' });
   assert.equal(loginRes.status, 302);
-  const stateCookie = parseSetCookie(loginRes, 'portal_admin_state');
-  assert.ok(stateCookie, 'state cookie set');
+  const state = loginState(loginRes);
+  assert.ok(state, 'state cookie set');
   const loc = new URL(loginRes.headers.get('location')!);
-  assert.equal(loc.searchParams.get('state'), stateCookie);
+  assert.equal(loc.searchParams.get('state'), state);
 
   // 2. /callback with matching state → session cookie.
   const cbRes = await fetch(
-    `${base}/admin/callback?code=abc&state=${stateCookie}`,
-    { redirect: 'manual', headers: { cookie: `portal_admin_state=${stateCookie}` } },
+    `${base}/admin/callback?code=abc&state=${state}`,
+    { redirect: 'manual', headers: { cookie: stateCookie(state!) } },
   );
   assert.equal(cbRes.status, 302, 'callback redirects on success');
   const session = parseSetCookie(cbRes, 'portal_admin_session');
@@ -942,9 +954,10 @@ test('integration: tampered oauth state is rejected', async () => {
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     // Cookie and query state disagree → back on the panel, no session minted.
+    const real = loginState(await fetch(`${base}/admin/login`, { redirect: 'manual' }))!;
     const res = await fetch(
-      `${base}/admin/callback?code=abc&state=forged`,
-      { redirect: 'manual', headers: { cookie: 'portal_admin_state=real' } },
+      `${base}/admin/callback?code=abc&state=${'B'.repeat(43)}`,
+      { redirect: 'manual', headers: { cookie: stateCookie(real) } },
     );
     assert.equal(res.status, 302, 'lands back on the panel');
     assert.equal(res.headers.get('location'), '/done?login_error=mismatch');
@@ -1085,8 +1098,8 @@ test('login: someone who administers no guild the relay serves gets no session',
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     const loginRes = await fetch(`${base}/admin/login`, { redirect: 'manual' });
-    const state = parseSetCookie(loginRes, 'portal_admin_state')!;
-    const cb = await fetch(`${base}/admin/callback?code=abc&state=${state}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${state}` } });
+    const state = loginState(loginRes)!;
+    const cb = await fetch(`${base}/admin/callback?code=abc&state=${state}`, { redirect: 'manual', headers: { cookie: stateCookie(state) } });
     assert.equal(cb.status, 302, 'lands back on the panel with a reason');
     assert.match(cb.headers.get('location') ?? '', /login_error=not_admin$/);
     assert.equal(parseSetCookie(cb, 'portal_admin_session'), undefined, 'no session cookie');
@@ -1964,8 +1977,8 @@ test('a refused sign-in puts login_error in the query even when postLoginUrl has
   const base = `http://127.0.0.1:${server.boundPort}`;
   try {
     const l = await fetch(`${base}/admin/login`, { redirect: 'manual' });
-    const st = parseSetCookie(l, 'portal_admin_state')!;
-    const cb = await fetch(`${base}/admin/callback?code=abc&state=${st}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${st}` } });
+    const st = loginState(l)!;
+    const cb = await fetch(`${base}/admin/callback?code=abc&state=${st}`, { redirect: 'manual', headers: { cookie: stateCookie(st) } });
     assert.equal(cb.status, 302);
     assert.equal(cb.headers.get('location'), '/panel?login_error=not_admin#start');
   } finally {
