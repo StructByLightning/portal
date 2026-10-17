@@ -12,7 +12,11 @@
  *   busy, onSubmit     one request per click: disable, aria-busy, relabel
  *   confirmDialog      an in-page confirm (replaces window.confirm)
  *   levelControl       Read | Write | Full | Custom… (uses PA.lib)
+ *   capsEditor         the capabilities one by one (inside Custom…)
  *   checkList, radioGroup   checkbox lists and radio rows
+ *   typeahead          an ARIA combobox over an async source, one value or chips
+ *   levelPill, directGrantControl   a persona's access in a channel: what it can
+ *                      do, and its direct grant there, changed in place
  *   copyText           clipboard, falling back to selecting the text
  *   modal              the shared modal layer (focus trap, Esc)
  *   dirtyTracker       has this form changed since it was drawn or saved?
@@ -137,10 +141,12 @@
 
   /**
    * Show a toast in #toasts. kind: 'ok' (default) | 'err' | 'info'. Errors are
-   * role=alert and sticky with a ✕; the rest hide after about 6 s unless
-   * sticky is set. While the drawer is open, Tab reaches the ✕ after the
-   * drawer's last control, and Esc on a toast dismisses it. Returns
-   * { node, dismiss }.
+   * role=alert and sticky with a ✕; the rest hide after about 6 s (opts.ms)
+   * unless sticky is set. opts.action { label, run, ariaLabel } adds a button
+   * (Undo): pressing it runs it and takes the toast down; while the pointer
+   * or focus is on such a toast it doesn't fade. While the drawer is open,
+   * Tab reaches the toast's buttons after the drawer's last control, and Esc
+   * on a toast dismisses it. Returns { node, dismiss }.
    */
   function toast(msg, opts) {
     const o = opts || {};
@@ -154,6 +160,24 @@
       el('span', { class: 'toast-msg', id: msgId }, [toText(msg)]),
     ]);
     let timer = null;
+    if (o.action && typeof o.action.run === 'function') {
+      const act = el('button', { class: 'toast-action', text: o.action.label || 'Undo', 'aria-label': o.action.ariaLabel || null, 'aria-describedby': msgId });
+      act.addEventListener('click', () => {
+        dismiss();
+        o.action.run();
+      });
+      node.appendChild(act);
+      // Time to reach it: it doesn't fade while it is pointed at or focused.
+      const hold = () => clearTimeout(timer);
+      const resume = () => {
+        clearTimeout(timer);
+        if (!sticky && node.parentNode) timer = setTimeout(dismiss, o.ms || TOAST_MS);
+      };
+      node.addEventListener('mouseenter', hold);
+      node.addEventListener('mouseleave', resume);
+      node.addEventListener('focusin', hold);
+      node.addEventListener('focusout', resume);
+    }
     const dismiss = () => {
       clearTimeout(timer);
       if (!node.parentNode) return;
@@ -195,7 +219,9 @@
    * and err() also show a toast (pass { toast: false } to skip it). The toast
    * mirrors the line: a newer result, or clear(), takes down the toast of the
    * one before, so a sticky error does not stay up once its section has
-   * reported something newer (say, the same form then succeeded).
+   * reported something newer (say, the same form then succeeded). ok() and
+   * err() return that toast ({ node, dismiss }, or null), so an Undo it
+   * carries can be taken down on its own once it no longer applies.
    */
   function statusLine(container) {
     const node = el('p', { class: 'status-line hidden', role: 'status' });
@@ -210,13 +236,17 @@
       node.className = 'status-line status-' + kind;
       clear(node);
       for (const n of toNodes(msg)) node.appendChild(n);
-      if (!o || o.toast !== false) mirror = toast((o && o.toastText) || toText(msg), { kind });
+      // o.action / o.ms: the toast's button (Undo) and how long it stays.
+      if (!o || o.toast !== false) mirror = toast((o && o.toastText) || toText(msg), { kind, action: o && o.action, ms: o && o.ms });
+      return mirror;
     }
     return {
       node,
       ok: (msg, o) => set('ok', msg, o),
       err: (msg, o) => set('err', msg, o),
       info: (msg, o) => set('info', msg, Object.assign({ toast: false }, o)),
+      /** Take down this line's toast (its Undo with it); the line stays. */
+      dismissToast: unmirror,
       clear() {
         unmirror();
         node.className = 'status-line hidden';
@@ -231,13 +261,29 @@
   // The button busy() took focus from, while its work runs: disabling it
   // dropped focus to <body>, so a dialog the work opens returns there.
   let busyFocus = null;
+  // On or off, as setDisabled() asked while busy() held the button: what it
+  // returns to when the work settles, instead of its state before the click.
+  const restDisabled = new WeakMap();
+
+  /**
+   * Turn `button` on or off. While busy() holds it, this is the state it
+   * returns to when the work is done (busy() would otherwise put back the one
+   * from before the click): a form whose work changes what can be sent —
+   * picks cleared after a save — sets its button through this.
+   */
+  function setDisabled(button, disabled) {
+    if (busyButtons.has(button)) restDisabled.set(button, !!disabled);
+    else button.disabled = !!disabled;
+  }
 
   /**
    * Lock `button` while `work` (a promise, or a function returning one) runs:
    * disabled, aria-busy, relabelled ('Saving…' unless `label` is given).
-   * Restores it when the work settles. Returns the work's promise.
+   * Restores it when the work settles (off, if the work turned it off with
+   * setDisabled()). Returns the work's promise. Focus the button had comes
+   * back to it — or, the button left off, to `offFocus()` when given.
    */
-  function busy(button, work, label) {
+  function busy(button, work, label, offFocus) {
     const prev = { text: button.textContent, disabled: button.disabled };
     // Disabling a focused button drops focus to <body>; hand it back after.
     const hadFocus = document.activeElement === button;
@@ -255,11 +301,14 @@
     const done = () => {
       busyButtons.delete(button);
       if (busyFocus === button) busyFocus = null;
-      button.disabled = prev.disabled;
+      button.disabled = restDisabled.has(button) ? restDisabled.get(button) : prev.disabled;
+      restDisabled.delete(button);
       button.removeAttribute('aria-busy');
       button.textContent = prev.text;
       const a = document.activeElement;
-      if (hadFocus && button.isConnected && !button.disabled && (!a || a === document.body || !a.isConnected)) button.focus();
+      if (!hadFocus || !button.isConnected || (a && a !== document.body && a.isConnected)) return;
+      if (!button.disabled) button.focus();
+      else if (offFocus) focusFirst([offFocus()]);
     };
     return p.then(
       (v) => {
@@ -281,6 +330,8 @@
    * Submit `form` through `run` (Enter or the submit button), one at a time:
    * while a submission is pending, further submits are ignored and the submit
    * button is locked with busy(). `run` reports its own result and errors.
+   * A `run` that leaves nothing to send turns the button off with
+   * setDisabled(); focus the button had then goes to the form's first field.
    * opts.settled() runs once the button is back as it was: a form whose
    * submit button is on only when it is complete says so again then (it can
    * have been edited while the submission was at work).
@@ -294,7 +345,8 @@
       if (pending || (button && (isBusy(button) || button.disabled))) return;
       pending = true;
       const work = () => run(e);
-      const p = button ? busy(button, work, o.busyLabel) : Promise.resolve().then(work);
+      const firstField = () => focusables(form).find((n) => n !== button) || null;
+      const p = button ? busy(button, work, o.busyLabel, firstField) : Promise.resolve().then(work);
       p.catch((err) => console.error('[portal-admin]', err)).then(() => {
         pending = false;
         if (o.settled) o.settled();
@@ -486,11 +538,69 @@
     }
     const help = el('p', { class: 'field-hint level-help' });
 
+    const editor = capsEditor({ hidden: true });
+    const custom = editor.node;
+
+    const node = el('div', { class: 'level-control' }, [radioRow, help, custom]);
+
+    const kind = () => kinds.find((k) => radios[k].checked) || null;
+    function value() {
+      const k = kind();
+      if (!k) return [];
+      return k === 'custom' ? editor.value() : lib.LEVEL_CAPS[k].slice();
+    }
+    function sync() {
+      const k = kind();
+      custom.classList.toggle('hidden', k !== 'custom');
+      const v = value();
+      editor.syncWarn(k === 'custom');
+      help.textContent = !k ? '' : k === 'custom' ? (v.length ? lib.capsSummary(v) + '.' : 'Tick at least one capability.') : lib.LEVEL_HELP[k];
+      help.classList.toggle('hidden', !k);
+    }
+    function set(caps) {
+      const l = lib.levelOf(caps);
+      for (const k of kinds) radios[k].checked = false;
+      if (l.level === 'custom' && allowCustom) radios.custom.checked = true;
+      else if (radios[l.level]) radios[l.level].checked = true;
+      editor.set(caps || []);
+      sync();
+    }
+
+    for (const k of kinds) {
+      radios[k].addEventListener('change', () => {
+        // A preset fills the boxes, so Custom… starts from what was picked.
+        if (k !== 'custom' && radios[k].checked) editor.set(lib.LEVEL_CAPS[k]);
+        sync();
+        emit(listeners, value());
+      });
+    }
+    editor.onChange(() => {
+      sync();
+      emit(listeners, value());
+    });
+    set(o.value || []);
+    return { node, value, level: kind, set, onChange: (fn) => listeners.push(fn) };
+  }
+
+  /**
+   * The capabilities one by one (inside Custom…), grouped as in
+   * PA.lib.CAP_GROUPS: ticking any Write or Moderation capability ticks View
+   * and History too, and leaving View unticked while others are ticked shows
+   * 'Without View this only works where a role already gives view.'
+   *   opts: { value (caps), hidden (start hidden) }
+   * Returns { node, value(), set(caps), onChange(fn), syncWarn(active) }:
+   * syncWarn(false) hides the warning while the boxes aren't in use.
+   * onChange fires on the admin's ticks, not on set().
+   */
+  function capsEditor(opts) {
+    const o = opts || {};
+    const lib = PA.lib;
+    const listeners = [];
     const boxes = {};
-    const custom = el('div', { class: 'caps-groups hidden' });
+    const node = el('div', { class: 'caps-groups' + (o.hidden ? ' hidden' : '') });
     for (const g of lib.CAP_GROUPS) {
       const labelId = uid('caps');
-      custom.appendChild(el('div', { class: 'cap-group', role: 'group', 'aria-labelledby': labelId }, [
+      node.appendChild(el('div', { class: 'cap-group', role: 'group', 'aria-labelledby': labelId }, [
         el('div', { class: 'cap-group-label', id: labelId, text: g.label }),
         el('div', { class: 'cap-chips' }, g.caps.map((c) => {
           const cb = el('input', { type: 'checkbox', value: c });
@@ -500,59 +610,30 @@
       ]));
     }
     const warn = el('p', { class: 'warn-line hidden', text: 'Without View this only works where a role already gives view.' });
-    custom.appendChild(warn);
-
-    const node = el('div', { class: 'level-control' }, [radioRow, help, custom]);
-
-    const kind = () => kinds.find((k) => radios[k].checked) || null;
-    const ticked = () => lib.ALL_CAPS.filter((c) => boxes[c] && boxes[c].checked);
-    function value() {
-      const k = kind();
-      if (!k) return [];
-      return k === 'custom' ? ticked() : lib.LEVEL_CAPS[k].slice();
-    }
-    function setBoxes(caps) {
-      const set = new Set(caps);
-      for (const c of Object.keys(boxes)) boxes[c].checked = set.has(c);
-    }
-    function sync() {
-      const k = kind();
-      custom.classList.toggle('hidden', k !== 'custom');
+    node.appendChild(warn);
+    const value = () => lib.ALL_CAPS.filter((c) => boxes[c] && boxes[c].checked);
+    function syncWarn(active) {
       const v = value();
-      warn.classList.toggle('hidden', !(k === 'custom' && v.length && !boxes.VIEW_CHANNEL.checked));
-      help.textContent = !k ? '' : k === 'custom' ? (v.length ? lib.capsSummary(v) + '.' : 'Tick at least one capability.') : lib.LEVEL_HELP[k];
-      help.classList.toggle('hidden', !k);
+      warn.classList.toggle('hidden', !(active !== false && v.length && boxes.VIEW_CHANNEL && !boxes.VIEW_CHANNEL.checked));
     }
     function set(caps) {
-      const l = lib.levelOf(caps);
-      for (const k of kinds) radios[k].checked = false;
-      if (l.level === 'custom' && allowCustom) radios.custom.checked = true;
-      else if (radios[l.level]) radios[l.level].checked = true;
-      setBoxes(caps || []);
-      sync();
-    }
-
-    for (const k of kinds) {
-      radios[k].addEventListener('change', () => {
-        // A preset fills the boxes, so Custom… starts from what was picked.
-        if (k !== 'custom' && radios[k].checked) setBoxes(lib.LEVEL_CAPS[k]);
-        sync();
-        emit(listeners, value());
-      });
+      const s = new Set(caps || []);
+      for (const c of Object.keys(boxes)) boxes[c].checked = s.has(c);
+      syncWarn();
     }
     const viewImplied = new Set(lib.CAP_GROUPS.filter((g) => g.key === 'write' || g.key === 'moderation').flatMap((g) => g.caps));
     for (const c of Object.keys(boxes)) {
       boxes[c].addEventListener('change', () => {
         if (boxes[c].checked && viewImplied.has(c)) {
-          boxes.VIEW_CHANNEL.checked = true;
-          boxes.READ_HISTORY.checked = true;
+          if (boxes.VIEW_CHANNEL) boxes.VIEW_CHANNEL.checked = true;
+          if (boxes.READ_HISTORY) boxes.READ_HISTORY.checked = true;
         }
-        sync();
+        syncWarn();
         emit(listeners, value());
       });
     }
     set(o.value || []);
-    return { node, value, level: kind, set, onChange: (fn) => listeners.push(fn) };
+    return { node, value, set, onChange: (fn) => listeners.push(fn), syncWarn };
   }
 
   /**
@@ -627,6 +708,532 @@
         for (const r of radios) r.checked = r.value === v;
       },
       onChange: (fn) => listeners.push(fn),
+    };
+  }
+
+  // ── Type-ahead ────────────────────────────────────────────────────────────
+
+  /**
+   * A type-ahead: an ARIA combobox (role=combobox on the text field, a
+   * role=listbox popup, aria-activedescendant) over an async source, picking
+   * one value or several (chips).
+   *   opts: { label (names the list), ariaLabel (names the field when no
+   *           <label for> does), placeholder, multiple
+   *           (default true), max, name (of the hidden inputs that hold the
+   *           picks), source(q) → Promise<[{ value, label, hint, tag, group,
+   *           disabled, title }]>, debounce (ms, default 150), empty,
+   *           expand(item) → [items] | null (a pick that stands for several:
+   *           its items are picked instead — a category's channels),
+   *           expanded(item, picked, fresh) (after such a pick: how many of
+   *           the `fresh` ones — not picked before — fit under `max`) }
+   * At `max` picks a visible note says so (and the live region): a pick
+   * past it does nothing else.
+   * Options come grouped in the order their groups first appear. ↑/↓ move,
+   * Enter picks, Esc closes the list (the next Esc is the drawer's), Tab
+   * leaves it, Backspace in an empty field removes the last chip. Typing asks
+   * the source after a pause; only the latest answer is shown. Each pick sits
+   * in a hidden input named `name`, so a form's dirty tracking counts it; the
+   * typed text doesn't count (it is a search).
+   * Returns { node, input, values(), items(), set(items), clear(),
+   * query(text) (type `text` into the field and ask), onChange(fn), close() };
+   * onChange fires on the admin's picks and removals.
+   */
+  function typeahead(opts) {
+    const o = opts || {};
+    const multiple = o.multiple !== false;
+    const max = o.max || (multiple ? Infinity : 1);
+    const listId = uid('ta-list');
+    const input = el('input', {
+      type: 'text', class: 'ta-input', role: 'combobox', 'aria-autocomplete': 'list', 'aria-expanded': 'false',
+      'aria-controls': listId, autocomplete: 'off', spellcheck: 'false', placeholder: o.placeholder || null,
+      'aria-label': o.ariaLabel || null, 'data-no-dirty': true,
+    });
+    const chips = el('span', { class: 'ta-chips' });
+    const list = el('div', { id: listId, class: 'ta-list hidden', role: 'listbox', 'aria-label': o.label || 'Suggestions' });
+    const live = el('span', { class: 'visually-hidden', role: 'status' });
+    const limitText = 'At most ' + max + ' can be picked. Remove one to pick another.';
+    const limitNote = el('p', { class: 'field-hint ta-limit hidden', text: limitText });
+    const node = el('div', { class: 'typeahead' }, [el('div', { class: 'ta-box' }, [chips, input]), list, live, limitNote]);
+    // A press anywhere in the list (its scrollbar too) keeps focus in the field.
+    list.addEventListener('mousedown', (e) => e.preventDefault());
+    const listeners = [];
+    let picked = [];
+    let options = []; // the options that can be picked: { item, node }
+    let active = -1;
+    let seq = 0;
+    let timer = null;
+    let open = false;
+
+    function setActive(i) {
+      const was = options[active];
+      if (was) {
+        was.node.setAttribute('aria-selected', 'false');
+        was.node.classList.remove('active');
+      }
+      active = i;
+      const cur = options[i];
+      if (cur) {
+        cur.node.setAttribute('aria-selected', 'true');
+        cur.node.classList.add('active');
+        input.setAttribute('aria-activedescendant', cur.node.id);
+        if (typeof cur.node.scrollIntoView === 'function') cur.node.scrollIntoView({ block: 'nearest' });
+      } else input.removeAttribute('aria-activedescendant');
+    }
+    function setOpen(v) {
+      open = v;
+      list.classList.toggle('hidden', !v);
+      input.setAttribute('aria-expanded', v ? 'true' : 'false');
+      if (!v) setActive(-1);
+    }
+    function draw(items, failed) {
+      clear(list);
+      options = [];
+      active = -1;
+      const taken = new Set(picked.map((p) => p.value));
+      const shown = (items || []).filter((it) => !taken.has(it.value));
+      if (!shown.length) {
+        const t = failed ? 'Couldn’t load suggestions. Type again to retry.' : o.empty || 'No match.';
+        list.appendChild(el('div', { class: 'ta-empty muted', role: 'presentation', text: t }));
+        live.textContent = t;
+        return;
+      }
+      const groups = [];
+      const byGroup = new Map();
+      for (const it of shown) {
+        const g = it.group || '';
+        if (!byGroup.has(g)) {
+          byGroup.set(g, []);
+          groups.push(g);
+        }
+        byGroup.get(g).push(it);
+      }
+      for (const g of groups) {
+        let parent = list;
+        if (g) {
+          const gid = uid('ta-group');
+          parent = el('div', { class: 'ta-group', role: 'group', 'aria-labelledby': gid }, [el('div', { id: gid, class: 'ta-group-label', role: 'presentation', text: g })]);
+          list.appendChild(parent);
+        }
+        for (const it of byGroup.get(g)) {
+          const opt = el('div', {
+            id: uid('ta-opt'), class: 'ta-option' + (it.disabled ? ' disabled' : ''), role: 'option', 'aria-selected': 'false',
+            'aria-disabled': it.disabled ? 'true' : null, title: it.title || null,
+          }, [
+            el('span', { class: 'ta-label', text: it.label }),
+            it.hint ? el('span', { class: 'ta-hint', text: it.hint }) : null,
+            it.tag ? el('span', { class: 'badge ta-tag', text: it.tag }) : null,
+          ]);
+          if (!it.disabled) {
+            const i = options.length;
+            options.push({ item: it, node: opt });
+            opt.addEventListener('click', () => pick(it));
+            opt.addEventListener('mousemove', () => { if (active !== i) setActive(i); });
+          }
+          parent.appendChild(opt);
+        }
+      }
+      live.textContent = options.length === 1 ? '1 result' : options.length + ' results';
+      setActive(options.length ? 0 : -1);
+    }
+    function search() {
+      clearTimeout(timer);
+      const mine = ++seq;
+      const q = input.value.trim();
+      timer = setTimeout(async () => {
+        timer = null;
+        let items = null;
+        try { items = await o.source(q); } catch { items = null; }
+        if (mine !== seq || document.activeElement !== input) return;
+        draw(items, items === null);
+        setOpen(true);
+      }, o.debounce == null ? 150 : o.debounce);
+    }
+    function drawChips() {
+      limitNote.classList.toggle('hidden', !(multiple && max !== Infinity && picked.length >= max));
+      clear(chips);
+      for (const p of picked) {
+        const hidden = el('input', { type: 'hidden', name: o.name || null, value: p.value });
+        if (!multiple) {
+          chips.appendChild(hidden);
+          continue;
+        }
+        const label = 'Remove ' + p.label;
+        const x = el('button', { class: 'x', text: '✕', 'aria-label': label, title: label });
+        x.addEventListener('click', () => {
+          remove(p.value);
+          input.focus();
+        });
+        chips.appendChild(el('span', { class: 'tag', title: p.title || null }, [el('span', { text: p.label }), hidden, x]));
+      }
+    }
+    function pick(it) {
+      const several = multiple && o.expand ? o.expand(it) : null;
+      if (several) {
+        const taken = new Set(picked.map((p) => p.value));
+        const fresh = several.filter((x) => !taken.has(x.value));
+        const room = Math.max(0, max - picked.length);
+        const added = Math.min(room, fresh.length);
+        picked.push(...fresh.slice(0, room));
+        input.value = '';
+        live.textContent = fresh.length > room
+          ? 'Picked ' + room + ' of ' + fresh.length + ': at most ' + max + ' can be picked.'
+          : fresh.length + ' picked from ' + it.label + '.';
+        if (o.expanded) o.expanded(it, added, fresh.length);
+      } else if (multiple) {
+        if (picked.length >= max) {
+          // Said where it is seen, not only to a screen reader; the list
+          // closes so the pick that did nothing doesn't look pending.
+          live.textContent = limitText;
+          limitNote.classList.remove('hidden');
+          seq++;
+          clearTimeout(timer);
+          setOpen(false);
+          return;
+        }
+        picked.push(it);
+        input.value = '';
+        live.textContent = it.label + ' picked.';
+      } else {
+        picked = [it];
+        input.value = it.label;
+      }
+      drawChips();
+      seq++;
+      clearTimeout(timer);
+      setOpen(false);
+      input.focus();
+      emit(listeners, values());
+    }
+    function remove(value) {
+      const before = picked.length;
+      picked = picked.filter((p) => p.value !== value);
+      if (picked.length === before) return;
+      drawChips();
+      emit(listeners, values());
+    }
+    function values() {
+      return picked.map((p) => p.value);
+    }
+    input.addEventListener('input', () => {
+      // One value, typed over: it is no longer picked.
+      if (!multiple && picked.length && input.value !== picked[0].label) {
+        picked = [];
+        drawChips();
+        emit(listeners, values());
+      }
+      search();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (!open) search();
+        else if (options.length) setActive((active + 1) % options.length);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (open && options.length) setActive((active - 1 + options.length) % options.length);
+      } else if (e.key === 'Enter') {
+        // While the list is open, Enter picks — it never submits the form.
+        if (open) {
+          e.preventDefault();
+          if (options[active]) pick(options[active].item);
+        }
+      } else if (e.key === 'Escape') {
+        if (open) {
+          e.preventDefault();
+          e.stopPropagation();
+          seq++;
+          setOpen(false);
+        }
+      } else if (e.key === 'Backspace') {
+        if (multiple && !input.value && picked.length) {
+          e.preventDefault();
+          const last = picked[picked.length - 1];
+          remove(last.value);
+          live.textContent = last.label + ' removed.';
+        }
+      } else if (e.key === 'Tab') setOpen(false);
+    });
+    input.addEventListener('blur', () => {
+      clearTimeout(timer);
+      seq++;
+      setOpen(false);
+    });
+    return {
+      node,
+      input,
+      values,
+      items: () => picked.slice(),
+      set(items) {
+        picked = (items || []).slice(0, max === Infinity ? undefined : max);
+        if (!multiple) input.value = picked.length ? picked[0].label : '';
+        drawChips();
+      },
+      clear() {
+        picked = [];
+        input.value = '';
+        drawChips();
+      },
+      query(text) {
+        input.value = text || '';
+        search();
+      },
+      close() {
+        seq++;
+        setOpen(false);
+      },
+      onChange: (fn) => listeners.push(fn),
+    };
+  }
+
+  // ── Access, as a channel or persona drawer shows it ───────────────────────
+
+  /** A persona's 'Can do here' pill ('Write', 'Write +1 (bot-limited)', '—'),
+   *  from a row of the relay's access read; the tooltip says it in words. */
+  function levelPill(row, where) {
+    const p = PA.lib.pillText(row, where);
+    return el('span', { class: 'pill pill-' + p.level + (p.limited ? ' pill-limited' : ''), title: p.title, text: p.text });
+  }
+
+  /** Where Custom… starts for a direct grant `value`: what is set, or
+   *  Write when nothing (or a block) is. */
+  function customStart(value) {
+    return value && value.length ? value.slice() : PA.lib.LEVEL_CAPS.write.slice();
+  }
+
+  /**
+   * A persona's direct grant in one channel, changed in place:
+   * [— | Read | Write | Full | Custom… | Block guild-wide here]. A pick
+   * applies at once (no Save): opts.apply(caps | null) → Promise<boolean>,
+   * true once it is saved — otherwise the control goes back to what it was.
+   * Custom… opens the capabilities inline, with Apply and Cancel. 'Block
+   * guild-wide here' ([]) is offered when opts.canBlock, or when it is what
+   * is set.
+   *
+   * A step from the keyboard is held until it is committed: in Chrome on
+   * Windows and Linux, and in Firefox, ↑/↓ on a closed select change its
+   * value (and fire 'change') at once, so going from — to Write would
+   * otherwise save Read on the way. Enter, or leaving the control, applies
+   * what it shows; Esc puts back what is set (inside a drawer too: the
+   * drawer's own Esc waits for the next one). A pick with the mouse, or
+   * from the open list, applies at once.
+   * The Custom… editor's ticks are the admin's until Apply or Cancel: the
+   * owner keeps them (opts.onEditing) and hands them back when it draws the
+   * row again (opts.editing), so a redraw never drops them, and counts them
+   * as unsaved once they differ from where the editor started.
+   *   opts: { value (caps | null), canBlock, label (the select's name), apply,
+   *           key (data-key for the select — and, from it, the editor's
+   *           boxes and buttons — so a redraw can give focus back),
+   *           busy (drawn while a change to it is still being saved
+   *           elsewhere: off, and aria-busy, until setBusy(false)),
+   *           removeOnly (a channel the panel can't give access on: what is
+   *           set, or — to remove it; nothing else),
+   *           editing ({ caps, start }: a Custom… edit open in this row
+   *           before it was drawn again — reopened as it was),
+   *           onEditing (fn({ caps, start } | null): the open Custom…
+   *           editor, as it opens and as its boxes are ticked; null once it
+   *           closes — applied, cancelled, or another pick made) }
+   * Returns { node, select, value(), editing(), set(value, canBlock,
+   * keepEditing), setBusy(on) }.
+   */
+  function directGrantControl(opts) {
+    const lib = PA.lib;
+    let value = opts.value == null ? null : opts.value.slice();
+    let canBlock = !!opts.canBlock;
+    let busyNow = false;
+    let held = false;     // a keyboard step shown, not applied yet
+    let stepping = false; // a step key was just pressed: its 'change' is held
+    let stepTimer = null;
+    let editing = null;   // the open Custom… editor: { caps, start }
+    const label = opts.label || 'Direct grant';
+    const select = el('select', { class: 'dg-select', 'aria-label': label, 'data-no-dirty': true, 'data-key': opts.key || null });
+    const edit = el('button', { class: 'btn btn-sm btn-ghost hidden', text: 'Edit…', 'aria-label': 'Edit capabilities — ' + label });
+    const heldHint = el('span', { class: 'field-hint dg-held hidden', text: 'Enter to apply · Esc to cancel' });
+    const editorBox = el('div', { class: 'dg-custom hidden' });
+    const node = el('div', { class: 'dg' }, [el('div', { class: 'dg-row' }, [select, edit, heldHint]), editorBox]);
+
+    function setHeld(on) {
+      held = on;
+      heldHint.classList.toggle('hidden', !on);
+      // While a step is held, Esc is this control's (it puts back what is
+      // set): the drawer's Esc, which runs first, leaves it to it.
+      if (on) select.setAttribute('data-esc-own', 'true');
+      else select.removeAttribute('data-esc-own');
+    }
+    function fill() {
+      clear(select);
+      setHeld(false);
+      const cur = lib.directValue(value);
+      const opt = (v, text, title) => el('option', { value: v, text, title: title || null });
+      if (opts.removeOnly) {
+        select.appendChild(opt('', '—', 'Remove the direct grant here'));
+        if (cur) select.appendChild(opt('keep', cur === 'block' ? 'Blocked guild-wide here' : cur === 'custom' ? lib.customOptionText(value) : lib.LEVEL_NAME[cur], lib.capsTitle(value || [])));
+        select.value = cur ? 'keep' : '';
+        select.disabled = !cur || busyNow;
+        edit.classList.add('hidden');
+        return;
+      }
+      select.appendChild(opt('', '—', 'No direct grant here'));
+      for (const k of lib.LEVELS) select.appendChild(opt(k, lib.LEVEL_NAME[k], lib.LEVEL_HELP[k]));
+      select.appendChild(opt('custom', cur === 'custom' ? lib.customOptionText(value) : 'Custom…', cur === 'custom' ? lib.capsTitle(value) : 'Pick the capabilities one by one.'));
+      if (canBlock || cur === 'block') select.appendChild(opt('block', 'Block guild-wide here', 'Blocks guild-wide and persona-default access in this channel. Roles still apply.'));
+      select.value = cur;
+      edit.classList.toggle('hidden', cur !== 'custom');
+    }
+    function closeEditor() {
+      clear(editorBox);
+      editorBox.classList.add('hidden');
+      if (!editing) return;
+      editing = null;
+      if (opts.onEditing) opts.onEditing(null);
+    }
+    /** Open Custom…: from what is set (Write when nothing is), or — `was`,
+     *  an edit made before this row was drawn again — as it was left. */
+    function openEditor(was) {
+      closeEditor();
+      const start = was && Array.isArray(was.start) ? was.start.slice() : customStart(value);
+      // The grant this edit was started over: Apply sends it as `expect`, so
+      // a grant someone changed meanwhile is refused, not overwritten — even
+      // when the row has been drawn again since with the newer grant.
+      const has = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+      const base = has(was, 'base') ? (was.base == null ? null : was.base.slice()) : value == null ? null : value.slice();
+      const editor = capsEditor({ value: was && Array.isArray(was.caps) ? was.caps : start });
+      const keyed = (n, k) => {
+        if (opts.key) n.setAttribute('data-key', opts.key + ':' + k);
+        return n;
+      };
+      for (const cb of editor.node.querySelectorAll('input')) keyed(cb, cb.value);
+      const baseCopy = () => (base == null ? null : base.slice());
+      const report = () => {
+        editing = { caps: editor.value(), start: start.slice(), base: baseCopy() };
+        if (opts.onEditing) opts.onEditing({ caps: editing.caps.slice(), start: start.slice(), base: baseCopy() });
+      };
+      editor.onChange(report);
+      const apply = keyed(el('button', { class: 'btn btn-sm btn-primary', text: 'Apply' }), 'apply');
+      const cancel = keyed(el('button', { class: 'btn btn-sm', text: 'Cancel' }), 'cancel');
+      const why = el('span', { class: 'field-hint', role: 'status' });
+      apply.addEventListener('click', () => {
+        const caps = editor.value();
+        if (!caps.length) {
+          why.textContent = 'Tick at least one capability, or pick —.';
+          return;
+        }
+        run(caps, { expect: baseCopy() });
+      });
+      cancel.addEventListener('click', () => {
+        closeEditor();
+        fill();
+        select.focus();
+      });
+      editorBox.appendChild(el('div', { class: 'dg-editor', role: 'group', 'aria-label': 'Capabilities — ' + label }, [
+        editor.node, el('div', { class: 'inline' }, [apply, cancel, why]),
+      ]));
+      editorBox.classList.remove('hidden');
+      // Reopened as it was, the owner has it already; opened now, it is told.
+      if (was) editing = { caps: editor.value(), start: start.slice(), base: baseCopy() };
+      else report();
+    }
+    async function run(next, meta) {
+      if (busyNow) return;
+      busyNow = true;
+      const hadFocus = node.contains(document.activeElement);
+      // As busy() does for a button: a confirm the change asks gives focus
+      // back here, once the change is done.
+      busyButtons.add(select);
+      if (hadFocus) busyFocus = select;
+      select.disabled = true;
+      edit.disabled = true;
+      node.setAttribute('aria-busy', 'true');
+      let ok = false;
+      try { ok = await opts.apply(next, meta); } catch (e) { console.error('[portal-admin]', e); ok = false; }
+      busyButtons.delete(select);
+      if (busyFocus === select) busyFocus = null;
+      busyNow = false;
+      node.removeAttribute('aria-busy');
+      select.disabled = false;
+      edit.disabled = false;
+      if (ok) {
+        value = next == null ? null : next.slice();
+        closeEditor();
+      }
+      fill();
+      // Turning it off dropped focus: give it back (if it is still on the page).
+      const a = document.activeElement;
+      if (hadFocus && select.isConnected && (!a || a === document.body || !a.isConnected)) select.focus();
+    }
+    /** Apply what the select shows (a pick, or a held step committed). */
+    function commit() {
+      setHeld(false);
+      const v = select.value;
+      if (v === 'custom') {
+        openEditor();
+        return;
+      }
+      if (v === 'keep' || v === lib.directValue(value)) return; // back where it was: nothing to send
+      closeEditor();
+      run(v === '' ? null : v === 'block' ? [] : lib.LEVEL_CAPS[v].slice());
+    }
+    const STEP_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
+    select.addEventListener('keydown', (e) => {
+      const typed = typeof e.key === 'string' && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+      if (STEP_KEYS.includes(e.key) || typed) {
+        // The 'change' a step fires comes at once (in the same task); one
+        // that comes later is a pick from the open list.
+        stepping = true;
+        clearTimeout(stepTimer);
+        stepTimer = setTimeout(() => { stepping = false; }, 100);
+      } else if (e.key === 'Enter' && held) {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape' && held) {
+        e.preventDefault();
+        e.stopPropagation(); // the drawer's Esc is the next one
+        fill(); // not held any more: leaving the control now applies nothing
+      }
+    });
+    select.addEventListener('blur', () => { if (held) commit(); });
+    select.addEventListener('change', () => {
+      if (stepping) {
+        setHeld(true);
+        return;
+      }
+      commit();
+    });
+    edit.addEventListener('click', () => openEditor(null));
+    if (opts.busy) {
+      busyNow = true;
+      select.disabled = true;
+      edit.disabled = true;
+      node.setAttribute('aria-busy', 'true');
+    }
+    fill();
+    if (opts.busy) select.disabled = true;
+    if (opts.editing && !opts.removeOnly) {
+      openEditor(opts.editing);
+      select.value = 'custom'; // as it read when Custom… was picked
+    }
+    return {
+      node,
+      select,
+      value: () => (value == null ? null : value.slice()),
+      /** The open Custom… editor ({ caps, start }), or null. */
+      editing: () => (editing ? { caps: editing.caps.slice(), start: editing.start.slice(), base: editing.base == null ? null : editing.base.slice() } : null),
+      /** What is set is now `v`. An open Custom… editor closes, unless
+       *  `keepEditing` (a change that wasn't made leaves the admin's ticks). */
+      set(v, cb, keepEditing) {
+        value = v == null ? null : v.slice();
+        if (cb !== undefined) canBlock = !!cb;
+        if (!keepEditing) closeEditor();
+        fill();
+      },
+      /** Drawn busy (opts.busy): on again once that change is done. */
+      setBusy(on) {
+        busyNow = !!on;
+        edit.disabled = busyNow;
+        if (busyNow) node.setAttribute('aria-busy', 'true');
+        else node.removeAttribute('aria-busy');
+        if (opts.removeOnly) fill();
+        else select.disabled = busyNow;
+      },
     };
   }
 
@@ -759,7 +1366,7 @@
       const returnFocus = current ? current.returnFocus : a && !d.drawer.contains(a) ? a : null;
       // A drawer replaced by this one takes its questions with it.
       if (current) for (const cancel of [...current.dialogs]) cancel(false);
-      current = { token: ++drawerSeq, trackers: [], form: null, onClose: opts.onClose || null, returnFocus, dialogs: new Set() };
+      current = { token: ++drawerSeq, trackers: [], forms: [], onClose: opts.onClose || null, returnFocus, dialogs: new Set() };
       const token = current.token;
       const handle = {
         isCurrent: () => !!current && current.token === token,
@@ -791,14 +1398,22 @@
           if (handle.isCurrent()) current.trackers.push(t);
           return t;
         },
+        /** Count unsaved state that isn't a form's fields toward "Discard
+         *  changes?": isDirty() says whether there is any. */
+        trackDirty(isDirty) {
+          if (handle.isCurrent()) current.trackers.push({ isDirty });
+        },
         /**
-         * The form whose unsaved state "Sign in again" keeps: key names its
+         * A form whose unsaved state "Sign in again" keeps: key names its
          * draft schema (PA.lib.DRAFT_FORMS); serialize() → its fields;
          * restore(fields) puts them back; isDirty() (optional) says whether
-         * there is anything to keep. The last form registered is the one kept.
+         * there is anything to keep. One form is kept: the one registered
+         * (or registered again — on a touch) last that has anything to keep.
          */
         registerForm(key, hooks) {
-          if (handle.isCurrent()) current.form = Object.assign({ key }, hooks);
+          if (!handle.isCurrent()) return;
+          current.forms = current.forms.filter((f) => f.key !== key);
+          current.forms.push(Object.assign({ key }, hooks));
         },
       };
       handle.setTitle(opts.title || '', opts.subtitle);
@@ -817,9 +1432,14 @@
 
     isDirty: () => !!current && current.trackers.some((t) => t.isDirty()),
 
-    /** The registered form of the open drawer ({ key, serialize, restore,
-     *  isDirty }), or null. */
-    activeForm: () => (current && current.form) || null,
+    /** The form of the open drawer a sign-in keeps ({ key, serialize,
+     *  restore, isDirty }): the last registered with unsaved changes, else
+     *  the last registered; null when none is. */
+    activeForm() {
+      const forms = current ? current.forms : [];
+      for (let i = forms.length - 1; i >= 0; i--) if (!forms[i].isDirty || forms[i].isDirty()) return forms[i];
+      return forms.length ? forms[forms.length - 1] : null;
+    },
 
     /** Close now, without asking. `reason` reaches onClose (the app tells a
      *  close it asked for from one the admin did: ✕, Esc, the scrim). */
@@ -1030,6 +1650,14 @@
         dismissers.get(t)();
         return;
       }
+      // Esc in a type-ahead whose list is open closes the list (its own
+      // handler); the next Esc is the drawer's.
+      const f = document.activeElement;
+      if (e.key === 'Escape' && f && f.getAttribute && f.getAttribute('role') === 'combobox' && f.getAttribute('aria-expanded') === 'true') return;
+      // Esc on a direct-grant control holding a keyboard step cancels the
+      // step (its own handler). Taking it here would move focus off the
+      // control, and leaving it applies the step: the opposite of Esc.
+      if (e.key === 'Escape' && f && f.getAttribute && f.getAttribute('data-esc-own') === 'true') return;
       if (!current) return;
       const d = drawerEls();
       // The toasts sit outside the drawer (above it), but their ✕s join its Tab
@@ -1062,13 +1690,19 @@
     statusLine,
     busy,
     isBusy,
+    setDisabled,
     onSubmit,
     modal,
     modalOpen,
     confirmDialog,
     levelControl,
+    capsEditor,
     checkList,
     radioGroup,
+    typeahead,
+    levelPill,
+    customStart,
+    directGrantControl,
     copyText,
     dirtyTracker,
     drawer,

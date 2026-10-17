@@ -9,12 +9,13 @@ import { PermissionsStore, ALL_CAPS } from '../src/permissions.js';
 import { LEVEL_CAPS } from '../src/slash.js';
 import { InviteStore } from '../src/invites.js';
 import { GuildAllowStore } from '../src/guild-allowlist.js';
-import { AdminServer, stateCookieName, type AdminDeps } from '../src/admin/server.js';
+import { AdminServer, stateCookieName, type AdminDeps, type AdminLimits } from '../src/admin/server.js';
 import { deriveAdminGuilds } from '../src/admin/oauth.js';
 import { SessionStore } from '../src/admin/sessions.js';
 import { AuditLog } from '../src/admin/audit.js';
 import { canManageGuild, canAuthorRoles } from '../src/admin/authz.js';
 import type { ChannelLabel } from '../src/admin/names.js';
+import type { Capability } from '@animalabs/portal-protocol';
 
 const ADMINISTRATOR = '8';
 const MANAGE_GUILD = '32';
@@ -160,7 +161,7 @@ function fakeDiscordFetch(guilds: unknown[]): typeof fetch {
 function setupDeps(
   superadmins: string[],
   guildAdmins: Record<string, string[]> = {},
-  opts: { allowlistEditable?: boolean; fileDefault?: string[] } = {},
+  opts: { allowlistEditable?: boolean; fileDefault?: string[]; botCaps?: Record<string, string[]> } = {},
 ): {
   deps: AdminDeps;
   dir: string;
@@ -222,6 +223,13 @@ function setupDeps(
     G2: [{ id: 'cZ', name: 'cZ', type: 'text' }],
   };
   const channels: Record<string, string[]> = Object.fromEntries(Object.entries(channelTable).map(([g, cs]) => [g, cs.map((c) => c.id)]));
+  // Where the channels sit in Discord: c1 and c2 in cat1.
+  const categoryOf: Record<string, string> = { c1: 'cat1', c2: 'cat1' };
+  // What the relay's bot can do: everything in a channel it has, unless the
+  // test says less; in one it doesn't have (not cached), what capsFor's
+  // computeCapabilities lets through without a channel.
+  const botCaps = (gid: string, cid: string): Capability[] =>
+    (channels[gid] ?? []).includes(cid) ? ((opts.botCaps?.[cid] ?? ALL_CAPS) as Capability[]) : ['EDIT_OWN', 'DELETE_OWN'];
   let codeN = 0;
   const deps: AdminDeps = {
     config,
@@ -261,6 +269,27 @@ function setupDeps(
       identity.upsert({ ...cur, token: hashToken(generateToken()) });
     },
     newInviteCode: () => `inv_test_${++codeN}`,
+    // As Relay.capsFor: nothing for an unknown persona or an unserved guild,
+    // else the policy within what the bot can do.
+    capsFor: (pid, cid, gid) => {
+      if (!identity.get(pid) || !deps.listGuilds().some((g) => g.id === gid)) return [];
+      const policy = permissions.resolve(pid, gid, cid);
+      const bot = new Set(botCaps(gid, cid));
+      return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
+    },
+    botCaps,
+    // As Relay.permChannelId: a thread's access is its parent's.
+    permChannelId: (cid) => {
+      for (const cs of Object.values(channelTable)) {
+        const c = cs.find((x) => x.id === cid);
+        if (c) return c.type === 'thread' && c.parentId ? c.parentId : cid;
+      }
+      return cid;
+    },
+    listChannelLayout: (gid) =>
+      (channelTable[gid] ?? []).filter((c) => c.type !== 'thread').map((c, i) => ({ id: c.id, categoryId: categoryOf[c.id] ?? null, position: i, announcement: false })),
+    canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, (cid) => (channels[gid] ?? []).includes(cid)),
+    resync: () => 0,
   };
   return { deps, dir, identity, permissions, invites, allowStore, allowPath, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
@@ -1289,7 +1318,7 @@ test("an invite whose role no longer resolves is hidden from guild admins (it is
   }
 });
 
-test('an explicit deny does not lift a ban; a grant does', async () => {
+test('an explicit deny does not lift a ban; a grant does only when the admin chose to lift it (liftBan: true)', async () => {
   const { deps, permissions, cleanup } = setupDeps([]);
   permissions.clearGuild('p1', 'G1');
   const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
@@ -1302,11 +1331,72 @@ test('an explicit deny does not lift a ban; a grant does', async () => {
     const put = (body: unknown) => fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: hdr, body: JSON.stringify(body) });
     assert.equal((await put({ channelId: 'c1', deny: true })).status, 200);
     assert.equal(permissions.isBanned('p1', 'G1'), true, 'a deny keeps the ban');
-    assert.equal((await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'] })).status, 200);
-    assert.equal(permissions.isBanned('p1', 'G1'), false, 'a grant lifts it');
+    // Unasked, a grant is refused and nothing is written: a write from a view
+    // loaded before the removal (an Undo, a queued change) can't lift it.
+    const before = JSON.stringify(permissions.getEntry('p1'));
+    for (const body of [{ channelId: 'c1', caps: ['VIEW_CHANNEL'] }, { channelId: 'c1', level: 'write', liftBan: false }, { guildDefault: true, level: 'read' }]) {
+      const r = await put(body);
+      assert.equal(r.status, 409, JSON.stringify(body));
+      assert.equal((await r.json()).error.code, 'BANNED');
+    }
+    assert.equal(JSON.stringify(permissions.getEntry('p1')), before, 'nothing written');
+    assert.equal(permissions.isBanned('p1', 'G1'), true);
+    assert.equal((await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'], liftBan: 'yes' })).status, 400, 'liftBan is a boolean');
+    const lifted = await put({ channelId: 'c1', caps: ['VIEW_CHANNEL'], liftBan: true });
+    assert.equal(lifted.status, 200);
+    assert.equal((await lifted.json()).liftedBan, true);
+    assert.equal(permissions.isBanned('p1', 'G1'), false, 'a grant the admin chose to lift with lifts it');
+    // Not removed: liftBan changes nothing.
+    const plain = await put({ channelId: 'c1', level: 'read', liftBan: true });
+    assert.equal(plain.status, 200);
+    assert.equal('liftedBan' in (await plain.json()), false);
   } finally {
     await server.close();
     cleanup();
+  }
+});
+
+test('a removal is never lifted unasked: an Undo sent after Remove, an access role, an invite applied — each 409 BANNED until the admin chooses to lift it', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    // A grant given, then taken away (its Undo would put Write back, expecting nothing there).
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: null })).status, 200);
+    assert.equal((await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1', { expect: WRITE })).status, 200);
+    // Removed from G1 meanwhile (the panel's Remove; slash /ban is the same function).
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/remove')).status, 200);
+    const sets = () => ctx.deps.audit.read({ guildId: 'G1', limit: 100 }).filter((x) => x.action === 'persona.grant.set').length;
+    const n = sets();
+    // The Undo: expect (nothing there) still matches — the removal dropped every grant — but it can't lift the removal.
+    const undo = await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: null });
+    assert.equal(undo.status, 409);
+    assert.equal(undo.body.error.code, 'BANNED');
+    assert.equal(ctx.permissions.isBanned('p1', 'G1'), true, 'still removed');
+    assert.equal(sets(), n, 'nothing written, nothing recorded');
+    assert.equal((await s.get('/admin/g/G1/personas/p1/access')).body.removed, true);
+    // A changed-meanwhile refusal still comes first.
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write', expect: READ })).body.error.code, 'CONFLICT');
+
+    // An access role that grants something: the same.
+    const role = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'r-g1' });
+    assert.equal(role.status, 409);
+    assert.equal(role.body.error.code, 'BANNED');
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), [], 'not given');
+    const roleLifted = await s.call('POST', '/admin/g/G1/personas/p1/roles', { role: 'r-g1', liftBan: true });
+    assert.equal(roleLifted.status, 200);
+    assert.equal(roleLifted.body.banned, false);
+    assert.deepEqual(ctx.deps.audit.read({ guildId: 'G1', limit: 1 })[0].after, { role: 'r-g1', liftedBan: true });
+
+    // An invite applied by the admin: the same.
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/remove')).status, 200);
+    const claim = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' });
+    assert.equal(claim.status, 409);
+    assert.equal(claim.body.error.code, 'BANNED');
+    assert.equal(ctx.invites.get('aug-g1')!.uses, 0, 'not applied');
+    const claimLifted = await s.call('POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1', liftBan: true });
+    assert.equal(claimLifted.status, 200);
+  } finally {
+    await s.close();
   }
 });
 
@@ -1335,7 +1425,11 @@ test('Unset guild-wide on a persona removed with /ban: refused unless the ban is
 
     const lift = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=unset&liftBan=1`, { method: 'DELETE', headers: hdr });
     assert.equal(lift.status, 200);
-    assert.deepEqual(await lift.json(), { guildPolicy: null, banned: false });
+    const { effective: liftEffect, ...lifted } = await lift.json();
+    assert.deepEqual(lifted, { guildPolicy: null, banned: false });
+    assert.deepEqual(liftEffect, {
+      guildWide: true, channels: 3, counts: { read: 3, write: 0, full: 0, custom: 0 }, direct: { read: 0, write: 0, full: 0, custom: 0 },
+    }, 'and says what that gives: the persona default’s Read in each of G1’s channels (odd1, of a kind the panel can’t give access on, too)');
     assert.equal(permissions.isBanned('p1', 'G1'), false);
     assert.deepEqual([...permissions.resolve('p1', 'G1', 'c1')].sort(), ['READ_HISTORY', 'VIEW_CHANNEL'], 'what the panel says: the persona default applies');
     const rec = deps.audit.read({ limit: 100 }).find((r) => r.action === 'persona.grant.clear')!;
@@ -1347,12 +1441,13 @@ test('Unset guild-wide on a persona removed with /ban: refused unless the ban is
     permissions.setGuildDefault('p1', 'G1', []);
     const again = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=unset`, { method: 'DELETE', headers: hdr });
     assert.equal(again.status, 200);
-    assert.deepEqual(await again.json(), { guildPolicy: null, banned: false });
+    const { effective: _again, ...unset } = await again.json();
+    assert.deepEqual(unset, { guildPolicy: null, banned: false });
     // A grant's answer says whether the persona is still removed.
     permissions.clearGuild('p1', 'G1');
     const deny = await fetch(`${base}/admin/g/G1/personas/p1/grants?guildDefault=deny`, { method: 'DELETE', headers: hdr });
     assert.equal((await deny.json()).banned, true, 'a deny keeps the ban, and says so');
-    const put = await fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: { ...hdr, 'content-type': 'application/json' }, body: JSON.stringify({ channelId: 'c1', level: 'read' }) });
+    const put = await fetch(`${base}/admin/g/G1/personas/p1/grants`, { method: 'PUT', headers: { ...hdr, 'content-type': 'application/json' }, body: JSON.stringify({ channelId: 'c1', level: 'read', liftBan: true }) });
     assert.equal((await put.json()).banned, false, 'a grant lifts it, and says so');
   } finally {
     await server.close();
@@ -1394,8 +1489,9 @@ const WRITE = LEVEL_CAPS.write;
 async function signedIn(
   ctx: ReturnType<typeof setupDeps>,
   oauthGuilds: unknown[] = [{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }],
+  limits: AdminLimits = {},
 ) {
-  const server = new AdminServer(ctx.deps, fakeDiscordFetch(oauthGuilds));
+  const server = new AdminServer(ctx.deps, fakeDiscordFetch(oauthGuilds), limits);
   await server.listen();
   const base = `http://127.0.0.1:${server.boundPort}`;
   const session = await login(base, []);
@@ -1411,7 +1507,7 @@ async function signedIn(
     const text = await r.text();
     let json: any = null;
     try { json = text ? JSON.parse(text) : null; } catch { json = text; }
-    return { status: r.status, body: json };
+    return { status: r.status, body: json, headers: r.headers };
   };
   const get = (path: string) => call('GET', path);
   return { server, base, cookie, me, call, get, close: async () => { await server.close(); ctx.cleanup(); } };
@@ -1631,7 +1727,7 @@ test('/admin/me: api version, the relay’s own levels and capabilities, feature
   const ctx = setupDeps([]);
   const s = await signedIn(ctx);
   try {
-    assert.equal(s.me.apiVersion, 2);
+    assert.equal(s.me.apiVersion, 3, 'API 3: the access views, the persona directory, Remove from <guild> and Resync');
     assert.deepEqual(s.me.levels, LEVEL_CAPS);
     assert.deepEqual(s.me.caps, ALL_CAPS);
     assert.deepEqual(s.me.features, { invites: true, avatarUploads: true, allowlistEditable: true });
@@ -1791,6 +1887,8 @@ test('invariant I2: no request but a GET gets past a missing or wrong CSRF token
     ['PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'read' }],
     ['DELETE', '/admin/g/G1/personas/p1/grants?guildDefault=unset'],
     ['POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' }],
+    ['POST', '/admin/g/G1/personas/p1/remove'],
+    ['POST', '/admin/g/G1/personas/p1/resync'],
     ['PATCH', '/admin/g/G1/personas/p1'],
     ['POST', '/admin/no-such-route', {}],
   ];
@@ -1852,6 +1950,9 @@ test('invariant I1: every guild route checks the guild first — a guild the adm
       ['POST', '/admin/g/G2/personas/p1/roles', { role: 'r-g1' }], ['DELETE', '/admin/g/G2/personas/p1/roles/r-g1'],
       ['PUT', '/admin/g/G2/personas/p1/grants', { channelId: 'cZ', level: 'read' }], ['DELETE', '/admin/g/G2/personas/p1/grants?guildDefault=deny'],
       ['POST', '/admin/g/G2/personas/p1/claim', { code: 'in-g2' }],
+      ['POST', '/admin/g/G2/personas/p1/remove'], ['POST', '/admin/g/G2/personas/p1/resync'],
+      ['GET', '/admin/g/G2/access/summary'], ['GET', '/admin/g/G2/channels/cZ/access'], ['GET', '/admin/g/G2/personas/p1/access'],
+      ['GET', '/admin/g/G2/persona-directory?q=p'],
     ];
     for (const [method, path, body] of routes) {
       const r = await s.call(method, path, body);
@@ -1917,6 +2018,8 @@ test('invariant I8: a guild admin never writes persona-wide state', async () => 
       ['DELETE', '/admin/g/G1/personas/p1/grants?guildDefault=unset', undefined],
       ['POST', '/admin/g/G1/personas/p1/roles', { role: 'r-g1' }],
       ['POST', '/admin/g/G1/personas/p1/claim', { code: 'aug-g1' }],
+      ['POST', '/admin/g/G1/personas/p1/resync', undefined],
+      ['POST', '/admin/g/G1/personas/p1/remove', undefined],
     ] as Array<[string, string, unknown]>) {
       assert.equal((await s.call(method, path, body)).status, 200, `${method} ${path}`);
       assert.deepEqual(ctx.permissions.getEntry('p1')?.policy?.default, ['VIEW_CHANNEL'], `${method} ${path}`);
@@ -1966,3 +2069,519 @@ test('assigning an access role whose scope names nothing does not lift a ban', a
   }
 });
 
+
+// ── Effective access (P6): reads, the directory, and grant echoes ──
+
+test('access reads: a channel that isn’t G’s is one 404, whatever the reason; threads and categories say why they hold nothing', async () => {
+  const ctx = setupDeps([]);
+  ctx.deps.listGuilds = () => [{ id: 'G1', name: 'Guild One', memberCount: 1 }, { id: 'G2', name: 'Guild Two', memberCount: 1 }];
+  const s = await signedIn(ctx);
+  try {
+    // Another guild's channel, a channel that never existed, one the bot can't see (not in the list): the same answer.
+    const answers = await Promise.all(['cZ', 'nope', 'gone1'].map((cid) => s.get(`/admin/g/G1/channels/${cid}/access`)));
+    for (const a of answers) {
+      assert.equal(a.status, 404);
+      assert.deepEqual(a.body, { error: { code: 'NOT_FOUND', message: 'no such channel in this guild' } });
+    }
+    const thread = await s.get('/admin/g/G1/channels/th-c1/access');
+    assert.equal(thread.body.inert, 'thread');
+    assert.equal(thread.body.parentId, 'c1');
+    assert.equal(thread.body.rows, undefined);
+    const cat = await s.get('/admin/g/G1/channels/cat1/access');
+    assert.equal(cat.body.inert, 'category');
+    assert.deepEqual(cat.body.channels, ['c1', 'c2']);
+    assert.equal((await s.get('/admin/g/G1/personas/nobody/access')).status, 404);
+  } finally {
+    await s.close();
+  }
+});
+
+test('access reads: who can act where and why — only G’s access roles named, the bot’s limits said, timed', async () => {
+  const ctx = setupDeps([], {}, { botCaps: { c2: ['VIEW_CHANNEL', 'READ_HISTORY'] } });
+  ctx.permissions.setRole('r-g2', { caps: WRITE, scope: { all: true }, guildId: 'G2' });
+  ctx.permissions.setRole('r-g1-chat', { caps: WRITE, scope: { channels: ['c1'] }, guildId: 'G1' });
+  ctx.permissions.addPersonaRoles('p1', ['r-g1', 'r-g1-chat', 'r-g2']);
+  ctx.permissions.setChannel('p1', 'G1', 'c2', WRITE);
+  ctx.permissions.setChannel('p1', 'G1', 'th-c1', WRITE); // does nothing: a thread
+  ctx.permissions.setChannel('p1', 'G1', 'cat1', READ); // does nothing: a category
+  const s = await signedIn(ctx);
+  try {
+    const c1 = await s.get('/admin/g/G1/channels/c1/access');
+    assert.equal(c1.status, 200);
+    assert.match(c1.headers.get('server-timing') ?? '', /^access;dur=\d+(\.\d+)?$/);
+    assert.deepEqual(c1.body.channel, { id: 'c1', name: 'c1', type: 'text', categoryId: 'cat1', position: 0, announcement: false, grantable: true });
+    assert.equal(c1.body.botBase, 'full');
+    const row = c1.body.rows.find((r: { personaId: string }) => r.personaId === 'p1');
+    assert.deepEqual(row.effective, WRITE);
+    assert.equal(row.level, 'write');
+    assert.equal(row.direct, null);
+    assert.deepEqual(row.sources.map((x: AnySource) => x.kind + (x.name ? ':' + x.name : '')), ['role:r-g1', 'role:r-g1-chat', 'guildWide'], 'never G2’s role');
+    assert.deepEqual(Object.keys(row).sort(), ['avatarUrl', 'base', 'botLacks', 'botLimited', 'direct', 'displayName', 'effective', 'extra', 'level', 'personaId', 'sources'].sort());
+
+    // c2: the bot can only read there.
+    const c2 = await s.get('/admin/g/G1/channels/c2/access');
+    assert.equal(c2.body.botBase, 'read');
+    const limited = c2.body.rows.find((r: { personaId: string }) => r.personaId === 'p1');
+    assert.deepEqual(limited.effective, READ);
+    assert.deepEqual(limited.direct, WRITE);
+    assert.equal(limited.botLimited, true);
+    assert.deepEqual(limited.botLacks, WRITE.filter((c) => !READ.includes(c)));
+    assert.deepEqual(limited.sources[0], { kind: 'role', name: 'r-g1', caps: ['VIEW_CHANNEL'], how: 'all' });
+    assert.deepEqual(limited.sources.find((x: AnySource) => x.kind === 'guildWide'), { kind: 'guildWide', caps: ['VIEW_CHANNEL'], shadowedBy: 'direct' });
+
+    // The persona: per channel, its settings here, the grants that do nothing, G's roles only.
+    const p = await s.get('/admin/g/G1/personas/p1/access');
+    assert.equal(p.status, 200);
+    assert.match(p.headers.get('server-timing') ?? '', /^access;dur=/);
+    assert.deepEqual(p.body.persona, { id: 'p1', displayName: 'Persona One', avatarUrl: '' });
+    assert.deepEqual(p.body.guildWide, ['VIEW_CHANNEL']);
+    assert.equal(p.body.personaDefault, null);
+    assert.equal(p.body.removed, false);
+    assert.deepEqual(p.body.rows.map((r: { channelId: string }) => r.channelId), ['c1', 'c2', 'odd1'],
+      'every channel with access of its own — odd1, of a kind the panel can’t give access on, too: the relay serves it with what capsFor gives');
+    assert.deepEqual(p.body.rows.find((r: { channelId: string }) => r.channelId === 'odd1').effective, ctx.deps.capsFor('p1', 'odd1', 'G1'));
+    assert.deepEqual(p.body.inactive, [
+      { channelId: 'th-c1', caps: WRITE, reason: 'thread' },
+      { channelId: 'cat1', caps: READ, reason: 'category' },
+    ]);
+    assert.deepEqual(p.body.roles.map((r: { name: string; channels: number }) => [r.name, r.channels]), [['r-g1', 3], ['r-g1-chat', 1]]);
+    assert.equal('otherGuildRoleCount' in p.body, false, 'a guild admin isn’t told about other guilds');
+    assert.ok(!JSON.stringify(p.body).includes('r-g2') && !JSON.stringify(c1.body).includes('r-g2'), 'another guild’s role is never named');
+    assert.ok(!JSON.stringify(p.body.names).includes('cZ'));
+
+    // A direct grant on odd1 (what slash /add stores when run in its chat) is a row, and does something.
+    ctx.permissions.setChannel('p1', 'G1', 'odd1', WRITE);
+    const o = await s.get('/admin/g/G1/personas/p1/access');
+    const odd = o.body.rows.find((r: { channelId: string }) => r.channelId === 'odd1');
+    assert.deepEqual(odd.direct, WRITE);
+    assert.deepEqual(odd.effective, ctx.deps.capsFor('p1', 'odd1', 'G1'));
+    assert.ok(!o.body.inactive.some((x: { channelId: string }) => x.channelId === 'odd1'), 'not “inactive”: it gives Write there');
+    ctx.permissions.clearChannel('p1', 'G1', 'odd1');
+
+    // A block with nothing to block, and a grant on a channel G doesn't have.
+    ctx.permissions.unsetGuildDefault('p1', 'G1');
+    ctx.permissions.setChannel('p1', 'G1', 'c1', []);
+    ctx.permissions.setChannel('p1', 'G1', 'cZ', READ);
+    const q = await s.get('/admin/g/G1/personas/p1/access');
+    assert.deepEqual(q.body.inactive.filter((x: { reason: string }) => x.reason === 'blocks-nothing' || x.reason === 'missing'), [
+      { channelId: 'c1', caps: [], reason: 'blocks-nothing' },
+      { channelId: 'cZ', caps: READ, reason: 'missing' },
+    ]);
+    assert.deepEqual(q.body.names.channels.cZ, { id: 'cZ', name: null, unavailable: true }, 'another guild’s channel goes unnamed');
+  } finally {
+    await s.close();
+  }
+});
+
+type AnySource = { kind: string; name?: string };
+
+test('/channels: each channel’s place in Discord, whether it can hold access, and the categories', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.get('/admin/g/G1/channels');
+    const byId = Object.fromEntries(r.body.channels.map((c: { id: string }) => [c.id, c]));
+    assert.deepEqual(byId.c2, { id: 'c2', name: 'c2', type: 'text', categoryId: 'cat1', position: 1, announcement: false, grantable: true });
+    assert.equal(byId['th-c1'].grantable, false);
+    assert.equal(byId['th-c1'].parentId, 'c1');
+    assert.equal(byId.cat1.grantable, false);
+    assert.equal(byId.odd1.grantable, false);
+    assert.deepEqual(r.body.categories, [{ id: 'cat1', name: 'cat1', position: 2 }]);
+  } finally {
+    await s.close();
+  }
+});
+
+test('access summary: counts for every channel with access of its own (unknown kinds too); what of Write the bot lacks; reused for 5 s; any change drops it; too big is truncated, never refused', async () => {
+  const ctx = setupDeps([], {}, { botCaps: { c2: [] } });
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  ctx.identity.upsert({ id: 'p3', displayName: 'Nobody Here', avatar: '', token: hashToken('t3') });
+  ctx.permissions.setChannel('p2', 'G1', 'c1', WRITE);
+  const s = await signedIn(ctx);
+  try {
+    const one = await s.get('/admin/g/G1/access/summary');
+    assert.equal(one.status, 200);
+    assert.match(one.headers.get('server-timing') ?? '', /^access;dur=/);
+    assert.deepEqual(one.body.channels, [
+      { id: 'c1', botBase: 'full', botCantView: false, counts: { read: 0, write: 1, full: 0, custom: 1 } },
+      { id: 'c2', botBase: null, botCantView: true, counts: { read: 0, write: 0, full: 0, custom: 0 } },
+      { id: 'odd1', botBase: 'full', botCantView: false, counts: { read: 0, write: 0, full: 0, custom: 1 } },
+    ]);
+    // p1: guild-wide View only (custom), in c1 and odd1; p2: Write in c1; p3 has nothing here and isn't looked at.
+    assert.deepEqual(one.body.personas, [
+      { id: 'p1', counts: { read: 0, write: 0, full: 0, custom: 2 } },
+      { id: 'p2', counts: { read: 0, write: 1, full: 0, custom: 0 } },
+    ]);
+    assert.equal(one.body.considered, 2);
+    assert.equal(one.body.truncated, undefined);
+
+    // Reused: a change behind the panel's back in Discord (the bot's caps) isn't seen for a moment …
+    ctx.deps.botCaps = () => [];
+    const two = await s.get('/admin/g/G1/access/summary');
+    assert.equal(two.body.computedAt, one.body.computedAt);
+    assert.deepEqual(two.body.channels, one.body.channels);
+    // … but a permissions change drops it at once.
+    ctx.deps.botCaps = (_g, cid) => (cid === 'c2' ? [] : ALL_CAPS);
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p2/grants', { channelId: 'c1', level: 'full' })).status, 200);
+    const three = await s.get('/admin/g/G1/access/summary');
+    assert.deepEqual(three.body.channels[0].counts, { read: 0, write: 0, full: 1, custom: 1 });
+
+    // A bot that can send but not start threads: what of Write it lacks, by name (the list words it).
+    ctx.deps.botCaps = (_g, cid) => (cid === 'c1' ? ALL_CAPS.filter((c) => c !== 'CREATE_THREADS') : cid === 'c2' ? ['VIEW_CHANNEL', 'READ_HISTORY'] : ALL_CAPS);
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p2/grants', { channelId: 'c1', level: 'write' })).status, 200);
+    const four = await s.get('/admin/g/G1/access/summary');
+    assert.deepEqual(four.body.channels.map((c: { id: string; botBase: string; botLacks?: string[] }) => [c.id, c.botBase, c.botLacks ?? null]), [
+      ['c1', 'read', ['CREATE_THREADS']],
+      ['c2', 'read', WRITE.filter((c) => !READ.includes(c))],
+      ['odd1', 'full', null],
+    ]);
+  } finally {
+    await s.close();
+  }
+  const ctx2 = setupDeps([]);
+  ctx2.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  ctx2.permissions.setChannel('p2', 'G1', 'c1', WRITE);
+  const t = await signedIn(ctx2, undefined, { accessCellCap: 5 }); // 2 personas × 3 channels = 6 > 5
+  try {
+    const r = await t.get('/admin/g/G1/access/summary');
+    assert.equal(r.status, 200, 'never a 413');
+    assert.equal(r.body.truncated, true);
+    assert.deepEqual(r.body.channels.map((c: object) => Object.keys(c).sort()), [['botBase', 'botCantView', 'id'], ['botBase', 'botCantView', 'id'], ['botBase', 'botCantView', 'id']]);
+    assert.deepEqual(r.body.personas, [{ id: 'p1' }, { id: 'p2' }]);
+  } finally {
+    await t.close();
+  }
+});
+
+test('persona directory: at most 25, only id, name, picture and access here; exact id, then names that start with it, then the rest', async () => {
+  const ctx = setupDeps([]);
+  for (let i = 1; i <= 30; i++) {
+    const n = String(i).padStart(2, '0');
+    ctx.identity.upsert({ id: `dir-${n}`, displayName: `Zed ${n}`, avatar: '', token: hashToken(`t-${n}`) });
+  }
+  ctx.identity.upsert({ id: 'pa', displayName: 'Zulu', avatar: '', token: hashToken('t-pa') });
+  ctx.identity.upsert({ id: 'pax', displayName: 'Pa Kettle', avatar: '', token: hashToken('t-pax') });
+  ctx.identity.upsert({ id: 'q-1', displayName: 'Apa', avatar: '', token: hashToken('t-q1') });
+  const s = await signedIn(ctx);
+  try {
+    const all = await s.get('/admin/g/G1/persona-directory?q=e');
+    assert.equal(all.status, 200);
+    assert.equal(all.body.personas.length, 25);
+    for (const row of all.body.personas) assert.deepEqual(Object.keys(row), ['id', 'displayName', 'avatarUrl', 'hasAccessHere']);
+    assert.match(all.headers.get('server-timing') ?? '', /^access;dur=/);
+
+    const pa = (await s.get('/admin/g/G1/persona-directory?q=PA')).body.personas.map((p: { id: string }) => p.id);
+    assert.deepEqual(pa, ['pa', 'pax', 'q-1'], 'exact id, then a name starting with it, then the rest');
+    const none = (await s.get('/admin/g/G1/persona-directory')).body.personas;
+    assert.equal(none.length, 25);
+    assert.deepEqual(none.slice(0, 2).map((p: { displayName: string }) => p.displayName), ['Apa', 'Pa Kettle'], 'no q: alphabetical');
+    const p1 = (await s.get('/admin/g/G1/persona-directory?q=persona one')).body.personas;
+    assert.deepEqual(p1, [{ id: 'p1', displayName: 'Persona One', avatarUrl: '', hasAccessHere: true }]);
+    assert.equal((await s.get('/admin/g/G1/persona-directory?q=zulu')).body.personas[0].hasAccessHere, false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: expect — a change made since the panel loaded is 409 CONFLICT {current}; nothing is written or recorded', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  const g1 = () => ctx.permissions.getEntry('p1')?.policy?.guilds?.G1;
+  const okRecords = () => ctx.deps.audit.read({ limit: 1000 }).filter((r) => r.ok && r.action.startsWith('persona.grant.')).length;
+  try {
+    const put = (body: unknown) => s.call('PUT', '/admin/g/G1/personas/p1/grants', body);
+    assert.equal((await put({ channelId: 'c1', level: 'read', expect: null })).status, 200, 'nothing was there, as the panel saw');
+    const records = okRecords();
+    const before = storeBytes(ctx.dir);
+    const stale = await put({ channelId: 'c1', level: 'write', expect: null });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.error.code, 'CONFLICT');
+    assert.deepEqual(stale.body.error.current, READ);
+    const staleDel = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1', { expect: WRITE });
+    assert.equal(staleDel.status, 409);
+    assert.deepEqual(staleDel.body.error.current, READ);
+    const staleWide = await put({ guildDefault: true, level: 'read', expect: null });
+    assert.deepEqual([staleWide.status, staleWide.body.error.current], [409, ['VIEW_CHANNEL']]);
+    const staleDeny = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?guildDefault=deny', { expect: [] });
+    assert.equal(staleDeny.status, 409);
+    assert.deepEqual(storeBytes(ctx.dir), before, 'nothing written, nothing recorded');
+    assert.equal(okRecords(), records);
+
+    // In any order, it's the same set.
+    assert.equal((await put({ channelId: 'c1', level: 'write', expect: [...READ].reverse() })).status, 200);
+    assert.deepEqual(g1()?.channels?.c1, WRITE);
+    const del = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1', { expect: WRITE, batchId: 'b-1_x' });
+    assert.equal(del.status, 200);
+    assert.deepEqual(ctx.deps.audit.read({ limit: 1 })[0].detail, { batchId: 'b-1_x' }, 'the batch is recorded');
+    assert.equal((await s.call('DELETE', '/admin/g/G1/personas/p1/grants?guildDefault=deny', { expect: ['VIEW_CHANNEL'] })).status, 200);
+
+    for (const bad of [{ expect: 'VIEW_CHANNEL' }, { expect: [1] }, { batchId: 'has space' }, { batchId: 'x'.repeat(33) }, { batchId: 7 }]) {
+      const r = await put({ channelId: 'c2', level: 'read', ...bad });
+      assert.deepEqual([r.status, r.body.error.code], [400, 'INVALID'], JSON.stringify(bad));
+    }
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: the answer says what the persona can do now — in the channel, or guild-wide in how many channels at each level', async () => {
+  const ctx = setupDeps([], {}, { botCaps: { c2: ['VIEW_CHANNEL', 'READ_HISTORY'] } });
+  const s = await signedIn(ctx);
+  try {
+    const put = (body: unknown) => s.call('PUT', '/admin/g/G1/personas/p1/grants', body);
+    const limited = await put({ channelId: 'c2', level: 'write' });
+    assert.deepEqual(limited.body.effective.effective, READ);
+    assert.equal(limited.body.effective.level, 'read');
+    assert.equal(limited.body.effective.botLimited, true);
+    assert.ok(limited.body.effective.botLacks.includes('SEND_MESSAGES'));
+    assert.deepEqual(limited.body.effective.direct, WRITE);
+
+    const wide = await put({ guildDefault: true, level: 'read' });
+    assert.deepEqual(wide.body.effective, {
+      guildWide: true, channels: 3, // c1, c2 and odd1: every channel with access of its own
+      counts: { read: 3, write: 0, full: 0, custom: 0 },
+      direct: { read: 1, write: 0, full: 0, custom: 0 }, // c2: Write directly, Read is what the bot allows
+    });
+    const removed = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c2');
+    assert.deepEqual(removed.body.effective.effective, READ);
+    assert.deepEqual(removed.body.effective.sources, [{ kind: 'guildWide', caps: READ }]);
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: removing a thread’s grant answers with its parent’s access (where the relay checks it); a channel that is gone answers missing', async () => {
+  const ctx = setupDeps([]);
+  const s = await signedIn(ctx);
+  try {
+    // Only an old entry, or slash before it refused threads, holds these: the
+    // panel's PUT refuses both.
+    ctx.permissions.setChannel('p1', 'G1', 'th-c1', WRITE);
+    ctx.permissions.setChannel('p1', 'G1', 'c-gone', WRITE);
+    assert.equal((await s.call('PUT', '/admin/g/G1/personas/p1/grants', { channelId: 'c1', level: 'write' })).status, 200);
+    const th = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=th-c1');
+    assert.equal(th.status, 200);
+    assert.equal(th.body.effective.parentId, 'c1', 'the thread uses c1’s access');
+    assert.deepEqual(th.body.effective.effective, ctx.deps.capsFor('p1', 'c1', 'G1'));
+    assert.deepEqual(th.body.effective.effective, WRITE, 'Write in c1 still reaches the thread');
+    assert.deepEqual(th.body.effective.sources, [{ kind: 'direct', caps: WRITE }, { kind: 'guildWide', caps: ['VIEW_CHANNEL'], shadowedBy: 'direct' }], 'c1’s sources');
+    // Removing c1's own grant: no parentId, and the guild-wide level is what is left.
+    const c1 = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c1');
+    assert.equal('parentId' in c1.body.effective, false);
+    assert.deepEqual(c1.body.effective.effective, ['VIEW_CHANNEL']);
+    const gone = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c-gone');
+    assert.equal(gone.status, 200);
+    assert.deepEqual(gone.body.effective, { missing: true }, 'nothing to explain in a channel that isn’t there');
+    assert.equal(ctx.permissions.getEntry('p1')?.policy?.guilds?.G1?.channels?.['c-gone'], undefined, 'and it was removed');
+  } finally {
+    await s.close();
+  }
+});
+
+test('persona directory: one removed with /ban says so; ?ids= gives exactly those personas, in that order', async () => {
+  const ctx = setupDeps([]);
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  ctx.permissions.clearGuild('p2', 'G1');
+  const s = await signedIn(ctx);
+  try {
+    const found = await s.get('/admin/g/G1/persona-directory?q=persona');
+    assert.deepEqual(found.body.personas, [
+      { id: 'p1', displayName: 'Persona One', avatarUrl: '', hasAccessHere: true },
+      { id: 'p2', displayName: 'Persona Two', avatarUrl: '', hasAccessHere: false, removed: true },
+    ], 'giving p2 access here lifts its removal: the panel is told before it asks');
+    const ids = await s.get('/admin/g/G1/persona-directory?ids=' + encodeURIComponent('p2,nobody,p1,p2'));
+    assert.equal(ids.status, 200);
+    assert.deepEqual(ids.body.personas.map((p: { id: string }) => p.id), ['p2', 'p1'], 'in the order asked, unknown ids left out, each once');
+    assert.equal(ids.body.personas[0].removed, true);
+    assert.deepEqual((await s.get('/admin/g/G1/persona-directory?ids=')).body.personas, []);
+    for (let i = 1; i <= 30; i++) ctx.identity.upsert({ id: `many-${i}`, displayName: `Many ${i}`, avatar: '', token: hashToken(`m-${i}`) });
+    const many = await s.get('/admin/g/G1/persona-directory?ids=' + Array.from({ length: 30 }, (_, i) => `many-${i + 1}`).join(','));
+    assert.equal(many.body.personas.length, 25, 'at most 25');
+    // Another guild's /ban isn't this guild's business.
+    ctx.permissions.liftBan('p2', 'G1');
+    ctx.permissions.clearGuild('p2', 'G2');
+    const elsewhere = await s.get('/admin/g/G1/persona-directory?ids=p2');
+    assert.equal('removed' in elsewhere.body.personas[0], false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('grants: a channel answer names the Discord roles its mirror sources follow; a grant that ended a /ban says so', async () => {
+  const ctx = setupDeps([]);
+  // role1 (@Mods, G1's) can see c2.
+  ctx.permissions.setMirrorLookup((gid, rid) => new Map(gid === 'G1' && rid === 'role1' ? [['c2', new Set<Capability>(['VIEW_CHANNEL', 'READ_HISTORY'])]] : []));
+  ctx.permissions.setRole('mirror-g1', { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { mirrorRole: 'role1' }, guildId: 'G1' });
+  ctx.permissions.addPersonaRoles('p1', ['mirror-g1']);
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  const s = await signedIn(ctx);
+  try {
+    const put = (pid: string, body: unknown) => s.call('PUT', `/admin/g/G1/personas/${pid}/grants`, body);
+    const set = await put('p1', { channelId: 'c2', level: 'write' });
+    assert.equal(set.status, 200);
+    assert.ok(set.body.effective.sources.some((x: { kind: string; mirror?: Array<{ id: string }> }) => x.kind === 'role' && x.mirror?.some((m) => m.id === 'role1')));
+    assert.deepEqual(set.body.names, { discordRoles: { role1: { name: 'Mods', guildId: 'G1' } } }, 'the role the panel shows as @Mods');
+    assert.equal('liftedBan' in set.body, false, 'nothing was lifted');
+    const del = await s.call('DELETE', '/admin/g/G1/personas/p1/grants?channelId=c2');
+    assert.deepEqual(del.body.names, { discordRoles: { role1: { name: 'Mods', guildId: 'G1' } } });
+    assert.deepEqual((await put('p1', { channelId: 'c1', level: 'read' })).body.names, { discordRoles: {} }, 'c1: no mirror there, nothing to name');
+    assert.equal('names' in (await put('p1', { guildDefault: true, level: 'read' })).body, false, 'guild-wide explains no channel');
+
+    // Removed with /ban: a deny keeps it; the grant that gives access ends it, and says so — once.
+    ctx.permissions.clearGuild('p2', 'G1');
+    const deny = await put('p2', { channelId: 'c1', deny: true });
+    assert.equal(deny.body.banned, true);
+    assert.equal('liftedBan' in deny.body, false);
+    assert.equal((await put('p2', { channelId: 'c2', level: 'read' })).body.error.code, 'BANNED', 'not without liftBan');
+    const grant = await put('p2', { channelId: 'c2', level: 'read', liftBan: true });
+    assert.equal(grant.body.liftedBan, true);
+    assert.equal(grant.body.banned, false);
+    assert.equal(ctx.permissions.isBanned('p2', 'G1'), false);
+    assert.equal('liftedBan' in (await put('p2', { channelId: 'c2', level: 'write', liftBan: true })).body, false, 'only the grant that ended it');
+  } finally {
+    await s.close();
+  }
+});
+
+// ── P8: Remove from guild and Resync ──
+
+test('remove from guild: G’s access roles and grants go, the removal is recorded, other guilds are untouched; audited as persona.guild.remove', async () => {
+  const ctx = setupDeps([]);
+  ctx.permissions.setRole('r-g2', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G2' });
+  ctx.permissions.addPersonaRoles('p1', ['r-g1', 'r-g2']);
+  ctx.permissions.setChannel('p1', 'G1', 'c1', WRITE);
+  ctx.permissions.setGuildDefault('p1', 'G2', READ);
+  const s = await signedIn(ctx);
+  try {
+    const r = await s.call('POST', '/admin/g/G1/personas/p1/remove');
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, { rolesRemoved: ['r-g1'], accessFullyRevoked: true });
+    assert.deepEqual(ctx.permissions.getRoleNames('p1'), ['r-g2'], 'only the role bound to G1');
+    const entry = ctx.permissions.getEntry('p1')!;
+    assert.deepEqual(entry.policy?.guilds?.G2, { default: READ }, 'Guild Two as it was');
+    assert.deepEqual(entry.policy?.guilds?.G1, { default: [] }, 'every grant in G1 gone, guild-wide pinned to deny');
+    assert.deepEqual(entry.bans, ['G1'], 'recorded: the persona can’t give itself access here again');
+    assert.equal(ctx.deps.canAccessGuild('p1', 'G1'), false);
+    assert.equal((await s.get('/admin/g/G1/personas/p1/access')).body.removed, true);
+    const rec = ctx.deps.audit.read({ guildId: 'G1' }).find((x) => x.action === 'persona.guild.remove')!;
+    assert.equal(rec.target, 'p1');
+    assert.equal(rec.ok, true);
+    assert.equal(rec.actor.id, 'admin1');
+    assert.deepEqual(rec.before, { roles: ['r-g1'], guildPolicy: { default: ['VIEW_CHANNEL'], channels: { c1: WRITE } } });
+    assert.deepEqual(rec.after, { accessFullyRevoked: true });
+
+    // Unknown persona: 404, nothing recorded.
+    const n = ctx.deps.audit.read({ guildId: 'G1' }).length;
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/nobody/remove')).status, 404);
+    assert.equal(ctx.deps.audit.read({ guildId: 'G1' }).length, n);
+
+    // An invariant break (access still resolves) is said, and recorded as not ok.
+    ctx.deps.canAccessGuild = () => true;
+    const odd = await s.call('POST', '/admin/g/G1/personas/p1/remove');
+    assert.deepEqual(odd.body, { rolesRemoved: [], accessFullyRevoked: false });
+    assert.equal(ctx.deps.audit.read({ guildId: 'G1' })[0].ok, false);
+  } finally {
+    await s.close();
+  }
+});
+
+test('remove from guild is slash /ban: both leave the stores byte for byte the same (file-default persona included)', async () => {
+  const { SlashHandler } = await import('../src/slash.js');
+  for (const fileDefault of [undefined, ['VIEW_CHANNEL']]) {
+    const panel = setupDeps([], {}, fileDefault ? { fileDefault } : {});
+    const slash = setupDeps([], {}, fileDefault ? { fileDefault } : {});
+    for (const c of [panel, slash]) {
+      c.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') }); // no permissions entry
+      c.permissions.setRole('r-g2', { caps: ['VIEW_CHANNEL'], scope: { all: true }, guildId: 'G2' });
+      c.permissions.addPersonaRoles('p1', ['r-g1', 'r-g2']);
+      c.permissions.setChannel('p1', 'G1', 'c2', READ);
+      c.permissions.setGuildDefault('p1', 'G2', READ);
+    }
+    const handler = new SlashHandler({
+      identity: slash.identity, permissions: slash.permissions, superadmins: [], guildAdmins: {},
+      capsFor: slash.deps.capsFor, canAccessGuild: slash.deps.canAccessGuild, resync: () => 0, newInviteCode: () => 'inv_x',
+    });
+    const s = await signedIn(panel);
+    try {
+      for (const pid of ['p1', 'p2']) {
+        const reply = handler.handle({
+          command: 'ban', guildId: 'G1', channelId: 'c1', channelName: 'c1',
+          invoker: { id: 'admin1', name: 'Admin', hasManageGuild: true }, options: { persona: pid },
+        });
+        assert.match(reply, /No remaining access in this guild\.$/);
+        assert.equal((await s.call('POST', `/admin/g/G1/personas/${pid}/remove`)).body.accessFullyRevoked, true);
+      }
+      assert.equal(
+        readFileSync(join(panel.dir, 'permissions.json'), 'utf8'),
+        readFileSync(join(slash.dir, 'permissions.json'), 'utf8'),
+        `fileDefault ${JSON.stringify(fileDefault)}`,
+      );
+    } finally {
+      await s.close();
+      slash.cleanup();
+    }
+  }
+});
+
+test('resync: once per 10 s per persona (429 RATE_LIMITED {retryAfterMs}); only a super-admin is told how many channels went out', async () => {
+  const ctx = setupDeps([]);
+  ctx.identity.upsert({ id: 'p2', displayName: 'Persona Two', avatar: '', token: hashToken('t2') });
+  const sent: string[] = [];
+  ctx.deps.resync = (pid) => (sent.push(pid), 7);
+  let t = 1_000_000;
+  const s = await signedIn(ctx, undefined, { clock: () => t });
+  try {
+    const first = await s.call('POST', '/admin/g/G1/personas/p1/resync');
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body, { ok: true }, 'no channel count for a guild admin: it is counted over every guild');
+    const again = await s.call('POST', '/admin/g/G1/personas/p1/resync');
+    assert.equal(again.status, 429);
+    assert.equal(again.body.error.code, 'RATE_LIMITED');
+    assert.equal(again.body.error.retryAfterMs, 10_000);
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p2/resync')).status, 200, 'per persona');
+    t += 9_999;
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/resync')).body.error.retryAfterMs, 1);
+    t += 1;
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/p1/resync')).status, 200);
+    assert.deepEqual(sent, ['p1', 'p2', 'p1'], 'a refused resync sends nothing');
+    const recs = ctx.deps.audit.read({ guildId: 'G1' }).filter((r) => r.action === 'persona.resync');
+    assert.equal(recs.length, 3);
+    for (const r of recs) {
+      assert.equal(r.detail, undefined, 'the count is not in the guild’s audit');
+      assert.equal(JSON.stringify(r).includes('pushed'), false);
+    }
+    assert.equal((await s.call('POST', '/admin/g/G1/personas/nobody/resync')).status, 404);
+  } finally {
+    await s.close();
+  }
+  const sup = setupDeps(['admin1']);
+  sup.deps.resync = () => 7;
+  const s2 = await signedIn(sup, []);
+  try {
+    assert.deepEqual((await s2.call('POST', '/admin/g/G1/personas/p1/resync')).body, { ok: true, pushed: 7 });
+  } finally {
+    await s2.close();
+  }
+});
+
+test('persona rows: a guild-wide deny is flagged, and so are direct grants here that do nothing (as the persona’s access lists them)', async () => {
+  const ctx = setupDeps([]);
+  ctx.permissions.setChannel('p1', 'G1', 'th-c1', WRITE); // a thread
+  ctx.permissions.setChannel('p1', 'G1', 'cat1', READ); // a category
+  ctx.permissions.setChannel('p1', 'G1', 'c-gone', WRITE); // not one of G1's now
+  ctx.permissions.setChannel('p1', 'G1', 'c2', []); // a block: guild-wide gives View, so it blocks that
+  const s = await signedIn(ctx);
+  const row = async () => (await s.get('/admin/g/G1/personas')).body.personas.find((p: { id: string }) => p.id === 'p1');
+  const listed = async () => (await s.get('/admin/g/G1/personas/p1/access')).body.inactive.length;
+  try {
+    assert.equal((await row()).inactiveGrants, 3);
+    assert.equal((await row()).guildWideDenied, false);
+    assert.equal(await listed(), 3);
+    await s.call('DELETE', '/admin/g/G1/personas/p1/grants?guildDefault=deny');
+    assert.equal((await row()).guildWideDenied, true);
+    assert.equal((await row()).inactiveGrants, 4, 'with guild-wide denied, the block has nothing left to block');
+    assert.equal(await listed(), 4);
+  } finally {
+    await s.close();
+  }
+});

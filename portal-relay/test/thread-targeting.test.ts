@@ -77,6 +77,7 @@ function makeRelay() {
         : { parentChannelId: meta.id };
     },
     channelForPerms: (_id: string) => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: (id: string) => metas[id] ?? null,
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 1 }],
     isGuildAllowed: () => true,

@@ -93,6 +93,7 @@ jobs:
         run: >-
           node --import tsx --test
           test/admin*.test.ts
+          test/access.test.ts
           test/slash.test.ts
           test/permissions.test.ts
           test/invites.test.ts

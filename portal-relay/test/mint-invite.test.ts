@@ -81,6 +81,7 @@ function makeRelay(opts: { minters?: string[]; realRateLimit?: boolean } = {}) {
       channelGuild[cid]
         ? { guildId: channelGuild[cid], permissionsFor: () => ({ has: () => true }) }
         : undefined,
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
     listChannelMetas: () => [],

@@ -47,7 +47,7 @@ a { color: var(--accent); }
   color: var(--fg); border-radius: 5px; padding: 5px 10px; line-height: 1;
 }
 .btn:hover { border-color: var(--accent); }
-.btn:disabled { opacity: .45; cursor: default; border-color: var(--line); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .45; cursor: default; border-color: var(--line); }
 .btn-sm { padding: 3px 8px; font-size: 12px; }
 .btn-primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .btn-danger { color: var(--danger); border-color: transparent; background: transparent; }
@@ -150,6 +150,10 @@ body:has(#drawer:not(.hidden)) #session-bar { visibility: hidden; }
 .hint { margin-top: 10px; font-size: 12px; }
 .load-error { padding: 14px; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .load-error p { margin: 0 0 8px; }
+/* A view the relay is too old to answer (PA ACCESS_API): not an error — the relay needs updating. */
+.relay-outdated { padding: 14px; border: 1px solid var(--warn); border-radius: 8px; background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.relay-outdated p { margin: 0 0 8px; }
+.relay-outdated-title { font-weight: 600; }
 .empty-note { color: var(--muted); padding: 12px 0; }
 
 /* ── Status lines: a section's result, where it happened; stays until the next. ── */
@@ -176,12 +180,15 @@ body:has(#drawer:not(.hidden)) #session-bar { visibility: hidden; }
 .toast-err { border-left: 4px solid var(--danger); color: var(--danger); }
 .toast-x { font: inherit; background: none; border: 1px solid transparent; border-radius: 5px; color: var(--muted); cursor: pointer; padding: 0 6px; line-height: 1.4; }
 .toast-x:hover { border-color: var(--line); color: var(--fg); }
+/* A toast's one action (Undo). */
+.toast-action { font: inherit; font-weight: 600; background: none; border: 1px solid var(--line); border-radius: 5px; color: var(--accent); cursor: pointer; padding: 1px 9px; line-height: 1.4; }
+.toast-action:hover { border-color: var(--accent); }
 /* With the drawer open on a wide screen the stack moves to its left, over the
    scrim, so a sticky error never covers the form it is about. Narrower than
    this it stays on top of the drawer (Tab and Esc still reach its ✕), and the
    drawer keeps room at its end as the page does (see .drawer-body). */
-@media (min-width: 820px) {
-  body:has(#drawer:not(.hidden)) .toasts { right: 532px; max-width: calc(100vw - 556px); }
+@media (min-width: 940px) {
+  body:has(#drawer:not(.hidden)) .toasts { right: 652px; max-width: calc(100vw - 676px); }
 }
 
 /* ── Toolbar / pager ── */
@@ -202,6 +209,11 @@ table.grid thead th {
   background: var(--panel); border-bottom: 1px solid var(--line); padding: 6px 10px; font-size: 12px;
   text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
 }
+/* In a drawer the scrolling box is .drawer-body, not the page: 46px (the
+   page's topbar) left a gap there with rows showing above the header. A
+   sticky box keeps to the scroller's padding, so -14px (.drawer-body's
+   padding) puts the header flush with the drawer body's top edge. */
+.drawer-body table.grid thead th { top: -14px; }
 table.grid thead th:first-child { border-top-left-radius: 8px; }
 table.grid thead th:last-child { border-top-right-radius: 8px; }
 table.grid tbody tr:last-child td:first-child { border-bottom-left-radius: 8px; }
@@ -227,7 +239,7 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 /* ── Drawer ── */
 .drawer-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 30; }
 .drawer {
-  position: fixed; top: 0; right: 0; height: 100vh; width: 520px; max-width: 94vw; z-index: 31;
+  position: fixed; top: 0; right: 0; height: 100vh; width: 640px; max-width: 94vw; z-index: 31;
   background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column;
   box-shadow: -8px 0 24px rgba(0,0,0,.18);
 }
@@ -235,8 +247,8 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .drawer-title { margin: 0; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .drawer-subtitle { font-weight: 400; }
 .drawer-body { padding: 14px; overflow-y: auto; }
-/* Narrower than 820px the toast stack sits over the drawer: keep room for it. */
-@media (max-width: 819.98px) {
+/* Narrower than 940px the toast stack sits over the drawer: keep room for it. */
+@media (max-width: 939.98px) {
   .drawer-body { padding-bottom: calc(14px + var(--toasts-h, 0px)); }
 }
 .drawer-sections { display: flex; flex-direction: column; gap: 16px; }
@@ -321,6 +333,136 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .grant-line { padding: 2px 0 2px 2px; }
 .grant-guild + .grant-guild { margin-top: 10px; }
 
+/* Read by screen readers, not shown (a type-ahead's result count). */
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ── Channels tab ── */
+.chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.chip { font: inherit; font-size: 12px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 999px; padding: 4px 11px; line-height: 1.2; }
+.chip:hover { border-color: var(--accent); }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.chip:disabled { opacity: .45; cursor: default; border-color: var(--line); }
+.updated { font-size: 12px; white-space: nowrap; }
+.chan-groups { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.chan-group + .chan-group { border-top: 1px solid var(--line); }
+.cat-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; font: inherit; font-size: 12px; font-weight: 600; color: var(--muted);
+  background: var(--zebra); border: none; padding: 7px 10px; cursor: pointer; text-align: left; letter-spacing: .4px;
+}
+.cat-head:hover { color: var(--fg); }
+/* The arrows are decoration: aria-expanded says it (the '/ ""' keeps them
+   out of the button's name where that is understood). */
+.cat-head::before { content: '▾'; content: '▾' / ''; display: inline-block; width: 1em; }
+.cat-head[aria-expanded="false"]::before { content: '▸'; content: '▸' / ''; }
+.cat-name { text-transform: uppercase; }
+.chan-list { list-style: none; margin: 0; padding: 0; }
+.chan-row {
+  display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; padding: 5px 12px 5px 28px; min-height: var(--row-h);
+  color: var(--fg); text-decoration: none; border-top: 1px solid var(--line-soft);
+}
+.chan-group-plain .chan-item:first-child .chan-row { border-top: none; }
+.chan-group-plain .chan-row { padding-left: 12px; }
+.chan-row:hover { background: var(--row-hover); }
+.chan-name { font-weight: 500; min-width: 0; overflow-wrap: anywhere; }
+.chan-cat { font-size: 12px; }
+.chan-warn { color: var(--warn); font-size: 12px; }
+.chan-counts { color: var(--muted); margin-left: auto; white-space: nowrap; }
+.chan-foot { margin-top: 8px; }
+
+/* ── Channel drawer ── */
+.chan-sub { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; margin: 0 0 6px; }
+.banner-warn { border-color: var(--warn); color: var(--fg); background: color-mix(in srgb, var(--warn) 10%, transparent); margin: 8px 0 0; }
+.currently { margin: 2px 0 8px; }
+.currently-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.add-form .level-control { margin-top: 2px; }
+.who-name { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.who-can { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.who-table td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.who-none .link { color: var(--muted); }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); white-space: nowrap; background: var(--code-bg); }
+.pill-read { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.pill-write, .pill-full { color: var(--accent); border-color: var(--accent); }
+.pill-full { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.pill-custom { color: var(--warn); border-color: var(--warn); }
+.pill-none { color: var(--muted); font-weight: 400; background: none; }
+.pill-limited { border-style: dashed; }
+.src-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.src-chip { font-size: 12px; padding: 1px 7px; border-radius: 999px; background: var(--code-bg); border: 1px solid var(--line); overflow-wrap: anywhere; }
+.src-override, .src-block { color: var(--muted); border-style: dashed; }
+.src-removed { color: var(--warn); border-color: var(--warn); }
+.dg-row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.dg-select { width: 11.5em; max-width: 100%; }
+.dg-custom { margin-top: 6px; }
+.dg-editor .caps-groups { margin-top: 0; }
+.dg-editor .inline { margin-top: 6px; }
+.row-status td { padding: 0 10px 8px; height: auto; }
+.row-status .status-line { margin-top: 0; }
+.status-part { display: block; }
+.drawer-foot { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.drawer-foot .hint { margin: 0; }
+
+/* ── Personas tab ── */
+/* The Add persona bar, in place under the toolbar. */
+.add-persona { margin: 0 0 10px; padding: 10px 12px; max-width: 560px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.add-persona > label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.add-persona-row { display: flex; gap: 6px; align-items: flex-start; }
+.add-persona-row .typeahead { flex: 1; min-width: 0; }
+.add-persona .field-hint { margin-top: 6px; }
+.ta-tag { margin-left: auto; }
+.flags { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.empty-note .inline { margin-top: 8px; }
+
+/* ── Persona drawer ── */
+.persona-head { display: flex; gap: 12px; align-items: center; }
+.persona-head-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.persona-id { overflow-wrap: anywhere; }
+.persona-summary { margin: 0; font-weight: 500; }
+.drawer-section h4 { font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: var(--fg); }
+.drawer-section h3:focus-visible { outline: none; }
+.access-section .add-form { margin-bottom: 4px; }
+.access-box { margin-top: 10px; }
+.access-table td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.access-table tr.cat-row th {
+  text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
+  background: var(--zebra); padding: 5px 10px; border-bottom: 1px solid var(--line-soft);
+}
+.access-table tr.run-row td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.run-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.run-text { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.inactive { margin-top: 12px; }
+.inactive-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.inactive-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; border: 1px dashed var(--line); border-radius: 6px; }
+.inactive-list li > span { min-width: 0; overflow-wrap: anywhere; }
+.danger-zone { border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line)); border-radius: 8px; padding: 10px 12px; }
+.danger-zone .inline + .inline { margin-top: 8px; }
+.resync-row .field-hint { margin: 0; }
+.elsewhere-link { display: block; font-size: 12px; margin-top: 6px; }
+/* A picker whose options are long (an access role and what it means) never
+   pushes the drawer wider than the screen. */
+.drawer-body select { max-width: 100%; min-width: 0; }
+.gw-row { display: flex; flex-direction: column; gap: 6px; }
+.gw-level { font-weight: 600; }
+.more-body, .identity-body { padding-top: 6px; }
+.identity-body { gap: 12px; }
+
+/* ── Type-ahead (an ARIA combobox) ── */
+.typeahead { position: relative; }
+.ta-box { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; border: 1px solid var(--line); border-radius: 5px; padding: 3px 5px; background: var(--panel); }
+.ta-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.ta-chips { display: contents; }
+.field .ta-box .ta-input, .ta-input { border: none; flex: 1 1 160px; width: auto; min-width: 120px; padding: 3px 2px; background: transparent; }
+.ta-input:focus, .ta-input:focus-visible { outline: none; }
+.ta-list {
+  position: absolute; z-index: 40; left: 0; right: 0; top: calc(100% + 2px); max-height: 260px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.18); padding: 3px 0;
+}
+.ta-option { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; padding: 5px 10px; cursor: pointer; }
+.ta-option.active { background: var(--row-hover); box-shadow: inset 3px 0 0 var(--accent); }
+.ta-option.disabled { color: var(--muted); cursor: default; }
+.ta-hint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ta-group-label { font-size: 12px; font-weight: 600; color: var(--muted); padding: 6px 10px 2px; text-transform: uppercase; letter-spacing: .4px; }
+.ta-empty { padding: 6px 10px; }
+
 /* ── Phone (<640px): no sideways page scroll; the drawer takes the screen. ── */
 @media (max-width: 640px) {
   .topbar { flex-wrap: wrap; height: auto; gap: 6px 10px; padding: 8px 12px; position: static; }
@@ -340,7 +482,9 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
   /* Inside a scrolling wrapper a sticky header would sit 46px down over the rows. */
   table.grid thead th { position: static; }
   .cell-roles { max-width: 220px; }
-  .drawer { width: 100vw; max-width: 100vw; height: 100vh; height: 100dvh; border-left: none; }
+  /* The whole screen: pinned to both edges rather than 100vw, which counts a
+     classic scrollbar too and pushed the drawer's left edge off-screen. */
+  .drawer { left: 0; width: auto; max-width: none; height: 100vh; height: 100dvh; border-left: none; }
   .drawer-body { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
   .field-row { flex-direction: column; gap: 0; }
   .guild-go { flex: 1 1 100%; }
@@ -353,4 +497,28 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
      the tabs and the guild switcher (the topbar is not sticky here). */
   .toasts { bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none; }
   .cropper-wrap { flex-direction: column; }
+  /* Tables marked .cards become one card per row, each cell captioned by its
+     data-label (the column heading). */
+  .table-wrap:has(table.cards) { overflow-x: visible; }
+  table.grid.cards, table.grid.cards tbody, table.grid.cards tr, table.grid.cards td { display: block; width: 100%; }
+  table.grid.cards thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.grid.cards tbody tr { padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }
+  table.grid.cards tbody tr:last-child { border-bottom: none; }
+  table.grid.cards tbody td { border: none; padding: 2px 0; height: auto; }
+  table.grid.cards td[data-label]::before { content: attr(data-label); display: block; font-size: 12px; color: var(--muted); }
+  table.grid.cards tr.row-status td { padding: 0; }
+  /* A persona's name needs no caption. */
+  table.grid.cards.who-table td:first-child::before { display: none; }
+  .chan-row { padding-left: 22px; }
+  .chan-group-plain .chan-row { padding-left: 12px; }
+  .chan-counts { margin-left: 0; flex-basis: 100%; white-space: normal; }
+  .dg-select { flex: 1 1 auto; }
+  /* The Personas list as cards: the picture beside nothing needs no caption. */
+  table.grid.cards.persona-table td.cell-avatar { display: none; }
+  table.grid.cards .cell-roles { max-width: none; white-space: normal; }
+  table.grid.cards.access-table tr.cat-row th, table.grid.cards.access-table tr.run-row td { display: block; width: 100%; }
+  table.grid.cards.access-table td:first-child::before { display: none; }
+  .add-persona { max-width: none; }
+  .persona-head { align-items: flex-start; }
+  .inactive-list li { flex-wrap: wrap; }
 }

@@ -50,7 +50,7 @@ import { AdminServer, type AdminDeps } from '../src/admin/server.js';
 import { AuditLog } from '../src/admin/audit.js';
 import { ChannelNameResolver } from '../src/admin/names.js';
 import { IdentityStore, generateToken, hashToken } from '../src/identity.js';
-import { PermissionsStore } from '../src/permissions.js';
+import { ALL_CAPS, PermissionsStore } from '../src/permissions.js';
 import { InviteStore } from '../src/invites.js';
 import { LEVEL_CAPS } from '../src/slash.js';
 import type { ChannelMeta } from '../src/discord-bot.js';
@@ -159,8 +159,11 @@ interface FixtureChannel {
   position: number;
   /** Discord announcement channel (the relay maps it to `text`). */
   announcement?: boolean;
-  /** What the relay's bot may do here (none = it can't see the channel). */
-  bot: Level | 'none';
+  /** What the relay's bot may do here (none = it can't see the channel;
+   *  full = every capability, as a bot with broad permissions has;
+   *  nothreads = all but starting threads, as where Create Public Threads
+   *  is denied). */
+  bot: Level | 'none' | 'nothreads';
   /** What members holding each Discord role may do here. */
   access: Partial<Record<'everyone' | 'mods' | 'researchers', Level>>;
 }
@@ -178,8 +181,12 @@ const C = {
   labNotes: '100000000000001023',
   ideas: '100000000000001024',
   oldLogs: '100000000000001031',
+  townHall: '100000000000001014',
+  showAndTell: '100000000000001015',
   lobby: '100000000000002011',
   desk: '100000000000002012',
+  // Not in the fixture: a channel of Guild One since deleted.
+  gone: '100000000000001099',
 };
 const everywhere = { everyone: 'write', mods: 'full', researchers: 'write' } as const;
 const CHANNELS: FixtureChannel[] = [
@@ -188,6 +195,10 @@ const CHANNELS: FixtureChannel[] = [
   { id: C.general, name: 'general', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 0, bot: 'full', access: everywhere },
   { id: C.random, name: 'random', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 1, bot: 'full', access: everywhere },
   { id: C.lounge, name: 'lounge', type: 'voice', guildId: G1, categoryId: C.catGeneral, position: 2, bot: 'full', access: everywhere },
+  // A stage channel: the relay calls its kind 'unknown', and serves it all the same.
+  { id: C.townHall, name: 'town-hall', type: 'unknown', guildId: G1, categoryId: C.catGeneral, position: 3, bot: 'full', access: everywhere },
+  // The bot can send here, but not start threads.
+  { id: C.showAndTell, name: 'show-and-tell', type: 'text', guildId: G1, categoryId: C.catGeneral, position: 4, bot: 'nothreads', access: everywhere },
   { id: C.catResearch, name: 'Research', type: 'category', guildId: G1, position: 2, bot: 'full', access: { mods: 'full', researchers: 'write' } },
   { id: C.research, name: 'research', type: 'text', guildId: G1, categoryId: C.catResearch, position: 0, bot: 'full', access: { mods: 'full', researchers: 'write' } },
   { id: C.designReview, name: 'design-review', type: 'thread', guildId: G1, parentId: C.research, position: 0, bot: 'full', access: { mods: 'full', researchers: 'write' } },
@@ -232,17 +243,20 @@ const PERSONAS = [
 
 const PERMISSIONS: Record<string, unknown> = {
   // Aria: talks in #general and #research through her access role, and holds
-  // her own direct grant in #research too.
-  [P.aria]: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE } } } } },
+  // her own direct grant in #research too — and one in the town-hall stage
+  // channel, as slash /add stores it when run in its chat.
+  [P.aria]: { roles: ['g1-chatters'], policy: { default: [], guilds: { [G1]: { channels: { [C.research]: WRITE, [C.townHall]: WRITE } } } } },
   // Cass: reads all of Guild One guild-wide, but is blocked in #random.
   [P.cass]: { policy: { default: [], guilds: { [G1]: { default: READ, channels: { [C.random]: [] } } } } },
   // Nyx: no entry at all — no access anywhere.
   // Juniper: grants on a thread id and a category id, which grant nothing.
   [P.juniper]: { policy: { default: [], guilds: { [G1]: { channels: { [C.designReview]: WRITE, [C.catResearch]: READ } } } } },
-  // Quill: mirrors @Mods with their per-channel permissions.
-  [P.quill]: { roles: ['g1-mods-mirror'] },
-  // Sol: a persona default (every guild) plus Guild Two's desk role.
-  [P.sol]: { roles: ['g2-desk'], policy: { default: READ } },
+  // Quill: mirrors @Mods with their per-channel permissions, and holds a block
+  // in #random that blocks nothing (no guild-wide level or persona default).
+  [P.quill]: { roles: ['g1-mods-mirror'], policy: { default: [], guilds: { [G1]: { channels: { [C.random]: [] } } } } },
+  // Sol: a persona default (every guild) plus Guild Two's desk role, and a
+  // grant in Guild One on a channel since deleted.
+  [P.sol]: { roles: ['g2-desk'], policy: { default: READ, guilds: { [G1]: { channels: { [C.gone]: WRITE } } } } },
 };
 
 const newCode = () => `inv_${randomBytes(18).toString('base64url')}`;
@@ -295,6 +309,10 @@ if (opts.scale === 'large') {
     }
   }
   CHANNELS.push(...big);
+  // Aria also holds an access role for every channel of Guild One, so her
+  // drawer folds hundreds of rows that read alike into one line.
+  (ACCESS_ROLES as Record<string, unknown>)['g1-everyone'] = { caps: WRITE, scope: { all: true }, guildId: G1 };
+  (PERMISSIONS[P.aria] as { roles: string[] }).roles.push('g1-everyone');
   const rooms = big.filter((c) => c.type === 'text' || c.type === 'voice');
   for (let i = 1; i <= 200; i++) {
     const id = `persona-${String(i).padStart(3, '0')}`;
@@ -378,18 +396,36 @@ const levelCaps = (l: Level | 'none' | undefined): Capability[] => (l && l !== '
 const roleKey = (gid: string, rid: string): 'everyone' | 'mods' | 'researchers' | null =>
   rid === gid ? 'everyone' : rid === ROLE.mods ? 'mods' : rid === ROLE.researchers ? 'researchers' : null;
 
-// Which channels a Discord role can see, and what it may do in each.
+// Which channels a Discord role can see, and what it may do in each. Worked
+// out once per role, as the relay's mirror cache does.
+const mirrors = new Map<string, Map<string, Set<Capability>>>();
 permissions.setMirrorLookup((gid, rid) => {
+  const k = `${gid}/${rid}`;
+  const hit = mirrors.get(k);
+  if (hit) return hit;
   const out = new Map<string, Set<Capability>>();
   const key = roleKey(gid, rid);
-  if (!key) return out;
-  for (const c of CHANNELS) {
-    if (c.guildId !== gid || c.type === 'category') continue;
-    const caps = levelCaps(c.access[key]);
-    if (caps.length) out.set(c.id, new Set(caps));
+  if (key) {
+    for (const c of CHANNELS) {
+      if (c.guildId !== gid || c.type === 'category') continue;
+      const caps = levelCaps(c.access[key]);
+      if (caps.length) out.set(c.id, new Set(caps));
+    }
   }
+  mirrors.set(k, out);
   return out;
 });
+
+// What the relay's bot can do in a channel — as computeCapabilities works it
+// out: a channel Discord's cache doesn't hold lets only the two capabilities
+// with no Discord permission behind them through.
+const BOT_CAPS: Record<Level | 'none' | 'nothreads', Capability[]> = {
+  none: [], read: LEVEL_CAPS.read, write: LEVEL_CAPS.write, full: ALL_CAPS, nothreads: ALL_CAPS.filter((c) => c !== 'CREATE_THREADS'),
+};
+const botCaps = (_gid: string, cid: string): Capability[] => {
+  const c = channelById.get(cid);
+  return c ? [...BOT_CAPS[c.bot]] : ['EDIT_OWN', 'DELETE_OWN'];
+};
 
 const meta = (c: FixtureChannel): ChannelMeta => ({
   id: c.id, name: c.name, type: c.type, guildId: c.guildId,
@@ -496,6 +532,31 @@ const deps: AdminDeps = {
     if (cur) identity.upsert({ ...cur, token: hashToken(generateToken()) });
   },
   newInviteCode: newCode,
+  // As Relay.capsFor: nothing for a persona it doesn't know or in a guild it
+  // doesn't serve; else the persona's access within what the bot can do.
+  capsFor: (pid, cid, gid) => {
+    if (!identity.get(pid) || (gid && !allowed.has(gid))) return [];
+    const policy = permissions.resolve(pid, gid, cid);
+    const bot = new Set(botCaps(gid, cid));
+    return ALL_CAPS.filter((c) => policy.has(c) && bot.has(c));
+  },
+  botCaps,
+  // As Relay.permChannelId: a thread's access is its parent's.
+  permChannelId: (cid) => {
+    const c = channelById.get(cid);
+    return c?.type === 'thread' && c.parentId ? c.parentId : cid;
+  },
+  listChannelLayout: (gid) =>
+    joinedGuilds().some((g) => g.id === gid)
+      ? CHANNELS.filter((c) => c.guildId === gid && c.type !== 'thread')
+        .map((c) => ({ id: c.id, categoryId: c.categoryId ?? null, position: c.position, announcement: !!c.announcement }))
+      : [],
+  canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, (cid) => channelById.get(cid)?.guildId === gid),
+  // No agents run in the preview: nothing to re-send.
+  resync: (pid) => {
+    console.error(`[preview] resync ${pid}`);
+    return 0;
+  },
 };
 
 let api = new AdminServer(deps, fakeDiscord);

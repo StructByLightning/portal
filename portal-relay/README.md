@@ -62,11 +62,15 @@ It listens on 127.0.0.1 only. Sign in as a fixture user:
 - `--ttl` sets the session lifetime in ms (default 30 minutes), to try expiry.
 - `--no-avatars` starts with no profile pictures and avatar uploads off.
 - `--scale large` adds a busy Guild One: 8 categories of 36 channels with
-  threads, 200 more personas, 60 more invites and 500 audit records.
+  threads, 200 more personas, 60 more invites and 500 audit records; Aria
+  also holds `g1-everyone` (Write in every channel), so her drawer folds
+  hundreds of rows that read alike into one line.
 
 The small world has Guild One (channels in General, Research and Archive
-categories, an announcement channel, a thread, a forum and a channel the bot
-can't see), Guild Two, four access roles, six personas (Aria, Cass, Nyx,
+categories, an announcement channel, a thread, a forum, a stage channel the
+relay calls `unknown` (Aria holds a direct grant there, as slash `/add` would
+store it), a channel where the bot can send but not start threads, and a
+channel the bot can't see), Guild Two, four access roles, six personas (Aria, Cass, Nyx,
 Juniper, Quill, Sol) with different kinds of access, and invites in every state.
 The stores live in a new temp directory each run (the path is printed) and are
 thrown away.
@@ -74,6 +78,15 @@ thrown away.
 Every name and id in the script is invented; keep it that way, since this repo
 is public. When a change adds a member to `AdminDeps`, give it a fake in this
 script, and in `scripts/admin-dev.mjs`, in the same change.
+
+`/admin/me` reports the admin API the relay speaks (`apiVersion`,
+`ADMIN_API_VERSION` in `src/admin/server.ts`; 3 since the access views,
+the persona directory, Remove from <guild> and Resync). Update the relay
+before the panel: a panel newer than its relay says "This panel needs the
+relay updated" in the Channels tab and the channel and persona drawers, and a
+relay newer than the panel gets a "The panel was updated — Reload" banner. A
+change to what the admin API answers or accepts bumps the version and the
+panel's `CLIENT_API` together (`test/admin-spa.test.ts` checks they match).
 
 CI (`.github/workflows/relay-ci.yml`) type-checks the relay and runs the admin,
 slash, permissions and invite tests, including `test/admin-spa.test.ts`, which

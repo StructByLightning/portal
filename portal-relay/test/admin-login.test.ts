@@ -83,6 +83,12 @@ async function world(): Promise<World> {
     rotatePersonaToken: () => 'unused',
     revokePersonaToken: () => {},
     newInviteCode: () => 'unused',
+    capsFor: () => [],
+    botCaps: () => [],
+    permChannelId: (cid) => cid,
+    listChannelLayout: () => [],
+    canAccessGuild: () => false,
+    resync: () => 0,
   };
   let tokenStatus: number | null = null;
   let held: Promise<void> | null = null;

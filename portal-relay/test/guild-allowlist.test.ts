@@ -122,6 +122,7 @@ function makeRelay() {
     listGuilds: () => (store.has(GUILD) ? [{ id: GUILD, name: 'New Guild', memberCount: 3 }] : []),
     listChannelMetas: () => [{ id: CHAN, guildId: GUILD, name: 'general', type: 'text', parentId: null, archived: false }],
     channelForPerms: () => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     isGuildAllowed: (gid: string) => store.has(gid),
     syncSlashCommands: async () => {},
