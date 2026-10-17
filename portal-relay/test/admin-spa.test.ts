@@ -1585,7 +1585,12 @@ test('lib.errorText: the relay’s refusal codes in the copy guide’s words', (
   assert.equal(t({ code: 'TARGET_REQUIRED', status: 400 }), 'Not saved: this page is out of date. Reload the page and try again.');
   assert.equal(t({ code: 'EXISTS', status: 409 }, 'Not created', { roleName: 'g1-chatters' }), 'A role named g1-chatters already exists — edit it instead?');
   assert.equal(t({ code: 'RATE_LIMITED', status: 429 }), 'Paused for a few seconds (rate limit).');
-  assert.equal(t({ code: 'NETWORK', status: 0 }), 'Couldn’t reach the relay. Nothing was changed. Try again.');
+  assert.equal(t({ code: 'NETWORK', status: 0, method: 'GET' }), 'Couldn’t reach the relay. Nothing was changed. Try again.', 'a failed read changed nothing');
+  for (const method of ['POST', 'PUT', 'DELETE', undefined]) {
+    assert.equal(t({ code: 'NETWORK', status: 0, method }, 'Not minted'),
+      'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.',
+      'a change whose answer was lost may have been made: ' + method);
+  }
   assert.equal(t({ code: 'FORBIDDEN', status: 403, reason: 'NOT_GUILD_ADMIN', message: 'not an admin of this guild' }),
     'You’re not an admin of this guild, or we couldn’t verify your Discord permissions right now.');
   assert.equal(t({ code: 'FORBIDDEN', status: 403, message: 'channel is not in this guild' }), 'Not saved: channel is not in this guild.', 'a route’s own refusal says what it is');
@@ -2795,6 +2800,26 @@ test('grant editor: a persona removed with /ban says so; Unset asks, then lifts 
   assert.equal(row().children[1].textContent, 'Not set');
   assert.ok(note().classList.contains('hidden'));
   assert.deepEqual(row().querySelectorAll('button').map((b) => b.textContent), ['Deny guild-wide']);
+});
+
+test('session: a change whose answer never came says it may have been made, not that nothing changed', async () => {
+  const g = '#/g/' + GA;
+  let down = false;
+  const box = await panelAt('/' + g + '/invites/new', {
+    me: ME_OP, guilds: [{ id: GA, name: 'Guild One' }],
+    handle: (method) => {
+      if (down && method === 'POST') throw new Error('connection reset'); // sent; the answer was lost
+      return undefined;
+    },
+  });
+  const form = fillMint(box.doc, 'x', 'g1-readers');
+  down = true;
+  form.fire('submit');
+  await settle();
+  assert.ok(box.calls.includes(`POST /admin/g/${GA}/invites`), 'the mint was sent');
+  const line = form.querySelector('.status-line')!;
+  assert.equal(line.textContent, 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.');
+  assert.ok(!/Nothing was changed|Try again\./.test(line.textContent), 'never “try again” as if nothing happened');
 });
 
 test('lib.errorText: a removal with /ban the page didn’t know about', () => {

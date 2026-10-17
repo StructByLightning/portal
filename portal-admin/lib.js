@@ -377,10 +377,14 @@
 
   /**
    * A failed change as its status line: '<prefix>: <reason>. <what to do>.'
-   * `e` is the API error ({status, code, message, …the error body's fields}),
-   * `ctx` what the request was about: { channelId, names } for a grant,
-   * { roleName } for an access role. The relay's codes get the copy guide's
-   * words; anything else says what the relay said.
+   * `e` is the API error ({status, code, message, method, …the error body's
+   * fields}), `ctx` what the request was about: { channelId, names } for a
+   * grant, { roleName } for an access role. The relay's codes get the copy
+   * guide's words; anything else says what the relay said.
+   *
+   * No answer at all: a read that failed changed nothing, but a change may
+   * have been made before the connection was lost — so it says to look
+   * before trying again (another try could mint a second invite).
    */
   function errorText(e, prefix, ctx) {
     const p = prefix || 'Not saved';
@@ -389,7 +393,9 @@
     const label = c.channelId && c.names && c.names.channels ? c.names.channels[c.channelId] : null;
     const bare = (label && label.name) || 'That channel';
     switch (code) {
-      case 'NETWORK': return 'Couldn’t reach the relay. Nothing was changed. Try again.';
+      case 'NETWORK': return e.method === 'GET'
+        ? 'Couldn’t reach the relay. Nothing was changed. Try again.'
+        : 'The relay didn’t answer, so this change may or may not have been made. Reload the page and check before you try again.';
       case 'RATE_LIMITED': return 'Paused for a few seconds (rate limit).';
       case 'CSRF': return p + ': this page’s security token is out of date. Reload the page and try again.';
       case 'THREAD_TARGET': {

@@ -90,11 +90,14 @@ const isSuper = () => !!(state.me && state.me.isSuper);
 // ── API layer ──────────────────────────────────────────────────────────────────
 
 class ApiError extends Error {
-  /** `detail`: the rest of the relay's error body (parentId, reason, existing…). */
-  constructor(status, code, message, detail) {
+  /** `detail`: the rest of the relay's error body (parentId, reason, existing…).
+   *  `method`: the request's, so a lost answer to a change can be told from a
+   *  failed read (lib.errorText). */
+  constructor(status, code, message, detail, method) {
     super(message || code || ('HTTP ' + status));
     this.status = status;
     this.code = code;
+    this.method = method;
     for (const k of ['parentId', 'reason', 'existing']) if (detail && detail[k] !== undefined) this[k] = detail[k];
   }
 }
@@ -122,18 +125,18 @@ async function api(method, path, body, opts = {}) {
   if (method !== 'GET' && state.me && state.me.csrf) req.headers['X-CSRF-Token'] = state.me.csrf;
   let res;
   try { res = await fetch(path, req); }
-  catch { throw new ApiError(0, 'NETWORK', 'network error'); }
+  catch { throw new ApiError(0, 'NETWORK', 'network error', null, method); }
   noteClock(res);
   if (res.status === 401) {
     if (!opts.boot && !opts.quiet && state.me) sessionEnded(method === 'GET' ? 'read' : 'mutation');
-    throw new ApiError(401, 'UNAUTHENTICATED', 'login required');
+    throw new ApiError(401, 'UNAUTHENTICATED', 'login required', null, method);
   }
   let data = null;
   const text = await res.text();
   if (text) { try { data = JSON.parse(text); } catch { /* non-JSON */ } }
   if (!res.ok) {
     const b = (data && data.error) || {};
-    const e = new ApiError(res.status, b.code, b.message, b);
+    const e = new ApiError(res.status, b.code, b.message, b, method);
     if (res.status === 403 && b.code === 'CSRF' && method !== 'GET' && !opts.retried && state.me) {
       const fresh = await refreshMe();
       if (fresh) return api(method, path, body, Object.assign({}, opts, { retried: true }));
