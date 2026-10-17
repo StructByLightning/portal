@@ -397,3 +397,16 @@ test('an admin claim lifts a ban only where the invite grants something', () => 
   }
 });
 
+test('a role whose scope names nothing grants nothing, so an admin claim of it leaves a ban', () => {
+  const t = makeRelay();
+  try {
+    t.relay.permissions.setRole('g1-empty', { caps: [...RW], scope: { channels: [] }, guildId: GUILD });
+    t.relay.invites.mint({ code: 'empty', mode: 'augment', maxUses: 5, roles: ['g1-empty'] } as any);
+    t.relay.permissions.clearGuild(EXISTING, GUILD);
+    t.relay.applyInviteAugment(EXISTING, 'empty', { byAdmin: true });
+    assert.equal(t.relay.permissions.isBanned(EXISTING, GUILD), true);
+  } finally {
+    t.cleanup();
+  }
+});
+

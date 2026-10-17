@@ -174,3 +174,18 @@ test('relay: allowing a not-yet-joined guild is dormant (no guild_create)', () =
     cleanup();
   }
 });
+
+test('bot: startup sync clears portal commands from joined guilds that are not allowed', async () => {
+  const bot = new DiscordBot('x', () => ['g1'], { guildMembersIntent: false }) as any;
+  const calls: Array<[string, number]> = [];
+  bot.handlers.slashCommand = () => '';
+  bot.client = {
+    application: { commands: { set: async (data: unknown[], gid: string) => void calls.push([gid, data.length]) } },
+    guilds: { cache: new Map([['g1', {}], ['g2', {}]]) },
+  };
+  await bot.syncSlashCommands();
+  const byGuild = Object.fromEntries(calls);
+  assert.equal(byGuild.g2, 0, 'g2 cleared');
+  assert.ok(byGuild.g1 > 0, 'g1 registered');
+});
+

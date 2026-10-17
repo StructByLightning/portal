@@ -18,7 +18,7 @@
  */
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
-import type { PermissionsStore } from './permissions.js';
+import { roleGrantsAccess, type PermissionsStore } from './permissions.js';
 import type { InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
@@ -378,7 +378,7 @@ export class SlashHandler {
       this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can assign it.`;
     }
-    if (role.caps.length) this.deps.permissions.liftBan(persona.id, role.guildId); // an admin granting access there ends a /ban
+    if (roleGrantsAccess(role)) this.deps.permissions.liftBan(persona.id, role.guildId); // an admin granting access there ends a /ban
     const roles = this.visibleRoles(this.deps.permissions.addPersonaRoles(persona.id, [name]), inv);
     this.audit(inv, 'slash.add-role', persona.id, true, { role: name });
     return `**${persona.displayName}** now holds \`${name}\` (roles here: ${roles.map((r) => `\`${r}\``).join(', ')}).`;

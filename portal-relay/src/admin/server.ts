@@ -14,7 +14,7 @@ import { join, extname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { AdminConfig, Scope } from '../config.js';
 import type { Capability } from '@animalabs/portal-protocol';
-import { ALL_CAPS } from '../permissions.js';
+import { ALL_CAPS, roleGrantsAccess } from '../permissions.js';
 import type { IdentityStore } from '../identity.js';
 import type { InviteStore } from '../invites.js';
 import type { PermissionsStore } from '../permissions.js';
@@ -553,7 +553,7 @@ export class AdminServer {
     if (e) return sendJson(res, 403, err('FORBIDDEN', e));
     // An admin granting access in the role's guild ends a /ban there.
     const role = this.deps.permissions.getRole(name);
-    const liftedBan = role?.guildId && role.caps.length ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
+    const liftedBan = role?.guildId && roleGrantsAccess(role) ? this.deps.permissions.liftBan(personaId, role.guildId) : false;
     const roles = this.deps.permissions.addPersonaRoles(personaId, [name]);
     this.audit.append({ actor: this.actorOf(session), action: 'persona.role.assign', target: personaId, guildId, ok: true, after: { role: name, ...(liftedBan ? { liftedBan } : {}) } });
     sendJson(res, 200, { roles: this.rolesVisibleIn(guildId, roles, session.isSuper) });
@@ -987,8 +987,13 @@ export class AdminServer {
   /** Land a failed or refused login on the panel with a fixed reason code
    *  (the SPA maps codes to messages; nothing from the request is echoed). */
   private loginFailed(res: ServerResponse, code: 'failed' | 'discord' | 'not_admin'): void {
+    // The code goes in the query, before any #fragment (the SPA reads
+    // location.search).
     const to = this.deps.config.postLoginUrl;
-    redirect(res, `${to}${to.includes('?') ? '&' : '?'}login_error=${code}`);
+    const hash = to.indexOf('#');
+    const base = hash < 0 ? to : to.slice(0, hash);
+    const frag = hash < 0 ? '' : to.slice(hash);
+    redirect(res, `${base}${base.includes('?') ? '&' : '?'}login_error=${code}${frag}`);
   }
 
   /** Some role isn't one of `guildId`'s own. A role that doesn't resolve

@@ -926,9 +926,9 @@ async function renderAudit(view) {
   clear(view);
   view.appendChild(toolbar('Filter audit…', []));
   const q = state.q.toLowerCase();
-  // Invite codes appear here as their first 12 characters: a pasted whole
-  // code finds its records by that prefix.
-  const qCode = q.length > 12 && q.startsWith('inv_') ? q.slice(0, 12) : null;
+  // Invite codes of 28+ characters appear here as their first 12 (shorter
+  // ones are hidden): a pasted whole code finds its records by that prefix.
+  const qCode = q.length >= 28 ? q.slice(0, 12) : null;
   const filtered = (records || []).filter((r) => {
     if (!q) return true;
     const hay = (JSON.stringify(r) + ' ' + auditTargetText(r, names)).toLowerCase();

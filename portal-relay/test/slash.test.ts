@@ -436,3 +436,17 @@ test('/ban holds until an admin grants access again; /add or /add-role lifts it'
   }
 });
 
+test('/add-role of a role that grants nothing does not lift a ban', () => {
+  const t = makeHandler();
+  try {
+    t.permissions.setRole('nothing-role', { caps: ['VIEW_CHANNEL'], scope: { channels: [] }, guildId: GUILD });
+    t.permissions.setRole('capless-role', { caps: [], scope: { all: true }, guildId: GUILD });
+    t.handler.handle(t.inv('ban', { persona: 'rhys-1' }));
+    t.handler.handle(t.inv('add-role', { persona: 'rhys-1', role: 'nothing-role' }));
+    t.handler.handle(t.inv('add-role', { persona: 'rhys-1', role: 'capless-role' }));
+    assert.equal(t.permissions.isBanned('rhys-1', GUILD), true);
+  } finally {
+    t.cleanup();
+  }
+});
+

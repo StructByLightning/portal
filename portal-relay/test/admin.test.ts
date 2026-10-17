@@ -1267,3 +1267,42 @@ test('audit view: short hand-chosen codes are hidden outright; deleted roles are
   }
 });
 
+test('a refused sign-in puts login_error in the query even when postLoginUrl has a fragment', async () => {
+  const { deps, cleanup } = setupDeps([]);
+  deps.config.postLoginUrl = '/panel#start';
+  const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G9', name: 'Unserved', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const l = await fetch(`${base}/admin/login`, { redirect: 'manual' });
+    const st = parseSetCookie(l, 'portal_admin_state')!;
+    const cb = await fetch(`${base}/admin/callback?code=abc&state=${st}`, { redirect: 'manual', headers: { cookie: `portal_admin_state=${st}` } });
+    assert.equal(cb.status, 302);
+    assert.equal(cb.headers.get('location'), '/panel?login_error=not_admin#start');
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+
+test('assigning an access role whose scope names nothing does not lift a ban', async () => {
+  const { deps, permissions, cleanup } = setupDeps([]);
+  permissions.setRole('r-g1-empty', { caps: ['VIEW_CHANNEL'], scope: { channels: [] }, guildId: 'G1' });
+  permissions.clearGuild('p1', 'G1');
+  const server = new AdminServer(deps, fakeDiscordFetch([{ id: 'G1', name: 'Guild One', permissions: MANAGE_GUILD }]));
+  await server.listen();
+  const base = `http://127.0.0.1:${server.boundPort}`;
+  try {
+    const session = await login(base, []);
+    const me = await (await fetch(`${base}/admin/me`, { headers: { cookie: `portal_admin_session=${session}` } })).json();
+    const r = await fetch(`${base}/admin/g/G1/personas/p1/roles`, {
+      method: 'POST', headers: { cookie: `portal_admin_session=${session}`, 'content-type': 'application/json', 'x-csrf-token': me.csrf }, body: JSON.stringify({ role: 'r-g1-empty' }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(permissions.isBanned('p1', 'G1'), true);
+  } finally {
+    await server.close();
+    cleanup();
+  }
+});
+

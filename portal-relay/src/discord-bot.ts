@@ -960,6 +960,19 @@ export class DiscordBot implements WebhookOps, RoleOps {
         ...(o.choices ? { choices: o.choices.map((v) => ({ name: v, value: v })) } : {}),
       })),
     }));
+    if (!guildId) {
+      // Startup/reconnect: a joined guild that isn't allowed keeps no portal
+      // commands (it may have been removed from the list while the relay was
+      // down; a live removal clears them in clearSlashCommands).
+      for (const gid of this.client.guilds.cache.keys()) {
+        if (this.guildAllowed(gid)) continue;
+        try {
+          await app.commands.set([], gid);
+        } catch (err) {
+          console.error(`[discord-bot] slash clear failed (${gid}):`, (err as Error).message);
+        }
+      }
+    }
     const gids = guildId
       ? [guildId]
       : [...this.client.guilds.cache.keys()].filter((id) => this.guildAllowed(id));
