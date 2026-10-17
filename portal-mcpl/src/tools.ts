@@ -313,10 +313,11 @@ const definitions: ToolDefinition[] = [
       'Ask the relay to join a voice channel and transcribe speech there ' +
       '(ElevenLabs Scribe). Final transcripts appear in your context as ' +
       '[voice] lines for channels you have open; they never wake you. ' +
-      'Requires the VOICE_LISTEN capability in that channel. The relay listens ' +
-      'in at most ONE voice channel per guild, shared by everyone: joining a ' +
-      'second channel fails with CONFLICT until someone calls voice_leave on ' +
-      'the first. Listening can also end on its own (channel deleted, bot moved, ' +
+      'Requires the VOICE_LISTEN capability in that channel, which list_channels ' +
+      "shows in each channel's capabilities. The relay listens in at most ONE " +
+      'voice channel per guild, shared by everyone: joining a second channel in ' +
+      'that guild is refused until someone calls voice_leave on the first. ' +
+      'Listening can also end on its own (channel deleted, bot moved, ' +
       'voice server lost) — a "[voice] transcription stopped" line reports it; ' +
       'call voice_join again to resume.',
     inputSchema: {

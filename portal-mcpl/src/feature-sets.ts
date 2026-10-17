@@ -165,7 +165,7 @@ export const TOOL_FEATURE_SETS: Readonly<Record<string, string>> = {
 export function toolFeatureSetCoverage(): { unmapped: string[]; unknownSets: string[] } {
   const declared = new Set(Object.keys(featureSets));
   return {
-    unmapped: toolDefinitions.map((t) => t.name).filter((name) => !(name in TOOL_FEATURE_SETS)),
+    unmapped: toolDefinitions.map((t) => t.name).filter((name) => !Object.hasOwn(TOOL_FEATURE_SETS, name)),
     unknownSets: Object.values(TOOL_FEATURE_SETS).filter((name) => !declared.has(name)),
   };
 }

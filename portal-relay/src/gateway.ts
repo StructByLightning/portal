@@ -276,7 +276,16 @@ export class Gateway {
         if (!session.identified) {
           session.send({
             op: 'rpc_result',
-            d: { id: frame.d.id, ok: false, error: { code: 'FORBIDDEN', message: 'not identified' } },
+            d: {
+              id: frame.d.id,
+              ok: false,
+              error: {
+                code: 'FORBIDDEN',
+                message:
+                  "Nothing ran: this connection hasn't finished signing in to the relay, so the call was refused. " +
+                  'Try again in a few seconds.',
+              },
+            },
           });
           return;
         }
