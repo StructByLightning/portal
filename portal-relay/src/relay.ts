@@ -29,7 +29,7 @@ import { IdentityStore, type IdentityChange, generateToken, hashToken } from './
 import { InviteStore, grantShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
-import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
+import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities, roleGrantsAccess } from './permissions.js';
 import { ReadStateStore } from './read-state.js';
 import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
@@ -1091,7 +1091,7 @@ export class Relay implements GatewayHooks {
       const role = this.permissions.getRole(r);
       if (!role?.guildId) continue;
       touched.add(role.guildId);
-      if (role.caps.length) grantsIn.add(role.guildId);
+      if (roleGrantsAccess(role)) grantsIn.add(role.guildId);
     }
     const banned = [...touched].filter((g) => this.permissions.isBanned(personaId, g));
     if (banned.length && !opts.byAdmin) {

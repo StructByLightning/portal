@@ -579,6 +579,17 @@ export const ALL_CAPS: Capability[] = [
  *  this role do here? EDIT_OWN/DELETE_OWN have no Discord bit (members always
  *  manage their own messages) — gated on SendMessages, mirroring
  *  {@link computeCapabilities}. */
+/** Whether an access role can grant anything at all: some capability, over a
+ *  scope that names something (every channel, at least one channel, or at
+ *  least one Discord role to mirror). Only such a role ends a /ban. */
+export function roleGrantsAccess(role: AccessRole | undefined): boolean {
+  if (!role || !role.caps?.length) return false;
+  const sc = role.scope as Record<string, unknown>;
+  if (sc.all === true) return true;
+  const named = (v: unknown) => Array.isArray(v) && v.some((x) => typeof x === 'string' && x !== '');
+  return named(sc.channels) || (typeof sc.mirrorRole === 'string' && sc.mirrorRole !== '') || named(sc.mirrorRoles);
+}
+
 export function capsFromPerms(perms: Readonly<PermissionsBitField>): Set<Capability> {
   const out = new Set<Capability>();
   for (const cap of ALL_CAPS) {
