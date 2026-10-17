@@ -1820,6 +1820,12 @@ function accessSection(ctx, m) {
   const empty = el('p', { class: 'empty-note hidden', role: 'status', text: 'No access in ' + guild + ' yet — add it to channels above.' });
   const inactiveBox = el('div', { class: 'inactive hidden' });
   const expanded = new Set(); // the folded runs shown
+  /** Channels whose direct-grant change is still at work (→ what it sets): a
+   *  redraw (another row's change read the persona again) draws their
+   *  control busy, showing that, so it can't be sent twice; `controls` holds
+   *  the table's current ones. */
+  const pendingCids = new Map();
+  let controls = new Map();
   let node = null;
   const chanById = new Map((m.meta.channels || []).map((c) => [c.id, c]));
   /** Can the panel give access on this channel (text, voice, forum)? One of
@@ -1866,13 +1872,18 @@ function accessSection(ctx, m) {
     const chips = lib.sourceChips(row, m.names, { isSuper: isSuper(), guild });
     const grantable = grantableAt(cid);
     const control = grantable || row.direct !== null ? ui.directGrantControl({
-      value: row.direct,
+      value: pendingCids.has(cid) ? pendingCids.get(cid) : row.direct,
       canBlock: lib.canBlock(row),
       label: 'Direct grant for ' + displayName + ' in ' + w,
       apply: (next) => changeDirect(cid, next),
+      busy: pendingCids.has(cid),
       removeOnly: !grantable,
     }) : null;
-    if (control) control.select.setAttribute('data-key', 'dg:' + cid);
+    if (control) {
+      control.select.setAttribute('data-key', 'dg:' + cid);
+      control.drawnBusy = pendingCids.has(cid);
+      controls.set(cid, control);
+    }
     const kind = chanById.get(cid);
     return el('tr', { 'data-cid': cid, class: eff.length ? null : 'who-none' }, [
       el('td', { 'data-label': 'Channel' }, [
@@ -1894,6 +1905,7 @@ function accessSection(ctx, m) {
     const a = document.activeElement;
     const focusKey = a && tableBox.contains(a) && a.dataset ? a.dataset.key || null : null;
     clear(tableBox);
+    controls = new Map();
     const rows = ordered(m.access.rows || []);
     empty.classList.toggle('hidden', rows.length > 0 || !!m.access.removed);
     if (!rows.length) return;
@@ -2042,7 +2054,19 @@ function accessSection(ctx, m) {
    *  guild-wide or default access, or lifts a removal; then send it.
    *  Resolves true when saved. */
   function changeDirect(cid, next) {
-    return m.track(changeDirectNow(cid, next));
+    pendingCids.set(cid, next);
+    return m.track(changeDirectNow(cid, next)).finally(() => {
+      pendingCids.delete(cid);
+      const c = controls.get(cid); // drawn busy by a redraw meanwhile, and not since
+      if (c && c.drawnBusy) {
+        // Not drawn again since it settled (cancelled at a confirm, or the
+        // read after it failed): back to what the drawer last read there.
+        c.drawnBusy = false;
+        const row = m.rowOf(cid);
+        c.set(row && row.direct !== undefined ? row.direct : null);
+        c.setBusy(false);
+      }
+    });
   }
 
   async function changeDirectNow(cid, next) {
@@ -2072,6 +2096,8 @@ function accessSection(ctx, m) {
       }
     }
     const res = await send(cid, next, row, lift);
+    // Settled: the redraw below draws this row's control as usable again.
+    pendingCids.delete(cid);
     if (res.ok) {
       const reloaded = await refresh('dg:' + cid);
       said(status, 'ok', res.text + (reloaded ? '' : ' (Couldn’t read the access again — reopen the drawer to see it.)'), null, [res.undo], 'the last change in ' + w);
@@ -2130,6 +2156,7 @@ function accessSection(ctx, m) {
     const inCat = (g) => g.rows.filter((r) => grantableAt(r.id)).map((r) => r.id);
     const cats = layout.groups.filter((g) => g.id && inCat(g).length);
     const all = layout.groups.flatMap((g) => inCat(g));
+    const catNameOf = new Map(cats.map((g) => [g.id, g.name]));
     const hereNow = (cid) => {
       const r = m.rowOf(cid);
       return r && Array.isArray(r.effective) && r.effective.length ? lib.levelLabel(r.effective) + ' now' : 'no access now';
@@ -2149,7 +2176,7 @@ function accessSection(ctx, m) {
           if (needle && String(g.name || '').toLowerCase().indexOf(needle) < 0) continue;
           const ids = inCat(g);
           out.push({
-            value: 'cat:' + g.id, group: 'Categories', channels: ids,
+            value: 'cat:' + g.id, group: 'Categories', channels: ids, catId: g.id,
             label: 'Category ' + g.name + ' (' + lib.plural(ids.length, 'channel') + ')',
             title: 'Picks the ' + lib.plural(ids.length, 'channel') + ' in ' + g.name + ' now. Channels added to it later aren’t covered.',
           });
@@ -2163,12 +2190,19 @@ function accessSection(ctx, m) {
         }
         return out;
       },
-      expand: (it) => {
-        if (!it.channels) return null;
-        catNote.textContent = 'Picked the ' + lib.plural(it.channels.length, 'channel') + ' in ' + it.label.replace(/^Category /, '').replace(/ \(\d+ channels?\)$/, '') +
-          ' now — channels added to it later aren’t covered.';
+      expand: (it) => (it.channels ? it.channels.map(itemOf) : null),
+      // Said once the limit is applied: what was picked, not what was asked for.
+      expanded: (it, picked, fresh) => {
+        const total = it.channels.length;
+        const cat = catNameOf.get(it.catId) || it.label.replace(/^Category /, '');
+        const later = ' — channels added to it later aren’t covered.';
+        catNote.textContent = picked < fresh
+          ? 'Picked ' + picked + ' of the ' + lib.plural(total, 'channel') + ' in ' + cat + ': at most ' + MAX_ADD_CHANNELS +
+            ' can be added at once. Channels added to it later aren’t covered.'
+          : fresh < total
+            ? 'Picked the other ' + lib.plural(fresh, 'channel') + ' in ' + cat + ' now (' + (total - fresh) + ' were picked already)' + later
+            : 'Picked the ' + lib.plural(total, 'channel') + ' in ' + cat + ' now' + later;
         catNote.classList.remove('hidden');
-        return it.channels.map(itemOf);
       },
     });
     ta.input.id = ui.uid('field');

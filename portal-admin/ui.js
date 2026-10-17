@@ -723,7 +723,11 @@
    *           picks), source(q) → Promise<[{ value, label, hint, tag, group,
    *           disabled, title }]>, debounce (ms, default 150), empty,
    *           expand(item) → [items] | null (a pick that stands for several:
-   *           its items are picked instead — a category's channels) }
+   *           its items are picked instead — a category's channels),
+   *           expanded(item, picked, fresh) (after such a pick: how many of
+   *           the `fresh` ones — not picked before — fit under `max`) }
+   * At `max` picks a visible note says so (and the live region): a pick
+   * past it does nothing else.
    * Options come grouped in the order their groups first appear. ↑/↓ move,
    * Enter picks, Esc closes the list (the next Esc is the drawer's), Tab
    * leaves it, Backspace in an empty field removes the last chip. Typing asks
@@ -747,7 +751,9 @@
     const chips = el('span', { class: 'ta-chips' });
     const list = el('div', { id: listId, class: 'ta-list hidden', role: 'listbox', 'aria-label': o.label || 'Suggestions' });
     const live = el('span', { class: 'visually-hidden', role: 'status' });
-    const node = el('div', { class: 'typeahead' }, [el('div', { class: 'ta-box' }, [chips, input]), list, live]);
+    const limitText = 'At most ' + max + ' can be picked. Remove one to pick another.';
+    const limitNote = el('p', { class: 'field-hint ta-limit hidden', text: limitText });
+    const node = el('div', { class: 'typeahead' }, [el('div', { class: 'ta-box' }, [chips, input]), list, live, limitNote]);
     // A press anywhere in the list (its scrollbar too) keeps focus in the field.
     list.addEventListener('mousedown', (e) => e.preventDefault());
     const listeners = [];
@@ -843,6 +849,7 @@
       }, o.debounce == null ? 150 : o.debounce);
     }
     function drawChips() {
+      limitNote.classList.toggle('hidden', !(multiple && max !== Infinity && picked.length >= max));
       clear(chips);
       for (const p of picked) {
         const hidden = el('input', { type: 'hidden', name: o.name || null, value: p.value });
@@ -865,14 +872,22 @@
         const taken = new Set(picked.map((p) => p.value));
         const fresh = several.filter((x) => !taken.has(x.value));
         const room = Math.max(0, max - picked.length);
+        const added = Math.min(room, fresh.length);
         picked.push(...fresh.slice(0, room));
         input.value = '';
         live.textContent = fresh.length > room
           ? 'Picked ' + room + ' of ' + fresh.length + ': at most ' + max + ' can be picked.'
           : fresh.length + ' picked from ' + it.label + '.';
+        if (o.expanded) o.expanded(it, added, fresh.length);
       } else if (multiple) {
         if (picked.length >= max) {
-          live.textContent = 'At most ' + max + ' can be picked.';
+          // Said where it is seen, not only to a screen reader; the list
+          // closes so the pick that did nothing doesn't look pending.
+          live.textContent = limitText;
+          limitNote.classList.remove('hidden');
+          seq++;
+          clearTimeout(timer);
+          setOpen(false);
           return;
         }
         picked.push(it);
@@ -987,24 +1002,42 @@
    * Custom… opens the capabilities inline, with Apply and Cancel. 'Block
    * guild-wide here' ([]) is offered when opts.canBlock, or when it is what
    * is set.
+   *
+   * A step from the keyboard is held until it is committed: in Chrome on
+   * Windows and Linux, and in Firefox, ↑/↓ on a closed select change its
+   * value (and fire 'change') at once, so going from — to Write would
+   * otherwise save Read on the way. Enter, or leaving the control, applies
+   * what it shows; Esc puts back what is set. A pick with the mouse, or
+   * from the open list, applies at once.
    *   opts: { value (caps | null), canBlock, label (the select's name), apply,
+   *           busy (drawn while a change to it is still being saved
+   *           elsewhere: off, and aria-busy, until setBusy(false)),
    *           removeOnly (a channel the panel can't give access on: what is
    *           set, or — to remove it; nothing else) }
-   * Returns { node, select, value(), set(value, canBlock) }.
+   * Returns { node, select, value(), set(value, canBlock), setBusy(on) }.
    */
   function directGrantControl(opts) {
     const lib = PA.lib;
     let value = opts.value == null ? null : opts.value.slice();
     let canBlock = !!opts.canBlock;
     let busyNow = false;
+    let held = false;     // a keyboard step shown, not applied yet
+    let stepping = false; // a step key was just pressed: its 'change' is held
+    let stepTimer = null;
     const label = opts.label || 'Direct grant';
     const select = el('select', { class: 'dg-select', 'aria-label': label, 'data-no-dirty': true });
     const edit = el('button', { class: 'btn btn-sm btn-ghost hidden', text: 'Edit…', 'aria-label': 'Edit capabilities — ' + label });
+    const heldHint = el('span', { class: 'field-hint dg-held hidden', text: 'Enter to apply · Esc to cancel' });
     const editorBox = el('div', { class: 'dg-custom hidden' });
-    const node = el('div', { class: 'dg' }, [el('div', { class: 'dg-row' }, [select, edit]), editorBox]);
+    const node = el('div', { class: 'dg' }, [el('div', { class: 'dg-row' }, [select, edit, heldHint]), editorBox]);
 
+    function setHeld(on) {
+      held = on;
+      heldHint.classList.toggle('hidden', !on);
+    }
     function fill() {
       clear(select);
+      setHeld(false);
       const cur = lib.directValue(value);
       const opt = (v, text, title) => el('option', { value: v, text, title: title || null });
       if (opts.removeOnly) {
@@ -1079,18 +1112,53 @@
       const a = document.activeElement;
       if (hadFocus && select.isConnected && (!a || a === document.body || !a.isConnected)) select.focus();
     }
-    select.addEventListener('change', () => {
+    /** Apply what the select shows (a pick, or a held step committed). */
+    function commit() {
+      setHeld(false);
       const v = select.value;
-      if (v === 'keep') return;
       if (v === 'custom') {
         openEditor();
         return;
       }
+      if (v === 'keep' || v === lib.directValue(value)) return; // back where it was: nothing to send
       closeEditor();
       run(v === '' ? null : v === 'block' ? [] : lib.LEVEL_CAPS[v].slice());
+    }
+    const STEP_KEYS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
+    select.addEventListener('keydown', (e) => {
+      const typed = typeof e.key === 'string' && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+      if (STEP_KEYS.includes(e.key) || typed) {
+        // The 'change' a step fires comes at once (in the same task); one
+        // that comes later is a pick from the open list.
+        stepping = true;
+        clearTimeout(stepTimer);
+        stepTimer = setTimeout(() => { stepping = false; }, 100);
+      } else if (e.key === 'Enter' && held) {
+        e.preventDefault();
+        commit();
+      } else if (e.key === 'Escape' && held) {
+        e.preventDefault();
+        e.stopPropagation(); // the drawer's Esc is the next one
+        fill();
+      }
+    });
+    select.addEventListener('blur', () => { if (held) commit(); });
+    select.addEventListener('change', () => {
+      if (stepping) {
+        setHeld(true);
+        return;
+      }
+      commit();
     });
     edit.addEventListener('click', openEditor);
+    if (opts.busy) {
+      busyNow = true;
+      select.disabled = true;
+      edit.disabled = true;
+      node.setAttribute('aria-busy', 'true');
+    }
     fill();
+    if (opts.busy) select.disabled = true;
     return {
       node,
       select,
@@ -1100,6 +1168,15 @@
         if (cb !== undefined) canBlock = !!cb;
         closeEditor();
         fill();
+      },
+      /** Drawn busy (opts.busy): on again once that change is done. */
+      setBusy(on) {
+        busyNow = !!on;
+        edit.disabled = busyNow;
+        if (busyNow) node.setAttribute('aria-busy', 'true');
+        else node.removeAttribute('aria-busy');
+        if (opts.removeOnly) fill();
+        else select.disabled = busyNow;
       },
     };
   }

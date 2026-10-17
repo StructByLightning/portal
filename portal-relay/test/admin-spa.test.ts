@@ -5507,6 +5507,36 @@ test('persona drawer: Remove from Guild One waits for an Add still being saved, 
   assert.deepEqual(order, [`PUT ${P}/grants`, `PUT ${P}/grants`, `POST ${P}/remove`], 'after both of the Add’s writes, none after it');
 });
 
+test('persona drawer: a row whose change is still queued stays off when another row’s change redraws the table', async () => {
+  let releaseG!: () => void;
+  let releaseR!: () => void;
+  const gateG = new Promise<void>((r) => { releaseG = r; });
+  const gateR = new Promise<void>((r) => { releaseR = r; });
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', {
+    handle: async (method, _path, body) => {
+      if (method === 'PUT' && body.channelId === CH.general) await gateG;
+      if (method === 'PUT' && body.channelId === CH.research) await gateR;
+      return undefined;
+    },
+  });
+  const { setDirectIn, tr, bodies } = box;
+  setDirectIn(CH.general, 'read');
+  await settle();
+  setDirectIn(CH.research, 'full');
+  await settle();
+  assert.equal(tr(CH.research).querySelector('select')!.disabled, true);
+  releaseG(); // #general's write lands: the persona is read again, the table drawn again
+  await settle();
+  const sel = tr(CH.research).querySelector('select')!;
+  assert.equal(sel.disabled, true, '#research’s Full is still on its way: it can’t be sent twice');
+  assert.equal(sel.value, 'full', 'showing what is being saved');
+  assert.equal(tr(CH.research).querySelector('.dg')!.getAttribute('aria-busy'), 'true');
+  releaseR();
+  await settle();
+  assert.equal(tr(CH.research).querySelector('select')!.disabled, false);
+  assert.equal(bodies.filter((b) => b.channelId === CH.research).length, 1, 'sent once');
+});
+
 test('channel drawer: a newer change to the same persona retires the older Undo; the outcome of an Undo leaves other Undo toasts up', async () => {
   const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
     handle: (method, path, body) => {
@@ -5528,6 +5558,124 @@ test('channel drawer: a newer change to the same persona retires the older Undo;
   await settle();
   assert.equal(undoFor('Nyx → Write').length, 0, 'retired: it would undo over this admin’s own newer change');
   assert.equal(undoFor('Nyx → Read').length, 1);
+});
+
+test('Channels tab: a change in a channel drawer is in the Personas tab’s counts when it is shown next', async () => {
+  let summaries = 0;
+  const after = { ...G1_SUMMARY, personas: [{ id: 'juniper', counts: { ...z7(), write: 1 } }] };
+  const box = await channelsPanel('/#/g/' + GA + '/channels/c/' + CH.research, {
+    routes: { [`/admin/g/${GA}/personas`]: { personas: [{ id: 'juniper', displayName: 'Juniper', roles: [] }], total: 1, limit: 50, offset: 0 } },
+    handle: (method, path) => {
+      if (method === 'GET' && path === `/admin/g/${GA}/access/summary`) return summaries++ ? after : G1_SUMMARY;
+      if (method === 'PUT' && path === `/admin/g/${GA}/personas/juniper/grants`) return echo(W7, [{ kind: 'direct', caps: W7 }], W7);
+      return undefined;
+    },
+  });
+  const { doc, drawerBody, tabs, view } = box;
+  const input = await typeAhead(box, 'jun');
+  input.fire('keydown', { key: 'Enter' });
+  drawerBody.querySelector('.add-form')!.fire('submit');
+  await settle();
+  doc.getElementById('drawer-close')!.click();
+  await settle();
+  const seen = summaries;
+  tabs.personas.click();
+  await settle();
+  assert.equal(summaries, seen + 1, 'asked again: the drawer patched only the channel’s counts');
+  const row = view.querySelectorAll('tr').find((t) => t.textContent.includes('Juniper'))!;
+  assert.match(row.textContent, /in 1 channel \(1 Write\)/);
+});
+
+test('persona drawer: a category that doesn’t fit under the 50-channel limit says how many of it were picked', async () => {
+  const chans: any[] = [];
+  for (const [ci, cat] of [['100000000000009001', 'Area 1'], ['100000000000009002', 'Area 2']].entries()) {
+    chans.push({ id: cat[0], name: cat[1], type: 'category', categoryId: null, position: ci, announcement: false, grantable: false });
+    for (let i = 0; i < 36; i++) {
+      chans.push({ id: String(100000000000010000n + BigInt(ci * 100 + i)), name: `area${ci + 1}-room-${i + 1}`, type: 'text', categoryId: cat[0], position: i, announcement: false, grantable: true });
+    }
+  }
+  const big = { channels: chans, categories: chans.filter((c) => c.type === 'category').map((c) => ({ id: c.id, name: c.name, position: c.position })) };
+  const box = await personaPanel('/#/g/' + GA + '/personas/p/aria', { rows: [], routes: { [`/admin/g/${GA}/channels`]: big } });
+  const { addForm, typeChannel, pickOption } = box;
+  await typeChannel('Area 1');
+  pickOption('Category Area 1 (36 channels)');
+  const note = () => addForm().querySelector('.field').querySelectorAll('.field-hint').find((n) => !n.classList.contains('ta-limit'))!;
+  assert.equal(note().textContent, 'Picked the 36 channels in Area 1 now — channels added to it later aren’t covered.');
+  await typeChannel('Area 2');
+  pickOption('Category Area 2 (36 channels)');
+  assert.equal(addForm().querySelector('.ta-chips')!.querySelectorAll('.tag').length, 50);
+  assert.equal(note().textContent, 'Picked 14 of the 36 channels in Area 2: at most 50 can be added at once. Channels added to it later aren’t covered.');
+  const limit = addForm().querySelector('.ta-limit')!;
+  assert.ok(!limit.classList.contains('hidden'), 'and the limit is shown');
+});
+
+test('ui.typeahead: at its limit the limit is said where it is seen; a pick past it closes the list', async () => {
+  const { ctx, doc, advance } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const { el, typeahead, drawer } = ctx.PA.ui;
+  drawerDom(doc, el);
+  const people = [{ value: 'a', label: 'Ada' }, { value: 'b', label: 'Bea' }, { value: 'c', label: 'Cyd' }];
+  const ta = typeahead({ label: 'Personas', ariaLabel: 'Personas', max: 2, source: async () => people });
+  const form = el('form', {}, [ta.node]);
+  drawer.open({ title: 'x', body: form });
+  const limit = ta.node.querySelector('.ta-limit')!;
+  assert.ok(limit.classList.contains('hidden'));
+  const input = ta.input;
+  input.focus();
+  for (const _ of [0, 1, 2]) {
+    input.value = '';
+    input.fire('input');
+    advance(150);
+    await settle();
+    input.fire('keydown', { key: 'Enter' });
+  }
+  assert.deepEqual(plain(ta.values()), ['a', 'b']);
+  assert.ok(!limit.classList.contains('hidden'), 'visible, not only to a screen reader');
+  assert.equal(limit.textContent, 'At most 2 can be picked. Remove one to pick another.');
+  assert.equal(input.getAttribute('aria-expanded'), 'false', 'the list closed: nothing looks pending');
+  ta.node.querySelector('button.x')!.click();
+  assert.ok(limit.classList.contains('hidden'), 'room again: the note goes');
+});
+
+test('ui.directGrantControl: a keyboard step is held until Enter or leaving it — passing Read on the way to Write saves only Write; Esc puts it back', async () => {
+  const { ctx, advance } = sandbox();
+  load(ctx, ['lib.js', 'ui.js']);
+  const { directGrantControl } = ctx.PA.ui;
+  const sent: unknown[] = [];
+  const c = directGrantControl({ value: null, label: 'x', apply: async (v: unknown) => { sent.push(plain(v)); return true; } });
+  const sel = c.select;
+  const step = (v: string) => {
+    sel.fire('keydown', { key: 'ArrowDown' });
+    sel.value = v; // the browser moves the value and fires 'change' at once
+    sel.fire('change');
+  };
+  step('read');
+  step('write');
+  assert.deepEqual(sent, [], 'nothing applied while stepping');
+  assert.ok(!c.node.querySelector('.dg-held')!.classList.contains('hidden'), 'it says how to apply');
+  sel.fire('keydown', { key: 'Enter' });
+  await settle();
+  assert.deepEqual(sent, [W7], 'Write, once');
+  advance(200);
+  // Leaving the control applies a held step too.
+  step('full');
+  sel.fire('blur');
+  await settle();
+  assert.deepEqual(sent.at(-1), F7);
+  advance(200);
+  // Esc puts back what is set, and sends nothing.
+  step('read');
+  sel.fire('keydown', { key: 'Escape' });
+  assert.equal(sel.value, 'full');
+  sel.fire('blur');
+  await settle();
+  assert.equal(sent.length, 2);
+  advance(200);
+  // A pick with the mouse (no step key just before) applies at once.
+  sel.value = 'read';
+  sel.fire('change');
+  await settle();
+  assert.deepEqual(sent.at(-1), R7);
 });
 
 test('every channel kind the relay serves: listed with its kind, its access shown, a direct grant there only removable, never an Add target', async () => {

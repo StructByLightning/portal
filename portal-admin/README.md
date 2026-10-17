@@ -107,7 +107,8 @@ the guild as a persistent **scope** in the header — not a gate you pass first.
     or lift a removal (`/ban` or *Remove from <guild>*). Only a change the
     admin was asked about lifts one: the relay refuses any other (an Undo, a
     change from a view read before the removal), and the drawer then says
-    the persona was removed since and reads it again;
+    the persona was removed since and reads it again. A row whose change is
+    still on its way stays off when another change redraws the table;
   - *Access roles in <guild>* — this guild's, each with what it means; ✕ asks
     first ("Aria loses Write in 2 channels unless another grant covers them");
   - **Remove from <guild>** — what slash `/ban` does (the same function on the

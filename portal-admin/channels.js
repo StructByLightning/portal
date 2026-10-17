@@ -44,14 +44,21 @@ const now = () => (typeof performance !== 'undefined' && performance.now ? perfo
 // drawn again), and patched from the answers to changes, so the list follows
 // a change without a round trip.
 
-const cache = {};    // gid → { chans, summary, at } — at 0: ask again
+const cache = {};    // gid → { chans, summary, at, seen } — at 0: ask again
 const inflight = {}; // gid → the request in flight
 let generation = 0;  // forget() bumps it: an answer asked for before is not kept
+/** gid → how many changes a channel drawer made there. An answer asked for
+ *  before the latest one (`seen` less than this) has the Personas tab's
+ *  per-persona counts from before it: the drawer patches only the channel's
+ *  counts in place (patchSummary), so those are asked for again. */
+const changes = {};
 
 function load(gid, force) {
   const have = cache[gid];
   if (!force && have && have.at && Date.now() - have.at <= REFETCH_AFTER_MS) return Promise.resolve(have);
-  if (inflight[gid]) return inflight[gid];
+  const seen = changes[gid] || 0;
+  // A request sent before the latest change answers from before it.
+  if (inflight[gid] && inflight[gid].seen === seen) return inflight[gid];
   const g = env.gpath(gid);
   const gen = generation;
   const p = Promise.all([
@@ -63,11 +70,13 @@ function load(gid, force) {
       return null;
     }),
   ]).then(([chans, summary]) => {
-    const v = { chans: chans || {}, summary, at: Date.now() };
-    if (gen === generation) cache[gid] = v;
-    else v.at = 0; // forgotten while in flight: shown once, asked again next time
+    const v = { chans: chans || {}, summary, at: Date.now(), seen };
+    // Not over an answer asked for after it, nor one forgotten meanwhile.
+    if (gen === generation && !(cache[gid] && (cache[gid].seen || 0) > seen)) cache[gid] = v;
+    else v.at = 0; // shown once, asked again next time
     return v;
   });
+  p.seen = seen;
   inflight[gid] = p;
   const done = () => { if (inflight[gid] === p) delete inflight[gid]; };
   p.then(done, done);
@@ -92,6 +101,12 @@ function patchSummary(gid, cid, rows, everywhere) {
   const same = ['read', 'write', 'full', 'custom'].every((k) => (s.counts[k] || 0) === next[k]);
   s.counts = next;
   return !same;
+}
+
+/** A channel drawer changed who can act in a channel of `gid`: the
+ *  Personas tab's counts are asked for again when it is next drawn. */
+function noteChange(gid) {
+  changes[gid] = (changes[gid] || 0) + 1;
 }
 
 /** What the list knows of a channel (its name, for a drawer's first title). */
@@ -719,10 +734,12 @@ function drawDrawer(d, gid, cid, data, note) {
       const lifted = !!(r && r.liftedBan) || (wasRemoved && !!fresh && !lib.isRemoved(fresh));
       // Lifted, the persona changed in every channel of the guild: the list asks again.
       patchSummary(gid, cid, rows, lifted);
+      noteChange(gid);
       env.markStale();
       const undo = grantable ? { key: pid, pid, name, prev: expect, next: next == null ? null : next.slice(), lifted } : null;
       return { ok: true, text: resultText(name, next, before, ex, lifted), undo };
     } catch (e) {
+      if (e && e.code === 'BANNED') noteChange(gid);
       return { ok: false, error: e };
     }
   }
@@ -756,6 +773,7 @@ function drawDrawer(d, gid, cid, data, note) {
         if (fresh) put(fresh, false);
         else if (d.isCurrent()) await reloadRows(null);
         patchSummary(gid, cid, rows, false);
+        noteChange(gid);
         env.markStale();
         const nowText = fresh ? lib.effectNowText(r.effective, where) : '';
         // Undo takes the grant back; a removal it lifted stays lifted.
@@ -1036,8 +1054,14 @@ PA.channels = {
   writeGrant,
   undoBook,
   /** The guild's access summary (cached with the channels, as the list has
-   *  it): the Personas list counts where each persona can act from it. */
-  summary: (gid) => load(gid, false).then((v) => v.summary),
+   *  it): the Personas list counts where each persona can act from it —
+   *  asked for again when a channel drawer changed something since it was
+   *  read (its per-persona counts aren't patched in place). */
+  summary(gid) {
+    const c = cache[gid];
+    const behind = !!c && (c.seen || 0) < (changes[gid] || 0);
+    return load(gid, behind).then((v) => v.summary);
+  },
   /** Forget what is known about a guild (every guild when none is named):
    *  something changed elsewhere in the panel, so the next look asks again. */
   forget(gid) {
