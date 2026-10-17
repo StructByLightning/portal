@@ -84,9 +84,43 @@ export function deriveAdminGuilds(guilds: PartialGuild[]): { ids: string[]; name
 /** Injectable fetch — lets tests run the callback flow without real network. */
 export type FetchLike = typeof fetch;
 
+/** Which call to Discord failed, and how — for the login.failed record. Never
+ *  carries Discord's own words: `status` is the HTTP status (100–599) or absent. */
+export class OAuthError extends Error {
+  constructor(
+    readonly step: 'token' | 'user' | 'guilds',
+    readonly failure: 'http' | 'network' | 'malformed',
+    readonly status?: number,
+  ) {
+    super(`oauth ${step} ${failure}${status !== undefined ? ` ${status}` : ''}`);
+    this.name = 'OAuthError';
+  }
+}
+
+/** One call to Discord: a thrown fetch is `network`, a non-2xx is `http`, a
+ *  body that isn't JSON is `malformed`. */
+async function call<T>(step: OAuthError['step'], fetchImpl: FetchLike, url: string, init: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetchImpl(url, init);
+  } catch {
+    throw new OAuthError(step, 'network');
+  }
+  if (!res.ok) {
+    const st = Number.isInteger(res.status) && res.status >= 100 && res.status <= 599 ? res.status : undefined;
+    throw new OAuthError(step, 'http', st);
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new OAuthError(step, 'malformed');
+  }
+}
+
 /**
  * Exchange the auth code for a user token, read identity + guilds, and derive the
  * admin-guild set. The user token is local to this call and discarded on return.
+ * Fails with an OAuthError.
  */
 export async function completeOAuth(
   opts: {
@@ -104,30 +138,21 @@ export async function completeOAuth(
     code: opts.code,
     redirect_uri: opts.redirectUri,
   });
-  const tokenRes = await fetchImpl(TOKEN_URL, {
+  const tok = await call<{ access_token?: unknown; token_type?: unknown } | null>('token', fetchImpl, TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
   });
-  if (!tokenRes.ok) {
-    throw new Error(`oauth token exchange failed: ${tokenRes.status}`);
-  }
-  const tok = (await tokenRes.json()) as { access_token?: string; token_type?: string };
-  if (!tok.access_token) throw new Error('oauth token exchange: no access_token');
-  const auth = `${tok.token_type ?? 'Bearer'} ${tok.access_token}`;
+  if (typeof tok?.access_token !== 'string' || !tok.access_token) throw new OAuthError('token', 'malformed');
+  const auth = `${typeof tok.token_type === 'string' ? tok.token_type : 'Bearer'} ${tok.access_token}`;
 
+  const init = { headers: { authorization: auth } };
   const [user, guilds] = await Promise.all([
-    apiGet<DiscordUser>(`${API_BASE}/users/@me`, auth, fetchImpl),
-    apiGet<PartialGuild[]>(`${API_BASE}/users/@me/guilds`, auth, fetchImpl),
+    call<DiscordUser | null>('user', fetchImpl, `${API_BASE}/users/@me`, init),
+    call<PartialGuild[] | null>('guilds', fetchImpl, `${API_BASE}/users/@me/guilds`, init),
   ]);
-  if (!user?.id) throw new Error('oauth: malformed /users/@me');
+  if (typeof user?.id !== 'string' || !user.id) throw new OAuthError('user', 'malformed');
 
   const derived = deriveAdminGuilds(Array.isArray(guilds) ? guilds : []);
   return { user, adminGuilds: derived.ids, guildNames: derived.names };
-}
-
-async function apiGet<T>(url: string, auth: string, fetchImpl: FetchLike): Promise<T> {
-  const res = await fetchImpl(url, { headers: { authorization: auth } });
-  if (!res.ok) throw new Error(`oauth GET ${url} failed: ${res.status}`);
-  return (await res.json()) as T;
 }

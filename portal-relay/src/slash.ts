@@ -18,7 +18,8 @@
  */
 import type { Capability } from '@animalabs/portal-protocol';
 import type { AccessRole, PersonaIdentity } from './config.js';
-import type { PermissionsStore } from './permissions.js';
+import { roleGrantsAccess, type PermissionsStore } from './permissions.js';
+import { LEVEL_CAPS, capsLabel, contributingRoles, removeFromGuild } from './access.js';
 import type { InviteStore } from './invites.js';
 import type { AuditLog } from './admin/audit.js';
 
@@ -188,32 +189,9 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
 
 // ── Capability presets ──
 
-const READ_CAPS: Capability[] = ['VIEW_CHANNEL', 'READ_HISTORY'];
-const WRITE_CAPS: Capability[] = [
-  ...READ_CAPS,
-  'SEND_MESSAGES',
-  'SEND_IN_THREADS',
-  'CREATE_THREADS',
-  'ATTACH_FILES',
-  'ADD_REACTIONS',
-  'EDIT_OWN',
-  'DELETE_OWN',
-];
-const FULL_CAPS: Capability[] = [...WRITE_CAPS, 'MANAGE_MESSAGES'];
-export const LEVEL_CAPS: Record<string, Capability[]> = {
-  read: READ_CAPS,
-  write: WRITE_CAPS,
-  full: FULL_CAPS,
-};
-
-/** Render a caps set as its level name when it matches one, else the raw list. */
-function capsLabel(caps: readonly Capability[]): string {
-  const set = new Set(caps);
-  for (const [level, levelCaps] of Object.entries(LEVEL_CAPS).reverse()) {
-    if (levelCaps.length === set.size && levelCaps.every((c) => set.has(c))) return level;
-  }
-  return caps.join(', ') || 'none';
-}
+// The presets and their labels live in access.ts (the admin panel speaks
+// them too); importers of LEVEL_CAPS from here keep working.
+export { LEVEL_CAPS };
 
 // ── Handler ──
 
@@ -231,12 +209,19 @@ export interface SlashDeps {
   /** Re-push the full channel set to a persona; returns channels pushed. */
   resync(personaId: string): number;
   newInviteCode(): string;
+  /** Whether the relay serves this guild (allow-listed). Commands linger in a
+   *  guild until Discord drops them, and a joined-but-not-allowed guild is not
+   *  one portal administers — so nothing runs there. */
+  isGuildServed?(guildId: string): boolean;
 }
 
 export class SlashHandler {
   constructor(private deps: SlashDeps) {}
 
   handle(inv: SlashInvocation): string {
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(inv.guildId)) {
+      return 'Portal is not enabled in this server.';
+    }
     if (!this.authorized(inv.invoker, inv.guildId)) {
       this.audit(inv, 'authz.denied', undefined, false, { command: inv.command });
       return 'Not authorized: requires Manage Server here, or portal superadmin.';
@@ -286,6 +271,13 @@ export class SlashHandler {
     return this.isSuper(inv.invoker) || role.guildId === inv.guildId;
   }
 
+  /** The role names a reply may list: all of them to a superadmin, only this
+   *  guild's to anyone else (another guild's roles are not theirs to see). */
+  private visibleRoles(roles: string[], inv: SlashInvocation): string[] {
+    if (this.isSuper(inv.invoker)) return roles;
+    return roles.filter((r) => this.deps.permissions.getRole(r)?.guildId === inv.guildId);
+  }
+
   private audit(
     inv: SlashInvocation,
     action: string,
@@ -316,6 +308,7 @@ export class SlashHandler {
     const persona = this.target(inv);
     if (typeof persona === 'string') return persona;
     const level = inv.options.level && LEVEL_CAPS[inv.options.level] ? inv.options.level : 'full';
+    this.deps.permissions.liftBan(persona.id, inv.guildId); // an admin granting access here ends a /ban
     this.deps.permissions.setChannel(persona.id, inv.guildId, inv.channelId, LEVEL_CAPS[level]);
     const effective = this.deps.capsFor(persona.id, inv.channelId, inv.guildId);
     this.audit(inv, 'slash.add', persona.id, true, { level });
@@ -363,9 +356,10 @@ export class SlashHandler {
       this.audit(inv, 'slash.add-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can assign it.`;
     }
-    const roles = this.deps.permissions.addPersonaRoles(persona.id, [name]);
+    if (roleGrantsAccess(role)) this.deps.permissions.liftBan(persona.id, role.guildId); // an admin granting access there ends a /ban
+    const roles = this.visibleRoles(this.deps.permissions.addPersonaRoles(persona.id, [name]), inv);
     this.audit(inv, 'slash.add-role', persona.id, true, { role: name });
-    return `**${persona.displayName}** now holds \`${name}\` (all roles: ${roles.map((r) => `\`${r}\``).join(', ')}).`;
+    return `**${persona.displayName}** now holds \`${name}\` (roles here: ${roles.map((r) => `\`${r}\``).join(', ')}).`;
   }
 
   private removeRole(inv: SlashInvocation): string {
@@ -382,9 +376,9 @@ export class SlashHandler {
       this.audit(inv, 'slash.remove-role', persona.id, false, { role: name, reason: 'guild-containment' });
       return `\`${name}\` is scoped to another guild — only a portal superadmin can remove it.`;
     }
-    const roles = this.deps.permissions.removePersonaRole(persona.id, name);
+    const roles = this.visibleRoles(this.deps.permissions.removePersonaRole(persona.id, name), inv);
     this.audit(inv, 'slash.remove-role', persona.id, true, { role: name });
-    return `Removed \`${name}\` from **${persona.displayName}** (remaining: ${roles.map((r) => `\`${r}\``).join(', ') || 'none'}).`;
+    return `Removed \`${name}\` from **${persona.displayName}** (remaining here: ${roles.map((r) => `\`${r}\``).join(', ') || 'none'}).`;
   }
 
   private invite(inv: SlashInvocation): string {
@@ -430,16 +424,12 @@ export class SlashHandler {
   private ban(inv: SlashInvocation): string {
     const persona = this.target(inv);
     if (typeof persona === 'string') return persona;
-    // Guild-scoped access roles off, inline guild policy pinned to deny.
-    const guildRoles = this.deps.permissions
-      .getRoleNames(persona.id)
-      .filter((name) => this.deps.permissions.getRole(name)?.guildId === inv.guildId);
-    for (const name of guildRoles) this.deps.permissions.removePersonaRole(persona.id, name);
-    this.deps.permissions.clearGuild(persona.id, inv.guildId);
-    // Roles are guild-scoped in resolution (2026-07-31), so removing this
-    // guild's roles + pinning the inline policy to deny IS full revocation
-    // here. Verify anyway — an invariant break must surface, not hide.
-    const stillHasAccess = this.deps.canAccessGuild(persona.id, inv.guildId);
+    // The one removal the panel's "Remove from <guild>" makes too: this
+    // guild's access roles off, its inline policy pinned to deny, the ban
+    // recorded — and verified (access.ts removeFromGuild).
+    const removed = removeFromGuild(this.deps.permissions, (p, g) => this.deps.canAccessGuild(p, g), persona.id, inv.guildId);
+    const guildRoles = removed.rolesRemoved;
+    const stillHasAccess = !removed.accessFullyRevoked;
     this.audit(inv, 'slash.ban', persona.id, !stillHasAccess, {
       rolesRemoved: guildRoles,
       accessFullyRevoked: !stillHasAccess,
@@ -490,6 +480,7 @@ export class SlashHandler {
     // Same gate as execution: a user who can see the command (e.g. after a
     // guild admin widened visibility in Integrations settings) but can't run
     // it must not be able to enumerate personas or the role catalog by typing.
+    if (this.deps.isGuildServed && !this.deps.isGuildServed(req.guildId)) return [];
     if (!this.authorized(req.invoker, req.guildId)) return [];
     if (req.option === 'persona') return this.personaChoices(req);
     if (req.option === 'role' || req.option === 'role2' || req.option === 'role3') {
@@ -552,15 +543,6 @@ export class SlashHandler {
   }
 
   private contributingRoles(personaId: string, guildId: string, channelId: string): string[] {
-    return this.deps.permissions.getRoleNames(personaId).filter((name) => {
-      const role = this.deps.permissions.getRole(name);
-      if (!role) return false;
-      if (role.guildId && role.guildId !== guildId) return false;
-      // A role contributes if removing everything else still leaves caps — cheap
-      // approximation: does a synthetic entry with only this role see the channel?
-      return this.deps.permissions
-        .resolveForRoles([name], guildId, channelId)
-        .has('VIEW_CHANNEL');
-    });
+    return contributingRoles(this.deps.permissions, personaId, guildId, channelId);
   }
 }
