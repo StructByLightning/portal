@@ -24,6 +24,8 @@ const FOREIGN_CATEGORY = 'foreign-category';
 const TEXT = 'text';
 const THREAD = 'thread';
 
+// A persona entry with `roles` takes its inline grants under `policy`: a `default` or `guilds` written beside
+// `roles` isn't read (permissions.ts's toEntry).
 function makeRelay(t: TestContext, policy: PermissionsFile) {
   const dir = mkdtempSync(join(tmpdir(), 'portal-create-channel-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -147,10 +149,7 @@ test('root creation uses unrestricted policy grants and existing default precede
       roles: { manager: { guildId: GUILD, scope: { all: true }, caps: MANAGE } },
       personas: { alice: { roles: ['manager'], policy: { default: [] } } },
     }, allow: true },
-    { policy: {
-      roles: { manager: { guildId: OTHER_GUILD, scope: { all: true }, caps: MANAGE } },
-      personas: { alice: { roles: ['manager'] } },
-    }, allow: false },
+    // A role bound to another server has its own test below, where the persona can see this one.
     // The role/inline union is most-permissive, as for channel resolution.
     { policy: {
       roles: { reader: { guildId: GUILD, scope: { all: true }, caps: VIEW } },
@@ -161,6 +160,23 @@ test('root creation uses unrestricted policy grants and existing default precede
     const h = makeRelay(t, policy);
     await (allow ? h.allowed : h.denied)({ guildId: GUILD });
   }
+});
+
+test('a server-wide role bound to another server grants nothing at this server\'s top level', async (t) => {
+  // The channel grant lets the persona see this server, so the access check passes and the refusal is the top
+  // level's: the role's MANAGE_CHANNELS stays in the server it's bound to.
+  const h = makeRelay(t, {
+    roles: { elsewhere: { guildId: OTHER_GUILD, scope: { all: true }, caps: MANAGE } },
+    personas: { alice: { roles: ['elsewhere'], policy: { default: [], guilds: { [GUILD]: { channels: { [TEXT]: VIEW } } } } } },
+  });
+  assert.equal(h.relay.guildVisible('alice', GUILD), true);
+  const top = await h.rpc({ guildId: GUILD });
+  assert.equal(top.ok, false);
+  assert.equal(top.error.code, 'FORBIDDEN');
+  assert.match(top.error.message, /^Nothing ran: creating a channel at the top level of server "g1" needs MANAGE_CHANNELS/);
+  assert.deepEqual(h.calls, []);
+  // Where it's bound, it grants.
+  await h.allowed({ guildId: OTHER_GUILD });
 });
 
 test('category grants stay local: inline, channel-scoped roles, and mirrored roles', async (t) => {
