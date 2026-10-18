@@ -158,10 +158,8 @@ export class PermissionsStore {
         for (const cap of role.caps) out.add(cap);
       }
     }
-    const policy = entry.policy;
-    if (policy) {
-      // A hand-edited policy can lack its default; read that as empty, as resolve() does.
-      for (const cap of policy.guilds?.[guildId]?.default ?? policy.default ?? []) out.add(cap);
+    if (entry.policy) {
+      for (const cap of this.explainPolicyDefault(entry.policy, guildId).caps) out.add(cap);
     }
     return out;
   }
@@ -197,20 +195,27 @@ export class PermissionsStore {
    * Which part of an inline policy decides (guildId, channelId), and what it
    * gives: the channel's own entry ([] blocks), else the guild's default
    * ([] denies), else the persona default. The one place this order lives —
-   * resolve() and the admin panel's explanations both go through it.
+   * resolve() and the admin panel's explanations both go through it, and
+   * resolveGuild reads its defaults part.
    */
   explainPolicy(
     pol: PersonaPolicy,
     guildId: string | null,
     channelId: string,
   ): { source: 'channel' | 'guildDefault' | 'personaDefault'; caps: Capability[] } {
-    if (guildId) {
-      const g = pol.guilds?.[guildId];
-      if (g) {
-        if (g.channels?.[channelId]) return { source: 'channel', caps: g.channels[channelId] };
-        if (g.default) return { source: 'guildDefault', caps: g.default };
-      }
-    }
+    const channel = guildId ? pol.guilds?.[guildId]?.channels?.[channelId] : undefined;
+    if (channel) return { source: 'channel', caps: channel };
+    return this.explainPolicyDefault(pol, guildId);
+  }
+
+  /** explainPolicy's order with no channel to consult: the guild's default
+   *  ([] denies), else the persona default, a missing one read as empty. */
+  private explainPolicyDefault(
+    pol: PersonaPolicy,
+    guildId: string | null,
+  ): { source: 'guildDefault' | 'personaDefault'; caps: Capability[] } {
+    const g = guildId ? pol.guilds?.[guildId] : undefined;
+    if (g?.default) return { source: 'guildDefault', caps: g.default };
     return { source: 'personaDefault', caps: pol.default ?? [] };
   }
 
@@ -389,8 +394,9 @@ export class PermissionsStore {
         // (nonempty default + channel-only guild entries) and unbinds
         // addressing roles / silences ambient dispatch while resolve()
         // still grants.
-        if (g.default === undefined && pol.default.length > 0) return true;
-      } else if (pol.default.length > 0) {
+        // A hand-edited policy can lack its default: read it as empty, as resolve() does.
+        if (g.default === undefined && (pol.default?.length ?? 0) > 0) return true;
+      } else if ((pol.default?.length ?? 0) > 0) {
         return true; // legacy global default applies where no guild entry says otherwise
       }
     }

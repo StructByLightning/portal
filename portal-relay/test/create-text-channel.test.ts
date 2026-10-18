@@ -400,6 +400,9 @@ test('a null categoryId asks for the guild root, as before the gate', async (t) 
 });
 
 test("a bot that lacks Manage Channels, or isn't in the guild, is named as the gap, not the persona's grant", async (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { logged.push(args.map(String).join(' ')); });
+  const gapLines = () => logged.filter((line) => line.startsWith('[portal-relay] create_text_channel'));
   const h = makeRelay(t, { default: MANAGE });
   h.state.guildPerms = new PermissionsBitField();
   const response = await h.rpc({ guildId: GUILD });
@@ -415,6 +418,18 @@ test("a bot that lacks Manage Channels, or isn't in the guild, is named as the g
   assert.equal(absent.error.message,
     `Nothing ran: the relay's Discord bot isn't in server "${GUILD}", so it can't create a channel there. ` +
     'Only whoever runs this host can change that.');
+  assert.deepEqual(gapLines(), [
+    `[portal-relay] create_text_channel in guild ${GUILD}: the bot lacks Manage Channels`,
+    `[portal-relay] create_text_channel in guild ${GUILD}: the bot isn't in the guild`,
+  ]);
+
+  // A persona without the right learns nothing about the bot: its own refusal comes first.
+  const viewer = makeRelay(t, { personas: { alice: { default: VIEW } } });
+  viewer.state.botInGuild = false;
+  const own = await viewer.rpc({ guildId: GUILD });
+  assert.equal(own.ok, false);
+  assert.match(own.error.message, /^Nothing ran: creating a channel at the top level of server "g1" needs MANAGE_CHANNELS/);
+  assert.equal(gapLines().length, 2, 'and nothing is logged about the bot');
 });
 
 test("each refusal of the persona says what didn't happen, why, and what to do", async (t) => {
@@ -430,8 +445,9 @@ test("each refusal of the persona says what didn't happen, why, and what to do",
     "to create at the server's top level.");
   assert.equal(await refusal(h, { guildId: GUILD, categoryId: TEXT }, 'FORBIDDEN'),
     `Nothing ran: "${TEXT}" isn't a category of server "${GUILD}" that the relay can see. Check the id: ` +
-    "list_channels, with that guildId, shows the server's categories you can use, with their ids. To create at the " +
-    "server's top level, leave categoryId out.");
+    "list_channels, with that guildId, shows the server's categories and your capabilities in each, and creating " +
+    'in one needs MANAGE_CHANNELS there. Leaving categoryId out creates at the server\'s top level, which needs ' +
+    'MANAGE_CHANNELS across the server.');
   assert.equal(await refusal(h, { guildId: GUILD }, 'FORBIDDEN'),
     `Nothing ran: creating a channel at the top level of server "${GUILD}" needs MANAGE_CHANNELS across the server, ` +
     "which you don't have, so calling again won't change that. Pass a categoryId where list_channels shows you " +
@@ -442,15 +458,48 @@ test("each refusal of the persona says what didn't happen, why, and what to do",
     'servers you can use. If you need this one, ask whoever runs this host.');
 });
 
-test('a persona banned from a server creates nothing there, whatever it holds, and keeps its rights elsewhere', async (t) => {
-  // A hand-edited file can hold a ban beside grants: /ban takes them off, and the admin API refuses new ones.
-  const h = makeRelay(t, {
+test('a server the persona has no access to, or is banned from, is refused as one the relay doesn\'t serve', async (t) => {
+  const noAccess = `Nothing ran: you have no access to server "${GUILD}" on this relay. Check the id: list_guilds ` +
+    'shows the servers you can use. If you need this one, ask whoever runs this host.';
+  const refusedAsUnserved = async (h: ReturnType<typeof makeRelay>) => {
+    for (const params of [{ guildId: GUILD }, { guildId: GUILD, categoryId: CATEGORY }, { guildId: GUILD, categoryId: TEXT }]) {
+      const response = await h.rpc(params);
+      assert.equal(response.ok, false);
+      assert.equal(response.error.code, 'FORBIDDEN');
+      assert.equal(response.error.message, noAccess);
+    }
+    assert.deepEqual(h.calls, []);
+  };
+  // Not served at all.
+  const unserved = makeRelay(t, { personas: { alice: { default: MANAGE } } });
+  unserved.state.allowedGuilds.delete(GUILD);
+  await refusedAsUnserved(unserved);
+  // Served, but the persona holds nothing there.
+  await refusedAsUnserved(makeRelay(t, {
+    roles: { elsewhere: { guildId: OTHER_GUILD, scope: { all: true }, caps: MANAGE } },
+    personas: { alice: { roles: ['elsewhere'] } },
+  }));
+  // Banned, beside grants a hand-edited file can still hold there: /ban takes them off, and the admin API
+  // refuses new ones. resolveGuild gives such a persona nothing either, as resolve() does, and its rights
+  // elsewhere stand.
+  const banned = makeRelay(t, {
     roles: { manager: { guildId: GUILD, scope: { all: true }, caps: MANAGE } },
     personas: { alice: { roles: ['manager'], policy: { default: MANAGE }, bans: [GUILD] } },
   });
-  await h.denied({ guildId: GUILD });
-  await h.denied({ guildId: GUILD, categoryId: CATEGORY });
-  await h.allowed({ guildId: OTHER_GUILD });
+  await refusedAsUnserved(banned);
+  assert.deepEqual([...banned.relay.permissions.resolveGuild('alice', GUILD)], []);
+  await banned.allowed({ guildId: OTHER_GUILD });
+});
+
+test('resolveGuild reads a server default as resolve() reads it, a hand-edited one that isn\'t a list included', async (t) => {
+  for (const serverDefault of ['', false, 0]) {
+    for (const personaDefault of [MANAGE, []]) {
+      const h = makeRelay(t, {
+        personas: { alice: { default: personaDefault, guilds: { [GUILD]: { default: serverDefault } } } },
+      } as unknown as PermissionsFile);
+      assert.deepEqual([...h.relay.permissions.resolveGuild('alice', GUILD)], [...h.relay.permissions.resolve('alice', GUILD, TEXT)]);
+    }
+  }
 });
 
 test('a persona removed during a category fetch is refused, even where the file default grants', async (t) => {
@@ -463,9 +512,11 @@ test('a persona removed during a category fetch is refused, even where the file 
 });
 
 test('hand-edited gaps deny root creation rather than throw', async (t) => {
-  // A policy with no default anywhere, and a role reference with no catalog entry.
+  // A policy with no default anywhere, with and without an entry for this server, and a role reference with
+  // no catalog entry.
   for (const policy of [
     { personas: { alice: { guilds: { [GUILD]: { channels: {} } } } } },
+    { personas: { alice: { guilds: { [OTHER_GUILD]: { channels: {} } } } } },
     { personas: { alice: { roles: ['no-such-role'] } } },
   ] as unknown as PermissionsFile[]) {
     const h = makeRelay(t, policy);

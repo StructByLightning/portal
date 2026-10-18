@@ -123,15 +123,16 @@ export interface CreateThreadParams {
 }
 /** Requires MANAGE_CHANNELS at the destination: effective category caps when
  *  categoryId is supplied, otherwise an unrestricted grant (a guild-bound
- *  all-channel role, or the persona's guild or persona-wide default) and the
- *  bot's guild-level ManageChannels permission. Channel-scoped and mirrored
- *  grants do not authorize creation at the guild root. The guild must be
- *  allowed, and a persona banned from it can't create there. Without
- *  categoryId (or with null), the channel goes at the root. */
+ *  all-channel role, or the persona's guild or persona-wide default, or for
+ *  a persona with no entry the file's default) and the bot's guild-level
+ *  ManageChannels permission. Channel-scoped and mirrored grants do not
+ *  authorize creation at the guild root. The guild must be allowed, and one
+ *  the persona has no access to, or is banned from, is refused as if it
+ *  weren't. Without categoryId (or with null), the channel goes at the root. */
 export interface CreateTextChannelParams {
   guildId: GuildId;
   name: string;
-  categoryId?: ChannelId;
+  categoryId?: ChannelId | null;
 }
 export interface ChannelResult {
   channel: PortalChannel;

@@ -2265,29 +2265,34 @@ export class Relay implements GatewayHooks {
           "to create at the server's top level.",
       );
     }
-    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) {
-      throw rpcError(
-        'FORBIDDEN',
-        `Nothing ran: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
-          'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
-      );
+    const noAccess = () => rpcError(
+      'FORBIDDEN',
+      `Nothing ran: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+        'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+    );
+    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) throw noAccess();
+    let category = categoryId === undefined ? undefined : this.bot.channelForPerms(categoryId);
+    if (categoryId !== undefined && !category) {
+      // REST can know a category before its gateway event arrives. Fetching
+      // populates discord.js's cache, which the effective-capability check uses.
+      await this.bot.getChannelMeta(categoryId);
+      category = this.bot.channelForPerms(categoryId);
+      // A mirror lookup may predate this newly fetched channel as well.
+      if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
     }
+    // A persona with no access to the server gets the refusal a server the
+    // relay doesn't serve gets, as list_channels gives both (requireGuild), so
+    // nothing below tells it about the server. Checked after the fetch, so a
+    // grant on a category the cache has only just learned counts.
+    if (!this.guildVisible(personaId, guildId)) throw noAccess();
     if (categoryId !== undefined) {
-      let category = this.bot.channelForPerms(categoryId);
-      if (!category) {
-        // REST can know a category before its gateway event arrives. Fetching
-        // populates discord.js's cache, which the effective-capability check uses.
-        await this.bot.getChannelMeta(categoryId);
-        category = this.bot.channelForPerms(categoryId);
-        // A mirror lookup may predate this newly fetched channel as well.
-        if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
-      }
       if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
         throw rpcError(
           'FORBIDDEN',
           `Nothing ran: ${JSON.stringify(categoryId)} isn't a category of server ${JSON.stringify(guildId)} that the ` +
-            "relay can see. Check the id: list_channels, with that guildId, shows the server's categories you can use, " +
-            "with their ids. To create at the server's top level, leave categoryId out.",
+            "relay can see. Check the id: list_channels, with that guildId, shows the server's categories and your " +
+            'capabilities in each, and creating in one needs MANAGE_CHANNELS there. Leaving categoryId out creates ' +
+            "at the server's top level, which needs MANAGE_CHANNELS across the server.",
         );
       }
       this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
