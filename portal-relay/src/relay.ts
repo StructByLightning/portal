@@ -2282,8 +2282,11 @@ export class Relay implements GatewayHooks {
     }
     // A persona with no access to the server gets the refusal a server the
     // relay doesn't serve gets, as list_channels gives both (requireGuild), so
-    // nothing below tells it about the server. Checked after the fetch, so a
-    // grant on a category the cache has only just learned counts.
+    // no answer below tells it about the server. Only the time can differ: a
+    // served server fetches an uncached category first, as send_message
+    // fetches a thread it's given before its check. It runs after the fetch
+    // because couldAccessGuild finds a channels-scoped grant through the
+    // cache, so a grant on a category the cache has only just learned counts.
     if (!this.guildVisible(personaId, guildId)) throw noAccess();
     if (categoryId !== undefined) {
       if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {

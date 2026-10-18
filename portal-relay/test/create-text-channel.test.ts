@@ -522,4 +522,41 @@ test('hand-edited gaps deny root creation rather than throw', async (t) => {
     const h = makeRelay(t, policy);
     await h.denied({ guildId: GUILD });
   }
+  // A persona that can see the server through a category grant, with no default anywhere, gets the top
+  // level's refusal: the missing default reads as empty.
+  const seen = makeRelay(t, {
+    personas: { alice: { guilds: { [GUILD]: { channels: { [CATEGORY]: MANAGE } } } } },
+  } as unknown as PermissionsFile);
+  const top = await seen.rpc({ guildId: GUILD });
+  assert.equal(top.ok, false);
+  assert.equal(top.error.code, 'FORBIDDEN');
+  assert.match(top.error.message, /^Nothing ran: creating a channel at the top level of server "g1" needs MANAGE_CHANNELS/);
+  assert.deepEqual(seen.calls, []);
+  await seen.allowed({ guildId: GUILD, categoryId: CATEGORY });
+});
+
+test('a channels-scoped role on a category only the fetch reveals lets the persona see the server', async (t) => {
+  // couldAccessGuild finds a channels-scoped grant through the cache, so the access check runs after the fetch.
+  const h = makeRelay(t, {
+    roles: { builder: { guildId: GUILD, scope: { channels: [CATEGORY] }, caps: MANAGE } },
+    personas: { alice: { roles: ['builder'] } },
+  });
+  h.channels.delete(CATEGORY);
+  await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
+  assert.deepEqual(h.fetchCalls, [CATEGORY]);
+});
+
+test('at the top level a server default shadows the persona-wide one, an explicit deny included', async (t) => {
+  // The channel grant lets the persona see the server, so the refusal is the top level's.
+  const serverDefaults: Capability[][] = [[], VIEW];
+  for (const serverDefault of serverDefaults) {
+    const h = makeRelay(t, { personas: { alice: {
+      default: MANAGE, guilds: { [GUILD]: { default: serverDefault, channels: { [TEXT]: VIEW } } },
+    } } });
+    const response = await h.rpc({ guildId: GUILD });
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, 'FORBIDDEN');
+    assert.match(response.error.message, /^Nothing ran: creating a channel at the top level of server "g1" needs MANAGE_CHANNELS/);
+    assert.deepEqual(h.calls, []);
+  }
 });
