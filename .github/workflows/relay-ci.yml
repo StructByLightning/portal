@@ -98,3 +98,9 @@ jobs:
           test/permissions.test.ts
           test/invites.test.ts
           test/mint-invite.test.ts
+
+      # The gate on create_text_channel (#16): what lets a persona have the
+      # shared bot create a channel.
+      - name: Channel-creation gate tests
+        working-directory: portal/portal-relay
+        run: node --import tsx --test test/create-text-channel.test.ts

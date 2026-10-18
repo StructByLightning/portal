@@ -136,6 +136,35 @@ export class PermissionsStore {
   }
 
   /**
+   * Caps for an operation with no existing channel (e.g. creating one at the
+   * guild root). Only unrestricted grants apply: a role bound to this guild
+   * with scope all:true, and the persona's default for this guild, else its
+   * persona-wide default; a persona with no entry gets the file-level default,
+   * as resolve() gives it, and one banned from the guild gets nothing. Channel
+   * and mirror scopes remain local, even if they happen to cover every
+   * currently cached channel. (A scope names one kind, roleShapeProblem, so a
+   * mirror is never also all:true.)
+   */
+  resolveGuild(personaId: string, guildId: string): Set<Capability> {
+    const entry = this.personas.get(personaId);
+    if (!entry) return new Set(this.fileDefault);
+    // A persona banned from the guild (/ban) has nothing there, as in resolveEntry.
+    if (entry.bans?.includes(guildId)) return new Set();
+    const out = new Set<Capability>();
+    for (const name of entry.roles ?? []) {
+      const role = this.roles.get(name);
+      if (!role || role.guildId !== guildId) continue;
+      if ('all' in role.scope && role.scope.all === true) {
+        for (const cap of role.caps) out.add(cap);
+      }
+    }
+    if (entry.policy) {
+      for (const cap of this.explainPolicyDefault(entry.policy, guildId).caps) out.add(cap);
+    }
+    return out;
+  }
+
+  /**
    * Policy-level caps a hypothetical persona holding exactly `roleNames` would
    * have in (guildId, channelId). Backs resolve(), and lets callers attribute
    * WHICH held role contributes access (slash /caps, /remove explanations).
@@ -166,20 +195,27 @@ export class PermissionsStore {
    * Which part of an inline policy decides (guildId, channelId), and what it
    * gives: the channel's own entry ([] blocks), else the guild's default
    * ([] denies), else the persona default. The one place this order lives —
-   * resolve() and the admin panel's explanations both go through it.
+   * resolve() and the admin panel's explanations both go through it, and
+   * resolveGuild reads its defaults part.
    */
   explainPolicy(
     pol: PersonaPolicy,
     guildId: string | null,
     channelId: string,
   ): { source: 'channel' | 'guildDefault' | 'personaDefault'; caps: Capability[] } {
-    if (guildId) {
-      const g = pol.guilds?.[guildId];
-      if (g) {
-        if (g.channels?.[channelId]) return { source: 'channel', caps: g.channels[channelId] };
-        if (g.default) return { source: 'guildDefault', caps: g.default };
-      }
-    }
+    const channel = guildId ? pol.guilds?.[guildId]?.channels?.[channelId] : undefined;
+    if (channel) return { source: 'channel', caps: channel };
+    return this.explainPolicyDefault(pol, guildId);
+  }
+
+  /** explainPolicy's order with no channel to consult: the guild's default
+   *  ([] denies), else the persona default, a missing one read as empty. */
+  private explainPolicyDefault(
+    pol: PersonaPolicy,
+    guildId: string | null,
+  ): { source: 'guildDefault' | 'personaDefault'; caps: Capability[] } {
+    const g = guildId ? pol.guilds?.[guildId] : undefined;
+    if (g?.default) return { source: 'guildDefault', caps: g.default };
     return { source: 'personaDefault', caps: pol.default ?? [] };
   }
 
@@ -358,8 +394,9 @@ export class PermissionsStore {
         // (nonempty default + channel-only guild entries) and unbinds
         // addressing roles / silences ambient dispatch while resolve()
         // still grants.
-        if (g.default === undefined && pol.default.length > 0) return true;
-      } else if (pol.default.length > 0) {
+        // A hand-edited policy can lack its default: read it as empty, as resolve() does.
+        if (g.default === undefined && (pol.default?.length ?? 0) > 0) return true;
+      } else if ((pol.default?.length ?? 0) > 0) {
         return true; // legacy global default applies where no guild entry says otherwise
       }
     }

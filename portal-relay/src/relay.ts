@@ -5,6 +5,7 @@
  *   - client RPC → capability-checked Discord actions via the pools
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { ChannelType, PermissionsBitField } from 'discord.js';
 import type {
   AddressReason,
   Capability,
@@ -1450,7 +1451,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
-        const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
+        const meta = await this.createTextChannel(personaId, p);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
       case 'delete_channel': {
@@ -2247,6 +2248,93 @@ export class Relay implements GatewayHooks {
           'if you need this one, ask whoever runs this host.',
       );
     }
+  }
+
+  /** Creation is authorized at its destination: the category, or the guild
+   *  root when no category is supplied. Rights on a sibling channel never
+   *  confer authority to create elsewhere in the guild. */
+  private async createTextChannel(personaId: string, p: RpcParams<'create_text_channel'>): Promise<ChannelMeta> {
+    const { guildId, name } = p;
+    // A null categoryId asks for no category, the guild root, as it did before this gate.
+    const categoryId = p.categoryId ?? undefined;
+    if (typeof guildId !== 'string' || !guildId ||
+        (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
+      throw rpcError(
+        'INVALID_PARAMS',
+        'Nothing ran: guildId must be a non-empty string, and categoryId a non-empty string, or null or left out ' +
+          "to create at the server's top level.",
+      );
+    }
+    const noAccess = () => rpcError(
+      'FORBIDDEN',
+      `Nothing ran: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+        'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+    );
+    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) throw noAccess();
+    let category = categoryId === undefined ? undefined : this.bot.channelForPerms(categoryId);
+    if (categoryId !== undefined && !category) {
+      // REST can know a category before its gateway event arrives. Fetching
+      // populates discord.js's cache, which the effective-capability check uses.
+      await this.bot.getChannelMeta(categoryId);
+      category = this.bot.channelForPerms(categoryId);
+      // A mirror lookup may predate this newly fetched channel as well.
+      if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
+    }
+    // A persona with no access to the server gets the refusal a server the
+    // relay doesn't serve gets, as list_channels gives both (requireGuild), so
+    // no answer below tells it about the server. Only the time can differ: a
+    // served server fetches an uncached category first, as send_message
+    // fetches a thread it's given before its check. It runs after the fetch
+    // because couldAccessGuild finds a channels-scoped grant through the
+    // cache, so a grant on a category the cache has only just learned counts.
+    if (!this.guildVisible(personaId, guildId)) throw noAccess();
+    if (categoryId !== undefined) {
+      if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: ${JSON.stringify(categoryId)} isn't a category of server ${JSON.stringify(guildId)} that the ` +
+            "relay can see. Check the id: list_channels, with that guildId, shows the server's categories and your " +
+            'capabilities in each, and creating in one needs MANAGE_CHANNELS there. Leaving categoryId out creates ' +
+            "at the server's top level, which needs MANAGE_CHANNELS across the server.",
+        );
+      }
+      this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
+    } else {
+      const allowed = this.permissions.resolveGuild(personaId, guildId);
+      if (!allowed.has('MANAGE_CHANNELS')) {
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: creating a channel at the top level of server ${JSON.stringify(guildId)} needs ` +
+            "MANAGE_CHANNELS across the server, which you don't have, so calling again won't change that. " +
+            'Pass a categoryId where list_channels shows you MANAGE_CHANNELS, or, if you need this, ask whoever ' +
+            'runs this host.',
+        );
+      }
+      // The persona holds the right; a refusal past here is a Discord-side gap,
+      // which a permissions.json edit can't fix. Say which, for the operator.
+      const me = this.bot.meIn(guildId);
+      if (!me) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot isn't in the guild`);
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot isn't in server ${JSON.stringify(guildId)}, so it can't create a ` +
+            'channel there. Only whoever runs this host can change that.',
+        );
+      }
+      if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot lacks Manage Channels`);
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot lacks Manage Channels in server ${JSON.stringify(guildId)}, so it ` +
+            "can't create a channel at the server's top level. Only whoever runs this host can change that, in the " +
+            "server's settings.",
+        );
+      }
+    }
+    // The final check runs in the same continuation as the bot call, with no
+    // await between them. The bot's own guild fetch still precedes Discord's
+    // create, so a revocation that lands during that fetch isn't seen.
+    return this.bot.createTextChannel(guildId, name, categoryId);
   }
 
   private displayName(personaId: string): string {
