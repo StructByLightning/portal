@@ -16,6 +16,8 @@ portal-admin.example.com {
 
 	# Admin API → relay (localhost). Keep this BEFORE the static file handler so
 	# /admin/* is always proxied and never shadowed by a file on disk.
+	# reverse_proxy sets X-Forwarded-For to the client address Caddy saw; the
+	# relay rate-limits sign-in callbacks by its rightmost entry.
 	handle /admin/* {
 		reverse_proxy 127.0.0.1:8791
 	}
@@ -24,6 +26,10 @@ portal-admin.example.com {
 	handle {
 		root * /srv/portal-admin
 		try_files {path} /index.html
+		# The page names its scripts with a ?v= release query, so it must
+		# never be served stale: browsers revalidate it on every load.
+		@page path / /index.html
+		header @page Cache-Control "no-cache"
 		file_server
 	}
 

@@ -1,11 +1,19 @@
-/* Portal Admin — dense, self-contained, no external fonts/CDNs (CSP-clean). */
+/* Portal Admin — dense, self-contained, no external fonts/CDNs (CSP-clean).
+ * Type: 14px base, nothing below 12px. */
 
+/* Text contrast (WCAG AA wants >= 4.5:1), measured against every surface it
+ * sits on (panel, page, zebra row, hovered row, code background):
+ *   light --warn  #8f5b00  5.06–5.73:1   (was #b7791f, 3.2–3.6:1)
+ *   light --muted #626b78  4.76–5.39:1   (was #69727f, 4.3–4.9:1)
+ *   dark  --warn  #e0a93f  7.56–8.93:1
+ *   dark  --muted #8a94a3  5.22–6.16:1 */
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --line: #d9dee5; --line-soft: #e9edf2;
-  --fg: #1c2430; --muted: #69727f; --accent: #2563eb; --accent-fg: #fff;
-  --danger: #c0392b; --warn: #b7791f; --ok: #1a7f4b;
+  --fg: #1c2430; --muted: #626b78; --accent: #2563eb; --accent-fg: #fff;
+  --danger: #c0392b; --warn: #8f5b00; --ok: #1a7f4b;
   --row-hover: #eef3fb; --zebra: #fafbfc; --code-bg: #eef1f5;
-  --row-h: 30px;
+  --focus: #2563eb;
+  --row-h: 32px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -13,6 +21,7 @@
     --fg: #dce3ec; --muted: #8a94a3; --accent: #4b8bff; --accent-fg: #0e1116;
     --danger: #e5675a; --warn: #e0a93f; --ok: #4ec47e;
     --row-hover: #1b222c; --zebra: #11161c; --code-bg: #1b212a;
+    --focus: #7aa7ff;
   }
 }
 
@@ -20,7 +29,7 @@
 html, body { margin: 0; height: 100%; }
 body {
   background: var(--bg); color: var(--fg);
-  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .hidden { display: none !important; }
@@ -28,25 +37,39 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 h1, h2, h3 { margin: 0 0 .4em; font-weight: 600; }
 a { color: var(--accent); }
 
+/* One visible focus ring for keyboard users, everywhere. */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.drawer:focus-visible, .drawer-title:focus-visible, .modal:focus-visible { outline: none; }
+
 /* ── Buttons ── */
 .btn {
   font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--panel);
   color: var(--fg); border-radius: 5px; padding: 5px 10px; line-height: 1;
 }
 .btn:hover { border-color: var(--accent); }
-.btn:disabled { opacity: .45; cursor: default; border-color: var(--line); }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .45; cursor: default; border-color: var(--line); }
 .btn-sm { padding: 3px 8px; font-size: 12px; }
 .btn-primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .btn-danger { color: var(--danger); border-color: transparent; background: transparent; }
 .btn-danger:hover { border-color: var(--danger); }
 .btn-ghost { background: transparent; border-color: transparent; }
 .btn-ghost:hover { border-color: var(--line); }
+.btn-danger-solid { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn[aria-busy="true"] { cursor: progress; }
+/* A link that looks like a button (+ Mint invite), and a name that is a link
+   (persona names in tables: <a href="#/…">, or a button when it can't be). */
+a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+.link { font: inherit; color: var(--accent); background: none; border: none; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
+.link:hover { text-decoration: underline; }
 
 /* ── Login ── */
 .login { display: grid; place-items: center; height: 100vh; }
 .login-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 32px 36px; max-width: 360px; text-align: center; }
 .login-card .btn { display: inline-block; margin-top: 12px; text-decoration: none; }
+.login-error { margin-top: 14px; }
+.login-error p { margin: 0; }
 .error { color: var(--danger); }
+.field-error { color: var(--danger); font-size: 12px; }
 
 /* ── Shell ── */
 .app { display: flex; flex-direction: column; min-height: 100vh; }
@@ -61,40 +84,116 @@ a { color: var(--accent); }
 .tabs { display: flex; gap: 2px; }
 .tab {
   border: none; background: transparent; color: var(--muted); cursor: pointer;
-  font: inherit; padding: 6px 11px; border-radius: 6px;
+  font: inherit; padding: 6px 11px; border-radius: 6px; text-decoration: none; white-space: nowrap;
 }
 .tab:hover { color: var(--fg); background: var(--row-hover); }
 .tab.active { color: var(--fg); background: var(--row-hover); box-shadow: inset 0 -2px 0 var(--accent); }
 
 .scope { display: flex; align-items: center; gap: 6px; }
-.scope-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+.scope-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
 .scope-select, .scope-static { max-width: 230px; }
 .scope-static { font-weight: 600; }
+/* Super-admins: go to a guild by id (in place of the old prompt()). It takes
+   the select's place while open; its error hangs below it, over the page, so
+   the top bar keeps its height. */
+.guild-go { position: relative; display: flex; align-items: center; gap: 6px; }
+.guild-go input { width: 190px; }
+.guild-go .field-error {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 25; white-space: nowrap;
+  background: var(--panel); border: 1px solid var(--danger); border-radius: 5px; padding: 2px 7px;
+}
+.guild-go .field-error:empty { display: none; }
 
 .user { display: flex; align-items: center; gap: 8px; }
 .user-name { color: var(--muted); }
 
-.badge { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); color: var(--muted); }
+.badge { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
 .badge-super { color: var(--accent); border-color: var(--accent); }
 .badge-warn { color: var(--warn); border-color: var(--warn); }
 .badge-ok { color: var(--ok); } .badge-no { color: var(--danger); }
 
 /* ── Inputs ── */
 input, select { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+input:focus, select:focus { border-color: var(--accent); }
 select[multiple] { padding: 2px; }
 label { display: block; }
 
 /* ── View / banner ── */
-.view { padding: 14px; flex: 1; }
+/* The bottom padding grows by the toast stack's height (--toasts-h). */
+.view { padding: 14px 14px calc(14px + var(--toasts-h, 0px)); flex: 1; }
 .empty { color: var(--muted); padding: 40px; text-align: center; }
 .loading { padding: 8px 2px; }
-.banner { margin: 8px 14px 0; padding: 7px 11px; border-radius: 6px; border: 1px solid var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.banner { margin: 0 0 10px; padding: 7px 11px; border-radius: 6px; border: 1px solid var(--ok); color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
 .banner.err { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+/* When the session ends: under the top bar, never over the page. */
+.session-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 14px 0; padding: 7px 11px;
+  border: 1px solid var(--warn); border-radius: 6px; background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+.session-bar-text { overflow-wrap: anywhere; }
+/* While the drawer is open the bar is its own copy, at the drawer's top (see
+   ui.expiryBar): the page's is behind the scrim, where a click on it closes
+   the drawer ("Discard changes?"), and on a phone under the drawer. Hidden,
+   not removed, so the page behind doesn't move. */
+body:has(#drawer:not(.hidden)) #session-bar { visibility: hidden; }
+.drawer > .session-bar { flex: none; }
+/* A guild this admin can't manage: why, the guilds they do, Try again. */
+.not-admin { max-width: 560px; margin: 32px auto; padding: 18px 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.not-admin h2 { font-size: 16px; }
+.not-admin h2:focus-visible { outline: none; }
+.not-admin .field select { width: 100%; }
+/* Notices about the panel itself, between the top bar and the view. */
+.notices:empty { display: none; }
+.notices { padding: 10px 14px 0; }
+.notices .banner { margin: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.banner-update { border-color: var(--accent); color: var(--fg); background: color-mix(in srgb, var(--accent) 10%, transparent); }
 .hint { margin-top: 10px; font-size: 12px; }
+.load-error { padding: 14px; border: 1px solid var(--danger); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.load-error p { margin: 0 0 8px; }
+/* A view the relay is too old to answer (PA ACCESS_API): not an error — the relay needs updating. */
+.relay-outdated { padding: 14px; border: 1px solid var(--warn); border-radius: 8px; background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.relay-outdated p { margin: 0 0 8px; }
+.relay-outdated-title { font-weight: 600; }
+.empty-note { color: var(--muted); padding: 12px 0; }
+
+/* ── Status lines: a section's result, where it happened; stays until the next. ── */
+.status-line { margin: 8px 0 0; padding: 6px 10px; border-radius: 6px; border: 1px solid transparent; overflow-wrap: anywhere; }
+.status-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.status-err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 8%, transparent); }
+/* A note about the form itself (a restored draft): neither a result nor an error. */
+.status-info { color: var(--fg); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.view > .status-line { margin: 0 0 8px; }
+.code-result { font-size: 13px; user-select: all; }
+
+/* ── Toasts: bottom-right, above the drawer and dialogs, newest at the bottom. ── */
+/* Not at the top: there a sticky error sat over the toolbar's buttons (+ Mint
+   invite, + Grant access by id, the scope select) and, on a phone, the tabs
+   and the guild switcher. At the bottom it can only cover the end of the page
+   or of the drawer, and ui.js keeps --toasts-h (the stack's height from the
+   bottom of the screen) so that much room is added there: whatever it covers
+   can be scrolled out from under it. */
+.toasts { position: fixed; bottom: 12px; right: 12px; z-index: 60; display: flex; flex-direction: column; gap: 8px; width: 360px; max-width: calc(100vw - 24px); pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px 9px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); box-shadow: 0 6px 20px rgba(0,0,0,.18); overflow-wrap: anywhere; }
+.toast-msg { flex: 1; }
+.toast-ok { border-left: 4px solid var(--ok); }
+.toast-info { border-left: 4px solid var(--accent); }
+.toast-err { border-left: 4px solid var(--danger); color: var(--danger); }
+.toast-x { font: inherit; background: none; border: 1px solid transparent; border-radius: 5px; color: var(--muted); cursor: pointer; padding: 0 6px; line-height: 1.4; }
+.toast-x:hover { border-color: var(--line); color: var(--fg); }
+/* A toast's one action (Undo). */
+.toast-action { font: inherit; font-weight: 600; background: none; border: 1px solid var(--line); border-radius: 5px; color: var(--accent); cursor: pointer; padding: 1px 9px; line-height: 1.4; }
+.toast-action:hover { border-color: var(--accent); }
+/* With the drawer open on a wide screen the stack moves to its left, over the
+   scrim, so a sticky error never covers the form it is about. Narrower than
+   this it stays on top of the drawer (Tab and Esc still reach its ✕), and the
+   drawer keeps room at its end as the page does (see .drawer-body). */
+@media (min-width: 940px) {
+  body:has(#drawer:not(.hidden)) .toasts { right: 652px; max-width: calc(100vw - 676px); }
+}
 
 /* ── Toolbar / pager ── */
-.toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.toolbar-form { flex: 1; max-width: 420px; }
 .search { flex: 1; max-width: 360px; }
 .toolbar-actions { display: flex; gap: 6px; margin-left: auto; }
 .pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; margin-top: 8px; }
@@ -107,9 +206,14 @@ label { display: block; }
 table.grid { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
 table.grid thead th {
   position: sticky; top: 46px; z-index: 5; text-align: left; font-weight: 600; color: var(--muted);
-  background: var(--panel); border-bottom: 1px solid var(--line); padding: 6px 10px; font-size: 11px;
+  background: var(--panel); border-bottom: 1px solid var(--line); padding: 6px 10px; font-size: 12px;
   text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
 }
+/* In a drawer the scrolling box is .drawer-body, not the page: 46px (the
+   page's topbar) left a gap there with rows showing above the header. A
+   sticky box keeps to the scroller's padding, so -14px (.drawer-body's
+   padding) puts the header flush with the drawer body's top edge. */
+.drawer-body table.grid thead th { top: -14px; }
 table.grid thead th:first-child { border-top-left-radius: 8px; }
 table.grid thead th:last-child { border-top-right-radius: 8px; }
 table.grid tbody tr:last-child td:first-child { border-bottom-left-radius: 8px; }
@@ -127,7 +231,7 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 /* ── Tags ── */
 .tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
 .tag { display: inline-flex; align-items: center; gap: 5px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 9px; font-size: 12px; }
-.tag .x { cursor: pointer; color: var(--muted); border-radius: 999px; padding: 0 5px; }
+.tag .x { font: inherit; cursor: pointer; color: var(--muted); background: none; border: none; border-radius: 999px; padding: 0 5px; line-height: 1.4; }
 .tag .x:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 15%, transparent); }
 
 .inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -135,26 +239,38 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 /* ── Drawer ── */
 .drawer-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 30; }
 .drawer {
-  position: fixed; top: 0; right: 0; height: 100vh; width: 520px; max-width: 94vw; z-index: 31;
+  position: fixed; top: 0; right: 0; height: 100vh; width: 640px; max-width: 94vw; z-index: 31;
   background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column;
   box-shadow: -8px 0 24px rgba(0,0,0,.18);
 }
-.drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--line); }
-.drawer-title { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.drawer-title { margin: 0; font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.drawer-subtitle { font-weight: 400; }
 .drawer-body { padding: 14px; overflow-y: auto; }
+/* Narrower than 940px the toast stack sits over the drawer: keep room for it. */
+@media (max-width: 939.98px) {
+  .drawer-body { padding-bottom: calc(14px + var(--toasts-h, 0px)); }
+}
 .drawer-sections { display: flex; flex-direction: column; gap: 16px; }
-.drawer-section h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.drawer-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+.subsection { margin-bottom: 12px; }
+.subsection-sep { border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.grant-form { margin-top: 10px; }
 .field { margin-bottom: 8px; }
-.field > label { color: var(--muted); font-size: 11px; margin-bottom: 3px; }
+.field > label, .field-label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+.field-hint { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
 .field input, .field select { width: 100%; }
+.field .inline input, .field .inline select { width: auto; flex: 1 1 160px; min-width: 0; }
 .field-row { display: flex; gap: 8px; }
 .field-row .field { flex: 1; }
 .advanced summary { cursor: pointer; color: var(--muted); padding: 4px 0; }
+.advanced > div > .table-wrap { margin: 4px 0 12px; }
 .plain { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 
 /* ── Caps grid ── */
 /* Avatars */
-.avatar-thumb { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; vertical-align: middle; background: var(--zebra); border: 1px solid var(--line); }
+/* overflow/nowrap: a broken image's alt text stays inside its circle. */
+.avatar-thumb { width: 22px; height: 22px; border-radius: 50%; object-fit: cover; vertical-align: middle; background: var(--zebra); border: 1px solid var(--line); overflow: hidden; white-space: nowrap; font-size: 12px; }
 .avatar-preview { width: 56px; height: 56px; }
 .avatar-row { display: flex; gap: 12px; align-items: flex-start; }
 .avatar-edit { flex: 1; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
@@ -169,18 +285,240 @@ code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .cropper-controls { display: flex; flex-direction: column; gap: 8px; min-width: 150px; }
 .cropper-zoom { width: 100%; }
 
-/* Grouped capability editor — vertical, fits the narrow drawer. */
-.caps-groups { display: flex; flex-direction: column; gap: 9px; }
-.cap-row { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--fg); }
-.cap-row .cap-name { font-weight: 600; }
-.cap-row input { width: auto; }
-.cap-chips { display: flex; flex-wrap: wrap; gap: 3px 12px; margin: 4px 0 0 22px; }
-.cap-chip { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); }
-.cap-chip input { width: auto; }
+/* Level control: Read | Write | Full | Custom… — and, under Custom…, the
+   capabilities in groups. Vertical, so it fits the narrow drawer. */
+.level-options, .radio-row { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.level-option { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--fg); }
+.level-option input, .check-item input, .check-inline input { width: auto; margin: 0; }
+.level-help { margin-top: 4px; }
+.caps-groups { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--line-soft); border-radius: 6px; }
+.cap-group-label { font-size: 12px; font-weight: 600; color: var(--fg); }
+.cap-chips { display: flex; flex-wrap: wrap; gap: 3px 14px; margin-top: 3px; }
+.cap-chip { display: flex; align-items: center; gap: 5px; font-size: 13px; color: var(--fg); }
+.cap-chip input { width: auto; margin: 0; }
+.warn-line { margin: 4px 0 8px; color: var(--warn); font-size: 12px; }
+.caps-groups .warn-line { margin: 0; }
+
+/* Checkbox lists (access roles, channels, Discord roles). */
+.check-list-wrap { display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; min-width: 0; }
+.check-list { max-height: 220px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: var(--panel); }
+.check-item { display: flex; align-items: baseline; gap: 7px; padding: 3px 0; cursor: pointer; color: var(--fg); }
+.check-empty { margin: 4px 0; }
+.check-inline { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.field .check-filter { width: 100%; }
+/* Boxes and radios keep their size inside a field (and a field's inline row). */
+.field .check-inline input, .field .level-option input, .field .check-item input, .field .cap-chip input { flex: none; width: auto; }
+
+/* A note under a table cell's main text (e.g. why a grant does nothing). */
+.cell-note { color: var(--warn); font-size: 12px; }
+.tag-meaning { color: var(--muted); }
+
+/* The minted invite, shown until Done. */
+.result-card h3 { font-size: 15px; color: var(--fg); text-transform: none; letter-spacing: 0; }
+.invite-code-wrap { margin: 10px 0; }
+.invite-code { display: block; font-size: 18px; padding: 10px 12px; word-break: break-all; user-select: all; }
+.invite-summary { margin: 0 0 6px; }
 
 /* ── Modal (one-time secret) ── */
-.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: grid; place-items: center; z-index: 40; }
-.modal { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 22px; width: 460px; max-width: 92vw; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: grid; place-items: center; z-index: 50; }
+.modal { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 22px; width: 460px; max-width: 92vw; max-height: 90dvh; overflow-y: auto; }
+.modal h2 { font-size: 16px; }
+.modal p { margin: 0 0 10px; }
 .modal .warn { color: var(--warn); }
 .secret { background: var(--code-bg); padding: 12px; border-radius: 6px; word-break: break-all; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+/* Names shown in place of ids (id in the tooltip). */
+.name-ref { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.grant-line { padding: 2px 0 2px 2px; }
+.grant-guild + .grant-guild { margin-top: 10px; }
+
+/* Read by screen readers, not shown (a type-ahead's result count). */
+.visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* ── Channels tab ── */
+.chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.chip { font: inherit; font-size: 12px; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 999px; padding: 4px 11px; line-height: 1.2; }
+.chip:hover { border-color: var(--accent); }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+.chip:disabled { opacity: .45; cursor: default; border-color: var(--line); }
+.updated { font-size: 12px; white-space: nowrap; }
+.chan-groups { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.chan-group + .chan-group { border-top: 1px solid var(--line); }
+.cat-head {
+  display: flex; align-items: center; gap: 6px; width: 100%; font: inherit; font-size: 12px; font-weight: 600; color: var(--muted);
+  background: var(--zebra); border: none; padding: 7px 10px; cursor: pointer; text-align: left; letter-spacing: .4px;
+}
+.cat-head:hover { color: var(--fg); }
+/* The arrows are decoration: aria-expanded says it (the '/ ""' keeps them
+   out of the button's name where that is understood). */
+.cat-head::before { content: '▾'; content: '▾' / ''; display: inline-block; width: 1em; }
+.cat-head[aria-expanded="false"]::before { content: '▸'; content: '▸' / ''; }
+.cat-name { text-transform: uppercase; }
+.chan-list { list-style: none; margin: 0; padding: 0; }
+.chan-row {
+  display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; padding: 5px 12px 5px 28px; min-height: var(--row-h);
+  color: var(--fg); text-decoration: none; border-top: 1px solid var(--line-soft);
+}
+.chan-group-plain .chan-item:first-child .chan-row { border-top: none; }
+.chan-group-plain .chan-row { padding-left: 12px; }
+.chan-row:hover { background: var(--row-hover); }
+.chan-name { font-weight: 500; min-width: 0; overflow-wrap: anywhere; }
+.chan-cat { font-size: 12px; }
+.chan-warn { color: var(--warn); font-size: 12px; }
+.chan-counts { color: var(--muted); margin-left: auto; white-space: nowrap; }
+.chan-foot { margin-top: 8px; }
+
+/* ── Channel drawer ── */
+.chan-sub { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; margin: 0 0 6px; }
+.banner-warn { border-color: var(--warn); color: var(--fg); background: color-mix(in srgb, var(--warn) 10%, transparent); margin: 8px 0 0; }
+.currently { margin: 2px 0 8px; }
+.currently-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.add-form .level-control { margin-top: 2px; }
+.who-name { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.who-can { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.who-table td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.who-none .link { color: var(--muted); }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); white-space: nowrap; background: var(--code-bg); }
+.pill-read { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.pill-write, .pill-full { color: var(--accent); border-color: var(--accent); }
+.pill-full { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.pill-custom { color: var(--warn); border-color: var(--warn); }
+.pill-none { color: var(--muted); font-weight: 400; background: none; }
+.pill-limited { border-style: dashed; }
+.src-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.src-chip { font-size: 12px; padding: 1px 7px; border-radius: 999px; background: var(--code-bg); border: 1px solid var(--line); overflow-wrap: anywhere; }
+.src-override, .src-block { color: var(--muted); border-style: dashed; }
+.src-removed { color: var(--warn); border-color: var(--warn); }
+.dg-row { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.dg-select { width: 11.5em; max-width: 100%; }
+.dg-custom { margin-top: 6px; }
+.dg-editor .caps-groups { margin-top: 0; }
+.dg-editor .inline { margin-top: 6px; }
+.row-status td { padding: 0 10px 8px; height: auto; }
+.row-status .status-line { margin-top: 0; }
+.status-part { display: block; }
+.drawer-foot { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.drawer-foot .hint { margin: 0; }
+
+/* ── Personas tab ── */
+/* The Add persona bar, in place under the toolbar. */
+.add-persona { margin: 0 0 10px; padding: 10px 12px; max-width: 560px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.add-persona > label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.add-persona-row { display: flex; gap: 6px; align-items: flex-start; }
+.add-persona-row .typeahead { flex: 1; min-width: 0; }
+.add-persona .field-hint { margin-top: 6px; }
+.ta-tag { margin-left: auto; }
+.flags { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.empty-note .inline { margin-top: 8px; }
+
+/* ── Persona drawer ── */
+.persona-head { display: flex; gap: 12px; align-items: center; }
+.persona-head-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.persona-id { overflow-wrap: anywhere; }
+.persona-summary { margin: 0; font-weight: 500; }
+.drawer-section h4 { font-size: 13px; font-weight: 600; margin: 12px 0 6px; color: var(--fg); }
+.drawer-section h3:focus-visible { outline: none; }
+.access-section .add-form { margin-bottom: 4px; }
+.access-box { margin-top: 10px; }
+.access-table td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.access-table tr.cat-row th {
+  text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .4px;
+  background: var(--zebra); padding: 5px 10px; border-bottom: 1px solid var(--line-soft);
+}
+.access-table tr.run-row td { background: color-mix(in srgb, var(--accent) 5%, transparent); }
+.run-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.run-text { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.inactive { margin-top: 12px; }
+.inactive-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.inactive-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; border: 1px dashed var(--line); border-radius: 6px; }
+.inactive-list li > span { min-width: 0; overflow-wrap: anywhere; }
+.danger-zone { border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line)); border-radius: 8px; padding: 10px 12px; }
+.danger-zone .inline + .inline { margin-top: 8px; }
+.resync-row .field-hint { margin: 0; }
+.elsewhere-link { display: block; font-size: 12px; margin-top: 6px; }
+/* A picker whose options are long (an access role and what it means) never
+   pushes the drawer wider than the screen. */
+.drawer-body select { max-width: 100%; min-width: 0; }
+.gw-row { display: flex; flex-direction: column; gap: 6px; }
+.gw-level { font-weight: 600; }
+.more-body, .identity-body { padding-top: 6px; }
+.identity-body { gap: 12px; }
+
+/* ── Type-ahead (an ARIA combobox) ── */
+.typeahead { position: relative; }
+.ta-box { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; border: 1px solid var(--line); border-radius: 5px; padding: 3px 5px; background: var(--panel); }
+.ta-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.ta-chips { display: contents; }
+.field .ta-box .ta-input, .ta-input { border: none; flex: 1 1 160px; width: auto; min-width: 120px; padding: 3px 2px; background: transparent; }
+.ta-input:focus, .ta-input:focus-visible { outline: none; }
+.ta-list {
+  position: absolute; z-index: 40; left: 0; right: 0; top: calc(100% + 2px); max-height: 260px; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.18); padding: 3px 0;
+}
+.ta-option { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: baseline; padding: 5px 10px; cursor: pointer; }
+.ta-option.active { background: var(--row-hover); box-shadow: inset 3px 0 0 var(--accent); }
+.ta-option.disabled { color: var(--muted); cursor: default; }
+.ta-hint { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ta-group-label { font-size: 12px; font-weight: 600; color: var(--muted); padding: 6px 10px 2px; text-transform: uppercase; letter-spacing: .4px; }
+.ta-empty { padding: 6px 10px; }
+
+/* ── Phone (<640px): no sideways page scroll; the drawer takes the screen. ── */
+@media (max-width: 640px) {
+  .topbar { flex-wrap: wrap; height: auto; gap: 6px 10px; padding: 8px 12px; position: static; }
+  .brand { order: 1; }
+  .user { order: 2; margin-left: auto; min-width: 0; }
+  .user-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw; }
+  .scope { order: 3; flex: 1 1 100%; min-width: 0; }
+  .scope-select, .scope-static { max-width: none; flex: 1; min-width: 0; }
+  .tabs { order: 4; flex: 1 1 100%; overflow-x: auto; scrollbar-width: none; }
+  .tab { flex: 0 0 auto; }
+  .spacer { display: none; }
+  .view { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
+  .toolbar .search { flex: 1 1 100%; max-width: none; }
+  .toolbar-actions { margin-left: 0; flex-wrap: wrap; }
+  .toolbar-form { max-width: none; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  /* Inside a scrolling wrapper a sticky header would sit 46px down over the rows. */
+  table.grid thead th { position: static; }
+  .cell-roles { max-width: 220px; }
+  /* The whole screen: pinned to both edges rather than 100vw, which counts a
+     classic scrollbar too and pushed the drawer's left edge off-screen. */
+  .drawer { left: 0; width: auto; max-width: none; height: 100vh; height: 100dvh; border-left: none; }
+  .drawer-body { padding: 12px 12px calc(12px + var(--toasts-h, 0px)); }
+  .field-row { flex-direction: column; gap: 0; }
+  .guild-go { flex: 1 1 100%; }
+  .guild-go input { flex: 1 1 120px; width: auto; min-width: 0; }
+  .session-bar { margin: 8px 12px 0; }
+  .not-admin { margin: 16px 0; padding: 14px; }
+  .modal { padding: 16px; }
+  .modal-actions { flex-wrap: wrap; }
+  /* Full width, at the bottom like the wide-screen stack: at the top it hid
+     the tabs and the guild switcher (the topbar is not sticky here). */
+  .toasts { bottom: 8px; left: 8px; right: 8px; width: auto; max-width: none; }
+  .cropper-wrap { flex-direction: column; }
+  /* Tables marked .cards become one card per row, each cell captioned by its
+     data-label (the column heading). */
+  .table-wrap:has(table.cards) { overflow-x: visible; }
+  table.grid.cards, table.grid.cards tbody, table.grid.cards tr, table.grid.cards td { display: block; width: 100%; }
+  table.grid.cards thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.grid.cards tbody tr { padding: 8px 10px; border-bottom: 1px solid var(--line-soft); }
+  table.grid.cards tbody tr:last-child { border-bottom: none; }
+  table.grid.cards tbody td { border: none; padding: 2px 0; height: auto; }
+  table.grid.cards td[data-label]::before { content: attr(data-label); display: block; font-size: 12px; color: var(--muted); }
+  table.grid.cards tr.row-status td { padding: 0; }
+  /* A persona's name needs no caption. */
+  table.grid.cards.who-table td:first-child::before { display: none; }
+  .chan-row { padding-left: 22px; }
+  .chan-group-plain .chan-row { padding-left: 12px; }
+  .chan-counts { margin-left: 0; flex-basis: 100%; white-space: normal; }
+  .dg-select { flex: 1 1 auto; }
+  /* The Personas list as cards: the picture beside nothing needs no caption. */
+  table.grid.cards.persona-table td.cell-avatar { display: none; }
+  table.grid.cards .cell-roles { max-width: none; white-space: normal; }
+  table.grid.cards.access-table tr.cat-row th, table.grid.cards.access-table tr.run-row td { display: block; width: 100%; }
+  table.grid.cards.access-table td:first-child::before { display: none; }
+  .add-persona { max-width: none; }
+  .persona-head { align-items: flex-start; }
+  .inactive-list li { flex-wrap: wrap; }
+}

@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { Relay } from '../src/relay.js';
 import type { RelayConfig } from '../src/config.js';
 import { AuditLog } from '../src/admin/audit.js';
+import { nameKey, nameKeys } from '../src/name-policy.js';
 
 const GUILD = 'g1';
 const OTHER_GUILD = 'g2';
@@ -80,10 +81,17 @@ function makeRelay(opts: { minters?: string[]; realRateLimit?: boolean } = {}) {
       channelGuild[cid]
         ? { guildId: channelGuild[cid], permissionsFor: () => ({ has: () => true }) }
         : undefined,
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 2 }],
     listChannelMetas: () => [],
     isGuildAllowed: (gid: string) => gid === GUILD,
+    // Guild members, for the enrollment name check: a human and a bot.
+    membersComplete: () => true,
+    memberNameMatches: (gid: string, keys: ReadonlySet<string>, o: { bots: boolean }) => {
+      const reads = (n: string) => nameKeys(n).some((k) => keys.has(k));
+      return gid === GUILD && (reads('Antra') || (o.bots && reads('MythosBot')));
+    },
   };
   relay.roles = {
     getRoleFor: () => 'role', roleByGuildFor: () => ({}),
@@ -367,6 +375,186 @@ test('augment path: machine mints get a flat "not claimable" (mode gate before r
       /not claimable \(mint-only\)/,
       'no minter-state oracle for code holders',
     );
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('an invite carrying roles AND a channel grant enrolls with the union (/invite pins its channel)', async () => {
+  const t = makeRelay();
+  try {
+    // A role that covers CHAN_B only; the grant covers CHAN_A — the channel
+    // /invite was run in — which the role does not.
+    t.relay.permissions.setRole('b-reader', {
+      caps: ['VIEW_CHANNEL', 'READ_HISTORY'],
+      scope: { channels: [CHAN_B] },
+      guildId: GUILD,
+    });
+    t.relay.invites.mint({
+      code: 'inv_slash',
+      roles: ['b-reader'],
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } },
+      guildId: GUILD,
+      maxUses: 1,
+    });
+    const enrolled = await t.relay.enroll({ invite: 'inv_slash', desiredName: 'newcomer' });
+    assert.ok(!('error' in enrolled), JSON.stringify(enrolled));
+    const pid = enrolled.personaId;
+    assert.deepEqual(t.relay.permissions.getRoleNames(pid), ['b-reader']);
+    assert.deepEqual([...t.relay.permissions.resolve(pid, GUILD, CHAN_A)].sort(), [...RW].sort(), 'channel grant applies');
+    assert.deepEqual(
+      [...t.relay.permissions.resolve(pid, GUILD, CHAN_B)].sort(),
+      ['READ_HISTORY', 'VIEW_CHANNEL'],
+      'role still applies',
+    );
+    assert.equal(t.relay.permissions.resolve(pid, GUILD, FOREIGN_CHAN).size, 0);
+
+    // Augment path unions both too.
+    t.relay.invites.mint({
+      code: 'inv_more',
+      roles: ['b-reader'],
+      grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_B] } },
+      guildId: GUILD,
+      mode: 'augment',
+      maxUses: 1,
+    });
+    t.relay.applyInviteAugment(RANDO, 'inv_more');
+    assert.deepEqual(t.relay.permissions.getRoleNames(RANDO), ['b-reader']);
+    assert.deepEqual([...t.relay.permissions.resolve(RANDO, GUILD, CHAN_A)].sort(), [...RW].sort(), 'existing grant kept');
+    assert.ok(t.relay.permissions.resolve(RANDO, GUILD, CHAN_B).has('VIEW_CHANNEL'));
+  } finally {
+    t.cleanup();
+  }
+});
+
+// ── Display-name collisions at enrollment ──
+
+test('nameKey folds case, accents, invisibles, separators and look-alike letters', () => {
+  const k = nameKey('antra');
+  for (const v of ['Antra', 'ANTRA', 'antra.', 'an tra', 'an_tra', 'ántra', 'an\u200btra', 'ａｎｔｒａ', '\u0430ntra' /* Cyrillic а */, 'аntrа']) {
+    assert.equal(nameKey(v), k, JSON.stringify(v));
+  }
+  assert.notEqual(nameKey('antra2'), k);
+  // Round-3 forms: small capitals, Cherokee, capital I for l, rn for m.
+  assert.equal(nameKey('ᴀɴᴛʀᴀ'), k);
+  assert.equal(nameKey(String.fromCodePoint(0xab7a) + 'ntra' /* Cherokee small GO */), k);
+  const alike = (a: string, b: string) => nameKeys(a).some((k) => nameKeys(b).includes(k));
+  assert.ok(alike('Iinn', 'linn'), 'capital I read as l');
+  assert.ok(alike('iris', 'Iris') && alike('IRIS', 'iris'), 'and plain case-insensitivity still holds');
+  assert.ok(!alike('lris', 'iris'));
+  assert.equal(nameKey('rnara'), nameKey('mara'));
+  assert.equal(nameKey('aqent1'), nameKey('aqentl'));
+  assert.equal(nameKey('🙂 —'), '', 'no letters or digits → empty key (not checked)');
+});
+
+test('enroll refuses a name that reads like a human member\'s — always, without saying who', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_n1', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD });
+    for (const name of ['antra', 'Аntra' /* Cyrillic А */, 'an.tra']) {
+      const res = await t.relay.enroll({ invite: 'inv_n1', desiredName: name });
+      assert.ok('error' in res, name);
+      assert.match(res.error, /reads like a server member's name/);
+      // Echoes the requested name, never the member's own spelling or the guild.
+      assert.doesNotMatch(res.error, /Antra/, 'member not named');
+      assert.doesNotMatch(res.error, /guild|\bG\b/i, 'guild not named');
+    }
+    assert.equal(t.relay.invites.get('inv_n1').uses ?? 0, 0, 'a refused name consumes no use');
+    assert.equal(t.relay.identity.all().length, 2, 'no persona minted');
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('enroll: persona and bot-name clashes are refused only when uniqueName is asked', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_n2', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD, maxUses: 10 });
+    // An existing persona ("Spawner") and a bot member ("MythosBot").
+    for (const name of ['spawner', 'Mythos Bot']) {
+      const strict = await t.relay.enroll({ invite: 'inv_n2', desiredName: name, uniqueName: true });
+      assert.ok('error' in strict, name);
+      assert.match(strict.error, /reads like an existing persona's name|reads like a server member's name/);
+      // Plain self-enrollment (an agent re-enrolling under its own name, or
+      // sharing its bot's name) still works.
+      const plain = await t.relay.enroll({ invite: 'inv_n2', desiredName: name });
+      assert.ok(!('error' in plain), JSON.stringify(plain));
+    }
+    const fresh = await t.relay.enroll({ invite: 'inv_n2', desiredName: 'brand-new-name', uniqueName: true });
+    assert.ok(!('error' in fresh), JSON.stringify(fresh));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('a runtime mint waits for a complete member list; plain enrollment goes ahead best-effort', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.bot.membersComplete = () => false;
+    t.relay.invites.mint({ code: 'inv_n3', label: 'n', grant: { caps: ['VIEW_CHANNEL'], scope: { channels: [CHAN_A] } }, guildId: GUILD, maxUses: 10 });
+    const minted = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'fresh-name', uniqueName: true });
+    assert.ok('error' in minted);
+    assert.match(minted.error, /member list is still loading/);
+    const plain = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'fresh-name' });
+    assert.ok(!('error' in plain), JSON.stringify(plain));
+    // The human check still runs on what IS cached.
+    const human = await t.relay.enroll({ invite: 'inv_n3', desiredName: 'antra' });
+    assert.ok('error' in human);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('mark_read passes count, since and keepPings through to the read-state store', async () => {
+  const t = makeRelay();
+  try {
+    const calls: unknown[] = [];
+    t.relay.readState.markRead = (...args: unknown[]) => void calls.push(args);
+    await t.relay.dispatchRpc({ personaId: RANDO }, 'mark_read', {
+      channelId: CHAN_A, uptoCreatedAt: '2026-01-01T00:00:00.000Z', count: 3, since: '2025-12-31T00:00:00.000Z', keepPings: true,
+    });
+    assert.deepEqual(calls, [[RANDO, CHAN_A, '2026-01-01T00:00:00.000Z', { count: 3, since: '2025-12-31T00:00:00.000Z', keepPings: true }]]);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('an invite granting scope:{all} covers every channel of ITS guild only — never every guild', async () => {
+  const t = makeRelay();
+  try {
+    t.relay.invites.mint({ code: 'inv_all', label: 'all', grant: { caps: ['VIEW_CHANNEL', 'READ_HISTORY'], scope: { all: true } }, guildId: GUILD });
+    const res = await t.relay.enroll({ invite: 'inv_all', desiredName: 'whole-guild' });
+    assert.ok(!('error' in res), JSON.stringify(res));
+    const policy = t.relay.permissions.getPolicy(res.personaId);
+    assert.deepEqual(policy.default, [], 'no persona-wide default');
+    assert.deepEqual(policy.guilds?.[GUILD]?.default, ['VIEW_CHANNEL', 'READ_HISTORY']);
+    assert.deepEqual(t.relay.capsFor(res.personaId, FOREIGN_CHAN, OTHER_GUILD), [], 'nothing in another guild');
+    // No guild on the invite: refused before anything is created or used up.
+    t.relay.invites.mint({ code: 'inv_all_noguild', label: 'x', grant: { caps: ['VIEW_CHANNEL'], scope: { all: true } } });
+    const count = t.relay.identity.all().length;
+    const bare = await t.relay.enroll({ invite: 'inv_all_noguild', desiredName: 'nowhere' });
+    assert.ok('error' in bare && /names no guild/.test(bare.error));
+    assert.equal(t.relay.identity.all().length, count);
+    assert.equal(t.relay.invites.get('inv_all_noguild').uses ?? 0, 0);
+    // Legacy blanket caps without a guild: the same.
+    t.relay.invites.mint({ code: 'inv_blanket', label: 'old', caps: ['VIEW_CHANNEL'] } as any);
+    const blanket = await t.relay.enroll({ invite: 'inv_blanket', desiredName: 'old-style' });
+    assert.ok('error' in blanket && /names no guild/.test(blanket.error));
+  } finally {
+    t.cleanup();
+  }
+});
+
+test('outstanding-mint cap counts what a claim finds live: a hand-edited numeric expiry is expired', () => {
+  const t = makeRelay();
+  try {
+    const dead = Array.from({ length: 20 }, (_, i) => ({
+      code: `inv_dead${i}`, mintedBy: SPAWNER, maxUses: 1, uses: 0, expiresAt: 0, mode: 'mint',
+      grant: { caps: [...RW], scope: { channels: [CHAN_A] } }, guildId: GUILD,
+    }));
+    writeFileSync(join(t.dir, 'invites.json'), JSON.stringify({ invites: dead }));
+    t.relay.invites.reload();
+    assert.doesNotThrow(() => t.mint(SPAWNER, t.goodParams()));
   } finally {
     t.cleanup();
   }

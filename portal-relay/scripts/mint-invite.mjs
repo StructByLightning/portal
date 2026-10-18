@@ -23,11 +23,11 @@
 //   node scripts/mint-invite.mjs --file invites.json --guild <gid> --mirror-roles <rid>,<rid> --caps ...
 //   (for LIVE multi-role mirroring, prefer an access role with scope.mirrorRoles + --roles)
 //
-//   # whole-guild/global (admin-ish; use sparingly):
-//   node scripts/mint-invite.mjs --file invites.json --all --caps ...
+//   # every channel of one guild (admin-ish; use sparingly):
+//   node scripts/mint-invite.mjs --file invites.json --guild <gid> --all --caps ...
 //
 //   # deprecated blanket caps (every channel) — must opt in:
-//   node scripts/mint-invite.mjs --file invites.json --allow-blanket --caps ...
+//   node scripts/mint-invite.mjs --file invites.json --guild <gid> --allow-blanket --caps ...
 //
 // Common: [--label x] [--subscriptions <cid>,<cid>] [--max-uses N]
 //         [--expires-in-days N] [--code <explicit-code>]
@@ -108,8 +108,12 @@ if (roles.length) {
   grantFields = { roles };
   summary = `roles: ${roles.join(',')}`;
 } else if (flag('all')) {
-  grantFields = { grant: { caps, scope: { all: true } } };
-  summary = `grant{all} caps: ${caps.join(',')}`;
+  if (!guildId) {
+    console.error('error: --guild <id> is required for --all (every channel of that guild)');
+    process.exit(1);
+  }
+  grantFields = { grant: { caps, scope: { all: true } }, guildId };
+  summary = `grant{all} guild:${guildId} caps: ${caps.join(',')}`;
 } else if (channels.length || mirrorRole || mirrorRoles.length) {
   if (!guildId) {
     console.error('error: --guild <id> is required for --channels / --mirror-role / --mirror-roles scopes');
@@ -120,14 +124,18 @@ if (roles.length) {
   const scopeDesc = mirrorRoles.length ? `mirror[${mirrorRoles.length}]` : mirrorRole ? `mirror:${mirrorRole}` : `channels[${channels.length}]`;
   summary = `grant{${scopeDesc}} guild:${guildId} caps: ${caps.join(',')}`;
 } else if (flag('allow-blanket')) {
-  console.error('warning: minting a DEPRECATED blanket-caps invite (every channel). Prefer --roles or a scope.');
-  grantFields = { caps };
-  summary = `BLANKET caps: ${caps.join(',')}`;
+  if (!guildId) {
+    console.error('error: --guild <id> is required for --allow-blanket (blanket caps cover every channel of that guild)');
+    process.exit(1);
+  }
+  console.error('warning: minting a DEPRECATED blanket-caps invite (every channel of the guild). Prefer --roles or a scope.');
+  grantFields = { caps, guildId };
+  summary = `BLANKET caps guild:${guildId}: ${caps.join(',')}`;
 } else {
   console.error('error: an invite must be scoped (RFC-004). Pass one of:');
   console.error('  --roles <name,...>            (preferred)');
   console.error('  --guild <id> --channels <id,...>   (or --mirror-role <id>)');
-  console.error('  --all                         (whole guild / global)');
+  console.error('  --guild <id> --all            (every channel of that guild)');
   console.error('  --allow-blanket               (deprecated: every channel)');
   process.exit(1);
 }

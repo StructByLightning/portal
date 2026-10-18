@@ -1,0 +1,100 @@
+name: Relay CI
+
+# Type-checks the relay and runs its admin-panel tests: the admin API, the
+# slash commands, the permission and invite stores, and the panel's own client
+# scripts (test/admin-spa.test.ts loads portal-admin/*.js in node:vm). The rest
+# of the relay suite (gateway, voice) is not run here; the gateway logging
+# test is known to be flaky.
+
+on:
+  pull_request:
+    paths:
+      - 'portal-relay/**'
+      - 'portal-protocol/**'
+      - 'portal-admin/**'
+      - '.github/workflows/relay-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'portal-relay/**'
+      - 'portal-protocol/**'
+      - 'portal-admin/**'
+      - '.github/workflows/relay-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  # As in client-ci.yml: a newer run of a pull request cancels the one in
+  # progress; runs for distinct main commits never cancel each other.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  relay:
+    name: Relay typecheck & admin tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The floor the relay's engines promise, pinned exactly, and the current
+    # maintained line.
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12.0', '24']
+    steps:
+      # portal-relay depends on file:../../voice-kit, a sibling of this
+      # repository, so both are checked out side by side:
+      #   $GITHUB_WORKSPACE/portal/portal-relay  →  ../../voice-kit
+      #   $GITHUB_WORKSPACE/voice-kit
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: portal
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: anima-research/voice-kit
+          path: voice-kit
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            voice-kit/package-lock.json
+            portal/portal-protocol/package-lock.json
+            portal/portal-relay/package-lock.json
+
+      # The relay imports both packages through their built output (package
+      # main/types point into dist/), and its tsconfig references
+      # ../portal-protocol as a project, so they are built first.
+      - name: Build voice-kit
+        working-directory: voice-kit
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build protocol
+        working-directory: portal/portal-protocol
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install & typecheck relay
+        working-directory: portal/portal-relay
+        run: |
+          npm ci
+          npx tsc --noEmit -p .
+
+      # Later phases add their new admin test files to this list.
+      - name: Admin tests
+        working-directory: portal/portal-relay
+        run: >-
+          node --import tsx --test
+          test/admin*.test.ts
+          test/access.test.ts
+          test/slash.test.ts
+          test/permissions.test.ts
+          test/invites.test.ts
+          test/mint-invite.test.ts

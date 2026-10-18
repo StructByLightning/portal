@@ -81,6 +81,7 @@ function makeRelay(opts: { withSpeaker: boolean }) {
   const relay = new Relay(config) as any;
   relay.bot = {
     channelForPerms: (_channelId: string) => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     isGuildAllowed: () => true,
     disconnect: async () => {},

@@ -77,6 +77,7 @@ function makeRelay() {
         : { parentChannelId: meta.id };
     },
     channelForPerms: (_id: string) => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: (id: string) => metas[id] ?? null,
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 1 }],
     isGuildAllowed: () => true,
@@ -135,11 +136,12 @@ test('send_message with a threadId that is not a thread under channelId is NOT_F
   try {
     await assert.rejects(
       rpc('send_message', { channelId: PARENT, threadId: OTHER_CHANNEL, content: 'nope' }),
-      /channel not found/,
+      // The refusal names the thread and the channel, so the caller knows which half to fix.
+      new RegExp(`^Error: Nothing ran: "${OTHER_CHANNEL}" isn't a thread of channel "${PARENT}"\\.`),
     );
     await assert.rejects(
       rpc('send_message', { channelId: OTHER_CHANNEL, threadId: THREAD, content: 'nope' }),
-      /channel not found/,
+      new RegExp(`^Error: Nothing ran: "${THREAD}" isn't a thread of channel "${OTHER_CHANNEL}"\\.`),
     );
     assert.equal(sent.length, 0);
   } finally {
@@ -183,7 +185,7 @@ test('fetch_history with a mismatched threadId is NOT_FOUND', async () => {
   try {
     await assert.rejects(
       rpc('fetch_history', { channelId: PARENT, threadId: OTHER_CHANNEL }),
-      /channel not found/,
+      new RegExp(`^Error: Nothing ran: "${OTHER_CHANNEL}" isn't a thread of channel "${PARENT}"\\.`),
     );
   } finally {
     cleanup();
@@ -256,6 +258,29 @@ test('echo recovery is age-gated: an OLD unattributed owned-webhook post stays w
     const { message } = relay.buildPortalMessage(old);
     assert.equal(message.author.kind, 'user');
     assert.equal(relay.store.getByDiscordId('dm-ancient')?.personaId, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test('a capability refusal on a thread names the parent channel whose access it takes', async () => {
+  const { rpc, cleanup } = makeRelay();
+  try {
+    await assert.rejects(rpc('create_thread', { channelId: THREAD, name: 'x' }), (err: any) => {
+      assert.equal(err.code, 'FORBIDDEN');
+      assert.equal(
+        err.message,
+        `Nothing ran: you don't have the CREATE_THREADS capability in channel "${PARENT}", which thread "${THREAD}" takes its access from, ` +
+          "so calling again won't change that. list_channels, with a guildId from list_guilds, shows each channel's capabilities; " +
+          'if you need this one, ask whoever runs this host.',
+      );
+      return true;
+    });
+    // A channel's own refusal names it alone.
+    await assert.rejects(
+      rpc('create_thread', { channelId: PARENT, name: 'x' }),
+      /^Error: Nothing ran: you don't have the CREATE_THREADS capability in channel "chan-parent", so calling again/,
+    );
   } finally {
     cleanup();
   }
