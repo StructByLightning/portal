@@ -2259,10 +2259,18 @@ export class Relay implements GatewayHooks {
     const categoryId = p.categoryId ?? undefined;
     if (typeof guildId !== 'string' || !guildId ||
         (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
-      throw rpcError('INVALID_PARAMS', 'guildId and categoryId must be non-empty strings');
+      throw rpcError(
+        'INVALID_PARAMS',
+        'Nothing ran: guildId must be a non-empty string, and categoryId a non-empty string, or null or left out ' +
+          "to create at the server's top level.",
+      );
     }
     if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) {
-      throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      throw rpcError(
+        'FORBIDDEN',
+        `Nothing ran: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+          'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+      );
     }
     if (categoryId !== undefined) {
       let category = this.bot.channelForPerms(categoryId);
@@ -2275,22 +2283,44 @@ export class Relay implements GatewayHooks {
         if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
       }
       if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
-        throw rpcError('FORBIDDEN', 'categoryId must identify a category in the requested guild');
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: ${JSON.stringify(categoryId)} isn't a category of server ${JSON.stringify(guildId)} that the ` +
+            "relay can see. Check the id: list_channels, with that guildId, shows the server's categories you can use, " +
+            "with their ids. To create at the server's top level, leave categoryId out.",
+        );
       }
       this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
     } else {
       const allowed = this.permissions.resolveGuild(personaId, guildId);
-      if (!allowed.has('MANAGE_CHANNELS')) throw rpcError('FORBIDDEN', 'missing capability MANAGE_CHANNELS');
+      if (!allowed.has('MANAGE_CHANNELS')) {
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: creating a channel at the top level of server ${JSON.stringify(guildId)} needs ` +
+            "MANAGE_CHANNELS across the server, which you don't have, so calling again won't change that. " +
+            'Pass a categoryId where list_channels shows you MANAGE_CHANNELS, or, if you need this, ask whoever ' +
+            'runs this host.',
+        );
+      }
       // The persona holds the right; a refusal past here is a Discord-side gap,
       // which a permissions.json edit can't fix. Say which, for the operator.
       const me = this.bot.meIn(guildId);
       if (!me) {
         console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot isn't in the guild`);
-        throw rpcError('FORBIDDEN', "the relay's Discord bot isn't in this guild");
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot isn't in server ${JSON.stringify(guildId)}, so it can't create a ` +
+            'channel there. Only whoever runs this host can change that.',
+        );
       }
       if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
         console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot lacks Manage Channels`);
-        throw rpcError('FORBIDDEN', "the relay's Discord bot lacks Manage Channels in this guild");
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot lacks Manage Channels in server ${JSON.stringify(guildId)}, so it ` +
+            "can't create a channel at the server's top level. Only whoever runs this host can change that, in the " +
+            "server's settings.",
+        );
       }
     }
     // The final check runs in the same continuation as the bot call, with no

@@ -126,7 +126,8 @@ export interface CreateThreadParams {
  *  all-channel role, or the persona's guild or persona-wide default) and the
  *  bot's guild-level ManageChannels permission. Channel-scoped and mirrored
  *  grants do not authorize creation at the guild root. The guild must be
- *  allowed. Without categoryId (or with null), the channel goes at the root. */
+ *  allowed, and a persona banned from it can't create there. Without
+ *  categoryId (or with null), the channel goes at the root. */
 export interface CreateTextChannelParams {
   guildId: GuildId;
   name: string;

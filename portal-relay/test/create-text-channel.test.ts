@@ -79,6 +79,7 @@ function makeRelay(t: TestContext, policy: PermissionsFile) {
       channels.set(id, channel); // discord.js fetch caches its result
       return { id, guildId: channel.guildId, type: channel.type === ChannelType.GuildCategory ? 'category' : 'text' };
     },
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     roleCapsByChannel: (guildId: string) => new Map(
       [...channels].filter(([, channel]) => channel.guildId === guildId)
         .map(([id]) => [id, new Set(MANAGE)]),
@@ -214,25 +215,18 @@ test('category resolution honors inline overrides and full-fidelity mirror masks
   await mirror.denied({ guildId: GUILD }); // mirror remains channel-scoped
 });
 
-test('full-fidelity mirrors stay local in admitted scopes that also contain all:true', async (t) => {
-  for (const mirrorScope of [{ mirrorRole: 'r1' }, { mirrorRoles: ['r1', 'r2'] }]) {
-    const h = makeRelay(t, {
-      roles: { manager: {
-        guildId: GUILD, scope: { all: true, ...mirrorScope }, caps: MANAGE, mirrorCaps: true,
-      } },
-      personas: { alice: { roles: ['manager'] } },
-    });
-    h.relay.permissions.setMirrorLookup(() => new Map([[CATEGORY, new Set(MANAGE)]]));
-    assert.deepEqual([...h.relay.permissions.resolve('alice', GUILD, OTHER_CATEGORY)], []);
-    await h.allowed({ guildId: GUILD, categoryId: CATEGORY });
-    await h.denied({ guildId: GUILD, categoryId: OTHER_CATEGORY });
-    await h.denied({ guildId: GUILD });
-
-    // Disabling mirrorCaps restores the existing all-scope precedence.
-    h.relay.permissions.setRole('manager', {
-      guildId: GUILD, scope: { all: true, ...mirrorScope }, caps: MANAGE, mirrorCaps: false,
-    });
-    await h.allowed({ guildId: GUILD });
+test('a role whose scope names all and a mirror is set aside, so it authorizes neither destination', async (t) => {
+  // A scope names one kind (roleShapeProblem): loading sets such a role aside, and setRole refuses it.
+  for (const mirrorCaps of [true, false]) {
+    for (const mirrorScope of [{ mirrorRole: 'r1' }, { mirrorRoles: ['r1', 'r2'] }]) {
+      const role = { guildId: GUILD, scope: { all: true, ...mirrorScope }, caps: MANAGE, mirrorCaps };
+      const h = makeRelay(t, { roles: { manager: role }, personas: { alice: { roles: ['manager'] } } });
+      h.relay.permissions.setMirrorLookup(() => new Map([[CATEGORY, new Set(MANAGE)]]));
+      assert.equal(h.relay.permissions.isQuarantined('manager'), true);
+      await h.denied({ guildId: GUILD });
+      await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+      assert.throws(() => h.relay.permissions.setRole('manager', role), /may name only one of/);
+    }
   }
 });
 
@@ -411,12 +405,52 @@ test("a bot that lacks Manage Channels, or isn't in the guild, is named as the g
   const response = await h.rpc({ guildId: GUILD });
   assert.equal(response.ok, false);
   assert.equal(response.error.code, 'FORBIDDEN');
-  assert.match(response.error.message, /bot lacks Manage Channels/);
+  assert.equal(response.error.message,
+    `Nothing ran: the relay's Discord bot lacks Manage Channels in server "${GUILD}", so it can't create a channel ` +
+    "at the server's top level. Only whoever runs this host can change that, in the server's settings.");
   h.state.botInGuild = false;
   const absent = await h.rpc({ guildId: GUILD });
   assert.equal(absent.ok, false);
   assert.equal(absent.error.code, 'FORBIDDEN');
-  assert.match(absent.error.message, /bot isn't in this guild/);
+  assert.equal(absent.error.message,
+    `Nothing ran: the relay's Discord bot isn't in server "${GUILD}", so it can't create a channel there. ` +
+    'Only whoever runs this host can change that.');
+});
+
+test("each refusal of the persona says what didn't happen, why, and what to do", async (t) => {
+  const refusal = async (h: ReturnType<typeof makeRelay>, params: Record<string, unknown>, code: string) => {
+    const response = await h.rpc(params);
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, code);
+    return response.error.message as string;
+  };
+  const h = makeRelay(t, { personas: { alice: { default: [], guilds: { [GUILD]: { channels: { [CATEGORY]: MANAGE } } } } } });
+  assert.equal(await refusal(h, { guildId: GUILD, categoryId: '' }, 'INVALID_PARAMS'),
+    'Nothing ran: guildId must be a non-empty string, and categoryId a non-empty string, or null or left out ' +
+    "to create at the server's top level.");
+  assert.equal(await refusal(h, { guildId: GUILD, categoryId: TEXT }, 'FORBIDDEN'),
+    `Nothing ran: "${TEXT}" isn't a category of server "${GUILD}" that the relay can see. Check the id: ` +
+    "list_channels, with that guildId, shows the server's categories you can use, with their ids. To create at the " +
+    "server's top level, leave categoryId out.");
+  assert.equal(await refusal(h, { guildId: GUILD }, 'FORBIDDEN'),
+    `Nothing ran: creating a channel at the top level of server "${GUILD}" needs MANAGE_CHANNELS across the server, ` +
+    "which you don't have, so calling again won't change that. Pass a categoryId where list_channels shows you " +
+    'MANAGE_CHANNELS, or, if you need this, ask whoever runs this host.');
+  h.state.allowedGuilds.delete(GUILD);
+  assert.equal(await refusal(h, { guildId: GUILD, categoryId: CATEGORY }, 'FORBIDDEN'),
+    `Nothing ran: you have no access to server "${GUILD}" on this relay. Check the id: list_guilds shows the ` +
+    'servers you can use. If you need this one, ask whoever runs this host.');
+});
+
+test('a persona banned from a server creates nothing there, whatever it holds, and keeps its rights elsewhere', async (t) => {
+  // A hand-edited file can hold a ban beside grants: /ban takes them off, and the admin API refuses new ones.
+  const h = makeRelay(t, {
+    roles: { manager: { guildId: GUILD, scope: { all: true }, caps: MANAGE } },
+    personas: { alice: { roles: ['manager'], policy: { default: MANAGE }, bans: [GUILD] } },
+  });
+  await h.denied({ guildId: GUILD });
+  await h.denied({ guildId: GUILD, categoryId: CATEGORY });
+  await h.allowed({ guildId: OTHER_GUILD });
 });
 
 test('a persona removed during a category fetch is refused, even where the file default grants', async (t) => {
