@@ -187,9 +187,14 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         // A call that timed out while held must not be sent later, nor pile
-        // up across a long outage.
+        // up across a long outage. It never ran, so a retry is safe; one that
+        // was sent may have run, and its error says so. Both keep "timed out",
+        // which callers may match.
+        const held = this.outbox.some((f) => f.id === id);
         this.outbox = this.outbox.filter((f) => f.id !== id);
-        reject(new Error(`RPC ${method} timed out`));
+        reject(new Error(held
+          ? `RPC ${method} timed out before it was sent: no relay session within ${this.opts.rpcTimeoutMs} ms`
+          : `RPC ${method} timed out after it was sent; it may have run`));
       }, this.opts.rpcTimeoutMs);
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
       this.outbox.push({ id, json });

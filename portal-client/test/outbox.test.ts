@@ -80,14 +80,76 @@ test('held RPCs flush in call order', (t) => {
   );
 });
 
-test('a held RPC that times out is rejected and never sent', async (t) => {
+test('a held RPC that times out is rejected, saying it was never sent, and never sent', async (t) => {
   const { client, created } = makeClient(20);
   t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
   client.connect().catch(() => {});
-  await assert.rejects(client.fetchHistory({ channelId: 'c1', limit: 1 }), /timed out/);
+  await assert.rejects(
+    client.fetchHistory({ channelId: 'c1', limit: 1 }),
+    /RPC fetch_history timed out before it was sent: no relay session within 20 ms/,
+  );
   created[0].feed(HELLO);
   created[0].feed(READY);
   assert.equal(created[0].rpcFrames().length, 0);
+});
+
+test('a sent RPC that gets no answer times out saying it may have run', async (t) => {
+  // A caller can retry a call that was never sent; one that was may have run.
+  const { client, created } = makeClient(20);
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+  const p = client.fetchHistory({ channelId: 'c1', limit: 1 });
+  assert.equal(created[0].rpcFrames().length, 1, 'sent at once');
+  await assert.rejects(p, /RPC fetch_history timed out after it was sent; it may have run/);
+});
+
+// Whether a call was sent is the outbox's to say, not the session's state at
+// the timeout: these three cases tell the two apart.
+test('a held RPC flushed on ready that then gets no answer times out saying it may have run', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  client.connect().catch(() => {});
+  const p = client.fetchHistory({ channelId: 'c1', limit: 1 });
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+  assert.equal(created[0].rpcFrames().length, 1, 'flushed on ready');
+  t.mock.timers.tick(1000); // its timeout (rpcTimeoutMs 1000)
+  await assert.rejects(p, /RPC fetch_history timed out after it was sent; it may have run/);
+});
+
+test('a sent RPC whose socket drops before its answer times out saying it may have run, beside one still held', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+  const sent = client.fetchHistory({ channelId: 'c1', limit: 1 });
+  assert.equal(created[0].rpcFrames().length, 1, 'sent at once');
+  created[0].emit('close', 1006); // the session is gone, but the call already went out
+  const held = client.sendMessage({ channelId: 'c1', content: 'during the gap' });
+  const sentRejects = assert.rejects(sent, /RPC fetch_history timed out after it was sent; it may have run/);
+  const heldRejects = assert.rejects(held, /RPC send_message timed out before it was sent: no relay session within 1000 ms/);
+  t.mock.timers.tick(1000); // both timeouts (rpcTimeoutMs 1000); no reconnect answers meanwhile
+  await sentRejects;
+  await heldRejects;
+});
+
+test('an RPC a closing socket refused times out saying it was never sent', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+  created[0].readyState = 2; // CLOSING, before its close event: the session still reads as ready
+  const p = client.fetchHistory({ channelId: 'c1', limit: 1 });
+  assert.equal(created[0].rpcFrames().length, 0, 'held, not sent');
+  t.mock.timers.tick(1000); // its timeout (rpcTimeoutMs 1000)
+  await assert.rejects(p, /RPC fetch_history timed out before it was sent: no relay session within 1000 ms/);
 });
 
 test('an RPC issued during a reconnect is sent on resumed', async (t) => {
