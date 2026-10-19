@@ -29,6 +29,9 @@ const READY = {
 };
 const HELLO = { op: 'hello', d: { protocolVersion: 3, heartbeatIntervalMs: 30000 } };
 
+/** The calls still waiting for an answer, each holding its timer. */
+const pendingOf = (client: PortalClient) => (client as unknown as { pending: Map<string, unknown> }).pending;
+
 function makeClient(rpcTimeoutMs = 1000) {
   const created: FakeWs[] = [];
   const client = new PortalClient({
@@ -74,10 +77,12 @@ test('held RPCs flush in call order', (t) => {
   client.sendMessage({ channelId: 'c1', content: 'hi' }).catch(() => {});
   created[0].feed(HELLO);
   created[0].feed(READY);
-  assert.deepEqual(
-    created[0].rpcFrames().map((f) => f.d.method),
-    ['fetch_history', 'send_message'],
-  );
+  const frames = created[0].rpcFrames();
+  assert.deepEqual(frames.map((f) => f.d.method), ['fetch_history', 'send_message']);
+  // Answered, so neither call's timer outlives the test.
+  created[0].feed({ op: 'rpc_result', d: { id: frames[0].d.id, ok: true, result: { messages: [] } } });
+  created[0].feed({ op: 'rpc_result', d: { id: frames[1].d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
+  assert.equal(pendingOf(client).size, 0);
 });
 
 test('a held RPC that times out is rejected, saying it was never sent, and never sent', async (t) => {
@@ -201,6 +206,36 @@ test('an RPC issued while the socket is closing is held, not dropped', async (t)
   assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
 });
 
+test('an RPC held through a reconnect whose resume is refused is sent once the fresh session is ready', async (t) => {
+  // The path every relay restart takes: the relay keeps sessions in memory,
+  // so it refuses the resume, and the client identifies afresh.
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  created[0].emit('close', 1006); // unexpected drop → reconnect scheduled
+  const p = client.sendMessage({ channelId: 'c1', content: 'across a relay restart' });
+  t.mock.timers.tick(20); // the reconnect, due within maxBackoffMs
+  const ws2 = created[1];
+  assert.ok(ws2, 'reconnected');
+
+  ws2.feed(HELLO);
+  assert.equal(JSON.parse(ws2.sent.at(-1)!).op, 'resume', 'the client has a session, so it resumes');
+  ws2.feed({ op: 'invalid_session', d: { resumable: false, reason: 'unknown session' } });
+  assert.equal(JSON.parse(ws2.sent.at(-1)!).op, 'identify', 'a refused resume starts a fresh session');
+  assert.equal(ws2.rpcFrames().length, 0, 'held until the fresh session is ready');
+  ws2.feed(READY);
+  const frames = ws2.rpcFrames();
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].d.method, 'send_message');
+
+  ws2.feed({ op: 'rpc_result', d: { id: frames[0].d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
+  assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
+});
+
 test('a connect() after close() holds calls until its own session is ready, while the old socket is still closing', async (t) => {
   // A real socket emits close only after its closing handshake, so close()
   // itself ends the session that takes calls.
@@ -269,6 +304,9 @@ test('a held RPC sends the params as they were at call time', (t) => {
   created[0].feed(READY);
   const [frame] = created[0].sent.map((s) => JSON.parse(s)).filter((f) => f.op === 'rpc');
   assert.equal(frame.d.params.channelId, 'c1');
+  // Answered, so its timer doesn't outlive the test.
+  created[0].feed({ op: 'rpc_result', d: { id: frame.d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
+  assert.equal(pendingOf(client).size, 0);
 });
 
 test('an RPC issued after close() is rejected and never sent on a later connect()', async (t) => {
