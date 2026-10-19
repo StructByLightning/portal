@@ -141,7 +141,7 @@ export class PortalCcChannelServer {
           const toolArgs = (params.arguments ?? {}) as Record<string, unknown>;
           // Identity tools act on the session itself, above the swappable agent.
           const out =
-            this.opts.identity && toolName in IDENTITY_TOOL_FEATURE_SETS
+            this.opts.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
               ? await this.opts.identity.handleToolCall(toolName, toolArgs)
               : await this.agent.handleToolCall(toolName, toolArgs);
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
@@ -153,7 +153,8 @@ export class PortalCcChannelServer {
     } catch (err) {
       const e = err as Error;
       if (req.method === 'tools/call') {
-        conn.sendResponse(req.id, { content: [textContent(`Error: ${e.message}`)], isError: true });
+        // isError says it failed; the message says what happened.
+        conn.sendResponse(req.id, { content: [textContent(e.message)], isError: true });
       } else {
         conn.sendError(req.id, -32000, e.message);
       }

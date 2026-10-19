@@ -35,8 +35,8 @@ import {
 } from '@animalabs/mcpl-core';
 import type { PortalClient } from '@animalabs/portal-client';
 import { chunkText } from './chunk.js';
-import type { AddressReason, PortalMessage } from '@animalabs/portal-protocol';
-import type { PortalAgent } from './agent.js';
+import type { AddressReason, PortalEvent, PortalMessage } from '@animalabs/portal-protocol';
+import { shortJson, unknownToolMessage, type PortalAgent } from './agent.js';
 import type { PendingPing } from './agent-state.js';
 import { parsePortalChannelId, portalChannelId, toDescriptor } from './channels.js';
 import { featureSets, TOOL_FEATURE_SETS, type PortalFeatureSet } from './feature-sets.js';
@@ -274,16 +274,28 @@ export class PortalMcplServer {
     if (!this.mcplEnabled) return true; // plain MCP host: §3.2, MCPL never applies
     const required = INBOUND_CAPABILITY[req.method];
     if (required === undefined) return true;
+    // The capability path and the spec section go to the operator log; the
+    // message says what didn't happen in words an agent can act on.
     if (!this.policy.isReady) {
+      console.error(
+        `[portal-mcpl] ${req.method} refused: capability ${required} — no featureSets/update policy received yet (SPEC §5.3)`,
+      );
       conn.sendError(
         req.id,
         ERR_CAPABILITY_DENIED,
-        `capability denied: ${required} — no featureSets/update policy received yet (SPEC §5.3)`,
+        "Nothing ran: Portal hasn't yet received this host's permissions, so it can't act for the host yet. " +
+          'Try again in a few seconds; if it keeps happening, ask whoever runs this host.',
       );
       return false;
     }
     if (!this.policy.allows(required)) {
-      conn.sendError(req.id, ERR_CAPABILITY_DENIED, `capability denied: ${required}`);
+      console.error(`[portal-mcpl] ${req.method} refused: capability ${required} not granted`);
+      conn.sendError(
+        req.id,
+        ERR_CAPABILITY_DENIED,
+        "Nothing ran: this host hasn't granted Portal what this call needs, so calling again won't change that. " +
+          'If you need it, ask whoever runs this host.',
+      );
       return false;
     }
     return true;
@@ -300,7 +312,11 @@ export class PortalMcplServer {
 
   /** Owning feature set of a tool; identity tools exist only when attached. */
   private toolFeatureSet(toolName: string): string | undefined {
-    return TOOL_FEATURE_SETS[toolName] ?? (this.identity ? IDENTITY_TOOL_FEATURE_SETS[toolName] : undefined);
+    // Own keys only: a name like "constructor" is no tool, not Object's.
+    if (Object.hasOwn(TOOL_FEATURE_SETS, toolName)) return TOOL_FEATURE_SETS[toolName];
+    return this.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
+      ? IDENTITY_TOOL_FEATURE_SETS[toolName]
+      : undefined;
   }
 
   private async handleRequest(req: JsonRpcRequest): Promise<void> {
@@ -320,15 +336,25 @@ export class PortalMcplServer {
         case 'tools/call': {
           const toolName = params.name as string;
           // A tool with no declared feature set is unauthorizable, so it is
-          // refused rather than defaulted on (§6.4 fails closed).
+          // refused rather than defaulted on (§6.4 fails closed). A declared
+          // agent tool this host doesn't list is retired here: the agent
+          // answers it with a pointer to the host's own tools, and runs
+          // nothing, so it isn't gated. On an MCPL host, identity tools are
+          // always gated; a plain MCP host runs no gate.
           const owningSet = this.toolFeatureSet(toolName);
-          if (this.mcplEnabled && (owningSet === undefined || !this.policy.featureEnabled(owningSet))) {
+          const retired =
+            Object.hasOwn(TOOL_FEATURE_SETS, toolName) && !this.agent.tools.some((tool) => tool.name === toolName);
+          if (this.mcplEnabled && (owningSet === undefined || (!retired && !this.policy.featureEnabled(owningSet)))) {
+            if (owningSet !== undefined) {
+              console.error(`[portal-mcpl] tools/call ${toolName} refused: feature set not enabled: ${owningSet}`);
+            }
             conn.sendError(
               req.id,
               owningSet === undefined ? ERR_CAPABILITY_DENIED : ERR_FEATURE_SET_NOT_ENABLED,
               owningSet === undefined
-                ? `tool ${toolName} has no declared feature set`
-                : `feature set not enabled: ${owningSet}`,
+                ? unknownToolMessage(toolName)
+                : `${toolName} isn't enabled for this host, so the call didn't run, and calling it again won't change that. ` +
+                  'If you need it, ask whoever runs this host.',
             );
             break;
           }
@@ -336,7 +362,7 @@ export class PortalMcplServer {
           // Identity tools act on the session itself, so they are answered
           // above the (per-identity, swappable) agent.
           const out =
-            this.identity && toolName in IDENTITY_TOOL_FEATURE_SETS
+            this.identity && Object.hasOwn(IDENTITY_TOOL_FEATURE_SETS, toolName)
               ? await this.identity.handleToolCall(toolName, toolArgs)
               : await this.agent.handleToolCall(toolName, toolArgs);
           conn.sendResponse(req.id, { content: [textContent(stringify(out))] });
@@ -377,7 +403,8 @@ export class PortalMcplServer {
       const e = err as Error & { code?: string };
       // Tool errors come back as a tool result with isError, not a JSON-RPC error.
       if (req.method === 'tools/call') {
-        conn.sendResponse(req.id, { content: [textContent(`Error: ${e.message}`)], isError: true });
+        // isError says it failed; the message says what happened.
+        conn.sendResponse(req.id, { content: [textContent(e.message)], isError: true });
       } else {
         conn.sendError(req.id, -32000, e.message);
       }
@@ -475,11 +502,31 @@ export class PortalMcplServer {
   }
 
   private async handleChannelOpen(open: ChannelsOpenParams): Promise<ChannelsOpenResult> {
-    const exact = open.channelId ? parsePortalChannelId(open.channelId) : null;
-    const addr = open.address as { channelId?: string } | undefined;
-    const channelId = exact ?? addr?.channelId;
+    const exact = typeof open.channelId === 'string' ? parsePortalChannelId(open.channelId) : null;
+    const addr = open.address as { channelId?: unknown } | undefined;
+    const fromAddress = !exact && typeof addr?.channelId === 'string' ? addr.channelId : undefined;
+    const channelId = exact ?? fromAddress;
     const channel = channelId ? this.client.cache.getChannel(channelId) : undefined;
-    if (!channelId || !channel) throw new Error('unknown channel');
+    if (!channelId || !channel) {
+      // Name the argument that was looked up, with its value as the host sent it.
+      // The two arguments take different forms: channelId a Portal channel id,
+      // and address.channelId the bare id a descriptor's address carries.
+      const [argument, value, remedy] =
+        fromAddress !== undefined
+          ? [
+              'address.channelId',
+              addr?.channelId,
+              "address.channelId takes a channel's bare id, as the address in your host's channel list gives it; " +
+                'copy one from there.',
+            ]
+          : [
+              'channelId',
+              open.channelId ?? null,
+              "Portal channel ids look like portal:<id>; your host's channel list shows the ones you can open, " +
+                'so copy one from there.',
+            ];
+      throw new Error(`No Portal channel matches the ${argument} ${shortJson(value)}, so nothing was opened. ${remedy}`);
+    }
 
     const result: ChannelsOpenResult = {
       channel: toDescriptor(channel, false, undefined, this.guildName(channel.guildId)),
@@ -514,8 +561,13 @@ export class PortalMcplServer {
   }
 
   private async handleChannelClose(close: ChannelsCloseParams): Promise<ChannelsCloseResult> {
-    const channelId = parsePortalChannelId(close.channelId);
-    if (!channelId) throw new Error(`invalid Portal channel id: ${close.channelId}`);
+    const channelId = typeof close.channelId === 'string' ? parsePortalChannelId(close.channelId) : null;
+    if (!channelId) {
+      throw new Error(
+        `Nothing was closed: ${shortJson(close.channelId ?? null)} isn't a Portal channel id. Portal channel ids ` +
+          "look like portal:<id>; your host's channel list shows the ones you can close.",
+      );
+    }
     // A resume can land while the unsubscribe waits: a client that holds calls
     // until its session is ready flushes them just before it emits `resumed`.
     // The resume reasserts every open channel, so it skips this one.
@@ -547,8 +599,11 @@ export class PortalMcplServer {
   private async handleChannelAcknowledge(
     request: ChannelsAcknowledgeParams,
   ): Promise<ChannelsAcknowledgeResult> {
-    if (!parsePortalChannelId(request.channelId)) {
-      return { acknowledged: false, reason: `invalid Portal channel id: ${request.channelId}` };
+    if (typeof request.channelId !== 'string' || !parsePortalChannelId(request.channelId)) {
+      return {
+        acknowledged: false,
+        reason: `Nothing was acknowledged: ${shortJson(request.channelId ?? null)} isn't a Portal channel id, which looks like portal:<id>.`,
+      };
     }
     const representation = request.value?.trim() || '👀';
     try {
@@ -727,14 +782,7 @@ export class PortalMcplServer {
     // ambient.
     track(this.client.on('voiceReceipt', (e) => {
       if (!this.conn || !this.canPushVoice()) return;
-      const where = this.channelLabel(e.channelId);
-      const line =
-        e.status === 'spoken'
-          ? `[voice] you spoke in ${where} (${(e.playedMs / 1000).toFixed(1)}s): ${e.voicedText}`
-          : e.status === 'interrupted'
-            ? `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
-              `heard: "${e.voicedText}"${e.estimated ? ' (boundary estimated)' : ''} — unsaid: "${e.unvoicedText}"`
-            : `[voice] your utterance in ${where} was ${e.status === 'refused' ? 'refused' : 'dropped by an error'}: ${e.reason ?? 'no reason given'}`;
+      const line = voiceReceiptLine(e, this.channelLabel(e.channelId));
       this.conn
         .sendRequest(method.PUSH_EVENT, {
           featureSet: VOICE,
@@ -1404,5 +1452,45 @@ function stringify(v: unknown): string {
     return JSON.stringify(v, null, 2);
   } catch {
     return String(v);
+  }
+}
+
+/**
+ * The context line for a voice_speak receipt, as the speaker reads it. A
+ * refusal can be an authority's verdict that saying it again won't change,
+ * so only an error's line suggests saying it again; an error that cut the
+ * utterance off says what was heard, with the boundary's estimate flag as an
+ * interruption's line has it. A refusal says nothing was said only when no
+ * characters were billed, since the output stopping mid-utterance is also
+ * reported as a refusal.
+ */
+export function voiceReceiptLine(e: Extract<PortalEvent, { type: 'voice_receipt' }>, where: string): string {
+  const reason = e.reason ?? 'no reason given';
+  const estimated = e.estimated ? ' (boundary estimated)' : '';
+  switch (e.status) {
+    case 'spoken':
+      return `[voice] you spoke in ${where} (${(e.playedMs / 1000).toFixed(1)}s): ${e.voicedText}`;
+    case 'interrupted':
+      return `[voice] you were interrupted in ${where} by ${e.interruptedBy?.username ?? 'someone'} — ` +
+        `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}"`;
+    case 'refused':
+      // Characters are billed when voicing opens, so a refusal that comes
+      // after billing (the output stopping mid-utterance) may have been heard.
+      if (e.billedChars > 0) {
+        const heard = e.voicedText ? ` — heard: "${e.voicedText}"${estimated}` : ', so some of it may have been heard';
+        return `[voice] your utterance in ${where} was stopped after the relay began voicing it${heard}: ${reason}.`;
+      }
+      return `[voice] your utterance in ${where} was refused, so nothing was said: ${reason}.`;
+    default:
+      if (e.voicedText) {
+        return `[voice] your utterance in ${where} was cut off by an error: ${reason} — ` +
+          `heard: "${e.voicedText}"${estimated} — unsaid: "${e.unvoicedText}". Call voice_speak with the rest if it still matters.`;
+      }
+      // An error after billing began can't say nothing was heard.
+      return e.billedChars > 0
+        ? `[voice] your utterance in ${where} was stopped by an error after the relay began voicing it, so some of it ` +
+          `may have been heard: ${reason}. Call voice_speak again if it still matters.`
+        : `[voice] your utterance in ${where} was dropped by an error, so nothing was said: ${reason}. ` +
+          'Call voice_speak again if it still matters.';
   }
 }

@@ -85,6 +85,9 @@ export interface AccessRole {
 export interface PersonaEntry {
   roles?: string[];
   policy?: PersonaPolicy;
+  /** Guilds this persona was banned from (/ban). Nothing grants access there
+   *  until an admin of that guild grants it again, which lifts the ban. */
+  bans?: string[];
 }
 
 /** What a persona looks like on disk — new entry shape or a legacy inline policy. */

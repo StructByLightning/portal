@@ -63,6 +63,7 @@ function makeRelay() {
       guildId: GUILD,
       permissionsFor: () => ({ has: () => true }),
     }),
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 1 }],
     isGuildAllowed: () => true,

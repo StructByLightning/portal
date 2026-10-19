@@ -345,7 +345,8 @@ export class VoiceSpeaker {
     const entry = this.voice.connectionFor(args.channelId);
     if (!entry) {
       throw new VoiceSpeakError('NOT_JOINED',
-        `relay is not joined to voice channel ${args.channelId} — voice_join it first (speaking never implicitly joins)`);
+        `Nothing was said: the relay isn't in voice channel ${JSON.stringify(args.channelId)}, and speaking never joins one. ` +
+          'Call voice_join on it first, then voice_speak again.');
     }
     // Re-read per utterance: registry edits (new resident voice, re-voicing)
     // take effect without a relay restart, and utterance cadence makes the
@@ -353,8 +354,11 @@ export class VoiceSpeaker {
     const registry = loadRegistry(this.registryPath);
     const voice = resolveVoice(registry, args.speakerName);
     if (!voice) {
+      // The registry's vocabulary is the operator's; the speaker hears what it can do.
+      this.log(`voice_speak refused: no voice registered for "${args.speakerName}" and no defaultBotVoice in the voice registry`);
       throw new VoiceSpeakError('NO_VOICE',
-        `no voice registered for "${args.speakerName}" and no defaultBotVoice in the voice registry`);
+        `Nothing was said: no voice is set up for you (${JSON.stringify(args.speakerName)}) on this relay, ` +
+          "so calling again won't change that. If you need to speak, ask whoever runs this host.");
     }
     const output = this.channelOutput(args.channelId, entry);
     output.engine.speak({
