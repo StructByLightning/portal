@@ -156,6 +156,10 @@ export class PortalClient extends TypedEmitter<PortalClientEvents> {
 
   close(): void {
     this.closedByUser = true;
+    // A real socket's close event comes only after its closing handshake, so
+    // close() marks the session gone itself: a connect() made before then
+    // holds calls until its own session is ready.
+    this.ready = false;
     if (this.heartbeat) clearInterval(this.heartbeat);
     // Unsent work dies with the client: a later connect() must not run an
     // operation the caller issued before shutting down. Calls already sent

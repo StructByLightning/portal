@@ -139,6 +139,46 @@ test('an RPC issued while the socket is closing is held, not dropped', async (t)
   assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
 });
 
+test('a connect() after close() holds calls until its own session is ready, while the old socket is still closing', async (t) => {
+  // A real socket emits close only after its closing handshake, so close()
+  // itself ends the session that takes calls.
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+
+  created[0].close = () => { created[0].readyState = 2; }; // CLOSING; its close event doesn't come in this test
+  client.close();
+  client.connect().catch(() => {});
+  const ws2 = created[1];
+  const p = client.sendMessage({ channelId: 'c1', content: 'after reconnecting' });
+  assert.equal(ws2.rpcFrames().length, 0, 'not sent on a socket that has not identified');
+
+  ws2.feed(HELLO); // the client kept its session, so it resumes
+  ws2.feed({ op: 'resumed', d: { replayedEvents: 0 } });
+  const frames = ws2.rpcFrames();
+  assert.equal(frames.length, 1);
+  ws2.feed({ op: 'rpc_result', d: { id: frames[0].d.id, ok: true, result: { messageId: 'm1', channelId: 'c1' } } });
+  assert.deepEqual(await p, { messageId: 'm1', channelId: 'c1' });
+});
+
+test('a connect() after close() rejects when its socket errors before its session is ready, as a first connect() does', async (t) => {
+  const { client, created } = makeClient();
+  t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
+  client.connect().catch(() => {});
+  created[0].feed(HELLO);
+  created[0].feed(READY);
+
+  created[0].close = () => { created[0].readyState = 2; }; // CLOSING; its close event doesn't come in this test
+  client.close();
+  let outcome: unknown = 'still pending';
+  client.connect().then(() => { outcome = 'resolved'; }, (error: unknown) => { outcome = error; });
+  created[1].emit('error', new Error('connect ECONNREFUSED'));
+  await new Promise((resolve) => setImmediate(resolve)); // the rejection settles in microtasks
+  assert.match(String(outcome), /ECONNREFUSED/);
+});
+
 test('close() rejects held RPCs and a later connect() never sends them', async (t) => {
   const { client, created } = makeClient();
   t.after(() => client.close()); // also on a failed assertion, so the heartbeat can't hang the run
@@ -180,8 +220,9 @@ test('an RPC issued after close() is rejected and never sent on a later connect(
   const p = client.sendMessage({ channelId: 'c1', content: 'after shutdown' });
   const rejected = assert.rejects(p, /closed/);
   client.connect().catch(() => {});
-  created[1].feed(HELLO);
-  created[1].feed(READY);
+  created[1].feed(HELLO); // the client kept its session, so it resumes
+  assert.equal(JSON.parse(created[1].sent.at(-1)!).op, 'resume');
+  created[1].feed({ op: 'resumed', d: { replayedEvents: 0 } }); // as the relay answers a resume
   assert.equal(created[1].rpcFrames().length, 0, 'a call made after close() is not sent after reconnecting');
   await rejected;
 });
