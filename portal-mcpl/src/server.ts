@@ -568,9 +568,12 @@ export class PortalMcplServer {
           "look like portal:<id>; your host's channel list shows the ones you can close.",
       );
     }
-    // A resume can land while the unsubscribe waits: a client that holds calls
-    // until its session is ready flushes them just before it emits `resumed`.
-    // The resume reasserts every open channel, so it skips this one.
+    // A resume can land while the unsubscribe waits, and the relay then applies
+    // the unsubscribe after the resume: one the client sent between its `resume`
+    // and the relay's `resumed`, or one a client that holds calls until its
+    // session is ready flushes just before it emits `resumed`. The resume
+    // reasserts every open channel, so it skips this one, which would otherwise
+    // be subscribed again once its close had gone through.
     this.closingChannels.add(channelId);
     try {
       await this.client.unsubscribe(channelId);

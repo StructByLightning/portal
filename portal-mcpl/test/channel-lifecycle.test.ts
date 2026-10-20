@@ -283,9 +283,10 @@ test('a resume while a close waits on its unsubscribe skips the channel, and the
     restored.push(channelId);
     return {};
   };
-  // An unsubscribe can still be waiting when a resume lands: a client that
-  // holds calls until its session is ready flushes them just before it emits
-  // `resumed`, and the result comes back after.
+  // An unsubscribe can still be waiting when a resume lands: one sent between
+  // the client's `resume` and the relay's `resumed`, or one a client that holds
+  // calls until its session is ready flushes just before it emits `resumed`.
+  // Its result comes back after.
   let finish!: () => void;
   const unsubscribed = new Promise<void>((resolve) => {
     finish = resolve;
