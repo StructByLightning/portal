@@ -4,17 +4,25 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="same-origin" />
-  <title>Portal Admin</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>Portal admin</title>
+  <link rel="stylesheet" href="styles.css?v=7" />
+  <!-- Classic deferred scripts, run in order; each assigns only window.PA.<module>.
+       Bump ?v= on a release so browsers don't mix old and new files. -->
+  <script src="lib.js?v=7" defer></script>
+  <script src="ui.js?v=7" defer></script>
+  <script src="channels.js?v=7" defer></script>
+  <script src="app.js?v=7" defer></script>
 </head>
 <body>
-  <!-- Login screen (shown when /admin/me returns 401) -->
+  <!-- Sign-in card: only at boot, when /admin/me returns 401. (A session that
+       ends mid-task is "Your session ended" over the page instead.) -->
   <section id="login" class="login hidden">
     <div class="login-card">
-      <h1>Portal Admin</h1>
-      <p>Sign in with Discord to manage personas, invites and access.</p>
-      <a class="btn btn-primary" href="/admin/login">Login with Discord</a>
-      <p id="login-error" class="error hidden"></p>
+      <h1>Portal admin</h1>
+      <p>Sign in with Discord to manage personas, channels and invites.</p>
+      <a id="login-btn" class="btn btn-primary" href="/admin/login">Sign in with Discord</a>
+      <!-- Why the last sign-in came back (?login_error=…), with Try again. -->
+      <div id="login-error" class="login-error hidden" role="alert"></div>
     </div>
   </section>
 
@@ -23,19 +31,20 @@
     <header class="topbar">
       <div class="brand">portal<span class="brand-dim">/admin</span></div>
 
-      <nav class="tabs" id="tabs">
-        <button class="tab" data-tab="personas">Personas</button>
-        <button class="tab" data-tab="invites">Invites</button>
-        <button class="tab" data-tab="roles">Roles</button>
-        <button class="tab" data-tab="audit">Audit</button>
-        <button class="tab tab-super" data-tab="identities">Identities</button>
-        <button class="tab tab-super" data-tab="guilds">Guilds</button>
+      <!-- Tabs are links: each has an address (#/g/<guild>/<tab>). -->
+      <nav class="tabs" id="tabs" aria-label="Sections">
+        <a class="tab" data-tab="channels" href="#/">Channels</a>
+        <a class="tab" data-tab="personas" href="#/">Personas</a>
+        <a class="tab" data-tab="invites" href="#/">Invites</a>
+        <a class="tab" data-tab="roles" href="#/">Access roles</a>
+        <a class="tab" data-tab="audit" href="#/">Audit</a>
+        <a class="tab tab-super hidden" data-tab="guilds" href="#/guilds">Guilds</a>
       </nav>
 
       <div class="spacer"></div>
 
       <div class="scope" id="scope">
-        <span class="scope-label">guild</span>
+        <label class="scope-label" for="guild-select">guild</label>
         <select id="guild-select" class="scope-select"></select>
         <span id="guild-static" class="scope-static hidden"></span>
       </div>
@@ -43,39 +52,37 @@
       <div class="user">
         <span id="user-name" class="user-name"></span>
         <span id="super-badge" class="badge badge-super hidden">super</span>
-        <button id="logout-btn" class="btn btn-ghost btn-sm">Logout</button>
+        <button type="button" id="logout-btn" class="btn btn-ghost btn-sm">Sign out</button>
       </div>
     </header>
 
-    <div id="banner" class="banner hidden"></div>
+    <!-- When the session ends (from two minutes before), with Sign in again.
+         While the drawer is open, its own copy (#drawer-session-bar) shows. -->
+    <div id="session-bar" class="session-bar hidden" role="status"></div>
+
+    <!-- Notices about the panel itself (a newer relay asks for a reload). -->
+    <div id="notices" class="notices"></div>
 
     <main id="view" class="view"><!-- active tab rendered here --></main>
   </div>
 
-  <!-- Right-side detail drawer (persona / mint / role editors) -->
+  <!-- Right-side detail drawer (channel / persona / mint / role editors) -->
   <div id="drawer-scrim" class="drawer-scrim hidden"></div>
-  <aside id="drawer" class="drawer hidden" aria-hidden="true">
+  <aside id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true" tabindex="-1">
     <header class="drawer-head">
-      <div id="drawer-title" class="drawer-title"></div>
-      <button id="drawer-close" class="btn btn-ghost btn-sm" title="Close (Esc)">✕</button>
+      <h2 id="drawer-title" class="drawer-title" tabindex="-1"></h2>
+      <button type="button" id="drawer-close" class="btn btn-ghost btn-sm" aria-label="Close panel" title="Close (Esc)">✕</button>
     </header>
+    <!-- The session bar again, for while the drawer covers the page: the
+         drawer is where an unsaved form is, and Tab stays inside it. -->
+    <div id="drawer-session-bar" class="session-bar hidden" role="status"></div>
     <div id="drawer-body" class="drawer-body"></div>
   </aside>
 
-  <!-- One-time secret reveal (token rotation) -->
-  <div id="secret-modal" class="modal-backdrop hidden">
-    <div class="modal">
-      <h2>New token — shown once</h2>
-      <p class="warn">Copy this now. It will <strong>not</strong> be shown again.
-        Deliver it to the agent out-of-band.</p>
-      <pre id="secret-value" class="secret"></pre>
-      <div class="modal-actions">
-        <button id="secret-copy" class="btn">Copy</button>
-        <button id="secret-close" class="btn btn-primary">Done</button>
-      </div>
-    </div>
-  </div>
+  <!-- The modal layer: confirms, "Your session ended", a token shown once. -->
+  <div id="modals"></div>
 
-  <script src="app.js"></script>
+  <!-- Results and errors: errors stay until dismissed; the rest fade. -->
+  <div id="toasts" class="toasts" aria-live="polite"></div>
 </body>
 </html>

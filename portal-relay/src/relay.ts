@@ -5,6 +5,7 @@
  *   - client RPC → capability-checked Discord actions via the pools
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { ChannelType, PermissionsBitField } from 'discord.js';
 import type {
   AddressReason,
   Capability,
@@ -20,21 +21,23 @@ import type {
   RpcRequest,
   RpcResponse,
 } from '@animalabs/portal-protocol';
-import type { InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
+import type { AccessRole, InviteTemplate, PersonaIdentity, PersonaPolicy, RelayConfig, Scope } from './config.js';
 import { DiscordBot, type ChannelMeta, type IncomingMessage } from './discord-bot.js';
 import { Gateway, type GatewayHooks, Session } from './gateway.js';
 import { GuildAllowStore, type GuildAllowChange } from './guild-allowlist.js';
 import { HistoryCache } from './history-cache.js';
 import { IdentityStore, type IdentityChange, generateToken, hashToken } from './identity.js';
-import { InviteStore } from './invites.js';
+import { InviteStore, inviteModeProblem, inviteShapeProblem } from './invites.js';
 import { MessageStore, makeRelayId, parseRelayId, type MessageRef } from './message-store.js';
 import { MirrorCache } from './mirror-cache.js';
-import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities } from './permissions.js';
+import { ALL_CAPS, PermissionsStore, type PermissionChange, computeCapabilities, roleGrantsAccess } from './permissions.js';
 import { ReadStateStore } from './read-state.js';
 import { RolePool } from './role-pool.js';
 import { WebhookPool } from './webhook-pool.js';
 import { AdminServer, type AdminDeps } from './admin/server.js';
 import { AuditLog } from './admin/audit.js';
+import { ChannelNameResolver } from './admin/names.js';
+import { nameKeys } from './name-policy.js';
 import { SlashHandler } from './slash.js';
 import { VoiceBot, VoiceJoinError, type VoiceTranscript } from './voice-bot.js';
 import { VoiceSpeakError, type SpeakReceipt } from './voice-output.js';
@@ -63,6 +66,60 @@ const ECHO_RECOVERY_MAX_AGE_MS = 5 * 60_000;
 /** list_members page cap — the limit used to be unbounded, so one call could
  *  dump a guild's whole roster (issue #27). */
 const MAX_MEMBERS_PAGE = 1000;
+
+/** The access role an inline mirror grant materializes into, and its name:
+ *  the guild in clear plus 128 bits of digest over (guild, roles, caps), so a
+ *  grant in one guild can't be made to name another guild's role. */
+function mirrorRoleFor(
+  guildId: string,
+  scope: { mirrorRole: string } | { mirrorRoles: string[] },
+  caps: Capability[],
+): { name: string; role: AccessRole } {
+  const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
+  const sortedCaps = [...new Set(caps)].sort();
+  const digest = createHash('sha256').update(JSON.stringify({ guildId, roleIds, caps: sortedCaps })).digest('hex');
+  return {
+    name: `mirror-${guildId}-${digest.slice(0, 32)}`,
+    role: {
+      caps: sortedCaps,
+      scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
+      guildId,
+    },
+  };
+}
+
+/** Same guild, same caps, same scope, same mirrorCaps — order-insensitive. */
+function sameAccessRole(a: AccessRole, b: AccessRole): boolean {
+  const norm = (r: AccessRole) => {
+    const sc = r.scope as Record<string, unknown>;
+    const scope =
+      sc.all === true ? 'all'
+      : Array.isArray(sc.channels) ? `ch:${[...(sc.channels as string[])].sort().join(',')}`
+      : typeof sc.mirrorRole === 'string' ? `mr:${sc.mirrorRole}`
+      : Array.isArray(sc.mirrorRoles) ? `mr:${[...(sc.mirrorRoles as string[])].sort().join(',')}`
+      : JSON.stringify(sc);
+    return JSON.stringify([r.guildId, [...new Set(r.caps)].sort(), scope, !!r.mirrorCaps]);
+  };
+  return norm(a) === norm(b);
+}
+
+/** Why a register frame's own fields can't be used, or null. A name or an
+ *  avatar that isn't a string would throw mid-enroll or be stored as sent, and
+ *  subscriptions that aren't a list of channel ids would throw or be read a
+ *  character at a time. An empty or false name, avatar or subscriptions ('',
+ *  0, false or null) means none: the default name, no avatar
+ *  and no subscriptions.
+ *  Checked before anything is read or created. */
+function registerFieldProblem(d: RegisterData): string | null {
+  const f = d as unknown as Record<string, unknown>;
+  if (f.desiredName && typeof f.desiredName !== 'string') return 'register desiredName must be a string';
+  if (f.avatar && typeof f.avatar !== 'string') return 'register avatar must be a string';
+  const subs = f.subscriptions;
+  if (subs && !(Array.isArray(subs) && subs.every((c) => typeof c === 'string'))) {
+    return 'register subscriptions must be a list of channel ids';
+  }
+  return null;
+}
 
 export class Relay implements GatewayHooks {
   private bot: DiscordBot;
@@ -142,6 +199,12 @@ export class Relay implements GatewayHooks {
     // admin module stays decoupled from discord.js and is unit-testable.
     if (config.admin) {
       this.audit = new AuditLog(config.admin.auditPath);
+      // Names for ids the gateway cache can't name (archived threads, deleted
+      // channels) — REST-backed, memoised, never touches the bot's cache.
+      const channelNames = new ChannelNameResolver({
+        cached: (id) => this.bot.channelMetaFromCache(id),
+        fetch: (id) => this.bot.fetchChannelMetaUncached(id),
+      });
       const deps: AdminDeps = {
         config: config.admin,
         identity: this.identity,
@@ -162,13 +225,28 @@ export class Relay implements GatewayHooks {
             id: c.id,
             name: c.name ?? undefined,
             type: c.type,
+            ...(c.parentId ? { parentId: c.parentId } : {}),
           })),
+        resolveChannels: (ids) => channelNames.resolve(ids),
+        discordRole: (roleId) => this.bot.roleLabel(roleId),
         channelInGuild: (gid, cid) => this.bot.channelForPerms(cid)?.guildId === gid,
         closePersona: (personaId) => this.gateway.closePersona(personaId),
-        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code),
+        applyClaim: (personaId, code) => this.applyInviteAugment(personaId, code, { byAdmin: true }),
         rotatePersonaToken: (personaId) => this.rotatePersonaToken(personaId),
         revokePersonaToken: (personaId) => this.revokePersonaToken(personaId),
         newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
+        // The effective-access view reads what the relay enforces: capsFor
+        // itself, and the bot's half of it per channel (capsFor's own
+        // computeCapabilities over every capability), so a whole guild can
+        // be counted with one resolve() per persona and channel.
+        capsFor: (personaId, channelId, guildId) => this.capsFor(personaId, channelId, guildId),
+        botCaps: (guildId, channelId) =>
+          computeCapabilities(new Set(ALL_CAPS), this.bot.channelForPerms(channelId), this.bot.meIn(guildId)),
+        // Where the relay checks a channel's access: a thread's is its parent's.
+        permChannelId: (channelId) => this.permIdOf(channelId),
+        listChannelLayout: (gid) => this.bot.listChannelLayout(gid),
+        canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
+        resync: (personaId) => this.resyncPersona(personaId),
       };
       this.admin = new AdminServer(deps);
     }
@@ -186,6 +264,7 @@ export class Relay implements GatewayHooks {
       canAccessGuild: (personaId, guildId) => this.personaCanAccessGuild(personaId, guildId),
       resync: (personaId) => this.resyncPersona(personaId),
       newInviteCode: () => `inv_${randomBytes(18).toString('base64url')}`,
+      isGuildServed: (guildId) => this.bot.isGuildAllowed(guildId),
     });
   }
 
@@ -207,6 +286,11 @@ export class Relay implements GatewayHooks {
     this.bot.on('slashCommand', (inv) => this.slash.handle(inv));
     this.bot.on('slashAutocomplete', (req) => this.slash.autocomplete(req));
     this.bot.on('ready', () => this.mirror.clear());
+    if (!this.config.elevenLabsKey) {
+      console.error('[portal-relay] voice off: ELEVENLABS_KEY is unset, so voice_join, voice_leave and voice_speak answer that voice isn\'t set up');
+    } else if (!this.config.voiceRegistryPath) {
+      console.error('[portal-relay] voice output off: PORTAL_VOICE_REGISTRY is unset, so voice_speak answers that speaking isn\'t set up');
+    }
     if (this.config.elevenLabsKey) {
       const wantSpeak = !!this.config.voiceRegistryPath;
       this.attachVoice(new VoiceBot(this.bot.rawClient, this.config.elevenLabsKey,
@@ -363,7 +447,8 @@ export class Relay implements GatewayHooks {
   private onPermissionChange(c: PermissionChange): void {
     // Stream-retained, not live-session — a change during a brief drop must
     // land in the resume buffer (see streamPersonas). No stream ⇒ the persona
-    // never identified since boot; its next identify rehydrates everything.
+    // has no live or resumable session (never identified since boot, or its
+    // resume window ended); its next identify rehydrates everything.
     if (!this.gateway.hasStream(c.personaId)) return;
     let channels: ChannelMeta[];
     if (c.scope === 'channel' && c.channelId) {
@@ -391,6 +476,10 @@ export class Relay implements GatewayHooks {
    *  joining a pre-authorized guild). The bot's cache already holds every
    *  joined guild, so no Discord reconnect is involved — just tell sessions. */
   private onGuildAllowChange(c: GuildAllowChange): void {
+    // A guild leaving the allow-list keeps no portal commands.
+    for (const gid of c.removed) {
+      void this.bot.clearSlashCommands(gid).catch((e) => console.error('[portal-relay] slash clear:', (e as Error).message));
+    }
     for (const gid of c.added) {
       this.mirror.invalidateGuild(gid);
       void this.bot.syncSlashCommands(gid).catch((e) => console.error('[portal-relay] slash sync:', (e as Error).message));
@@ -556,9 +645,9 @@ export class Relay implements GatewayHooks {
    * Force-push the full channel set (with current caps) to one persona's
    * stream (/resync). Upserts fix missing channels and stale caps; it cannot
    * remove stale extras the client invented — a fresh identify does that.
-   * No-op for personas with no retained stream (never identified since boot):
-   * dispatch() would CREATE a stream, silently flipping them into the
-   * stream-retained fan-out set.
+   * No-op for personas with no retained stream (no live or resumable session):
+   * dispatch() has nowhere to put the channels, and the persona's next identify
+   * sends a fresh set. The count says nothing was pushed.
    */
   resyncPersona(personaId: string): number {
     if (!this.gateway.hasStream(personaId)) return 0;
@@ -619,31 +708,46 @@ export class Relay implements GatewayHooks {
    */
   async enroll(d: RegisterData): Promise<RegisteredData | { error: string }> {
     if (!this.invites) return { error: 'registration disabled' };
+    const frameProblem = registerFieldProblem(d);
+    if (frameProblem) return { error: frameProblem };
     const checked = this.invites.check(d.invite, Date.now());
     if (typeof checked === 'string') return { error: `invite ${checked}` };
     // RFC-005 §5.6: an augment-only invite cannot mint a new persona.
     if (checked.mode === 'augment') return { error: 'invite is augment-only' };
+    // Before anything is created or consumed, and before the machine-mint
+    // recheck reads its grant: an invite a claim can't read as written, or
+    // whose grant can't be applied, must fail loudly, not mint a persona with
+    // no access.
+    const grantProblem = this.inviteGrantProblem(checked);
+    if (grantProblem) return { error: grantProblem };
     // Machine mints re-verify the subset rule against the minter's CURRENT
     // rights — a revoked/demoted spawner's outstanding codes die here.
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) return { error: staleMint };
 
     const displayName = (d.desiredName || 'agent').slice(0, 80).trim() || 'agent';
+    const clash = this.nameClash(displayName, d.uniqueName === true);
+    if (clash) {
+      console.error(`[portal-relay] enroll refused (${checked.label ?? 'invite'}): ${clash}`);
+      return { error: clash };
+    }
     const personaId = this.mintPersonaId(checked.namePrefix ?? displayName);
     const token = generateToken(); // plaintext, returned to the agent
     const identity: PersonaIdentity = {
       id: personaId,
       displayName,
-      avatar: d.avatar ?? '',
+      avatar: d.avatar || '',
       token: hashToken(token), // stored hashed-at-rest (RFC-005 §5.9)
     };
     this.identity.upsert(identity);
     this.applyInviteGrant(personaId, checked);
     this.invites.consume(d.invite);
 
-    // Carry the invite's default subscriptions through to this session.
+    // Carry the invite's default subscriptions through to this session. The
+    // frame's own are a list, or '', 0, false or null for none: registerFieldProblem
+    // lets those through.
     if (checked.subscriptions?.length) {
-      d.subscriptions = [...new Set([...(d.subscriptions ?? []), ...checked.subscriptions])];
+      d.subscriptions = [...new Set([...(d.subscriptions || []), ...checked.subscriptions])];
     }
 
     console.error(`[portal-relay] enrolled persona "${personaId}" via invite (${checked.label ?? d.invite})`);
@@ -651,22 +755,60 @@ export class Relay implements GatewayHooks {
   }
 
   /**
-   * Translate an invite into the new persona's permissions (RFC-004). Prefers
-   * access roles (live resolution); else an inline scoped grant; else the
-   * deprecated blanket `caps` (honoured as scope:{all} with a warning). A grant
-   * with no scope-able guild, or an invite granting nothing, yields a
-   * default-deny entry.
+   * Why `name` can't be a new persona's display name, or null if it can. Names
+   * compare by nameKey (case, accents, invisible characters, separators and
+   * look-alike letters folded). Always refused: a name that reads like a HUMAN
+   * member's in any guild the relay serves — that is impersonation of a
+   * person. With `unique` (runtime minting, where a model picks the name and
+   * channel text can steer it), also an existing persona's or a bot member's.
+   * Plain self-enrollment doesn't ask for that: an agent that lost its token
+   * re-enrolls under its own name, and an agent may share its name with its
+   * own bot. The message never says which member or guild matched.
+   */
+  private nameClash(name: string, unique: boolean): string | null {
+    const keys = new Set(nameKeys(name));
+    if (!keys.size) return null;
+    const guilds = this.bot.listGuilds().map((g) => g.id);
+    // The human-name check reads the member cache; membersComplete() also
+    // kicks a (throttled) re-warm when it's short. A runtime mint (`unique`)
+    // waits for a complete roster rather than pass on a partial one; plain
+    // enrollment — an agent recovering its own persona — goes ahead
+    // best-effort rather than be locked out by a slow warm.
+    const incomplete = guilds.filter((gid) => !this.bot.membersComplete(gid));
+    if (incomplete.length) {
+      if (unique) return `can't check name "${name}" right now — the member list is still loading; try again in a minute`;
+      console.error(`[portal-relay] enroll name check is best-effort: member list incomplete in ${incomplete.length} guild(s)`);
+    }
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: false }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    if (!unique) return null;
+    if (this.identity.all().some((p) => nameKeys(p.displayName).some((k) => keys.has(k)))) {
+      return `name "${name}" reads like an existing persona's name — choose a different name`;
+    }
+    if (guilds.some((gid) => this.bot.memberNameMatches(gid, keys, { bots: true }))) {
+      return `name "${name}" reads like a server member's name — choose a different name`;
+    }
+    return null;
+  }
+
+  /**
+   * Translate an invite into the new persona's permissions (RFC-004): access
+   * roles (live resolution) AND/OR an inline scoped grant — both apply when
+   * both are present, and the persona holds the union (resolve() unions roles
+   * with inline policy). The deprecated blanket `caps` is honoured as
+   * scope:{all} with a warning. A grant with no scope-able guild, or an invite
+   * granting nothing, yields a default-deny entry.
    */
   private applyInviteGrant(personaId: string, inv: InviteTemplate): void {
     if (inv.roles?.length) {
       this.permissions.setPersonaRoles(personaId, inv.roles);
-      return;
     }
     let grant = inv.grant;
     if (!grant && inv.caps?.length) {
       console.error(
         `[portal-relay] invite "${inv.label ?? inv.code}" uses deprecated blanket caps; ` +
-          `honouring as scope:{all}. Re-mint scoped (RFC-004).`,
+          `honouring as scope:{all} of its guild. Re-mint scoped (RFC-004).`,
       );
       grant = { caps: inv.caps, scope: { all: true } };
     }
@@ -680,7 +822,10 @@ export class Relay implements GatewayHooks {
         this.permissions.setPersonaPolicy(personaId, { default: [] }); // malformed mirror grant → deny
         return;
       }
-      this.permissions.addPersonaRoles(personaId, [role]);
+      // setPersonaRoles, not addPersonaRoles: this persona has no entry yet
+      // unless the invite carried roles, and enrollment sets exactly what the
+      // invite grants (no copy of the file default).
+      this.permissions.setPersonaRoles(personaId, [...new Set([...this.permissions.getRoleNames(personaId), role])]);
       return;
     }
     this.permissions.setPersonaPolicy(personaId, this.scopeToPolicy(inv.guildId, grant.scope, grant.caps));
@@ -705,28 +850,81 @@ export class Relay implements GatewayHooks {
       console.error('[portal-relay] mirror grant without guildId — denying (no channels in scope)');
       return null;
     }
-    const roleIds = [...new Set('mirrorRoles' in scope ? scope.mirrorRoles : [scope.mirrorRole])].sort();
-    const sortedCaps = [...new Set(caps)].sort();
-    const hash = createHash('sha256')
-      .update(JSON.stringify({ guildId, roleIds, caps: sortedCaps }))
-      .digest('hex')
-      .slice(0, 8);
-    const name = `mirror-${hash}`;
-    if (!this.permissions.getRole(name)) {
-      this.permissions.setRole(name, {
-        caps: sortedCaps,
-        scope: roleIds.length === 1 ? { mirrorRole: roleIds[0] } : { mirrorRoles: roleIds },
-        guildId,
-      });
+    const { name, role } = mirrorRoleFor(guildId, scope, caps);
+    const existing = this.permissions.getRole(name);
+    if (existing) {
+      // Reuse only the IDENTICAL role. A name hit on anything else — another
+      // guild, other caps, another scope — must never hand that role out.
+      if (!sameAccessRole(existing, role)) {
+        console.error(`[portal-relay] mirror grant name ${name} collides with a different access role — refusing`);
+        return null;
+      }
+      return name;
     }
+    // A role set aside at load under this name is replaced: the name is a
+    // digest of the grant's guild, roles and caps, so the entry was this
+    // grant's role unless a hand edit changed it. The log keeps what was
+    // there, for the relay's operator.
+    if (this.permissions.isQuarantined(name)) {
+      console.warn(`[portal-relay] mirror grant ${name}: replacing the entry set aside at load, which was ${JSON.stringify(this.permissions.quarantinedEntry(name))}`);
+    }
+    this.permissions.setRole(name, role);
     return name;
+  }
+
+  /**
+   * Why an invite's grant can't be applied, or null. Checked BEFORE a persona
+   * is created or a use is consumed, so a bad invite fails loudly instead of
+   * minting a persona with no access. The grant (or legacy blanket caps) must
+   * be well-formed and name its guild — every scope resolves within one guild
+   * — with every other field a claim reads of its declared type
+   * (inviteShapeProblem), and a mirror grant must not collide with a
+   * different access role of the same name.
+   */
+  private inviteGrantProblem(inv: InviteTemplate): string | null {
+    // The claimant can't change a stored invite, so the refusal says who can.
+    const shape = inviteShapeProblem(inv);
+    if (shape) return `${shape} — whoever minted it must mint a new one`;
+    // A role name that resolves to nothing is refused, not stored: a name
+    // left on a persona would come alive if a role of that name were created
+    // later — possibly in another guild, by someone the invite's minter
+    // never meant to delegate to. A role quarantined at load is still on
+    // disk, and only the relay's operator can repair it.
+    const missing = (inv.roles ?? []).filter((r) => !this.permissions.getRole(r));
+    const unreadable = missing.filter((r) => this.permissions.isQuarantined(r));
+    const gone = missing.filter((r) => !this.permissions.isQuarantined(r));
+    if (unreadable.length && gone.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')}, which the relay's operator must fix, and that no longer exist: ${gone.join(', ')}, so whoever minted it must mint a new one`;
+    }
+    if (unreadable.length) {
+      return `invite names access role(s) that can't be read: ${unreadable.join(', ')} — the relay's operator must fix them`;
+    }
+    if (gone.length) return `invite names access role(s) that no longer exist: ${gone.join(', ')} — whoever minted it must mint a new one`;
+    const grant = inv.grant ?? (inv.caps?.length ? { caps: inv.caps, scope: { all: true } as Scope } : undefined);
+    if (!grant || !inv.guildId) return null;
+    if (isMirrorScope(grant.scope)) {
+      const { name, role } = mirrorRoleFor(inv.guildId, grant.scope, grant.caps);
+      const existing = this.permissions.getRole(name);
+      if (existing && !sameAccessRole(existing, role)) return 'invite mirror grant conflicts with an existing access role';
+    }
+    return null;
   }
 
   /** Turn a (guild, scope, caps) grant into a default-deny PersonaPolicy.
    *  Static scopes only — mirror shapes go through materializeMirrorGrant so
    *  they resolve live; reaching here with one is a caller bug (deny). */
   private scopeToPolicy(guildId: string | undefined, scope: Scope, caps: Capability[]): PersonaPolicy {
-    if ('all' in scope) return { default: caps };
+    // `all` = every channel of the INVITE'S guild — a guild default — never a
+    // persona-wide default (which would apply in every guild the relay
+    // serves). Same rule as access roles (scope:{all} is guild-bound). No
+    // guild, no grant.
+    if ((scope as { all?: unknown }).all === true) {
+      if (!guildId) {
+        console.error('[portal-relay] scope:{all} grant without guildId — denying');
+        return { default: [] };
+      }
+      return { default: [], guilds: { [guildId]: { default: caps } } };
+    }
     if (!guildId || !('channels' in scope)) {
       console.error('[portal-relay] scoped grant without guildId or with a mirror shape — denying');
       return { default: [] };
@@ -820,15 +1018,10 @@ export class Relay implements GatewayHooks {
     }
     // Outstanding-mint cap: a minter may hold at most 20 live unclaimed codes.
     const now = Date.now();
-    const outstanding = this.invites.all().filter((inv) => {
-      if (inv.mintedBy !== personaId) return false;
-      if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return false;
-      if (inv.expiresAt) {
-        const at = Date.parse(inv.expiresAt);
-        if (!Number.isFinite(at) || at <= now) return false;
-      }
-      return true;
-    }).length;
+    // Counted by check()'s own expiry and use rules: a code it finds neither
+    // expired nor used up.
+    const invites = this.invites;
+    const outstanding = invites.all().filter((inv) => inv.mintedBy === personaId && invites.check(inv.code, now) === inv).length;
     if (outstanding >= 20) {
       reject('FORBIDDEN', 'too many outstanding unclaimed invites for this minter (max 20)');
     }
@@ -918,7 +1111,7 @@ export class Relay implements GatewayHooks {
    * grant, consumes a use, and returns the resulting role set. Throws rpcError on
    * any rejection. Auditing is the caller's responsibility (actor differs).
    */
-  private applyInviteAugment(personaId: string, code: string): { roles: string[] } {
+  private applyInviteAugment(personaId: string, code: string, opts: { byAdmin?: boolean } = {}): { roles: string[]; liftedBans?: string[] } {
     if (!this.invites) throw rpcError('NOT_FOUND', 'invites not enabled');
     if (!this.identity.get(personaId)) throw rpcError('NOT_FOUND', 'no such persona');
     const checked = this.invites.check(code, Date.now());
@@ -928,49 +1121,99 @@ export class Relay implements GatewayHooks {
     // the recheck's distinct messages) whether the minter still exists / is
     // still allowlisted / still holds rights. The recheck below is NOT dead
     // code — it is load-bearing for hand-edited mintedBy + mode:'both' invites.
+    // A mode outside the three gets the shape check's reason, since
+    // "mint-only" would be false for it.
     if (checked.mode !== 'augment' && checked.mode !== 'both') {
+      const mode = inviteModeProblem(checked);
+      if (mode) throw rpcError('INVALID_PARAMS', `${mode} — whoever minted it must mint a new one`);
       throw rpcError('FORBIDDEN', 'invite is not claimable (mint-only)');
     }
+    // Roles AND grant: an /invite carries roles plus a direct grant on the
+    // channel it was run in, and an augment must apply both. Validate ALL of
+    // it before changing anything: a rejection must leave the persona as it
+    // was and the invite unconsumed — otherwise a rejected claim still grants
+    // its roles, and can be repeated past maxUses. The shape comes before the
+    // machine-mint recheck, which reads the grant.
+    const grantProblem = this.inviteGrantProblem(checked);
+    if (grantProblem) throw rpcError('INVALID_PARAMS', grantProblem);
     const staleMint = this.recheckMachineMint(checked);
     if (staleMint) throw rpcError('FORBIDDEN', staleMint);
+    const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
+    // A persona banned from a guild (/ban) can't give itself access there
+    // again by claiming an invite — only an admin can. An admin-initiated
+    // claim is that admin's decision, and lifts the ban in each guild where
+    // the invite actually grants something (a role with no capabilities
+    // grants nothing, so it doesn't).
+    const touched = new Set<string>();
+    const grantsIn = new Set<string>();
+    if (grant && checked.guildId) touched.add(checked.guildId), grantsIn.add(checked.guildId);
+    for (const r of checked.roles ?? []) {
+      const role = this.permissions.getRole(r);
+      if (!role?.guildId) continue;
+      touched.add(role.guildId);
+      if (roleGrantsAccess(role)) grantsIn.add(role.guildId);
+    }
+    const banned = [...touched].filter((g) => this.permissions.isBanned(personaId, g));
+    if (banned.length && !opts.byAdmin) {
+      throw rpcError('FORBIDDEN', 'this persona was banned from that server; only an admin there can give it access again');
+    }
+    let mirrorRole: string | null = null;
+    if (grant && isMirrorScope(grant.scope)) {
+      // Same live-role materialization as enroll; a silent snapshot here is
+      // strictly worse because an augmented persona has no reason to suspect
+      // its shiny new scope is already fossilizing.
+      mirrorRole = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
+      if (!mirrorRole) throw rpcError('INVALID_PARAMS', 'invite mirror grant is malformed');
+    }
+    const liftedBans = banned.filter((g) => grantsIn.has(g) && this.permissions.liftBan(personaId, g));
     if (checked.roles?.length) {
       this.permissions.addPersonaRoles(personaId, checked.roles);
-    } else {
-      const grant = checked.grant ?? (checked.caps?.length ? { caps: checked.caps, scope: { all: true } as Scope } : undefined);
-      if (grant && isMirrorScope(grant.scope)) {
-        // Same live-role materialization as enroll; a silent snapshot here is
-        // strictly worse because an augmented persona has no reason to suspect
-        // its shiny new scope is already fossilizing. Missing guildId is a
-        // hard reject (augment already throws on malformed invites).
-        const role = this.materializeMirrorGrant(checked.guildId, grant.scope, grant.caps);
-        if (!role) throw rpcError('INVALID_PARAMS', 'invite mirror grant is missing guildId');
-        this.permissions.addPersonaRoles(personaId, [role]);
-      } else if (grant) {
-        const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
-        const base = this.permissions.getPolicy(personaId) ?? { default: [] };
-        this.permissions.setPersonaPolicy(personaId, this.mergePolicy(base, add));
-      }
+    }
+    if (mirrorRole) {
+      this.permissions.addPersonaRoles(personaId, [mirrorRole]);
+    } else if (grant) {
+      const add = this.scopeToPolicy(checked.guildId, grant.scope, grant.caps);
+      this.permissions.setPersonaPolicy(personaId, this.mergePolicy(this.permissions.basePolicy(personaId), add));
     }
     this.invites.consume(code);
-    return { roles: this.permissions.getRoleNames(personaId) };
+    return { roles: this.permissions.getRoleNames(personaId), ...(liftedBans.length ? { liftedBans } : {}) };
   }
 
-  /** Union two policies (most-permissive) for augment-merge. */
+  /**
+   * Union two policies for augment-merge: the result grants at least what
+   * `base` granted EVERYWHERE, plus what `add` grants. Resolution is
+   * channel override ?? guild default ?? persona default, so a new override
+   * or guild default starts from what that place resolved to before (never
+   * from empty, which would narrow it), and a guild default `add` brings also
+   * reaches existing non-empty channel overrides in that guild ("every
+   * channel of G" — an explicit [] channel deny is left as it is). A guild
+   * default is only written when `add` brings one: an undefined guild default
+   * stays transparent.
+   */
   private mergePolicy(base: PersonaPolicy, add: PersonaPolicy): PersonaPolicy {
-    const out: PersonaPolicy = { default: [...new Set([...base.default, ...add.default])] };
+    const union = (...lists: Array<Capability[] | undefined>): Capability[] => [...new Set(lists.flatMap((l) => l ?? []))];
+    const out: PersonaPolicy = { default: union(base.default, add.default) };
     const guilds: Record<string, { default?: Capability[]; channels?: Record<string, Capability[]> }> = {
       ...(base.guilds ?? {}),
     };
     for (const [gid, gp] of Object.entries(add.guilds ?? {})) {
       const cur = guilds[gid] ?? {};
+      const guildBase = cur.default ?? base.default; // what G resolves to today
+      const addDefault = gp.default ?? [];
       const channels = { ...(cur.channels ?? {}) };
-      for (const [cid, caps] of Object.entries(gp.channels ?? {})) {
-        channels[cid] = [...new Set([...(channels[cid] ?? []), ...caps])];
+      if (addDefault.length) {
+        for (const [cid, caps] of Object.entries(channels)) {
+          if (caps.length) channels[cid] = union(caps, addDefault);
+        }
       }
-      guilds[gid] = {
-        default: [...new Set([...(cur.default ?? []), ...(gp.default ?? [])])],
-        ...(Object.keys(channels).length ? { channels } : {}),
-      };
+      for (const [cid, caps] of Object.entries(gp.channels ?? {})) {
+        channels[cid] = union(channels[cid] ?? union(guildBase, addDefault), caps);
+      }
+      const next: { default?: Capability[]; channels?: Record<string, Capability[]> } = {};
+      if (addDefault.length) next.default = union(guildBase, addDefault);
+      else if (cur.default !== undefined) next.default = cur.default;
+      if (Object.keys(channels).length) next.channels = channels;
+      guilds[gid] = next;
     }
     if (Object.keys(guilds).length) out.guilds = guilds;
     return out;
@@ -993,6 +1236,9 @@ export class Relay implements GatewayHooks {
     if (!cur) throw rpcError('NOT_FOUND', 'no such persona');
     this.identity.upsert({ ...cur, token: hashToken(generateToken()) });
     this.gateway.closePersona(personaId);
+    // Resume authenticates by key, not token, so a kept key would let the
+    // revoked holder back in. Drop the keys and stream, as identity removal does.
+    this.gateway.dropStream(personaId);
   }
 
   /** Slug a display name + short random suffix into a unique persona id. */
@@ -1086,9 +1332,25 @@ export class Relay implements GatewayHooks {
       case 'edit_message': {
         const p = params as RpcParams<'edit_message'>;
         const ref = await this.resolveRef(p.messageId);
-        if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
-        if (ref.personaId !== personaId) throw rpcError('FORBIDDEN', 'not your message');
-        if (!ref.webhookId) throw rpcError('NOT_FOUND', 'no webhook recorded for message');
+        if (!ref) throw unknownMessage(p.messageId, 'nothing was edited');
+        if (ref.personaId !== personaId) {
+          throw rpcError(
+            'FORBIDDEN',
+            ref.personaId
+              ? `Nothing was edited: message ${JSON.stringify(p.messageId)} was posted by someone else, ` +
+                'and edit_message changes only your own messages.'
+              : `Nothing was edited: the relay can't tell who posted message ${JSON.stringify(p.messageId)}, ` +
+                "and edit_message changes only messages it knows are yours, so calling again won't help. " +
+                'send_message posts a new message if the text must change.',
+          );
+        }
+        if (!ref.webhookId) {
+          throw rpcError(
+            'NOT_FOUND',
+            `Nothing was edited: the relay has no record of how message ${JSON.stringify(p.messageId)} was posted, ` +
+              "so it can't change it, and calling again won't help. send_message posts a new message if the text must change.",
+          );
+        }
         this.requireCap(personaId, ref.channelId, 'EDIT_OWN');
         await this.webhooks.ensureLoaded(ref.channelId); // adopt webhooks post-restart
         await this.webhooks.edit(ref.webhookId, ref.discordMsgId, p.content, ref.threadId);
@@ -1097,7 +1359,7 @@ export class Relay implements GatewayHooks {
       case 'delete_message': {
         const p = params as RpcParams<'delete_message'>;
         const ref = await this.resolveRef(p.messageId);
-        if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
+        if (!ref) throw unknownMessage(p.messageId, 'nothing was deleted');
         if (ref.personaId === personaId && ref.webhookId) {
           // Own webhook message → delete via the webhook.
           this.requireCap(personaId, ref.channelId, 'DELETE_OWN');
@@ -1118,27 +1380,26 @@ export class Relay implements GatewayHooks {
       case 'unreact': {
         const p = params as RpcParams<'unreact'>;
         const ref = await this.resolveRef(p.messageId);
-        if (ref) {
-          // Same gate as react (issue #27): with native=true this strips the
-          // shared bot's reaction — i.e. another persona's visible reaction —
-          // from any message the caller can name, viewable or not.
-          this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
-          this.gateway.dispatch(personaId, {
-            type: 'reaction_remove',
-            channelId: ref.channelId,
-            threadId: ref.threadId,
-            messageId: ref.relayId,
-            emoji: p.emoji,
-            actor: { kind: 'persona', id: personaId, name: this.displayName(personaId) },
-          });
-          // Optionally drop the shared bot's native reaction (best-effort — the
-          // structured pseudo-remove above is authoritative for agents/UI).
-          if (p.native) {
-            try {
-              await this.bot.removeReaction(ref.threadId ?? ref.channelId, ref.discordMsgId, p.emoji);
-            } catch (err) {
-              console.error('[portal-relay] native unreact failed:', (err as Error).message);
-            }
+        if (!ref) throw unknownMessage(p.messageId, 'no reaction was removed');
+        // Same gate as react (issue #27): with native=true this strips the
+        // shared bot's reaction — i.e. another persona's visible reaction —
+        // from any message the caller can name, viewable or not.
+        this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
+        this.gateway.dispatch(personaId, {
+          type: 'reaction_remove',
+          channelId: ref.channelId,
+          threadId: ref.threadId,
+          messageId: ref.relayId,
+          emoji: p.emoji,
+          actor: { kind: 'persona', id: personaId, name: this.displayName(personaId) },
+        });
+        // Optionally drop the shared bot's native reaction (best-effort — the
+        // structured pseudo-remove above is authoritative for agents/UI).
+        if (p.native) {
+          try {
+            await this.bot.removeReaction(ref.threadId ?? ref.channelId, ref.discordMsgId, p.emoji);
+          } catch (err) {
+            console.error('[portal-relay] native unreact failed:', (err as Error).message);
           }
         }
         return {};
@@ -1146,7 +1407,7 @@ export class Relay implements GatewayHooks {
       case 'fetch_history': {
         const p = params as RpcParams<'fetch_history'>;
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(personaId, target.parentChannelId, 'READ_HISTORY');
         const before = this.cursorToSnowflake(p.before);
         const after = this.cursorToSnowflake(p.after);
@@ -1190,7 +1451,7 @@ export class Relay implements GatewayHooks {
       }
       case 'create_text_channel': {
         const p = params as RpcParams<'create_text_channel'>;
-        const meta = await this.bot.createTextChannel(p.guildId, p.name, p.categoryId);
+        const meta = await this.createTextChannel(personaId, p);
         return { channel: this.toPortalChannel(meta, personaId) };
       }
       case 'delete_channel': {
@@ -1215,7 +1476,9 @@ export class Relay implements GatewayHooks {
       }
       case 'voice_join': {
         const p = params as RpcParams<'voice_join'>;
-        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        if (!this.voice) throw voiceNotSetUp();
+        // An id the bot can't see isn't a missing capability: say so first.
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
         // Joining implies wanting the transcripts: auto-subscribe this session,
         // same as it could do explicitly (capability already checked above —
@@ -1229,13 +1492,19 @@ export class Relay implements GatewayHooks {
         } catch (e) {
           if (!wasSubscribed) session.subscriptions.delete(p.channelId);
           if (e instanceof VoiceJoinError) throw rpcError(e.code, e.message);
-          throw rpcError('DISCORD_ERROR', `voice join failed: ${(e as Error).message}`);
+          console.error(`[portal-relay] voice_join ${p.channelId} failed: ${(e as Error).message}`);
+          throw rpcError(
+            'DISCORD_ERROR',
+            `voice_join failed, so you aren't listening in channel ${JSON.stringify(p.channelId)}. ` +
+              'Calling it again may work; if it keeps failing, ask whoever runs this host.',
+          );
         }
         return { listening: true };
       }
       case 'voice_leave': {
         const p = params as RpcParams<'voice_leave'>;
-        if (!this.voice) throw rpcError('UNAVAILABLE', 'voice transcription not configured (ELEVENLABS_KEY unset)');
+        if (!this.voice) throw voiceNotSetUp();
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_LISTEN');
         this.voice.leave(p.channelId);
         return {};
@@ -1243,14 +1512,22 @@ export class Relay implements GatewayHooks {
       case 'voice_speak': {
         const p = params as RpcParams<'voice_speak'>;
         if (!this.speaker) {
-          throw rpcError('UNAVAILABLE',
-            'voice output not configured (needs ELEVENLABS_KEY + PORTAL_VOICE_REGISTRY)');
+          throw rpcError(
+            'UNAVAILABLE',
+            "Speaking isn't set up on this Portal relay, so nothing was said, and calling again won't change that. " +
+              'If you need voice output, ask whoever runs this host.',
+          );
         }
+        if (!this.bot.channelForPerms(p.channelId)) throw containerNotFound(p.channelId);
         this.requireCap(personaId, p.channelId, 'VOICE_SPEAK');
         const text = (p.text ?? '').trim();
-        if (!text) throw rpcError('INVALID_PARAMS', 'text is empty');
+        if (!text) throw rpcError('INVALID_PARAMS', 'Nothing was spoken: text is empty. Pass the words to say in text.');
         if (text.length > MAX_SPEAK_CHARS) {
-          throw rpcError('INVALID_PARAMS', `text exceeds ${MAX_SPEAK_CHARS} characters (one conversational turn per call)`);
+          throw rpcError(
+            'INVALID_PARAMS',
+            `Nothing was spoken: text is ${text.length} characters, over the ${MAX_SPEAK_CHARS}-character limit ` +
+              'for one voice_speak call. Split it into several calls, one conversational turn each.',
+          );
         }
         const clientId = p.requestId ?? `spk${Date.now().toString(36)}-${this.speakSeq++}`;
         const persona = this.identity.get(personaId);
@@ -1270,7 +1547,12 @@ export class Relay implements GatewayHooks {
           if (e instanceof VoiceSpeakError) {
             throw rpcError(e.code === 'NOT_JOINED' ? 'CONFLICT' : 'NOT_FOUND', e.message);
           }
-          throw rpcError('INTERNAL', `voice output failed: ${(e as Error).message}`);
+          console.error(`[portal-relay] voice_speak ${p.channelId} failed: ${(e as Error).message}`);
+          throw rpcError(
+            'INTERNAL',
+            `voice_speak failed, so nothing was said in channel ${JSON.stringify(p.channelId)}. ` +
+              'If it keeps failing, ask whoever runs this host.',
+          );
         }
         return { requestId: clientId };
       }
@@ -1325,7 +1607,7 @@ export class Relay implements GatewayHooks {
         // Typing is the shared bot's indicator, fired wherever the caller can
         // name — gate it exactly like send_message (issue #27).
         const target = await this.resolveContainer(p.channelId, p.threadId);
-        if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+        if (!target) throw containerNotFound(p.channelId, p.threadId);
         this.requireCap(
           personaId,
           target.parentChannelId,
@@ -1349,7 +1631,11 @@ export class Relay implements GatewayHooks {
         };
       case 'mark_read': {
         const p = params as RpcParams<'mark_read'>;
-        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt);
+        this.readState.markRead(personaId, p.channelId, p.uptoCreatedAt, {
+          ...(typeof p.count === 'number' ? { count: p.count } : {}),
+          ...(typeof p.since === 'string' ? { since: p.since } : {}),
+          ...(p.keepPings === true ? { keepPings: true } : {}),
+        });
         return {};
       }
       case 'channel_missed': {
@@ -1411,7 +1697,7 @@ export class Relay implements GatewayHooks {
   ): Promise<{ messageId: string }> {
     const cfg = this.identity.get(personaId)!;
     const target = await this.resolveContainer(p.channelId, p.threadId);
-    if (!target) throw rpcError('NOT_FOUND', 'channel not found');
+    if (!target) throw containerNotFound(p.channelId, p.threadId);
     // Capabilities live on the parent channel; a thread never carries its own
     // grant rows, so checking the raw passed id (which may BE a thread id)
     // refuses personas whose parent-channel rights are complete.
@@ -1478,7 +1764,7 @@ export class Relay implements GatewayHooks {
     native: boolean,
   ): Promise<Record<string, never>> {
     const ref = await this.resolveRef(relayMsgId);
-    if (!ref) throw rpcError('NOT_FOUND', 'unknown message');
+    if (!ref) throw unknownMessage(relayMsgId, 'no reaction was added');
     this.requireCap(personaId, ref.channelId, 'ADD_REACTIONS');
     // Structured pseudo-reaction for agents / a real UI.
     this.gateway.dispatch(personaId, {
@@ -1898,15 +2184,26 @@ export class Relay implements GatewayHooks {
 
   private requireGuild(personaId: string, guildId: string): void {
     if (!this.guildVisible(personaId, guildId)) {
-      throw rpcError('FORBIDDEN', 'no capabilities in guild');
+      throw rpcError(
+        'FORBIDDEN',
+        `Nothing was returned: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+          'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+      );
     }
   }
 
   /** GatewayHooks.canSubscribe — the identify/register-time twin of the
-   *  subscribe_channel VIEW_CHANNEL gate. */
+   *  subscribe_channel VIEW_CHANNEL gate (a thread: its parent's, as there). */
   canSubscribe(personaId: string, channelId: string): boolean {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
-    return this.capsFor(personaId, channelId, guildId).includes('VIEW_CHANNEL');
+    return this.capsFor(personaId, this.permIdOf(channelId), guildId).includes('VIEW_CHANNEL');
+  }
+
+  /** permChannelId for a raw id the persona sent: a cached thread's access
+   *  is its parent's; anything else is checked as itself. */
+  private permIdOf(channelId: string): string {
+    const meta = this.bot.channelMetaFromCache(channelId);
+    return meta ? this.permChannelId(meta) : channelId;
   }
 
   /** Whether a persona has any rights in a guild — gates addressing-role minting
@@ -1930,11 +2227,114 @@ export class Relay implements GatewayHooks {
     return computeCapabilities(allowed, channel, me);
   }
 
+  /** Refuse unless the persona holds `cap` where the relay checks
+   *  `channelId`: a thread is checked against its parent (permChannelId), as
+   *  sending, reading and delivery are — so a grant on the thread itself, or
+   *  a guild-wide level its parent blocks, gives nothing there, and every
+   *  RPC on a thread agrees with the directory and the admin panel. */
   private requireCap(personaId: string, channelId: string, cap: Capability): void {
     const guildId = this.bot.channelForPerms(channelId)?.guildId ?? null;
-    if (!this.capsFor(personaId, channelId, guildId).includes(cap)) {
-      throw rpcError('FORBIDDEN', `missing capability ${cap}`);
+    const checked = this.permIdOf(channelId);
+    if (!this.capsFor(personaId, checked, guildId).includes(cap)) {
+      // A thread is checked as its parent, so the refusal names the channel
+      // whose capabilities list_channels shows.
+      const where = checked === channelId
+        ? `in channel ${JSON.stringify(channelId)}`
+        : `in channel ${JSON.stringify(checked)}, which thread ${JSON.stringify(channelId)} takes its access from`;
+      throw rpcError(
+        'FORBIDDEN',
+        `Nothing ran: you don't have the ${cap} capability ${where}, ` +
+          "so calling again won't change that. list_channels, with a guildId from list_guilds, shows each channel's capabilities; " +
+          'if you need this one, ask whoever runs this host.',
+      );
     }
+  }
+
+  /** Creation is authorized at its destination: the category, or the guild
+   *  root when no category is supplied. Rights on a sibling channel never
+   *  confer authority to create elsewhere in the guild. */
+  private async createTextChannel(personaId: string, p: RpcParams<'create_text_channel'>): Promise<ChannelMeta> {
+    const { guildId, name } = p;
+    // A null categoryId asks for no category, the guild root, as it did before this gate.
+    const categoryId = p.categoryId ?? undefined;
+    if (typeof guildId !== 'string' || !guildId ||
+        (categoryId !== undefined && (typeof categoryId !== 'string' || !categoryId))) {
+      throw rpcError(
+        'INVALID_PARAMS',
+        'Nothing ran: guildId must be a non-empty string, and categoryId a non-empty string, or null or left out ' +
+          "to create at the server's top level.",
+      );
+    }
+    const noAccess = () => rpcError(
+      'FORBIDDEN',
+      `Nothing ran: you have no access to server ${JSON.stringify(guildId)} on this relay. ` +
+        'Check the id: list_guilds shows the servers you can use. If you need this one, ask whoever runs this host.',
+    );
+    if (!this.identity.get(personaId) || !this.bot.isGuildAllowed(guildId)) throw noAccess();
+    let category = categoryId === undefined ? undefined : this.bot.channelForPerms(categoryId);
+    if (categoryId !== undefined && !category) {
+      // REST can know a category before its gateway event arrives. Fetching
+      // populates discord.js's cache, which the effective-capability check uses.
+      await this.bot.getChannelMeta(categoryId);
+      category = this.bot.channelForPerms(categoryId);
+      // A mirror lookup may predate this newly fetched channel as well.
+      if (category?.guildId === guildId) this.mirror.invalidateGuild(guildId);
+    }
+    // A persona with no access to the server gets the refusal a server the
+    // relay doesn't serve gets, as list_channels gives both (requireGuild), so
+    // no answer below tells it about the server. Only the time can differ: a
+    // served server fetches an uncached category first, as send_message
+    // fetches a thread it's given before its check. It runs after the fetch
+    // because couldAccessGuild finds a channels-scoped grant through the
+    // cache, so a grant on a category the cache has only just learned counts.
+    if (!this.guildVisible(personaId, guildId)) throw noAccess();
+    if (categoryId !== undefined) {
+      if (!category || category.guildId !== guildId || category.type !== ChannelType.GuildCategory) {
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: ${JSON.stringify(categoryId)} isn't a category of server ${JSON.stringify(guildId)} that the ` +
+            "relay can see. Check the id: list_channels, with that guildId, shows the server's categories and your " +
+            'capabilities in each, and creating in one needs MANAGE_CHANNELS there. Leaving categoryId out creates ' +
+            "at the server's top level, which needs MANAGE_CHANNELS across the server.",
+        );
+      }
+      this.requireCap(personaId, categoryId, 'MANAGE_CHANNELS');
+    } else {
+      const allowed = this.permissions.resolveGuild(personaId, guildId);
+      if (!allowed.has('MANAGE_CHANNELS')) {
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: creating a channel at the top level of server ${JSON.stringify(guildId)} needs ` +
+            "MANAGE_CHANNELS across the server, which you don't have, so calling again won't change that. " +
+            'Pass a categoryId where list_channels shows you MANAGE_CHANNELS, or, if you need this, ask whoever ' +
+            'runs this host.',
+        );
+      }
+      // The persona holds the right; a refusal past here is a Discord-side gap,
+      // which a permissions.json edit can't fix. Say which, for the operator.
+      const me = this.bot.meIn(guildId);
+      if (!me) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot isn't in the guild`);
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot isn't in server ${JSON.stringify(guildId)}, so it can't create a ` +
+            'channel there. Only whoever runs this host can change that.',
+        );
+      }
+      if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        console.error(`[portal-relay] create_text_channel in guild ${guildId}: the bot lacks Manage Channels`);
+        throw rpcError(
+          'FORBIDDEN',
+          `Nothing ran: the relay's Discord bot lacks Manage Channels in server ${JSON.stringify(guildId)}, so it ` +
+            "can't create a channel at the server's top level. Only whoever runs this host can change that, in the " +
+            "server's settings.",
+        );
+      }
+    }
+    // The final check runs in the same continuation as the bot call, with no
+    // await between them. The bot's own guild fetch still precedes Discord's
+    // create, so a revocation that lands during that fetch isn't seen.
+    return this.bot.createTextChannel(guildId, name, categoryId);
   }
 
   private displayName(personaId: string): string {
@@ -1944,6 +2344,43 @@ export class Relay implements GatewayHooks {
 
 function isMirrorScope(scope: Scope): scope is { mirrorRole: string } | { mirrorRoles: string[] } {
   return 'mirrorRole' in scope || 'mirrorRoles' in scope;
+}
+
+/** resolveContainer's refusal. With a threadId it names the thread and the
+ *  channel, so a caller knows which half to fix: the thread isn't a thread,
+ *  or isn't one of that channel's. */
+function containerNotFound(channelId: string, threadId?: string): Error & { code: string } {
+  return threadId
+    ? rpcError(
+        'NOT_FOUND',
+        `Nothing ran: ${JSON.stringify(threadId)} isn't a thread of channel ${JSON.stringify(channelId)}. ` +
+          "Pass the thread's parent channel as channelId, with the thread's id as create_thread returns it " +
+          "and as a message's threadId shows it.",
+      )
+    : rpcError(
+        'NOT_FOUND',
+        `Nothing ran: no channel ${JSON.stringify(channelId)} is visible to you. ` +
+          'Check the id: list_channels, with a guildId from list_guilds, shows the channels you can use, with their ids.',
+      );
+}
+
+/** The refusal for a message id the relay can't find; `outcome` says what didn't happen. */
+function unknownMessage(messageId: string, outcome: string): Error & { code: string } {
+  return rpcError(
+    'NOT_FOUND',
+    `The relay can't find message ${JSON.stringify(messageId)}, so ${outcome}. ` +
+      'Check the id against what send_message, fetch_history or fetch_around gave; if it matches, ' +
+      "the message may have been deleted, or its channel may be out of the relay's reach.",
+  );
+}
+
+/** voice_join and voice_leave on a relay without voice transcription. */
+function voiceNotSetUp(): Error & { code: string } {
+  return rpcError(
+    'UNAVAILABLE',
+    "Voice isn't set up on this Portal relay, so nothing ran, and calling again won't change that. " +
+      'If you need voice, ask whoever runs this host.',
+  );
 }
 
 function rpcError(code: string, message: string): Error & { code: string } {

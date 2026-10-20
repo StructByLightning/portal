@@ -229,9 +229,15 @@ export class VoiceBot {
   async join(channelId: string): Promise<void> {
     if (this.connections.has(channelId)) return; // idempotent
     const channel = await this.client.channels.fetch(channelId).catch(() => null);
-    if (!channel) throw new VoiceJoinError('NOT_FOUND', 'channel not found');
+    if (!channel) {
+      throw new VoiceJoinError('NOT_FOUND',
+        `Nothing ran: no channel ${JSON.stringify(channelId)} is visible to the relay, so it isn't listening there. ` +
+          'Check the id: list_channels, with a guildId from list_guilds, shows the channels you can use.');
+    }
     if (channel.type !== ChannelType.GuildVoice && channel.type !== ChannelType.GuildStageVoice) {
-      throw new VoiceJoinError('INVALID_PARAMS', 'not a voice channel');
+      throw new VoiceJoinError('INVALID_PARAMS',
+        `Nothing ran: channel ${JSON.stringify(channelId)} isn't a voice channel, so the relay can't listen there. ` +
+          "Pass a voice channel's id: list_channels, with a guildId from list_guilds, shows each channel's type.");
     }
     const voice = channel as VoiceBasedChannel;
     // Discord permits ONE voice connection per guild: joining a second channel
@@ -241,7 +247,9 @@ export class VoiceBot {
     const elsewhere = this.listeningIn(voice.guild.id);
     if (elsewhere) {
       throw new VoiceJoinError('CONFLICT',
-        `relay is already listening in voice channel ${elsewhere} of this guild; voice_leave it first`, elsewhere);
+        `Nothing ran: the relay listens in one voice channel per server, and it's already listening in ${JSON.stringify(elsewhere)}, ` +
+          `so it didn't join ${JSON.stringify(channelId)}. Someone has to call voice_leave on ${JSON.stringify(elsewhere)} first; ` +
+          'then voice_join this one again.', elsewhere);
     }
     const conn = joinVoiceChannel({
       channelId,

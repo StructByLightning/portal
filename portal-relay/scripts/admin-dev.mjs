@@ -115,6 +115,15 @@ const deps = {
     identity.upsert({ ...cur, token: hashToken(generateToken()) });
   },
   newInviteCode: () => `inv_dev_${++codeN}`,
+  // No bot here: it can do everything in the stub channels, and the persona's
+  // access is what it is given.
+  capsFor: (pid, cid, gid) => (identity.get(pid) ? [...permissions.resolve(pid, gid, cid)] : []),
+  botCaps: () => ['VIEW_CHANNEL', 'READ_HISTORY', 'SEND_MESSAGES', 'SEND_IN_THREADS', 'CREATE_THREADS', 'ATTACH_FILES', 'ADD_REACTIONS', 'MENTION_EVERYONE', 'EDIT_OWN', 'DELETE_OWN', 'MANAGE_MESSAGES', 'MANAGE_CHANNELS', 'VOICE_LISTEN', 'VOICE_SPEAK'],
+  // No threads here: every channel's access is its own.
+  permChannelId: (cid) => cid,
+  listChannelLayout: () => STUB_CHANNELS.map((c, i) => ({ id: c.id, categoryId: null, position: i, announcement: false })),
+  canAccessGuild: (pid, gid) => permissions.couldAccessGuild(pid, gid, (cid) => STUB_CHANNELS.some((c) => c.id === cid)),
+  resync: () => 0,
 };
 
 const admin = new AdminServer(deps); // real fetch → real Discord OAuth

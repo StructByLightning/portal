@@ -72,6 +72,7 @@ function makeRelay(opts: { withVoice: boolean }) {
   const relay = new Relay(config) as any;
   relay.bot = {
     channelForPerms: (_channelId: string) => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     listGuilds: () => [{ id: GUILD, name: 'G', memberCount: 1 }],
     isGuildAllowed: () => true,
@@ -129,6 +130,20 @@ test('voice_join: FORBIDDEN without VOICE_LISTEN, CONFLICT on a second channel i
 
     await assert.rejects(() => relay.dispatchRpc(session(BOB), 'voice_join', { channelId: 'text-chan' }),
       (e: any) => e?.code === 'INVALID_PARAMS');
+  } finally { cleanup(); }
+});
+
+test("voice_join/voice_leave on a channel the relay can't see: NOT_FOUND naming it, before any capability check", async () => {
+  const { relay, voice, cleanup } = makeRelay({ withVoice: true });
+  try {
+    const known = relay.bot.channelForPerms;
+    relay.bot.channelForPerms = (id: string) => (id === 'gone-chan' ? undefined : known(id));
+    // Alice holds no capability there either; the missing channel is what she's told.
+    for (const m of ['voice_join', 'voice_leave']) {
+      await assert.rejects(() => relay.dispatchRpc(session(ALICE), m, { channelId: 'gone-chan' }),
+        (e: any) => e?.code === 'NOT_FOUND' && /no channel "gone-chan" is visible to you/.test(e.message));
+    }
+    assert.equal(voice.joined.size, 0);
   } finally { cleanup(); }
 });
 

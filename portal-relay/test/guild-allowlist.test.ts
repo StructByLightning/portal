@@ -117,13 +117,16 @@ function makeRelay() {
 
   // Fake bot: joined to GUILD with one channel; allow-check delegates to the
   // real store so the capsFor gate is exercised end-to-end.
+  const cleared: string[] = [];
   relay.bot = {
     listGuilds: () => (store.has(GUILD) ? [{ id: GUILD, name: 'New Guild', memberCount: 3 }] : []),
     listChannelMetas: () => [{ id: CHAN, guildId: GUILD, name: 'general', type: 'text', parentId: null, archived: false }],
     channelForPerms: () => ({ guildId: GUILD, permissionsFor: () => ({ has: () => true }) }),
+    channelMetaFromCache: () => null, // no thread is cached: every id is checked as itself
     meIn: () => ({}),
     isGuildAllowed: (gid: string) => store.has(gid),
     syncSlashCommands: async () => {},
+    clearSlashCommands: async (gid: string) => void cleared.push(gid),
   };
   const dispatched: Array<{ personaId: string; event: any }> = [];
   relay.gateway = {
@@ -132,11 +135,11 @@ function makeRelay() {
     hasStream: (pid: string) => pid === PERSONA,
     dispatch: (personaId: string, event: any) => dispatched.push({ personaId, event }),
   };
-  return { relay, store, dispatched, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { relay, store, dispatched, cleared, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 test('relay: allow ⇒ guild_create with per-persona channels; disallow ⇒ guild_delete + zeroed caps', () => {
-  const { store, dispatched, cleanup } = makeRelay();
+  const { store, dispatched, cleared, cleanup } = makeRelay();
   try {
     store.allow(GUILD);
     const created = dispatched.find((d) => d.event.type === 'guild_create');
@@ -157,6 +160,7 @@ test('relay: allow ⇒ guild_create with per-persona channels; disallow ⇒ guil
     const caps = dispatched.find((d) => d.event.type === 'capabilities_update');
     assert.ok(caps, 'capabilities re-pushed on disallow');
     assert.deepEqual(caps!.event.capabilities, [], 'capsFor allow-gate zeroes capabilities');
+    assert.deepEqual(cleared, [GUILD], "the guild's slash commands are removed");
   } finally {
     cleanup();
   }
@@ -171,3 +175,18 @@ test('relay: allowing a not-yet-joined guild is dormant (no guild_create)', () =
     cleanup();
   }
 });
+
+test('bot: startup sync clears portal commands from joined guilds that are not allowed', async () => {
+  const bot = new DiscordBot('x', () => ['g1'], { guildMembersIntent: false }) as any;
+  const calls: Array<[string, number]> = [];
+  bot.handlers.slashCommand = () => '';
+  bot.client = {
+    application: { commands: { set: async (data: unknown[], gid: string) => void calls.push([gid, data.length]) } },
+    guilds: { cache: new Map([['g1', {}], ['g2', {}]]) },
+  };
+  await bot.syncSlashCommands();
+  const byGuild = Object.fromEntries(calls);
+  assert.equal(byGuild.g2, 0, 'g2 cleared');
+  assert.ok(byGuild.g1 > 0, 'g1 registered');
+});
+
