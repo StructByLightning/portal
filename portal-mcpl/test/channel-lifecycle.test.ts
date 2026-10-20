@@ -382,10 +382,12 @@ async function until(condition: () => boolean, what: string): Promise<void> {
   }
 }
 
-test('with the real client, a close sent between its resume and the relay\'s resumed leaves the channel unsubscribed', async () => {
-  // No client hold is needed for this race: a close made after the client
-  // sends `resume`, and before `resumed` arrives, goes on the wire at once. The
-  // relay takes the resume first, sends `resumed`, then applies the
+test('with the real client, a close made between its resume and the relay\'s resumed leaves the channel unsubscribed', async () => {
+  // A close made after the client sends `resume`, and before `resumed`
+  // arrives, reaches the relay after the resume by either route: a client
+  // that sends at once puts it on the wire behind the resume, and one that
+  // holds calls until its session is ready flushes it just before it emits
+  // `resumed`. Either way the relay sends `resumed` and then applies the
   // unsubscribe, so a resume that subscribed every open channel would put the
   // closing channel back on the relay after it.
   const sockets: RelaySocket[] = [];
@@ -431,7 +433,7 @@ test('with the real client, a close sent between its resume and the relay\'s res
     sockets[0].drop();
     await until(() => sockets[1]?.inbox.some((frame) => frame.op === 'resume') === true, 'the client resumes');
     const closing = internal.handleChannelClose({ channelId: `portal:${channel.id}` });
-    assert.deepEqual(sockets[1].inbox.map((frame) => frame.op), ['resume', 'rpc'], 'the close went out behind the resume');
+    assert.equal(sockets[1].inbox[0]?.op, 'resume', 'the relay has the resume before anything the close sends');
     sockets[1].answer(ready);
 
     assert.deepEqual(await closing, { closed: true });
